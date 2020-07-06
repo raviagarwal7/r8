@@ -6,7 +6,7 @@ package com.android.tools.r8.maindexlist.warnings;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.CoreMatchers.containsString;
-import static org.junit.Assert.assertThat;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 import com.android.tools.r8.ForceInline;
 import com.android.tools.r8.TestBase;
@@ -31,7 +31,6 @@ public class MainDexWarningsTest extends TestBase {
   public void testNoWarningFromMainDexRules() throws Exception {
     testForR8(Backend.DEX)
         .setMinApi(AndroidApiLevel.K)
-        .enableInliningAnnotations()
         .addProgramClasses(testClasses)
         .addKeepMainRule(mainClass)
         // Include main dex rule for class Static.
@@ -45,11 +44,11 @@ public class MainDexWarningsTest extends TestBase {
   public void testWarningFromManualMainDexList() throws Exception {
     testForR8(Backend.DEX)
         .setMinApi(AndroidApiLevel.K)
-        .enableInliningAnnotations()
         .addProgramClasses(testClasses)
         .addKeepMainRule(mainClass)
         // Include explicit main dex entry for class Static.
         .addMainDexListClasses(Static.class)
+        .allowDiagnosticWarningMessages()
         .compile()
         .inspect(this::classStaticGone)
         .assertOnlyWarnings()
@@ -62,13 +61,13 @@ public class MainDexWarningsTest extends TestBase {
   public void testWarningFromManualMainDexListWithRuleAsWell() throws Exception {
     testForR8(Backend.DEX)
         .setMinApi(AndroidApiLevel.K)
-        .enableInliningAnnotations()
         .addProgramClasses(testClasses)
         .addKeepMainRule(mainClass)
         // Include explicit main dex entry for class Static.
         .addMainDexListClasses(Main.class, Static.class)
         // Include main dex rule for class Static2.
         .addMainDexClassRules(Static2.class)
+        .allowDiagnosticWarningMessages()
         .compile()
         .inspect(this::classStaticGone)
         .assertOnlyWarnings()

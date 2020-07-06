@@ -26,7 +26,7 @@ import com.android.tools.r8.utils.InternalOptions.PackageObfuscationMode;
 import com.android.tools.r8.utils.LongInterval;
 import com.android.tools.r8.utils.Reporter;
 import com.android.tools.r8.utils.StringDiagnostic;
-import com.google.common.base.MoreObjects;
+import com.android.tools.r8.utils.StringUtils;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import java.io.File;
@@ -53,15 +53,14 @@ public class ProguardConfigurationParser {
 
   private static final List<String> IGNORED_SINGLE_ARG_OPTIONS = ImmutableList.of(
       "protomapping",
-      "target");
+      "target",
+      "maximuminlinedcodelength");
 
-  private static final List<String> IGNORED_OPTIONAL_SINGLE_ARG_OPTIONS = ImmutableList.of(
-      "runtype",
-      "laststageoutput");
+  private static final List<String> IGNORED_OPTIONAL_SINGLE_ARG_OPTIONS =
+      ImmutableList.of("runtype", "laststageoutput");
 
   private static final List<String> IGNORED_FLAG_OPTIONS = ImmutableList.of(
       "forceprocessing",
-      "dontusemixedcaseclassnames",
       "dontpreverify",
       "experimentalshrinkunusedprotofields",
       "filterlibraryjarswithorginalprogramjars",
@@ -71,8 +70,9 @@ public class ProguardConfigurationParser {
       // TODO(b/62524562): we may support this later.
       "mergeinterfacesaggressively",
       "android",
-      "shrinkunusedprotofields",
-      "allowruntypeandignoreoptimizationpasses");
+      "allowruntypeandignoreoptimizationpasses",
+      "dontshrinkduringoptimization",
+      "convert_proto_enum_to_string");
 
   private static final List<String> IGNORED_CLASS_DESCRIPTOR_OPTIONS = ImmutableList.of(
       "isclassnamestring",
@@ -87,9 +87,7 @@ public class ProguardConfigurationParser {
       "dump");
 
   private static final List<String> WARNED_FLAG_OPTIONS =
-      ImmutableList.of(
-          // TODO(b/73707846): add support -addconfigurationdebugging
-          "addconfigurationdebugging", "useuniqueclassmembernames");
+      ImmutableList.of("useuniqueclassmembernames");
 
   private static final List<String> WARNED_CLASS_DESCRIPTOR_OPTIONS = ImmutableList.of(
       // TODO(b/73708157): add support -assumenoexternalsideeffects <class_spec>
@@ -131,6 +129,20 @@ public class ProguardConfigurationParser {
           configurationBuilder.getKeepParameterNamesOptionOrigin(),
           configurationBuilder.getKeepParameterNamesOptionPosition()));
     }
+    if (configurationBuilder.isConfigurationDebugging()) {
+      String suffix = "due to the use of -addconfigurationdebugging";
+      if (configurationBuilder.isObfuscating()) {
+        reporter.info(
+            new StringDiagnostic("Build is not being obfuscated " + suffix));
+        configurationBuilder.disableObfuscation();
+      }
+      if (configurationBuilder.hasApplyMappingFile()) {
+        reporter.info(
+            new StringDiagnostic(
+                "Applying the obfuscation map (-applymapping) is disabled " + suffix));
+        configurationBuilder.setApplyMappingFile(null);
+      }
+    }
   }
 
   /**
@@ -166,7 +178,7 @@ public class ProguardConfigurationParser {
         reporter.error(new StringDiagnostic("Failed to read file: " + e.getMessage(),
             source.getOrigin()));
       } catch (ProguardRuleParserException e) {
-        reporter.error(e, MoreObjects.firstNonNull(e.getCause(), e));
+        reporter.error(e);
       }
     }
     reporter.failIfPendingErrors();
@@ -189,7 +201,8 @@ public class ProguardConfigurationParser {
     private final Origin origin;
 
     ProguardConfigurationSourceParser(ProguardConfigurationSource source) throws IOException {
-      contents = source.get();
+      // Strip any leading BOM here so it is not included in the text position.
+      contents = StringUtils.stripLeadingBOM(source.get());
       baseDirectory = source.getBaseDirectory();
       name = source.getName();
       this.origin = source.getOrigin();
@@ -199,12 +212,17 @@ public class ProguardConfigurationParser {
       do {
         skipWhitespace();
       } while (parseOption());
+      // This may be unknown, but we want to always ensure that we don't attribute lines to the
+      // wrong configuration.
+      configurationBuilder.addParsedConfiguration(
+          "# The proguard configuration file for the following section is " + origin.toString());
+
       // Collect the parsed configuration.
       configurationBuilder.addParsedConfiguration(contents.substring(positionAfterInclude));
+      configurationBuilder.addParsedConfiguration("# End of content from " + origin.toString());
     }
 
-    private boolean parseOption()
-        throws ProguardRuleParserException {
+    private boolean parseOption() throws ProguardRuleParserException {
       if (eof()) {
         return false;
       }
@@ -213,10 +231,17 @@ public class ProguardConfigurationParser {
       }
       TextPosition optionStart = getPosition();
       expectChar('-');
-      if (parseIgnoredOption(optionStart) ||
-          parseIgnoredOptionAndWarn(optionStart) ||
-          parseUnsupportedOptionAndErr(optionStart)) {
+      if (parseIgnoredOption(optionStart)
+          || parseIgnoredOptionAndWarn(optionStart)
+          || parseTestingOption(optionStart)
+          || parseUnsupportedOptionAndErr(optionStart)) {
         // Intentionally left empty.
+      } else if (acceptString("adaptkotlinmetadata")) {
+        reporter.info(
+            new StringDiagnostic(
+                "Ignoring -adaptkotlinmetadata because R8 always process kotlin.Metadata",
+                origin,
+                getPosition(optionStart)));
       } else if (acceptString("renamesourcefileattribute")) {
         skipWhitespace();
         if (isOptionalArgumentGiven()) {
@@ -233,15 +258,12 @@ public class ProguardConfigurationParser {
       } else if (acceptString("checkdiscard")) {
         ProguardCheckDiscardRule rule = parseCheckDiscardRule(optionStart);
         configurationBuilder.addRule(rule);
+      } else if (acceptString("checkenumstringsdiscarded")) {
+        // Not supported, ignore.
+        parseCheckDiscardRule(optionStart);
       } else if (acceptString("keepdirectories")) {
         configurationBuilder.enableKeepDirectories();
         parsePathFilter(configurationBuilder::addKeepDirectories);
-      } else if (allowTestOptions && acceptString("keepconstantarguments")) {
-        ConstantArgumentRule rule = parseConstantArgumentRule(optionStart);
-        configurationBuilder.addRule(rule);
-      } else if (allowTestOptions && acceptString("keepunusedarguments")) {
-        UnusedArgumentRule rule = parseUnusedArgumentRule(optionStart);
-        configurationBuilder.addRule(rule);
       } else if (acceptString("keep")) {
         ProguardKeepRule rule = parseKeepRule(optionStart);
         configurationBuilder.addRule(rule);
@@ -268,6 +290,8 @@ public class ProguardConfigurationParser {
         if (isOptionalArgumentGiven()) {
           configurationBuilder.setPrintUsageFile(parseFileName(false));
         }
+      } else if (acceptString("shrinkunusedprotofields")) {
+        configurationBuilder.enableProtoShrinking();
       } else if (acceptString("verbose")) {
         configurationBuilder.setVerbose(true);
       } else if (acceptString("ignorewarnings")) {
@@ -366,28 +390,6 @@ public class ProguardConfigurationParser {
       } else if (acceptString("alwaysinline")) {
         InlineRule rule = parseInlineRule(InlineRule.Type.ALWAYS, optionStart);
         configurationBuilder.addRule(rule);
-      } else if (allowTestOptions && acceptString("assumemayhavesideeffects")) {
-        ProguardAssumeMayHaveSideEffectsRule rule = parseAssumeMayHaveSideEffectsRule(optionStart);
-        configurationBuilder.addRule(rule);
-      } else if (allowTestOptions && acceptString("forceinline")) {
-        InlineRule rule = parseInlineRule(InlineRule.Type.FORCE, optionStart);
-        configurationBuilder.addRule(rule);
-        // Insert a matching -checkdiscard rule to ensure force inlining happens.
-        ProguardCheckDiscardRule ruled = rule.asProguardCheckDiscardRule();
-        configurationBuilder.addRule(ruled);
-      } else if (allowTestOptions && acceptString("neverinline")) {
-        InlineRule rule = parseInlineRule(InlineRule.Type.NEVER, optionStart);
-        configurationBuilder.addRule(rule);
-      } else if (allowTestOptions && acceptString("neverclassinline")) {
-        ClassInlineRule rule = parseClassInlineRule(ClassInlineRule.Type.NEVER, optionStart);
-        configurationBuilder.addRule(rule);
-      } else if (allowTestOptions && acceptString("nevermerge")) {
-        ClassMergingRule rule = parseClassMergingRule(ClassMergingRule.Type.NEVER, optionStart);
-        configurationBuilder.addRule(rule);
-      } else if (allowTestOptions && acceptString("neverpropagatevalue")) {
-        MemberValuePropagationRule rule =
-            parseMemberValuePropagationRule(MemberValuePropagationRule.Type.NEVER, optionStart);
-        configurationBuilder.addRule(rule);
       } else if (acceptString("adaptclassstrings")) {
         parseClassFilter(configurationBuilder::addAdaptClassStringsPattern);
       } else if (acceptString("adaptresourcefilenames")) {
@@ -398,24 +400,120 @@ public class ProguardConfigurationParser {
         configurationBuilder.addRule(parseIdentifierNameStringRule(optionStart));
       } else if (acceptString("if")) {
         configurationBuilder.addRule(parseIfRule(optionStart));
+      } else if (acceptString("addconfigurationdebugging")) {
+        configurationBuilder.setConfigurationDebugging(true);
+      } else if (acceptString("dontusemixedcaseclassnames")) {
+        configurationBuilder.setDontUseMixedCaseClassnames(true);
+      } else if (acceptString("maximumremovedandroidloglevel")) {
+        skipWhitespace();
+        Integer maxRemovedAndroidLogLevel = acceptInteger();
+        if (maxRemovedAndroidLogLevel != null) {
+          configurationBuilder.setMaxRemovedAndroidLogLevel(maxRemovedAndroidLogLevel);
+        } else {
+          throw parseError("Expected integer", getPosition());
+        }
       } else {
         String unknownOption = acceptString();
         String devMessage = "";
-        if (Version.isDev()
+        if (Version.isDevelopmentVersion()
             && unknownOption != null
             && (unknownOption.equals("forceinline") || unknownOption.equals("neverinline"))) {
           devMessage = ", this option needs to be turned on explicitly if used for tests.";
         }
-        unknownOption(unknownOption, optionStart, devMessage);
+        throw unknownOption(unknownOption, optionStart, devMessage);
       }
       return true;
     }
 
-    private void unknownOption(String unknownOption, TextPosition optionStart) {
-      unknownOption(unknownOption, optionStart, "");
+    private boolean parseTestingOption(TextPosition optionStart)
+        throws ProguardRuleParserException {
+      if (allowTestOptions) {
+        if (acceptString("assumemayhavesideeffects")) {
+          ProguardAssumeMayHaveSideEffectsRule rule =
+              parseAssumeMayHaveSideEffectsRule(optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+        if (acceptString("forceinline")) {
+          InlineRule rule = parseInlineRule(InlineRule.Type.FORCE, optionStart);
+          configurationBuilder.addRule(rule);
+          // Insert a matching -checkdiscard rule to ensure force inlining happens.
+          ProguardCheckDiscardRule ruled = rule.asProguardCheckDiscardRule();
+          configurationBuilder.addRule(ruled);
+          return true;
+        }
+        if (acceptString("keepconstantarguments")) {
+          ConstantArgumentRule rule = parseConstantArgumentRule(optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+        if (acceptString("keepunusedarguments")) {
+          UnusedArgumentRule rule = parseUnusedArgumentRule(optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+        if (acceptString("alwaysclassinline")) {
+          ClassInlineRule rule = parseClassInlineRule(ClassInlineRule.Type.ALWAYS, optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+        if (acceptString("neverclassinline")) {
+          ClassInlineRule rule = parseClassInlineRule(ClassInlineRule.Type.NEVER, optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+        if (acceptString("neverinline")) {
+          InlineRule rule = parseInlineRule(InlineRule.Type.NEVER, optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+        if (acceptString("nevermerge")) {
+          ClassMergingRule rule = parseClassMergingRule(ClassMergingRule.Type.NEVER, optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+        if (acceptString("neverpropagatevalue")) {
+          MemberValuePropagationRule rule =
+              parseMemberValuePropagationRule(MemberValuePropagationRule.Type.NEVER, optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+        if (acceptString("neverreprocessclassinitializer")) {
+          configurationBuilder.addRule(
+              parseReprocessClassInitializerRule(
+                  ReprocessClassInitializerRule.Type.NEVER, optionStart));
+          return true;
+        }
+        if (acceptString("neverreprocessmethod")) {
+          configurationBuilder.addRule(
+              parseReprocessMethodRule(ReprocessMethodRule.Type.NEVER, optionStart));
+          return true;
+        }
+        if (acceptString("reprocessclassinitializer")) {
+          configurationBuilder.addRule(
+              parseReprocessClassInitializerRule(
+                  ReprocessClassInitializerRule.Type.ALWAYS, optionStart));
+          return true;
+        }
+        if (acceptString("reprocessmethod")) {
+          configurationBuilder.addRule(
+              parseReprocessMethodRule(ReprocessMethodRule.Type.ALWAYS, optionStart));
+          return true;
+        }
+        if (acceptString("whyareyounotinlining")) {
+          WhyAreYouNotInliningRule rule = parseWhyAreYouNotInliningRule(optionStart);
+          configurationBuilder.addRule(rule);
+          return true;
+        }
+      }
+      return false;
     }
 
-    private void unknownOption(
+    private RuntimeException unknownOption(String unknownOption, TextPosition optionStart) {
+      throw unknownOption(unknownOption, optionStart, "");
+    }
+
+    private RuntimeException unknownOption(
         String unknownOption, TextPosition optionStart, String additionalMessage) {
       throw reporter.fatalError((new StringDiagnostic(
           "Unknown option \"-" + unknownOption + "\"" + additionalMessage,
@@ -452,10 +550,11 @@ public class ProguardConfigurationParser {
       return true;
     }
 
-    private boolean parseIgnoredOption(TextPosition optionStart) {
+    private boolean parseIgnoredOption(TextPosition optionStart)
+        throws ProguardRuleParserException {
       return Iterables.any(IGNORED_SINGLE_ARG_OPTIONS, this::skipOptionWithSingleArg)
-          || Iterables.any(IGNORED_OPTIONAL_SINGLE_ARG_OPTIONS,
-                           this::skipOptionWithOptionalSingleArg)
+          || Iterables.any(
+              IGNORED_OPTIONAL_SINGLE_ARG_OPTIONS, this::skipOptionWithOptionalSingleArg)
           || Iterables.any(IGNORED_FLAG_OPTIONS, this::skipFlag)
           || Iterables.any(IGNORED_CLASS_DESCRIPTOR_OPTIONS, this::skipOptionWithClassSpec)
           || parseOptimizationOption(optionStart);
@@ -540,14 +639,14 @@ public class ProguardConfigurationParser {
           parseClassSpec(keepRuleBuilder, true);
           return true;
         } catch (ProguardRuleParserException e) {
-          throw reporter.fatalError(e, MoreObjects.firstNonNull(e.getCause(), e));
+          throw reporter.fatalError(e);
         }
       }
       return false;
-
     }
 
-    private boolean parseOptimizationOption(TextPosition optionStart) {
+    private boolean parseOptimizationOption(TextPosition optionStart)
+        throws ProguardRuleParserException {
       if (!acceptString("optimizations")) {
         return false;
       }
@@ -560,11 +659,19 @@ public class ProguardConfigurationParser {
       return true;
     }
 
-    private void skipOptimizationName() {
+    private void skipOptimizationName() throws ProguardRuleParserException {
+      char quote = acceptQuoteIfPresent();
+      if (isQuote(quote)) {
+        skipWhitespace();
+      }
       if (acceptChar('!')) {
         skipWhitespace();
       }
       acceptString(next -> Character.isAlphabetic(next) || next == '/' || next == '*');
+      if (isQuote(quote)) {
+        skipWhitespace();
+        expectClosingQuote(quote);
+      }
     }
 
     private void skipSingleArgument() {
@@ -727,6 +834,40 @@ public class ProguardConfigurationParser {
       return keepRuleBuilder.build();
     }
 
+    private ReprocessClassInitializerRule parseReprocessClassInitializerRule(
+        ReprocessClassInitializerRule.Type type, Position start)
+        throws ProguardRuleParserException {
+      ReprocessClassInitializerRule.Builder builder =
+          ReprocessClassInitializerRule.builder().setOrigin(origin).setStart(start).setType(type);
+      parseClassSpec(builder, false);
+      Position end = getPosition();
+      builder.setSource(getSourceSnippet(contents, start, end));
+      builder.setEnd(end);
+      return builder.build();
+    }
+
+    private ReprocessMethodRule parseReprocessMethodRule(
+        ReprocessMethodRule.Type type, Position start) throws ProguardRuleParserException {
+      ReprocessMethodRule.Builder builder =
+          ReprocessMethodRule.builder().setOrigin(origin).setStart(start).setType(type);
+      parseClassSpec(builder, false);
+      Position end = getPosition();
+      builder.setSource(getSourceSnippet(contents, start, end));
+      builder.setEnd(end);
+      return builder.build();
+    }
+
+    private WhyAreYouNotInliningRule parseWhyAreYouNotInliningRule(Position start)
+        throws ProguardRuleParserException {
+      WhyAreYouNotInliningRule.Builder keepRuleBuilder =
+          WhyAreYouNotInliningRule.builder().setOrigin(origin).setStart(start);
+      parseClassSpec(keepRuleBuilder, false);
+      Position end = getPosition();
+      keepRuleBuilder.setSource(getSourceSnippet(contents, start, end));
+      keepRuleBuilder.setEnd(end);
+      return keepRuleBuilder.build();
+    }
+
     void verifyAndLinkBackReferences(Iterable<ProguardWildcard> wildcards) {
       List<Pattern> patterns = new ArrayList<>();
       boolean backReferenceStarted = false;
@@ -756,7 +897,7 @@ public class ProguardConfigurationParser {
         ProguardClassSpecification.Builder<C, B> builder,
         boolean allowValueSpecification)
         throws ProguardRuleParserException {
-      parseClassFlagsAndAnnotations(builder);
+      parseClassAnnotationsAndFlags(builder);
       parseClassType(builder);
       builder.setClassNames(parseClassNames());
       parseInheritance(builder);
@@ -784,7 +925,7 @@ public class ProguardConfigurationParser {
           TextPosition start = getPosition();
           acceptString("-");
           String unknownOption = acceptString();
-          unknownOption(unknownOption, start);
+          throw unknownOption(unknownOption, start);
         }
       } else {
         builder.setType(ProguardKeepRuleType.KEEP);
@@ -795,7 +936,7 @@ public class ProguardConfigurationParser {
         TextPosition start = getPosition();
         acceptString("-");
         String unknownOption = acceptString();
-        unknownOption(unknownOption, start);
+        throw unknownOption(unknownOption, start);
       }
       parseRuleModifiers(builder);
     }
@@ -804,6 +945,7 @@ public class ProguardConfigurationParser {
       skipWhitespace();
       while (acceptChar(',')) {
         skipWhitespace();
+        TextPosition start = getPosition();
         if (acceptString("allow")) {
           if (acceptString("shrinking")) {
             builder.getModifiersBuilder().setAllowsShrinking(true);
@@ -811,17 +953,31 @@ public class ProguardConfigurationParser {
             builder.getModifiersBuilder().setAllowsOptimization(true);
           } else if (acceptString("obfuscation")) {
             builder.getModifiersBuilder().setAllowsObfuscation(true);
+          } else if (acceptString("accessmodification")) {
+            builder.getModifiersBuilder().setAllowsAccessModification(true);
           }
         } else if (acceptString("includedescriptorclasses")) {
           builder.getModifiersBuilder().setIncludeDescriptorClasses(true);
+        } else if (acceptString("includecode")) {
+          infoIgnoringModifier("includecode", start);
         }
         skipWhitespace();
       }
     }
 
-    private ProguardTypeMatcher parseAnnotation()
-      throws ProguardRuleParserException {
+    private List<ProguardTypeMatcher> parseAnnotationList() throws ProguardRuleParserException {
+      List<ProguardTypeMatcher> annotations = null;
+      ProguardTypeMatcher current;
+      while ((current = parseAnnotation()) != null) {
+        if (annotations == null) {
+          annotations = new ArrayList<>(2);
+        }
+        annotations.add(current);
+      }
+      return annotations != null ? annotations : Collections.emptyList();
+    }
 
+    private ProguardTypeMatcher parseAnnotation() throws ProguardRuleParserException {
       skipWhitespace();
       int startPosition = position;
       if (acceptChar('@')) {
@@ -844,16 +1000,14 @@ public class ProguardConfigurationParser {
       return acceptChar('!');
     }
 
-    private void parseClassFlagsAndAnnotations(ProguardClassSpecification.Builder builder)
+    private void parseClassAnnotationsAndFlags(ProguardClassSpecification.Builder<?, ?> builder)
         throws ProguardRuleParserException {
+      // We allow interleaving the class annotations and class flags for compatibility with
+      // Proguard, although this should not be possible according to the grammar.
       while (true) {
-        skipWhitespace();
         ProguardTypeMatcher annotation = parseAnnotation();
         if (annotation != null) {
-          // TODO(ager): Should we only allow one annotation? It looks that way from the
-          // proguard keep rule description, but that seems like a strange restriction?
-          assert builder.getClassAnnotation() == null;
-          builder.setClassAnnotation(annotation);
+          builder.addClassAnnotation(annotation);
         } else {
           int start = position;
           ProguardAccessFlags flags =
@@ -881,7 +1035,7 @@ public class ProguardConfigurationParser {
           "Expected [!]interface|@interface|class|enum", origin, getPosition(start));
     }
 
-    private void parseClassType(ProguardClassSpecification.Builder builder) {
+    private void parseClassType(ProguardClassSpecification.Builder<?, ?> builder) {
       skipWhitespace();
       TextPosition start = getPosition();
       if (acceptChar('!')) {
@@ -905,7 +1059,8 @@ public class ProguardConfigurationParser {
       }
     }
 
-    private void parseInheritance(ProguardClassSpecification.Builder classSpecificationBuilder)
+    private void parseInheritance(
+        ProguardClassSpecification.Builder<?, ?> classSpecificationBuilder)
         throws ProguardRuleParserException {
       skipWhitespace();
       if (acceptString("implements")) {
@@ -915,7 +1070,7 @@ public class ProguardConfigurationParser {
       } else {
         return;
       }
-      classSpecificationBuilder.setInheritanceAnnotation(parseAnnotation());
+      classSpecificationBuilder.addInheritanceAnnotations(parseAnnotationList());
       classSpecificationBuilder.setInheritanceClassName(ProguardTypeMatcher.create(parseClassName(),
           ClassOrType.CLASS, dexItemFactory));
     }
@@ -940,8 +1095,7 @@ public class ProguardConfigurationParser {
     private ProguardMemberRule parseMemberRule(boolean allowValueSpecification)
         throws ProguardRuleParserException {
       ProguardMemberRule.Builder ruleBuilder = ProguardMemberRule.builder();
-      skipWhitespace();
-      ruleBuilder.setAnnotation(parseAnnotation());
+      ruleBuilder.setAnnotations(parseAnnotationList());
       parseMemberAccessFlags(ruleBuilder);
       parseMemberPattern(ruleBuilder, allowValueSpecification);
       return ruleBuilder.isValid() ? ruleBuilder.build() : null;
@@ -951,8 +1105,9 @@ public class ProguardConfigurationParser {
       boolean found = true;
       while (found && !eof()) {
         found = false;
+        boolean negated = parseNegation();
         ProguardAccessFlags flags =
-            parseNegation() ? ruleBuilder.getNegatedAccessFlags() : ruleBuilder.getAccessFlags();
+            negated ? ruleBuilder.getNegatedAccessFlags() : ruleBuilder.getAccessFlags();
         skipWhitespace();
         switch (peekChar()) {
           case 'a':
@@ -1008,6 +1163,12 @@ public class ProguardConfigurationParser {
           default:
             // Intentionally left empty.
         }
+
+        // Ensure that we do not consume a negation character '!' when the subsequent identifier
+        // does not match a valid access flag name (e.g., "private !int x").
+        if (!found && negated) {
+          unacceptString("!");
+        }
       }
     }
 
@@ -1015,6 +1176,11 @@ public class ProguardConfigurationParser {
         ProguardMemberRule.Builder ruleBuilder, boolean allowValueSpecification)
         throws ProguardRuleParserException {
       skipWhitespace();
+      if (!eof() && peekChar() == '!') {
+        throw parseError(
+            "Unexpected character '!': "
+                + "The negation character can only be used to negate access flags");
+      }
       if (acceptString("<methods>")) {
         ruleBuilder.setRuleType(ProguardMemberType.ALL_METHODS);
       } else if (acceptString("<fields>")) {
@@ -1022,6 +1188,10 @@ public class ProguardConfigurationParser {
       } else if (acceptString("<init>")) {
         ruleBuilder.setRuleType(ProguardMemberType.INIT);
         ruleBuilder.setName(IdentifierPatternWithWildcards.withoutWildcards("<init>"));
+        ruleBuilder.setArguments(parseArgumentList());
+      } else if (acceptString("<clinit>")) {
+        ruleBuilder.setRuleType(ProguardMemberType.CLINIT);
+        ruleBuilder.setName(IdentifierPatternWithWildcards.withoutWildcards("<clinit>"));
         ruleBuilder.setArguments(parseArgumentList());
       } else {
         TextPosition firstStart = getPosition();
@@ -1032,90 +1202,122 @@ public class ProguardConfigurationParser {
           if (first.pattern.equals("*") && hasNextChar(';')) {
             ruleBuilder.setRuleType(ProguardMemberType.ALL);
           } else {
+            // No return type present, only method name, most likely constructors.
             if (hasNextChar('(')) {
+              // "<init>" and "<clinit>" are explicitly checked, so angular brackets can't appear.
+              checkConstructorPattern(first, firstStart);
               ruleBuilder.setRuleType(ProguardMemberType.CONSTRUCTOR);
               ruleBuilder.setName(first);
               ruleBuilder.setArguments(parseArgumentList());
             } else {
-              TextPosition secondStart = getPosition();
-              IdentifierPatternWithWildcards second =
-                  acceptIdentifierWithBackreference(IdentifierType.ANY);
-              if (second != null) {
-                skipWhitespace();
-                if (hasNextChar('(')) {
-                  ruleBuilder.setRuleType(ProguardMemberType.METHOD);
-                  ruleBuilder.setName(second);
-                  ruleBuilder
-                      .setTypeMatcher(
-                          ProguardTypeMatcher.create(first, ClassOrType.TYPE, dexItemFactory));
-                  ruleBuilder.setArguments(parseArgumentList());
-                } else {
-                  if (first.hasUnusualCharacters()) {
-                    warnUnusualCharacters("type", first.pattern, "field", firstStart);
-                  }
-                  if (second.hasUnusualCharacters()) {
-                    warnUnusualCharacters("field name", second.pattern, "field", secondStart);
-                  }
-                  ruleBuilder.setRuleType(ProguardMemberType.FIELD);
-                  ruleBuilder.setName(second);
-                  ruleBuilder
-                      .setTypeMatcher(
-                          ProguardTypeMatcher.create(first, ClassOrType.TYPE, dexItemFactory));
+              if (acceptString("<init>")) {
+                ProguardTypeMatcher typeMatcher =
+                    ProguardTypeMatcher.create(first, ClassOrType.TYPE, dexItemFactory);
+                if (!typeMatcher.matchesSpecificType()
+                    || !typeMatcher.getSpecificType().isVoidType()) {
+                  throw parseError("Expected [access-flag]* void <init>");
                 }
-                skipWhitespace();
-                // Parse "return ..." if present.
-                if (acceptString("return")) {
+                ruleBuilder.setRuleType(ProguardMemberType.INIT);
+                ruleBuilder.setName(IdentifierPatternWithWildcards.withoutWildcards("<init>"));
+                ruleBuilder.setTypeMatcher(typeMatcher);
+                ruleBuilder.setArguments(parseArgumentList());
+              } else if (acceptString("<clinit>")) {
+                ProguardTypeMatcher typeMatcher =
+                    ProguardTypeMatcher.create(first, ClassOrType.TYPE, dexItemFactory);
+                if (!typeMatcher.matchesSpecificType()
+                    || !typeMatcher.getSpecificType().isVoidType()) {
+                  throw parseError("Expected [access-flag]* void <clinit>");
+                }
+                ruleBuilder.setRuleType(ProguardMemberType.CLINIT);
+                ruleBuilder.setName(IdentifierPatternWithWildcards.withoutWildcards("<clinit>"));
+                ruleBuilder.setTypeMatcher(typeMatcher);
+                ruleBuilder.setArguments(parseArgumentList());
+              } else {
+                TextPosition secondStart = getPosition();
+                IdentifierPatternWithWildcards second =
+                    acceptIdentifierWithBackreference(IdentifierType.ANY);
+                if (second != null) {
                   skipWhitespace();
-                  if (acceptString("true")) {
-                    ruleBuilder.setReturnValue(new ProguardMemberRuleReturnValue(true));
-                  } else if (acceptString("false")) {
-                    ruleBuilder.setReturnValue(new ProguardMemberRuleReturnValue(false));
-                  } else if (acceptString("null")) {
-                    ruleBuilder.setReturnValue(new ProguardMemberRuleReturnValue());
+                  if (hasNextChar('(')) {
+                    // Parsing legitimate constructor patters is already done, so angular brackets
+                    // can't appear, except for legitimate back references.
+                    if (!second.hasBackreference() || second.hasUnusualCharacters()) {
+                      checkConstructorPattern(second, secondStart);
+                    }
+                    ruleBuilder.setRuleType(ProguardMemberType.METHOD);
+                    ruleBuilder.setName(second);
+                    ruleBuilder
+                        .setTypeMatcher(
+                            ProguardTypeMatcher.create(first, ClassOrType.TYPE, dexItemFactory));
+                    ruleBuilder.setArguments(parseArgumentList());
                   } else {
-                    TextPosition fieldOrValueStart = getPosition();
-                    String qualifiedFieldNameOrInteger = acceptFieldNameOrIntegerForReturn();
-                    if (qualifiedFieldNameOrInteger != null) {
-                      if (isInteger(qualifiedFieldNameOrInteger)) {
-                        Integer min = Integer.parseInt(qualifiedFieldNameOrInteger);
-                        Integer max = min;
-                        skipWhitespace();
-                        if (acceptString("..")) {
+                    if (first.hasUnusualCharacters()) {
+                      warnUnusualCharacters("type", first.pattern, "field", firstStart);
+                    }
+                    if (second.hasUnusualCharacters()) {
+                      warnUnusualCharacters("field name", second.pattern, "field", secondStart);
+                    }
+                    ruleBuilder.setRuleType(ProguardMemberType.FIELD);
+                    ruleBuilder.setName(second);
+                    ruleBuilder
+                        .setTypeMatcher(
+                            ProguardTypeMatcher.create(first, ClassOrType.TYPE, dexItemFactory));
+                  }
+                  skipWhitespace();
+                  // Parse "return ..." if present.
+                  if (acceptString("return")) {
+                    skipWhitespace();
+                    if (acceptString("true")) {
+                      ruleBuilder.setReturnValue(new ProguardMemberRuleReturnValue(true));
+                    } else if (acceptString("false")) {
+                      ruleBuilder.setReturnValue(new ProguardMemberRuleReturnValue(false));
+                    } else if (acceptString("null")) {
+                      ruleBuilder.setReturnValue(new ProguardMemberRuleReturnValue());
+                    } else {
+                      TextPosition fieldOrValueStart = getPosition();
+                      String qualifiedFieldNameOrInteger = acceptFieldNameOrIntegerForReturn();
+                      if (qualifiedFieldNameOrInteger != null) {
+                        if (isInteger(qualifiedFieldNameOrInteger)) {
+                          Integer min = Integer.parseInt(qualifiedFieldNameOrInteger);
+                          Integer max = min;
                           skipWhitespace();
-                          max = acceptInteger();
-                          if (max == null) {
-                            throw parseError("Expected integer value");
+                          if (acceptString("..")) {
+                            skipWhitespace();
+                            max = acceptInteger();
+                            if (max == null) {
+                              throw parseError("Expected integer value");
+                            }
                           }
-                        }
-                        if (!allowValueSpecification) {
-                          throw parseError("Unexpected value specification", fieldOrValueStart);
-                        }
-                        ruleBuilder.setReturnValue(
-                            new ProguardMemberRuleReturnValue(new LongInterval(min, max)));
-                      } else {
-                        if (ruleBuilder.getTypeMatcher() instanceof MatchSpecificType) {
-                          int lastDotIndex = qualifiedFieldNameOrInteger.lastIndexOf(".");
-                          DexType fieldType = ((MatchSpecificType) ruleBuilder
-                              .getTypeMatcher()).type;
-                          DexType fieldClass =
-                              dexItemFactory.createType(
-                                  javaTypeToDescriptor(
-                                      qualifiedFieldNameOrInteger.substring(0, lastDotIndex)));
-                          DexString fieldName =
-                              dexItemFactory.createString(
-                                  qualifiedFieldNameOrInteger.substring(lastDotIndex + 1));
-                          DexField field = dexItemFactory
-                              .createField(fieldClass, fieldType, fieldName);
-                          ruleBuilder.setReturnValue(new ProguardMemberRuleReturnValue(field));
+                          if (!allowValueSpecification) {
+                            throw parseError("Unexpected value specification", fieldOrValueStart);
+                          }
+                          ruleBuilder.setReturnValue(
+                              new ProguardMemberRuleReturnValue(new LongInterval(min, max)));
                         } else {
-                          throw parseError("Expected specific type", fieldOrValueStart);
+                          if (ruleBuilder.getTypeMatcher() instanceof MatchSpecificType) {
+                            int lastDotIndex = qualifiedFieldNameOrInteger.lastIndexOf(".");
+                            DexType fieldType = ((MatchSpecificType) ruleBuilder
+                                .getTypeMatcher()).type;
+                            DexType fieldClass =
+                                dexItemFactory.createType(
+                                    javaTypeToDescriptor(
+                                        qualifiedFieldNameOrInteger.substring(0, lastDotIndex)));
+                            DexString fieldName =
+                                dexItemFactory.createString(
+                                    qualifiedFieldNameOrInteger.substring(lastDotIndex + 1));
+                            DexField field = dexItemFactory
+                                .createField(fieldClass, fieldType, fieldName);
+                            ruleBuilder.setReturnValue(new ProguardMemberRuleReturnValue(field));
+                          } else {
+                            throw parseError("Expected specific type", fieldOrValueStart);
+                          }
                         }
                       }
                     }
                   }
+                } else {
+                  throw parseError("Expected field or method name");
                 }
-              } else {
-                throw parseError("Expected field or method name");
               }
             }
           }
@@ -1125,6 +1327,23 @@ public class ProguardConfigurationParser {
       if (ruleBuilder.isValid()) {
         skipWhitespace();
         expectChar(';');
+      }
+    }
+
+    private void checkConstructorPattern(
+        IdentifierPatternWithWildcards pattern, TextPosition position)
+        throws ProguardRuleParserException {
+      if (pattern.pattern.equals("<clinit>")) {
+        reporter.warning(
+            new StringDiagnostic("Member rule for <clinit> has no effect.", origin, position));
+        return;
+      }
+      if (pattern.pattern.contains("<")) {
+        throw parseError("Unexpected character '<' in method name. "
+            + "The character '<' is only allowed in the method name '<init>'.", position);
+      } else if (pattern.pattern.contains(">")) {
+        throw parseError("Unexpected character '>' in method name. "
+            + "The character '>' is only allowed in the method name '<init>'.", position);
       }
     }
 
@@ -1223,13 +1442,14 @@ public class ProguardConfigurationParser {
     private List<FilteredClassPath> parseClassPath() throws ProguardRuleParserException {
       List<FilteredClassPath> classPath = new ArrayList<>();
       skipWhitespace();
+      TextPosition position = getPosition();
       Path file = parseFileName(true);
       ImmutableList<String> filters = parseClassPathFilters();
-      classPath.add(new FilteredClassPath(file, filters));
+      classPath.add(new FilteredClassPath(file, filters, origin, position));
       while (acceptChar(File.pathSeparatorChar)) {
         file = parseFileName(true);
         filters = parseClassPathFilters();
-        classPath.add(new FilteredClassPath(file, filters));
+        classPath.add(new FilteredClassPath(file, filters, origin, position));
       }
       return classPath;
     }
@@ -1302,7 +1522,7 @@ public class ProguardConfigurationParser {
     }
 
     private void skipWhitespace() {
-      while (!eof() && Character.isWhitespace(contents.charAt(position))) {
+      while (!eof() && StringUtils.isWhitespace(peekChar())) {
         if (peekChar() == '\n') {
           line++;
           lineStartPosition = position + 1;
@@ -1618,20 +1838,32 @@ public class ProguardConfigurationParser {
     private List<String> acceptPatternList() throws ProguardRuleParserException {
       List<String> patterns = new ArrayList<>();
       skipWhitespace();
+      char quote = acceptQuoteIfPresent();
       String pattern = acceptPattern();
+      if (isQuote(quote)) {
+        expectClosingQuote(quote);
+      }
       while (pattern != null) {
         patterns.add(pattern);
         skipWhitespace();
-        TextPosition start = getPosition();
         if (acceptChar(',')) {
           skipWhitespace();
+          TextPosition start = getPosition();
+          quote = acceptQuoteIfPresent();
           pattern = acceptPattern();
+          if (isQuote(quote)) {
+            expectClosingQuote(quote);
+          }
           if (pattern == null) {
             throw parseError("Expected list element", start);
           }
         } else {
           pattern = null;
         }
+      }
+      skipWhitespace();
+      if (!eof() && !hasNextChar('-') && !hasNextChar('@')) {
+        throw parseError("Unexpected attribute");
       }
       return patterns;
     }
@@ -1641,7 +1873,8 @@ public class ProguardConfigurationParser {
           codePoint ->
               IdentifierUtils.isDexIdentifierPart(codePoint)
                   || codePoint == '!'
-                  || codePoint == '*');
+                  || codePoint == '*'
+                  || codePoint == '.');
     }
 
     private String acceptString(Predicate<Integer> codepointAcceptor) {
@@ -1847,6 +2080,11 @@ public class ProguardConfigurationParser {
           origin, getPosition(start)));
     }
 
+    private void infoIgnoringModifier(String modifier, TextPosition start) {
+      reporter.info(new StringDiagnostic(
+          "Ignoring modifier: " + modifier, origin, getPosition(start)));
+    }
+
     private Position getPosition(TextPosition start) {
       if (start.getOffset() == position) {
         return start;
@@ -1867,19 +2105,19 @@ public class ProguardConfigurationParser {
       return start instanceof TextPosition && end instanceof TextPosition
           ? getTextSourceSnippet(source, (TextPosition) start, (TextPosition) end)
           : null;
-      }
     }
+  }
 
-    private String getTextSourceSnippet(String source, TextPosition start, TextPosition end) {
-      long length = end.getOffset() - start.getOffset();
-      if (start.getOffset() < 0 || end.getOffset() < 0
-          || start.getOffset() >= source.length() || end.getOffset() > source.length()
-          || length <= 0) {
-        return null;
-      } else {
-        return source.substring((int) start.getOffset(), (int) end.getOffset());
-      }
+  private String getTextSourceSnippet(String source, TextPosition start, TextPosition end) {
+    long length = end.getOffset() - start.getOffset();
+    if (start.getOffset() < 0 || end.getOffset() < 0
+        || start.getOffset() >= source.length() || end.getOffset() > source.length()
+        || length <= 0) {
+      return null;
+    } else {
+      return source.substring((int) start.getOffset(), (int) end.getOffset());
     }
+  }
 
   static class IdentifierPatternWithWildcards {
     final String pattern;
@@ -1896,6 +2134,11 @@ public class ProguardConfigurationParser {
 
     boolean isMatchAllNames() {
       return pattern.equals("*");
+    }
+
+    boolean hasBackreference() {
+      return !wildcards.isEmpty()
+          && wildcards.stream().anyMatch(ProguardWildcard::isBackReference);
     }
 
     boolean hasUnusualCharacters() {

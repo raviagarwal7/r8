@@ -8,10 +8,10 @@ import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.cf.code.CfLoad;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -21,6 +21,11 @@ public class Load extends Instruction {
 
   public Load(StackValue dest, Value src) {
     super(dest, src);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.LOAD;
   }
 
   @Override
@@ -59,7 +64,7 @@ public class Load extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forLoad();
   }
 
@@ -75,8 +80,7 @@ public class Load extends Instruction {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return helper.getDexType(src());
   }
 
@@ -86,12 +90,17 @@ public class Load extends Instruction {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return src().getTypeLattice();
+  public TypeElement evaluate(AppView<?> appView) {
+    return src().getType();
   }
 
   @Override
   public boolean hasInvariantOutType() {
+    return false;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
     return false;
   }
 }

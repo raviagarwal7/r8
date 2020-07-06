@@ -8,11 +8,16 @@ import static org.objectweb.asm.ClassReader.SKIP_CODE;
 import static org.objectweb.asm.ClassReader.SKIP_DEBUG;
 import static org.objectweb.asm.ClassReader.SKIP_FRAMES;
 import static org.objectweb.asm.Opcodes.ACC_DEPRECATED;
+import static org.objectweb.asm.Opcodes.V1_6;
+import static org.objectweb.asm.Opcodes.V9;
 
+import com.android.tools.r8.ProgramResource;
 import com.android.tools.r8.ProgramResource.Kind;
+import com.android.tools.r8.ResourceException;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.DexProgramClass.ChecksumSupplier;
 import com.android.tools.r8.graph.DexValue.DexValueAnnotation;
 import com.android.tools.r8.graph.DexValue.DexValueArray;
 import com.android.tools.r8.graph.DexValue.DexValueBoolean;
@@ -30,23 +35,24 @@ import com.android.tools.r8.graph.DexValue.DexValueType;
 import com.android.tools.r8.jar.CfApplicationWriter;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.shaking.ProguardKeepAttributes;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.ExceptionUtils;
 import com.android.tools.r8.utils.FieldSignatureEquivalence;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.MethodSignatureEquivalence;
 import com.android.tools.r8.utils.StringDiagnostic;
+import com.android.tools.r8.utils.StringUtils;
 import com.google.common.base.Equivalence.Wrapper;
-import java.io.BufferedInputStream;
-import java.io.IOException;
-import java.io.InputStream;
+import com.google.common.collect.Iterables;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.zip.CRC32;
 import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.Attribute;
 import org.objectweb.asm.ClassReader;
@@ -76,26 +82,26 @@ public class JarClassFileReader {
     this.classConsumer = classConsumer;
   }
 
-  public void read(Origin origin, ClassKind classKind, InputStream input) throws IOException {
-    if (!input.markSupported()) {
-      input = new BufferedInputStream(input);
-    }
-    byte[] header = new byte[CLASSFILE_HEADER.length];
-    input.mark(header.length);
-    int size = 0;
-    while (size < header.length) {
-      int read = input.read(header, size, header.length - size);
-      if (read < 0) {
-        throw new CompilationError("Invalid empty classfile", origin);
-      }
-      size += read;
-    }
-    if (!Arrays.equals(CLASSFILE_HEADER, header)) {
-      throw new CompilationError("Invalid classfile header", origin);
-    }
-    input.reset();
+  public void read(ProgramResource resource, ClassKind classKind) throws ResourceException {
+    read(resource.getOrigin(), classKind, resource.getBytes());
+  }
 
-    ClassReader reader = new ClassReader(input);
+  public void read(Origin origin, ClassKind classKind, byte[] bytes) {
+    ExceptionUtils.withOriginAttachmentHandler(
+        origin, () -> internalRead(origin, classKind, bytes));
+  }
+
+  public void internalRead(Origin origin, ClassKind classKind, byte[] bytes) {
+    if (bytes.length < CLASSFILE_HEADER.length) {
+      throw new CompilationError("Invalid empty classfile", origin);
+    }
+    for (int i = 0; i < CLASSFILE_HEADER.length; i++) {
+      if (bytes[i] != CLASSFILE_HEADER[i]) {
+        throw new CompilationError("Invalid classfile header", origin);
+      }
+    }
+
+    ClassReader reader = new ClassReader(bytes);
 
     int parsingOptions = SKIP_FRAMES | SKIP_CODE;
 
@@ -104,7 +110,7 @@ public class JarClassFileReader {
     if (application.options.getProguardConfiguration() != null) {
       ProguardKeepAttributes keep =
           application.options.getProguardConfiguration().getKeepAttributes();
-      if (!keep.sourceFile && !keep.sourceDebugExtension) {
+      if (!keep.sourceFile && !keep.sourceDebugExtension && !keep.methodParameters) {
         parsingOptions |= SKIP_DEBUG;
       }
     }
@@ -149,10 +155,23 @@ public class JarClassFileReader {
       List<DexAnnotation> annotations,
       JarApplicationReader application) {
     assert annotations != null;
-    int visiblity = visible ? DexAnnotation.VISIBILITY_RUNTIME : DexAnnotation.VISIBILITY_BUILD;
-    return new CreateAnnotationVisitor(application, (names, values) ->
-        annotations.add(new DexAnnotation(visiblity,
-            createEncodedAnnotation(desc, names, values, application))));
+    if (visible || retainCompileTimeAnnotation(desc, application)) {
+      int visiblity = visible ? DexAnnotation.VISIBILITY_RUNTIME : DexAnnotation.VISIBILITY_BUILD;
+      return new CreateAnnotationVisitor(
+          application,
+          (names, values) ->
+              annotations.add(
+                  new DexAnnotation(
+                      visiblity, createEncodedAnnotation(desc, names, values, application))));
+    }
+    return null;
+  }
+
+  private static boolean retainCompileTimeAnnotation(
+      String desc, JarApplicationReader application) {
+    return application.options.readCompileTimeAnnotations
+        || DexAnnotation.retainCompileTimeAnnotation(
+            application.getTypeFromDescriptor(desc), application.options);
   }
 
   private static DexEncodedAnnotation createEncodedAnnotation(String desc,
@@ -211,6 +230,18 @@ public class JarClassFileReader {
 
     @Override
     public void visitInnerClass(String name, String outerName, String innerName, int access) {
+      if (outerName != null && innerName != null) {
+        String separator = DescriptorUtils.computeInnerClassSeparator(outerName, name, innerName);
+        if (separator == null && getMajorVersion() < V9) {
+          application.options.reporter.info(
+              new StringDiagnostic(
+                  StringUtils.lines(
+                      "Malformed inner-class attribute:",
+                      "\touterTypeInternal: " + outerName,
+                      "\tinnerTypeInternal: " + name,
+                      "\tinnerName: " + innerName)));
+        }
+      }
       innerClasses.add(
           new InnerClassAttribute(
               access,
@@ -234,7 +265,6 @@ public class JarClassFileReader {
     public void visitNestHost(String nestHost) {
       assert this.nestHost == null && nestMembers.isEmpty();
       DexType nestHostType = application.getTypeFromName(nestHost);
-      // TODO anonymous classes b/130716158
       this.nestHost = new NestHostClassAttribute(nestHostType);
     }
 
@@ -242,7 +272,6 @@ public class JarClassFileReader {
     public void visitNestMember(String nestMember) {
       assert nestHost == null;
       DexType nestMemberType = application.getTypeFromName(nestMember);
-      // TODO anonymous classes b/130716158
       nestMembers.add(new NestMemberClassAttribute(nestMemberType));
     }
 
@@ -268,6 +297,9 @@ public class JarClassFileReader {
     public void visit(int version, int access, String name, String signature, String superName,
         String[] interfaces) {
       this.version = version;
+      if (InternalOptions.SUPPORTED_CF_MAJOR_VERSION < getMajorVersion()) {
+        throw new CompilationError("Unsupported class file version: " + getMajorVersion(), origin);
+      }
       accessFlags = ClassAccessFlags.fromCfAccessFlags(cleanAccessFlags(access));
       type = application.getTypeFromName(name);
       // Check if constraints from
@@ -289,6 +321,7 @@ public class JarClassFileReader {
                 "must extend class java.lang.Object. Found: " + Objects.toString(superName)),
             origin);
       }
+      checkName(name);
       assert superName != null || name.equals(Constants.JAVA_LANG_OBJECT_NAME);
       superType = superName == null ? null : application.getTypeFromName(superName);
       this.interfaces = application.getTypeListFromNames(interfaces);
@@ -318,6 +351,7 @@ public class JarClassFileReader {
           return null;
         }
       }
+      checkName(name);
       return new CreateFieldVisitor(
           this, access, name, desc, signature, classKind == ClassKind.LIBRARY ? null : value);
     }
@@ -331,6 +365,7 @@ public class JarClassFileReader {
           return null;
         }
       }
+      checkName(name);
       return new CreateMethodVisitor(access, name, desc, signature, exceptions, this);
     }
 
@@ -376,12 +411,63 @@ public class JarClassFileReader {
               instanceFields.toArray(DexEncodedField.EMPTY_ARRAY),
               directMethods.toArray(DexEncodedMethod.EMPTY_ARRAY),
               virtualMethods.toArray(DexEncodedMethod.EMPTY_ARRAY),
-              application.getFactory().getSkipNameValidationForTesting());
+              application.getFactory().getSkipNameValidationForTesting(),
+              getChecksumSupplier(classKind));
+      InnerClassAttribute innerClassAttribute = clazz.getInnerClassAttributeForThisClass();
+      // A member class should not be a local or anonymous class.
+      if (innerClassAttribute != null && innerClassAttribute.getOuter() != null) {
+        if (innerClassAttribute.isAnonymous()) {
+          assert innerClassAttribute.getInnerName() == null;
+          // If the enclosing member is not null, the intention would be an anonymous class, and
+          // thus the outer-class reference should have been null.  If the enclosing member is null,
+          // it is likely due to the missing enclosing member.  In either case, we can recover
+          // InnerClasses attribute by erasing the outer-class reference.
+          InnerClassAttribute recoveredAttribute = new InnerClassAttribute(
+              innerClassAttribute.getAccess(), innerClassAttribute.getInner(), null, null);
+          clazz.replaceInnerClassAttributeForThisClass(recoveredAttribute);
+        } else if (enclosingMember != null) {
+          assert innerClassAttribute.isNamed();
+          // It is unclear whether the intention was a member class or a local class. Fail hard.
+          throw new CompilationError(
+              StringUtils.lines(
+                  "A member class cannot also be a (non-member) local class at the same time.",
+                  "This is likely due to invalid EnclosingMethod and InnerClasses attributes:",
+                  enclosingMember.toString(),
+                  innerClassAttribute.toString()),
+              origin);
+        }
+      }
+      if (enclosingMember == null
+          && (clazz.isLocalClass() || clazz.isAnonymousClass())
+          && getMajorVersion() > V1_6) {
+        application.options.warningMissingEnclosingMember(clazz.type, clazz.origin, version);
+      }
+      if (!clazz.isLibraryClass()) {
+        context.owner = clazz;
+      }
       if (clazz.isProgramClass()) {
-        context.owner = clazz.asProgramClass();
-        clazz.asProgramClass().setInitialClassFileVersion(version);
+        DexProgramClass programClass = clazz.asProgramClass();
+        programClass.setInitialClassFileVersion(version);
       }
       classConsumer.accept(clazz);
+    }
+
+    private ChecksumSupplier getChecksumSupplier(ClassKind classKind) {
+      if (application.options.encodeChecksums && classKind == ClassKind.PROGRAM) {
+        CRC32 crc = new CRC32();
+        crc.update(this.context.classCache, 0, this.context.classCache.length);
+        final long value = crc.getValue();
+        return clazz -> value;
+      }
+      return DexProgramClass::invalidChecksumRequest;
+    }
+
+    private void checkName(String name) {
+      if (!application.getFactory().getSkipNameValidationForTesting()
+          && !DexString.isValidSimpleName(application.options.minApiLevel, name)) {
+        throw new CompilationError("Space characters in SimpleName '"
+          + name + "' are not allowed prior to DEX version 040");
+      }
     }
 
     // If anything is marked reachability sensitive, all methods need to be parsed including
@@ -389,16 +475,10 @@ public class JarClassFileReader {
     // or method is annotated, all methods get parsed with locals information.
     private void checkReachabilitySensitivity() {
       if (hasReachabilitySensitiveMethod || hasReachabilitySensitiveField()) {
-        for (DexEncodedMethod method : directMethods) {
+        for (DexEncodedMethod method : Iterables.concat(directMethods, virtualMethods)) {
           Code code = method.getCode();
-          if (code != null && code.isJarCode()) {
-            code.asJarCode().markReachabilitySensitive();
-          }
-        }
-        for (DexEncodedMethod method : virtualMethods) {
-          Code code = method.getCode();
-          if (code != null && code.isJarCode()) {
-            code.asJarCode().markReachabilitySensitive();
+          if (code != null && code.isCfCode()) {
+            code.asLazyCfCode().markReachabilitySensitive();
           }
         }
       }
@@ -406,15 +486,8 @@ public class JarClassFileReader {
 
     private boolean hasReachabilitySensitiveField() {
       DexType reachabilitySensitive = application.getFactory().annotationReachabilitySensitive;
-      for (DexEncodedField field : instanceFields) {
-        for (DexAnnotation annotation : field.annotations.annotations) {
-          if (annotation.annotation.type == reachabilitySensitive) {
-            return true;
-          }
-        }
-      }
-      for (DexEncodedField field : staticFields) {
-        for (DexAnnotation annotation : field.annotations.annotations) {
+      for (DexEncodedField field : Iterables.concat(instanceFields, staticFields)) {
+        for (DexAnnotation annotation : field.annotations().annotations) {
           if (annotation.annotation.type == reachabilitySensitive) {
             return true;
           }
@@ -447,6 +520,10 @@ public class JarClassFileReader {
 
     private int getMinorVersion() {
       return ((version >> 16) & 0xFFFF);
+    }
+
+    public boolean isInANest() {
+      return !nestMembers.isEmpty() || nestHost != null;
     }
   }
 
@@ -593,7 +670,7 @@ public class JarClassFileReader {
       this.parent = parent;
       this.method = parent.application.getMethod(parent.type, name, desc);
       this.flags = createMethodAccessFlags(name, access);
-      parameterCount = JarApplicationReader.getArgumentCount(desc);
+      parameterCount = DescriptorUtils.getArgumentCount(desc);
       if (exceptions != null && exceptions.length > 0) {
         DexValue[] values = new DexValue[exceptions.length];
         for (int i = 0; i < exceptions.length; i++) {
@@ -693,31 +770,34 @@ public class JarClassFileReader {
       throw new Unreachable("visitCode() should not be called when SKIP_CODE is set");
     }
 
+    private boolean classRequiresCode() {
+      return parent.classKind == ClassKind.PROGRAM
+          || (parent.application.options.enableNestBasedAccessDesugaring
+              && !parent.application.options.canUseNestBasedAccess()
+              && parent.classKind == ClassKind.CLASSPATH
+              && parent.isInANest());
+    }
+
     @Override
     public void visitEnd() {
-      if (!flags.isAbstract() && !flags.isNative() && parent.classKind == ClassKind.PROGRAM) {
-        if (parent.application.options.enableCfFrontend) {
-          code = new LazyCfCode(method, parent.origin, parent.context, parent.application);
-        } else {
-          code = new JarCode(method, parent.origin, parent.context, parent.application);
-        }
+      InternalOptions options = parent.application.options;
+      if (!flags.isAbstract() && !flags.isNative() && classRequiresCode()) {
+        code = new LazyCfCode(method, parent.origin, parent.context, parent.application);
       }
-      ParameterAnnotationsList annotationsList;
+      ParameterAnnotationsList parameterAnnotationsList;
       if (parameterAnnotationsLists == null) {
-        annotationsList = ParameterAnnotationsList.empty();
+        parameterAnnotationsList = ParameterAnnotationsList.empty();
       } else {
         DexAnnotationSet[] sets = new DexAnnotationSet[parameterAnnotationsLists.size()];
         for (int i = 0; i < parameterAnnotationsLists.size(); i++) {
-          sets[i] =
-              createAnnotationSet(parameterAnnotationsLists.get(i), parent.application.options);
+          sets[i] = createAnnotationSet(parameterAnnotationsLists.get(i), options);
         }
-        annotationsList = new ParameterAnnotationsList(sets);
+        parameterAnnotationsList = new ParameterAnnotationsList(sets);
       }
-      InternalOptions internalOptions = parent.application.options;
-      if (parameterNames != null && internalOptions.canUseParameterNameAnnotations()) {
+      if (parameterNames != null) {
         assert parameterFlags != null;
         if (parameterNames.size() != parameterCount) {
-          internalOptions.warningInvalidParameterAnnotations(
+          options.warningInvalidParameterAnnotations(
               method, parent.origin, parameterCount, parameterNames.size());
         }
         getAnnotations().add(DexAnnotation.createMethodParametersAnnotation(
@@ -729,8 +809,8 @@ public class JarClassFileReader {
           new DexEncodedMethod(
               method,
               flags,
-              createAnnotationSet(annotations, parent.application.options),
-              annotationsList,
+              createAnnotationSet(annotations, options),
+              parameterAnnotationsList,
               code,
               parent.version);
       Wrapper<DexMethod> signature = MethodSignatureEquivalence.get().wrap(method);
@@ -742,7 +822,7 @@ public class JarClassFileReader {
           parent.virtualMethods.add(dexMethod);
         }
       } else {
-        internalOptions.reporter.warning(
+        options.reporter.warning(
             new StringDiagnostic(
                 String.format(
                     "Ignoring an implementation of the method `%s` because it has multiple "
@@ -928,7 +1008,7 @@ public class JarClassFileReader {
     // from this to the actual JarCode, no other references would be left and the content can be
     // GC'd.
     public byte[] classCache;
-    public DexProgramClass owner;
+    public DexClass owner;
     public final List<Code> codeList = new ArrayList<>();
   }
 }

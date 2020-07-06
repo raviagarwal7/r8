@@ -5,10 +5,12 @@ package com.android.tools.r8;
 
 import com.android.tools.r8.debug.DebugTestConfig;
 import com.android.tools.r8.utils.ListUtils;
+import com.google.common.collect.ImmutableList;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 
 public abstract class TestBuilder<RR extends TestRunResult, T extends TestBuilder<RR, T>> {
@@ -25,7 +27,7 @@ public abstract class TestBuilder<RR extends TestRunResult, T extends TestBuilde
 
   abstract T self();
 
-  public <S> S map(ThrowableFunction<T, S> fn) {
+  public <S, E extends Throwable> S map(ThrowingFunction<T, S, E> fn) {
     return fn.applyWithRuntimeException(self());
   }
 
@@ -36,11 +38,30 @@ public abstract class TestBuilder<RR extends TestRunResult, T extends TestBuilde
     return self();
   }
 
+  public T applyIf(boolean value, ThrowableConsumer<T> consumer) {
+    T self = self();
+    if (value) {
+      consumer.acceptWithRuntimeException(self);
+    }
+    return self;
+  }
+
+  public T applyIf(
+      boolean value, ThrowableConsumer<T> trueConsumer, ThrowableConsumer<T> falseConsumer) {
+    T self = self();
+    if (value) {
+      trueConsumer.acceptWithRuntimeException(self);
+    } else {
+      falseConsumer.acceptWithRuntimeException(self);
+    }
+    return self;
+  }
+
   @Deprecated
   public abstract RR run(String mainClass)
       throws CompilationFailedException, ExecutionException, IOException;
 
-  public abstract RR run(TestRuntime runtime, String mainClass)
+  public abstract RR run(TestRuntime runtime, String mainClass, String... args)
       throws CompilationFailedException, ExecutionException, IOException;
 
   @Deprecated
@@ -49,9 +70,9 @@ public abstract class TestBuilder<RR extends TestRunResult, T extends TestBuilde
     return run(mainClass.getTypeName());
   }
 
-  public RR run(TestRuntime runtime, Class<?> mainClass)
+  public RR run(TestRuntime runtime, Class<?> mainClass, String... args)
       throws CompilationFailedException, ExecutionException, IOException {
-    return run(runtime, mainClass.getTypeName());
+    return run(runtime, mainClass.getTypeName(), args);
   }
 
   public abstract DebugTestConfig debugConfig();
@@ -110,11 +131,49 @@ public abstract class TestBuilder<RR extends TestRunResult, T extends TestBuilde
     return addLibraryFiles(Arrays.asList(files));
   }
 
+  public T addClasspathClasses(Class<?>... classes) {
+    return addClasspathClasses(Arrays.asList(classes));
+  }
+
+  public abstract T addClasspathClasses(Collection<Class<?>> classes);
+
+  public T addClasspathFiles(Path... files) {
+    return addClasspathFiles(Arrays.asList(files));
+  }
+
+  public abstract T addClasspathFiles(Collection<Path> files);
+
+  public final T addTestingAnnotationsAsProgramClasses() {
+    return addProgramClasses(getTestingAnnotations());
+  }
+
+  public final T addTestingAnnotationsAsLibraryClasses() {
+    return addLibraryClasses(getTestingAnnotations());
+  }
+
+  private List<Class<?>> getTestingAnnotations() {
+    return ImmutableList.of(
+        AssumeMayHaveSideEffects.class,
+        ForceInline.class,
+        KeepConstantArguments.class,
+        KeepUnusedArguments.class,
+        NeverClassInline.class,
+        NeverInline.class,
+        NeverMerge.class,
+        NeverPropagateValue.class);
+  }
+
   static Collection<Path> getFilesForClasses(Collection<Class<?>> classes) {
     return ListUtils.map(classes, ToolHelper::getClassFileForTestClass);
   }
 
   static Collection<Path> getFilesForInnerClasses(Collection<Class<?>> classes) throws IOException {
     return ToolHelper.getClassFilesForInnerClasses(classes);
+  }
+
+  public abstract T addRunClasspathFiles(Collection<Path> files);
+
+  public T addRunClasspathFiles(Path... files) {
+    return addRunClasspathFiles(Arrays.asList(files));
   }
 }

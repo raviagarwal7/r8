@@ -4,18 +4,19 @@
 
 package com.android.tools.r8.naming;
 
-import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.position.Position;
+import com.android.tools.r8.utils.StringDiagnostic;
 
-public class ApplyMappingError extends CompilationError {
+public class ApplyMappingError extends StringDiagnostic {
 
   private static final String EXISTING_MESSAGE_START =
       "'%s' cannot be mapped to '%s' because it is in conflict with an existing ";
   private static final String EXISTING_MESSAGE_END =
       ". This usually happens when compiling a test application against a source application and "
-          + "having short generic names in the test application. Try giving '%s' a more specific "
-          + "name or add a keep rule to keep '%s'.";
+          + "there are used classes in the test that was not given a -keep rule when compiling the "
+          + "app. Try either renaming '%s' such that it will not collide or add a keep rule to "
+          + "keep '%s'.";
 
   protected static final String EXISTING_CLASS_MESSAGE =
       EXISTING_MESSAGE_START + "class with the same name" + EXISTING_MESSAGE_END;
@@ -23,7 +24,7 @@ public class ApplyMappingError extends CompilationError {
       EXISTING_MESSAGE_START + "member with the same signature" + EXISTING_MESSAGE_END;
 
   private ApplyMappingError(String message, Position position) {
-    super(message, null, Origin.unknown(), position);
+    super(message, Origin.unknown(), position);
   }
 
   static ApplyMappingError mapToExistingClass(

@@ -5,13 +5,16 @@ package com.android.tools.r8.naming.retrace;
 
 import static com.android.tools.r8.naming.retrace.StackTrace.isSameExceptForFileName;
 import static com.android.tools.r8.naming.retrace.StackTrace.isSameExceptForFileNameAndLineNumber;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
+import static org.junit.Assume.assumeTrue;
 
 import com.android.tools.r8.CompilationMode;
 import com.android.tools.r8.NeverInline;
-import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.R8TestBuilder;
+import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.naming.retrace.StackTrace.StackTraceLine;
+import com.android.tools.r8.utils.BooleanUtils;
 import com.google.common.collect.ImmutableList;
 import java.util.Collection;
 import java.util.HashSet;
@@ -25,13 +28,22 @@ import org.junit.runners.Parameterized.Parameters;
 public class VerticalClassMergingRetraceTest extends RetraceTestBase {
   private Set<StackTraceLine> haveSeenLines = new HashSet<>();
 
-  @Parameters(name = "Backend: {0}, mode: {1}")
+  @Parameters(name = "{0}, mode: {1}, compat: {2}")
   public static Collection<Object[]> data() {
-    return buildParameters(ToolHelper.getBackends(), CompilationMode.values());
+    return buildParameters(
+        getTestParameters().withAllRuntimesAndApiLevels().build(),
+        CompilationMode.values(),
+        BooleanUtils.values());
   }
 
-  public VerticalClassMergingRetraceTest(Backend backend, CompilationMode mode) {
-    super(backend, mode);
+  public VerticalClassMergingRetraceTest(
+      TestParameters parameters, CompilationMode mode, boolean compat) {
+    super(parameters, mode, compat);
+  }
+
+  @Override
+  public void configure(R8TestBuilder builder) {
+    builder.enableInliningAnnotations();
   }
 
   @Override
@@ -54,10 +66,13 @@ public class VerticalClassMergingRetraceTest extends RetraceTestBase {
     return retracedStackTraceLine.lineNumber > 0;
   }
 
-  private boolean filterSynthesizedMethod(StackTraceLine retracedStackTraceLine) {
-    return haveSeenLines.add(retracedStackTraceLine)
-        && (retracedStackTraceLine.className.contains("ResourceWrapper")
-            || retracedStackTraceLine.className.contains("MainApp"));
+  private boolean filterSynthesizedBridgeMethod(StackTraceLine retracedStackTraceLine) {
+    if (!haveSeenLines.add(retracedStackTraceLine)) {
+      return false;
+    }
+    return !retracedStackTraceLine.className.contains("ResourceWrapper")
+        || !retracedStackTraceLine.methodName.contains("foo")
+        || retracedStackTraceLine.lineNumber != 0;
   }
 
   @Test
@@ -67,7 +82,8 @@ public class VerticalClassMergingRetraceTest extends RetraceTestBase {
         (StackTrace actualStackTrace, StackTrace retracedStackTrace) -> {
           // Even when SourceFile is present retrace replaces the file name in the stack trace.
           StackTrace reprocessedStackTrace =
-              mode == CompilationMode.DEBUG ? retracedStackTrace
+              mode == CompilationMode.DEBUG
+                  ? retracedStackTrace
                   : retracedStackTrace.filter(this::filterSynthesizedMethodWhenLineNumberAvailable);
           assertThat(reprocessedStackTrace, isSameExceptForFileName(expectedStackTrace));
           assertEquals(expectedActualStackTraceHeight(), actualStackTrace.size());
@@ -76,11 +92,13 @@ public class VerticalClassMergingRetraceTest extends RetraceTestBase {
 
   @Test
   public void testLineNumberTableOnly() throws Exception {
+    assumeTrue(compat);
     runTest(
         ImmutableList.of("-keepattributes LineNumberTable"),
         (StackTrace actualStackTrace, StackTrace retracedStackTrace) -> {
           StackTrace reprocessedStackTrace =
-              mode == CompilationMode.DEBUG ? retracedStackTrace
+              mode == CompilationMode.DEBUG
+                  ? retracedStackTrace
                   : retracedStackTrace.filter(this::filterSynthesizedMethodWhenLineNumberAvailable);
           assertThat(reprocessedStackTrace, isSameExceptForFileName(expectedStackTrace));
           assertEquals(expectedActualStackTraceHeight(), actualStackTrace.size());
@@ -89,15 +107,41 @@ public class VerticalClassMergingRetraceTest extends RetraceTestBase {
 
   @Test
   public void testNoLineNumberTable() throws Exception {
+    // This tests will show a difference in r8 retrace compared to proguard retrace. Given the
+    // mapping:
+    // com.android.tools.r8.naming.retrace.TintResources -> com.android.tools.r8.naming.retrace.a:
+    //     1:1:void com.android.tools.r8.naming.retrace.ResourceWrapper.<init>():0:0 -> <init>
+    //     1:1:void <init>():0 -> <init>
+    //     1:1:void foo()      -> b
+    //     java.lang.String com.android.tools.r8.naming.retrace.ResourceWrapper.foo() -> a
+    //     java.lang.String com.android.tools.r8.naming.retrace.ResourceWrapper.foo() -> b
+    //
+    // and stack trace:
+    // at com.android.tools.r8.naming.retrace.a.b(Unknown Source:1)
+    // at com.android.tools.r8.naming.retrace.a.a(Unknown Source:0)
+    // at com.android.tools.r8.naming.retrace.MainApp.main(Unknown Source:7)
+    //
+    // proguard retrace will produce:
+    // at com.android.tools.r8.naming.retraceproguard.TintResources.b(TintResources.java:1)
+    // at com.android.tools.r8.naming.retraceproguard.ResourceWrapper.foo(ResourceWrapper.java:0)
+    // at com.android.tools.r8.naming.retraceproguard.MainApp.main(MainApp.java:7)
+    //
+    // We should instead translate to:
+    // at com.android.tools.r8.naming.retraceproguard.ResourceWrapper.foo(ResourceWrapper.java:1)
+    // at com.android.tools.r8.naming.retraceproguard.ResourceWrapper.foo(ResourceWrapper.java:0)
+    // at com.android.tools.r8.naming.retraceproguard.MainApp.main(MainApp.java:7)
+    // since the synthetic bridge belongs to ResourceWrapper.foo.
+    assumeTrue(compat);
     haveSeenLines.clear();
     runTest(
         ImmutableList.of(),
         (StackTrace actualStackTrace, StackTrace retracedStackTrace) -> {
           StackTrace reprocessedStackTrace =
-              mode == CompilationMode.DEBUG ? retracedStackTrace
-                  : retracedStackTrace.filter(this::filterSynthesizedMethod);
-          assertThat(reprocessedStackTrace,
-              isSameExceptForFileNameAndLineNumber(expectedStackTrace));
+              mode == CompilationMode.DEBUG
+                  ? retracedStackTrace
+                  : retracedStackTrace.filter(this::filterSynthesizedBridgeMethod);
+          assertThat(
+              reprocessedStackTrace, isSameExceptForFileNameAndLineNumber(expectedStackTrace));
           assertEquals(expectedActualStackTraceHeight(), actualStackTrace.size());
         });
   }
@@ -112,8 +156,7 @@ class ResourceWrapper {
   }
 }
 
-class TintResources extends ResourceWrapper {
-}
+class TintResources extends ResourceWrapper {}
 
 class MainApp {
   public static void main(String[] args) {

@@ -15,6 +15,8 @@ import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
@@ -46,11 +48,11 @@ import java.util.zip.ZipFile;
 @Keep
 public final class FeatureClassMapping {
 
-  HashMap<String, String> parsedRules = new HashMap<>(); // Already parsed rules.
-  HashMap<String, String> parseNonClassRules = new HashMap<>();
+  Map<String, String> parsedRules = new HashMap<>(); // Already parsed rules.
+  Map<String, String> parseNonClassRules = new HashMap<>();
   boolean usesOnlyExactMappings = true;
 
-  HashSet<FeaturePredicate> mappings = new HashSet<>();
+  Set<FeaturePredicate> mappings = new HashSet<>();
 
   Path mappingFile;
   String baseName = DEFAULT_BASE_NAME;
@@ -99,8 +101,9 @@ public final class FeatureClassMapping {
     try {
       lines = FileUtils.readAllLines(file);
     } catch (IOException e) {
-      reporter.error(new ExceptionDiagnostic(e, new SpecificationOrigin(file)));
-      throw new AbortException();
+      ExceptionDiagnostic error = new ExceptionDiagnostic(e, new SpecificationOrigin(file));
+      reporter.error(error);
+      throw new AbortException(error);
     }
     for (int i = 0; i < lines.size(); i++) {
       String line = lines.get(i);
@@ -118,8 +121,9 @@ public final class FeatureClassMapping {
             .map(DescriptorUtils::descriptorToJavaType)
             .collect(Collectors.toList());
       } catch (IOException e) {
-        reporter.error(new ExceptionDiagnostic(e, new JarFileOrigin(jarPath)));
-        throw new AbortException();
+        ExceptionDiagnostic error = new ExceptionDiagnostic(e, new JarFileOrigin(jarPath));
+        reporter.error(error);
+        throw new AbortException(error);
       }
     }
 
@@ -130,8 +134,9 @@ public final class FeatureClassMapping {
               .map(ZipEntry::getName)
               .collect(Collectors.toList());
         } catch (IOException e) {
-          reporter.error(new ExceptionDiagnostic(e, new JarFileOrigin(Paths.get(jar))));
-          throw new AbortException();
+        ExceptionDiagnostic error = new ExceptionDiagnostic(e, new JarFileOrigin(Paths.get(jar)));
+        reporter.error(error);
+        throw new AbortException(error);
         }
     }
 

@@ -11,8 +11,8 @@ import com.android.tools.r8.code.ReturnVoid;
 import com.android.tools.r8.code.ReturnWide;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -21,11 +21,16 @@ import com.android.tools.r8.ir.optimize.InliningConstraints;
 public class Return extends JumpInstruction {
 
   public Return() {
-    super(null);
+    super();
   }
 
   public Return(Value value) {
-    super(null, value);
+    super(value);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.RETURN;
   }
 
   @Override
@@ -37,9 +42,9 @@ public class Return extends JumpInstruction {
     return inValues.size() == 0;
   }
 
-  public TypeLatticeElement getReturnType() {
+  public TypeElement getReturnType() {
     assert !isReturnVoid();
-    return returnValue().getTypeLattice();
+    return returnValue().getType();
   }
 
   public Value returnValue() {
@@ -52,14 +57,14 @@ public class Return extends JumpInstruction {
       return new ReturnVoid();
     }
     int register = builder.allocatedRegister(returnValue(), getNumber());
-    TypeLatticeElement returnType = getReturnType();
-    if (returnType.isReference()) {
+    TypeElement returnType = getReturnType();
+    if (returnType.isReferenceType()) {
       return new ReturnObject(register);
     }
-    if (returnType.isSingle()) {
+    if (returnType.isSinglePrimitive()) {
       return new com.android.tools.r8.code.Return(register);
     }
-    if (returnType.isWide()) {
+    if (returnType.isWidePrimitive()) {
       return new ReturnWide(register);
     }
     throw new Unreachable();
@@ -105,7 +110,7 @@ public class Return extends JumpInstruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forReturn();
   }
 
@@ -119,8 +124,6 @@ public class Return extends JumpInstruction {
   @Override
   public void buildCf(CfBuilder builder) {
     builder.add(
-        isReturnVoid()
-            ? new CfReturnVoid()
-            : new CfReturn(ValueType.fromTypeLattice(getReturnType())));
+        isReturnVoid() ? new CfReturnVoid() : new CfReturn(ValueType.fromType(getReturnType())));
   }
 }

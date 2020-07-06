@@ -5,15 +5,17 @@
 package com.android.tools.r8.ir.optimize;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 import com.android.tools.r8.NeverInline;
 import com.android.tools.r8.R8TestRunResult;
 import com.android.tools.r8.TestBase;
-import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
+import com.android.tools.r8.ToolHelper.DexVm.Version;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Instruction;
@@ -22,7 +24,6 @@ import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.InstructionSubject;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import com.google.common.collect.Streams;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -31,34 +32,39 @@ import org.junit.runners.Parameterized.Parameters;
 @RunWith(Parameterized.class)
 public class RedundantConstNumberRemovalTest extends TestBase {
 
-  private final Backend backend;
+  private final TestParameters parameters;
 
-  @Parameters(name = "Backend: {0}")
-  public static Backend[] data() {
-    return ToolHelper.getBackends();
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters()
+        .withCfRuntimes()
+        .withDexRuntimesStartingFromExcluding(Version.V4_4_4)
+        .build();
   }
 
-  public RedundantConstNumberRemovalTest(Backend backend) {
-    this.backend = backend;
+  public RedundantConstNumberRemovalTest(TestParameters parameters) {
+    this.parameters = parameters;
   }
 
   @Test
-  @Ignore("b/123284765")
   public void test() throws Exception {
     String expectedOutput =
         StringUtils.lines(
             "true", "true", "true", "true", "true", "true", "true", "true", "true", "true", "true",
             "true", "true", "true", "true", "true");
 
-    if (backend == Backend.CF) {
+    if (parameters.getBackend() == Backend.CF) {
       testForJvm().addTestClasspath().run(TestClass.class).assertSuccessWithOutput(expectedOutput);
     }
 
     R8TestRunResult result =
-        testForR8(backend)
+        testForR8(parameters.getBackend())
             .addInnerClasses(RedundantConstNumberRemovalTest.class)
-            .addKeepMainRule(TestClass.class)
+            .addKeepClassAndMembersRules(TestClass.class)
             .enableInliningAnnotations()
+            .addOptionsModification(
+                internalOptions -> internalOptions.enableRedundantConstNumberOptimization = true)
+            .setMinApi(parameters.getRuntime())
             .run(TestClass.class)
             .assertSuccessWithOutput(expectedOutput);
 
@@ -77,21 +83,23 @@ public class RedundantConstNumberRemovalTest extends TestBase {
   private void verifyBooleanCheckTest(MethodSubject methodSubject) {
     assertThat(methodSubject, isPresent());
 
-    if (backend == Backend.DEX) {
+    if (parameters.getBackend() == Backend.DEX) {
       // Check that the generated code for booleanCheckTest() only has a return instruction.
       assertEquals(1, methodSubject.streamInstructions().count());
       assertTrue(methodSubject.iterateInstructions().next().isReturn());
     } else {
-      assert backend == Backend.CF;
+      assert parameters.getBackend() == Backend.CF;
       // Check that the generated code for booleanCheckTest() only has return instructions that
       // return the argument.
       // TODO(christofferqa): CF backend does not share identical prefix of successors.
-      IRCode code = methodSubject.buildIR();
-      assertTrue(
-          Streams.stream(code.instructionIterator())
-              .filter(Instruction::isReturn)
-              .allMatch(
-                  instruction -> instruction.asReturn().returnValue().definition.isArgument()));
+      // TODO(mkroghj): Redundant ConstNumber has also been disabled on CF, by
+      //   canHaveDalvikIntUsedAsNonIntPrimitiveTypeBug() that checks for CF.
+      // IRCode code = methodSubject.buildIR();
+      // assertTrue(
+      //     Streams.stream(code.instructionIterator())
+      //         .filter(Instruction::isReturn)
+      //         .allMatch(
+      //             instruction -> instruction.asReturn().returnValue().definition.isArgument()));
     }
   }
 
@@ -99,7 +107,7 @@ public class RedundantConstNumberRemovalTest extends TestBase {
     assertThat(methodSubject, isPresent());
     IRCode code = methodSubject.buildIR();
 
-    if (backend == Backend.DEX) {
+    if (parameters.getBackend() == Backend.DEX) {
       // Only a single basic block.
       assertEquals(1, code.blocks.size());
       // The block only has three instructions.
@@ -121,11 +129,13 @@ public class RedundantConstNumberRemovalTest extends TestBase {
       // Check that the generated code for intCheckTest() only has return instructions that
       // return the argument.
       // TODO(christofferqa): CF backend does not share identical prefix of successors.
-      assertTrue(
-          Streams.stream(code.instructionIterator())
-              .filter(Instruction::isReturn)
-              .allMatch(
-                  instruction -> instruction.asReturn().returnValue().definition.isArgument()));
+      // TODO(mkroghj): Redundant ConstNumber has also been disabled on CF, by
+      //   canHaveDalvikIntUsedAsNonIntPrimitiveTypeBug() that checks for CF.
+      // assertTrue(
+      //     Streams.stream(code.instructionIterator())
+      //         .filter(Instruction::isReturn)
+      //         .allMatch(
+      //             instruction -> instruction.asReturn().returnValue().definition.isArgument()));
     }
   }
 

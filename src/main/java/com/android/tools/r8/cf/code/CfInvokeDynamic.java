@@ -6,23 +6,20 @@ package com.android.tools.r8.cf.code;
 import com.android.tools.r8.cf.CfPrinter;
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.DexCallSite;
+import com.android.tools.r8.graph.DexClassAndMethod;
 import com.android.tools.r8.graph.DexMethodHandle;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexValue;
-import com.android.tools.r8.graph.DexValue.DexValueDouble;
-import com.android.tools.r8.graph.DexValue.DexValueFloat;
-import com.android.tools.r8.graph.DexValue.DexValueInt;
-import com.android.tools.r8.graph.DexValue.DexValueLong;
-import com.android.tools.r8.graph.DexValue.DexValueMethodHandle;
-import com.android.tools.r8.graph.DexValue.DexValueMethodType;
-import com.android.tools.r8.graph.DexValue.DexValueString;
-import com.android.tools.r8.graph.DexValue.DexValueType;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.UseRegistry;
 import com.android.tools.r8.ir.code.ValueType;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import java.util.ArrayList;
 import java.util.List;
@@ -39,7 +36,7 @@ public class CfInvokeDynamic extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     DexMethodHandle bootstrapMethod = callSite.bootstrapMethod;
     List<DexValue> bootstrapArgs = callSite.bootstrapArgs;
     Object[] bsmArgs = new Object[bootstrapArgs.size()];
@@ -52,26 +49,28 @@ public class CfInvokeDynamic extends CfInstruction {
         methodName.toString(), callSite.methodProto.toDescriptorString(lens), bsmHandle, bsmArgs);
   }
 
-  private Object decodeBootstrapArgument(DexValue dexValue, NamingLens lens) {
-    if (dexValue instanceof DexValueInt) {
-      return ((DexValueInt) dexValue).getValue();
-    } else if (dexValue instanceof DexValueLong) {
-      return ((DexValueLong) dexValue).getValue();
-    } else if (dexValue instanceof DexValueFloat) {
-      return ((DexValueFloat) dexValue).getValue();
-    } else if (dexValue instanceof DexValueDouble) {
-      return ((DexValueDouble) dexValue).getValue();
-    } else if (dexValue instanceof DexValueString) {
-      return ((DexValueString) dexValue).getValue();
-    } else if (dexValue instanceof DexValueType) {
-      return Type.getType(lens.lookupDescriptor(((DexValueType) dexValue).value).toString());
-    } else if (dexValue instanceof DexValueMethodType) {
-      return Type.getMethodType(((DexValueMethodType) dexValue).value.toDescriptorString(lens));
-    } else if (dexValue instanceof DexValueMethodHandle) {
-      return ((DexValueMethodHandle) dexValue).value.toAsmHandle(lens);
-    } else {
-      throw new Unreachable(
-          "Unsupported bootstrap argument of type " + dexValue.getClass().getSimpleName());
+  private Object decodeBootstrapArgument(DexValue value, NamingLens lens) {
+    switch (value.getValueKind()) {
+      case DOUBLE:
+        return value.asDexValueDouble().getValue();
+      case FLOAT:
+        return value.asDexValueFloat().getValue();
+      case INT:
+        return value.asDexValueInt().getValue();
+      case LONG:
+        return value.asDexValueLong().getValue();
+      case METHOD_HANDLE:
+        return value.asDexValueMethodHandle().getValue().toAsmHandle(lens);
+      case METHOD_TYPE:
+        return Type.getMethodType(value.asDexValueMethodType().getValue().toDescriptorString(lens));
+      case STRING:
+        DexString innerValue = value.asDexValueString().getValue();
+        return innerValue == null ? null : innerValue.toString();
+      case TYPE:
+        return Type.getType(lens.lookupDescriptor(value.asDexValueType().value).toString());
+      default:
+        throw new Unreachable(
+            "Unsupported bootstrap argument of type " + value.getClass().getSimpleName());
     }
   }
 
@@ -85,7 +84,7 @@ public class CfInvokeDynamic extends CfInstruction {
   }
 
   @Override
-  public void registerUse(UseRegistry registry, DexType clazz) {
+  void internalRegisterUse(UseRegistry registry, DexClassAndMethod context) {
     registry.registerCallSite(callSite);
   }
 
@@ -109,5 +108,11 @@ public class CfInvokeDynamic extends CfInstruction {
     if (!callSite.methodProto.returnType.isVoidType()) {
       builder.addMoveResult(state.push(callSite.methodProto.returnType).register);
     }
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return inliningConstraints.forInvokeCustom();
   }
 }

@@ -14,6 +14,7 @@ import com.android.tools.r8.NeverInline;
 import com.android.tools.r8.R8TestRunResult;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.TestRunResult;
+import com.android.tools.r8.TestRuntime.CfVm;
 import com.android.tools.r8.ToolHelper;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
@@ -134,12 +135,26 @@ public class GetSimpleNameTest extends GetNameTestBase {
       "Outer$Inner",
       "Outer$Inner"
   );
-  private static final String RENAMED_OUTPUT = StringUtils.lines(
-      "c",
+  // JDK8 computes the simple name differently: some assumptions about non-member classes,
+  // e.g., 1 or more digits (followed by the simple name if it's local).
+  // Since JDK9, the simple name is computed by stripping off the package name.
+  // See b/132808897 for more details.
+  private static final String RENAMED_OUTPUT_JDK8 = StringUtils.lines(
+      "d",
       "a",
       "a",
       "a",
+      "c[][][]",
       "b[][][]",
+      "a",
+      "a"
+  );
+  private static final String RENAMED_OUTPUT = StringUtils.lines(
+      "d",
+      "a",
+      "a",
+      "a",
+      "c[][][]",
       "[][][]",
       "a",
       "a"
@@ -164,7 +179,7 @@ public class GetSimpleNameTest extends GetNameTestBase {
   @Test
   public void testJVMOutput() throws Exception {
     assumeTrue(
-        "Only run JVM reference once (for CF backend)",
+        "Only run JVM reference on CF runtimes",
         parameters.isCfRuntime() && !enableMinification);
     testForJvm()
         .addTestClasspath()
@@ -188,7 +203,7 @@ public class GetSimpleNameTest extends GetNameTestBase {
         testForD8()
             .debug()
             .addProgramFiles(classPaths)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
@@ -198,7 +213,7 @@ public class GetSimpleNameTest extends GetNameTestBase {
         testForD8()
             .release()
             .addProgramFiles(classPaths)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
@@ -215,10 +230,10 @@ public class GetSimpleNameTest extends GetNameTestBase {
             .addKeepMainRule(MAIN)
             .addKeepRules("-keep class **.ClassGetSimpleName*")
             .addKeepRules("-keep class **.Outer*")
-            .addKeepRules("-keepattributes InnerClasses,EnclosingMethod")
+            .addKeepAttributes("InnerClasses", "EnclosingMethod")
             .addKeepRules("-printmapping " + createNewMappingPath().toAbsolutePath().toString())
             .minification(enableMinification)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
@@ -238,14 +253,19 @@ public class GetSimpleNameTest extends GetNameTestBase {
             // Comment out the following line to reproduce b/120130435
             // then use OUTPUT_WITH_SHRUNK_ATTRIBUTES
             .addKeepRules("-keep,allowobfuscation class **.Outer*")
-            .addKeepRules("-keepattributes InnerClasses,EnclosingMethod")
+            .addKeepAttributes("InnerClasses", "EnclosingMethod")
             .addKeepRules("-printmapping " + createNewMappingPath().toAbsolutePath().toString())
             .minification(enableMinification)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN);
     if (enableMinification) {
-      result.assertSuccessWithOutput(RENAMED_OUTPUT);
+      if (parameters.isCfRuntime()
+          && parameters.getRuntime().asCf().getVm().lessThanOrEqual(CfVm.JDK8)) {
+        result.assertSuccessWithOutput(RENAMED_OUTPUT_JDK8);
+      } else {
+        result.assertSuccessWithOutput(RENAMED_OUTPUT);
+      }
     } else {
       result.assertSuccessWithOutput(JAVA_OUTPUT);
     }

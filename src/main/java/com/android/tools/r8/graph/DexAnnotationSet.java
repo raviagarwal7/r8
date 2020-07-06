@@ -5,15 +5,20 @@ package com.android.tools.r8.graph;
 
 import com.android.tools.r8.dex.IndexedItemCollection;
 import com.android.tools.r8.dex.MixedSectionCollection;
+import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.utils.ArrayUtils;
+import com.google.common.collect.Sets;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.stream.Stream;
 
 public class DexAnnotationSet extends CachedHashValueDexItem {
+
+  public static final DexAnnotationSet[] EMPTY_ARRAY = {};
 
   private static final int UNSORTED = 0;
   private static final DexAnnotationSet THE_EMPTY_ANNOTATIONS_SET =
@@ -31,7 +36,7 @@ public class DexAnnotationSet extends CachedHashValueDexItem {
   }
 
   public static DexType findDuplicateEntryType(List<DexAnnotation> annotations) {
-    Set<DexType> seenTypes = new HashSet<>();
+    Set<DexType> seenTypes = Sets.newIdentityHashSet();
     for (DexAnnotation annotation : annotations) {
       if (!seenTypes.add(annotation.annotation.type)) {
         return annotation.annotation.type;
@@ -42,6 +47,20 @@ public class DexAnnotationSet extends CachedHashValueDexItem {
 
   public static DexAnnotationSet empty() {
     return THE_EMPTY_ANNOTATIONS_SET;
+  }
+
+  public void forEach(Consumer<DexAnnotation> consumer) {
+    for (DexAnnotation annotation : annotations) {
+      consumer.accept(annotation);
+    }
+  }
+
+  public Stream<DexAnnotation> stream() {
+    return Arrays.stream(annotations);
+  }
+
+  public int size() {
+    return annotations.length;
   }
 
   @Override
@@ -74,12 +93,13 @@ public class DexAnnotationSet extends CachedHashValueDexItem {
     return annotations.length == 0;
   }
 
-  public void sort() {
+  public void sort(NamingLens namingLens) {
     if (sorted != UNSORTED) {
       assert sorted == sortedHashCode();
       return;
     }
-    Arrays.sort(annotations, (a, b) -> a.annotation.type.compareTo(b.annotation.type));
+    Arrays.sort(
+        annotations, (a, b) -> a.annotation.type.slowCompareTo(b.annotation.type, namingLens));
     for (DexAnnotation annotation : annotations) {
       annotation.annotation.sort();
     }

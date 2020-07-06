@@ -8,15 +8,15 @@ import static org.junit.Assert.assertEquals;
 
 import com.android.tools.r8.NeverInline;
 import com.android.tools.r8.TestBase;
-import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.InstructionSubject;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Streams;
 import java.util.Iterator;
+import java.util.List;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -110,15 +110,15 @@ public class InstanceOfRemovalTest extends TestBase {
     }
   }
 
-  @Parameters(name = "Backend: {0}")
-  public static Backend[] data() {
-    return ToolHelper.getBackends();
+  @Parameters(name = "{0}")
+  public static List<Object[]> data() {
+    return buildParameters(getTestParameters().withAllRuntimesAndApiLevels().build());
   }
 
-  private final Backend backend;
+  private final TestParameters parameters;
 
-  public InstanceOfRemovalTest(Backend backend) {
-    this.backend = backend;
+  public InstanceOfRemovalTest(TestParameters parameters) {
+    this.parameters = parameters;
   }
 
   @Test
@@ -147,15 +147,20 @@ public class InstanceOfRemovalTest extends TestBase {
             "B[] instanceof B[]: true",
             "");
 
-    testForJvm().addTestClasspath().run(TestClass.class).assertSuccessWithOutput(expected);
+    if (parameters.isCfRuntime()) {
+      testForJvm()
+          .addTestClasspath()
+          .run(parameters.getRuntime(), TestClass.class)
+          .assertSuccessWithOutput(expected);
+    }
 
     CodeInspector inspector =
-        testForR8(backend)
+        testForR8(parameters.getBackend())
             .addProgramClasses(A.class, B.class, TestClass.class)
             .addKeepMainRule(TestClass.class)
-            .addKeepAllClassesRule()
             .enableInliningAnnotations()
-            .run(TestClass.class)
+            .setMinApi(parameters.getApiLevel())
+            .run(parameters.getRuntime(), TestClass.class)
             .assertSuccessWithOutput(expected)
             .inspector();
 
@@ -167,10 +172,11 @@ public class InstanceOfRemovalTest extends TestBase {
         fooMethodSubject.iterateInstructions(InstructionSubject::isInstanceOf);
     assertEquals(0, Streams.stream(fooInstructionIterator).count());
 
-    // Without inlining we cannot prove any of the instance-of checks to be trivial.
+    // Without inlining we cannot prove any of the instance-of checks to be trivial, but the dynamic
+    // type optimization allows us to prove that some are safe.
     MethodSubject barMethodSubject = testClass.uniqueMethodWithName("bar");
     Iterator<InstructionSubject> barInstructionIterator =
         barMethodSubject.iterateInstructions(InstructionSubject::isInstanceOf);
-    assertEquals(6, Streams.stream(barInstructionIterator).count());
+    assertEquals(4, Streams.stream(barInstructionIterator).count());
   }
 }

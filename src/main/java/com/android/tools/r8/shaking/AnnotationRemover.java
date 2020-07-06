@@ -9,6 +9,7 @@ import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexAnnotationElement;
 import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexDefinition;
 import com.android.tools.r8.graph.DexEncodedAnnotation;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
@@ -17,10 +18,8 @@ import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.GraphLense;
 import com.android.tools.r8.graph.InnerClassAttribute;
-import com.android.tools.r8.utils.InternalOptions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
-import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Set;
@@ -28,33 +27,54 @@ import java.util.Set;
 public class AnnotationRemover {
 
   private final AppView<AppInfoWithLiveness> appView;
-  private final ProguardKeepAttributes keep;
+  private final Set<DexAnnotation> annotationsToRetain;
   private final Set<DexType> classesToRetainInnerClassAttributeFor;
+  private final ProguardKeepAttributes keep;
+  private final Set<DexType> removedClasses;
 
-  public AnnotationRemover(
-      AppView<AppInfoWithLiveness> appView, Set<DexType> classesToRetainInnerClassAttributeFor) {
+  private AnnotationRemover(
+      AppView<AppInfoWithLiveness> appView,
+      Set<DexType> classesToRetainInnerClassAttributeFor,
+      Set<DexAnnotation> annotationsToRetain,
+      Set<DexType> removedClasses) {
     this.appView = appView;
-    this.keep = appView.options().getProguardConfiguration().getKeepAttributes();
+    this.annotationsToRetain = annotationsToRetain;
     this.classesToRetainInnerClassAttributeFor = classesToRetainInnerClassAttributeFor;
+    this.keep = appView.options().getProguardConfiguration().getKeepAttributes();
+    this.removedClasses = removedClasses;
   }
 
-  /**
-   * Used to filter annotations on classes, methods and fields.
-   */
-  private boolean filterAnnotations(DexAnnotation annotation) {
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  public Set<DexType> getClassesToRetainInnerClassAttributeFor() {
+    return classesToRetainInnerClassAttributeFor;
+  }
+
+  /** Used to filter annotations on classes, methods and fields. */
+  private boolean filterAnnotations(DexDefinition holder, DexAnnotation annotation) {
+    return annotationsToRetain.contains(annotation)
+        || shouldKeepAnnotation(appView, holder, annotation, isAnnotationTypeLive(annotation));
+  }
+
+  public static boolean shouldKeepAnnotation(
+      AppView<AppInfoWithLiveness> appView, DexDefinition holder, DexAnnotation annotation) {
     return shouldKeepAnnotation(
-        annotation, isAnnotationTypeLive(annotation), appView.dexItemFactory(), appView.options());
+        appView, holder, annotation, isAnnotationTypeLive(annotation, appView));
   }
 
-  static boolean shouldKeepAnnotation(
+  public static boolean shouldKeepAnnotation(
+      AppView<?> appView,
+      DexDefinition holder,
       DexAnnotation annotation,
-      boolean isAnnotationTypeLive,
-      DexItemFactory dexItemFactory,
-      InternalOptions options) {
+      boolean isAnnotationTypeLive) {
     ProguardKeepAttributes config =
-        options.getProguardConfiguration() != null
-            ? options.getProguardConfiguration().getKeepAttributes()
+        appView.options().getProguardConfiguration() != null
+            ? appView.options().getProguardConfiguration().getKeepAttributes()
             : ProguardKeepAttributes.fromPatterns(ImmutableList.of());
+
+    DexItemFactory dexItemFactory = appView.dexItemFactory();
 
     switch (annotation.visibility) {
       case DexAnnotation.VISIBILITY_SYSTEM:
@@ -69,11 +89,13 @@ public class AnnotationRemover {
         if (config.signature && DexAnnotation.isSignatureAnnotation(annotation, dexItemFactory)) {
           return true;
         }
-        if (config.sourceDebugExtension
-            && DexAnnotation.isSourceDebugExtension(annotation, dexItemFactory)) {
-          return true;
+        if (DexAnnotation.isSourceDebugExtension(annotation, dexItemFactory)) {
+          assert holder.isDexClass();
+          appView.setSourceDebugExtensionForType(
+              holder.asDexClass(), annotation.annotation.elements[0].value.asDexValueString());
+          return config.sourceDebugExtension;
         }
-        if (options.canUseParameterNameAnnotations()
+        if (config.methodParameters
             && DexAnnotation.isParameterNameAnnotation(annotation, dexItemFactory)) {
           return true;
         }
@@ -106,21 +128,22 @@ public class AnnotationRemover {
   }
 
   private boolean isAnnotationTypeLive(DexAnnotation annotation) {
+    return isAnnotationTypeLive(annotation, appView);
+  }
+
+  private static boolean isAnnotationTypeLive(
+      DexAnnotation annotation, AppView<AppInfoWithLiveness> appView) {
     DexType annotationType = annotation.annotation.type.toBaseType(appView.dexItemFactory());
-    DexClass definition = appView.definitionFor(annotationType);
-    // TODO(b/73102187): How to handle annotations without definition.
-    if (appView.options().isShrinking() && definition == null) {
-      return false;
-    }
-    return definition == null
-        || definition.isNotProgramClass()
-        || appView.appInfo().liveTypes.contains(annotationType);
+    return appView.appInfo().isNonProgramTypeOrLiveProgramType(annotationType);
   }
 
   /**
    * Used to filter annotations on parameters.
    */
   private boolean filterParameterAnnotations(DexAnnotation annotation) {
+    if (annotationsToRetain.contains(annotation)) {
+      return true;
+    }
     switch (annotation.visibility) {
       case DexAnnotation.VISIBILITY_SYSTEM:
         return false;
@@ -140,8 +163,8 @@ public class AnnotationRemover {
     return isAnnotationTypeLive(annotation);
   }
 
-  public AnnotationRemover ensureValid(ProguardConfiguration.Builder compatibility) {
-    keep.ensureValid(appView.options().forceProguardCompatibility, compatibility);
+  public AnnotationRemover ensureValid() {
+    keep.ensureValid(appView.options().forceProguardCompatibility);
     return this;
   }
 
@@ -162,7 +185,7 @@ public class AnnotationRemover {
   }
 
   private static boolean hasSignatureAnnotation(DexProgramClass clazz, DexItemFactory itemFactory) {
-    for (DexAnnotation annotation : clazz.annotations.annotations) {
+    for (DexAnnotation annotation : clazz.annotations().annotations) {
       if (DexAnnotation.isSignatureAnnotation(annotation, itemFactory)) {
         return true;
       }
@@ -170,122 +193,74 @@ public class AnnotationRemover {
     return false;
   }
 
-  public static Set<DexType> computeClassesToRetainInnerClassAttributeFor(
-      AppView<? extends AppInfoWithLiveness> appView) {
-    // In case of minification for certain inner classes we need to retain their InnerClass
-    // attributes because their minified name still needs to be in hierarchical format
-    // (enclosing$inner) otherwise the GenericSignatureRewriter can't produce the correct,
-    // renamed signature.
-
-    // More precisely:
-    // - we're going to retain the InnerClass attribute that refers to the same class as 'inner'
-    // - for live, inner, nonstatic classes
-    // - that are enclosed by a class with a generic signature.
-
-    // In compat mode we always keep all InnerClass attributes (if requested).
-    // If not requested we never keep any. In these cases don't compute eligible classes.
-    if (appView.options().forceProguardCompatibility
-        || !appView.options().getProguardConfiguration().getKeepAttributes().innerClasses) {
-      return Collections.emptySet();
-    }
-
-    // Build lookup table and set of the interesting classes.
-    // enclosingClasses.get(clazz) gives the enclosing class of 'clazz'
-    Map<DexType, DexProgramClass> enclosingClasses = new IdentityHashMap<>();
-    Set<DexProgramClass> genericClasses = Sets.newIdentityHashSet();
-
-    Iterable<DexProgramClass> programClasses = appView.appInfo().classes();
-    for (DexProgramClass clazz : programClasses) {
-      if (hasSignatureAnnotation(clazz, appView.dexItemFactory())) {
-        genericClasses.add(clazz);
-      }
-      for (InnerClassAttribute innerClassAttribute : clazz.getInnerClasses()) {
-        if ((innerClassAttribute.getAccess() & Constants.ACC_STATIC) == 0
-            && innerClassAttribute.getOuter() == clazz.type) {
-          enclosingClasses.put(innerClassAttribute.getInner(), clazz);
-        }
-      }
-    }
-
-    Set<DexType> result = Sets.newIdentityHashSet();
-    for (DexProgramClass clazz : programClasses) {
-      // If [clazz] is mentioned by a keep rule, it could be used for reflection, and we therefore
-      // need to keep the enclosing method and inner classes attributes, if requested.
-      if (appView.appInfo().isPinned(clazz.type)) {
-        for (InnerClassAttribute innerClassAttribute : clazz.getInnerClasses()) {
-          DexType inner = innerClassAttribute.getInner();
-          if (appView.appInfo().liveTypes.contains(inner)) {
-            result.add(inner);
-          }
-          DexType context = innerClassAttribute.getLiveContext(appView.appInfo());
-          if (context != null && appView.appInfo().liveTypes.contains(context)) {
-            result.add(context);
-          }
-        }
-      }
-      if (clazz.getInnerClassAttributeForThisClass() != null
-          && appView.appInfo().liveTypes.contains(clazz.type)
-          && hasGenericEnclosingClass(clazz, enclosingClasses, genericClasses)) {
-        result.add(clazz.type);
-      }
-    }
-    return result;
-  }
-
   public void run() {
     for (DexProgramClass clazz : appView.appInfo().classes()) {
       stripAttributes(clazz);
-      clazz.annotations = clazz.annotations.rewrite(this::rewriteAnnotation);
+      clazz.setAnnotations(
+          clazz.annotations().rewrite(annotation -> rewriteAnnotation(clazz, annotation)));
       clazz.forEachMethod(this::processMethod);
       clazz.forEachField(this::processField);
     }
   }
 
   private void processMethod(DexEncodedMethod method) {
-    method.annotations = method.annotations.rewrite(this::rewriteAnnotation);
+    method.setAnnotations(
+        method.annotations().rewrite(annotation -> rewriteAnnotation(method, annotation)));
     method.parameterAnnotationsList =
         method.parameterAnnotationsList.keepIf(this::filterParameterAnnotations);
   }
 
   private void processField(DexEncodedField field) {
-    field.annotations = field.annotations.rewrite(this::rewriteAnnotation);
+    field.setAnnotations(
+        field.annotations().rewrite(annotation -> rewriteAnnotation(field, annotation)));
   }
 
-  private DexAnnotation rewriteAnnotation(DexAnnotation original) {
+  private DexAnnotation rewriteAnnotation(DexDefinition holder, DexAnnotation original) {
     // Check if we should keep this annotation first.
-    if (!filterAnnotations(original)) {
-      return null;
+    if (filterAnnotations(holder, original)) {
+      // Then, filter out values that refer to dead definitions.
+      return original.rewrite(this::rewriteEncodedAnnotation);
     }
-    // Then, filter out values that refer to dead definitions.
-    return original.rewrite(this::rewriteEncodedAnnotation);
+    return null;
   }
 
   private DexEncodedAnnotation rewriteEncodedAnnotation(DexEncodedAnnotation original) {
     GraphLense graphLense = appView.graphLense();
     DexType annotationType = original.type.toBaseType(appView.dexItemFactory());
-    return original.rewrite(
-        graphLense::lookupType,
-        element -> rewriteAnnotationElement(graphLense.lookupType(annotationType), element));
+    if (removedClasses.contains(annotationType)) {
+      return null;
+    }
+    DexType rewrittenType = graphLense.lookupType(annotationType);
+    DexEncodedAnnotation rewrite =
+        original.rewrite(
+            graphLense::lookupType, element -> rewriteAnnotationElement(rewrittenType, element));
+    assert rewrite != null;
+    DexClass annotationClass = appView.appInfo().definitionFor(rewrittenType);
+    assert annotationClass == null
+        || appView.appInfo().isNonProgramTypeOrLiveProgramType(rewrittenType);
+    return rewrite;
   }
 
   private DexAnnotationElement rewriteAnnotationElement(
       DexType annotationType, DexAnnotationElement original) {
     DexClass definition = appView.definitionFor(annotationType);
-    // TODO(b/73102187): How to handle annotations without definition.
+    // We cannot strip annotations where we cannot look up the definition, because this will break
+    // apps that rely on the annotation to exist. See b/134766810 for more information.
     if (definition == null) {
       return original;
     }
     assert definition.isInterface();
     boolean liveGetter =
-        definition.virtualMethods().stream()
-            .anyMatch(method -> method.method.name == original.name);
+        definition
+            .getMethodCollection()
+            .hasVirtualMethods(method -> method.method.name == original.name);
     return liveGetter ? original : null;
   }
 
   private boolean enclosingMethodPinned(DexClass clazz) {
-    return clazz.getEnclosingMethod() != null
-        && clazz.getEnclosingMethod().getEnclosingClass() != null
-        && appView.appInfo().isPinned(clazz.getEnclosingMethod().getEnclosingClass());
+    return clazz.getEnclosingMethodAttribute() != null
+        && clazz.getEnclosingMethodAttribute().getEnclosingClass() != null
+        && appView.appInfo().isPinned(clazz.getEnclosingMethodAttribute().getEnclosingClass());
   }
 
   private static boolean hasInnerClassesFromSet(DexProgramClass clazz, Set<DexType> innerClasses) {
@@ -317,7 +292,7 @@ public class AnnotationRemover {
     }
     if (keptAnyway || keepForThisInnerClass || keepForThisEnclosingClass) {
       if (!keep.enclosingMethod) {
-        clazz.clearEnclosingMethod();
+        clazz.clearEnclosingMethodAttribute();
       }
       if (!keep.innerClasses) {
         clazz.clearInnerClasses();
@@ -330,14 +305,15 @@ public class AnnotationRemover {
               if (appView.appInfo().isPinned(ica.getInner())) {
                 return false;
               }
-              if (appView.appInfo().isPinned(ica.getOuter())) {
+              DexType outer = ica.getOuter();
+              if (outer != null && appView.appInfo().isPinned(outer)) {
                 return false;
               }
               if (finalKeepForThisInnerClass && ica.getInner() == clazz.type) {
                 return false;
               }
               if (finalKeepForThisEnclosingClass
-                  && ica.getOuter() == clazz.type
+                  && outer == clazz.type
                   && classesToRetainInnerClassAttributeFor.contains(ica.getInner())) {
                 return false;
               }
@@ -347,8 +323,102 @@ public class AnnotationRemover {
     } else {
       // These attributes are only relevant for reflection, and this class is not used for
       // reflection. (Note that clearing these attributes can enable more vertical class merging.)
-      clazz.clearEnclosingMethod();
+      clazz.clearEnclosingMethodAttribute();
       clazz.clearInnerClasses();
+    }
+  }
+
+  public static void clearAnnotations(AppView<?> appView) {
+    for (DexProgramClass clazz : appView.appInfo().classes()) {
+      clazz.clearAnnotations();
+      clazz.members().forEach(DexDefinition::clearAnnotations);
+    }
+  }
+
+  public static class Builder {
+
+    /**
+     * The set of annotations that were matched by a conditional if rule. These are needed for the
+     * interpretation of if rules in the second round of tree shaking.
+     */
+    private final Set<DexAnnotation> annotationsToRetain = Sets.newIdentityHashSet();
+
+    private Set<DexType> classesToRetainInnerClassAttributeFor;
+
+    public Builder computeClassesToRetainInnerClassAttributeFor(
+        AppView<AppInfoWithLiveness> appView) {
+      assert classesToRetainInnerClassAttributeFor == null;
+      // In case of minification for certain inner classes we need to retain their InnerClass
+      // attributes because their minified name still needs to be in hierarchical format
+      // (enclosing$inner) otherwise the GenericSignatureRewriter can't produce the correct,
+      // renamed signature.
+
+      // More precisely:
+      // - we're going to retain the InnerClass attribute that refers to the same class as 'inner'
+      // - for live, inner, nonstatic classes
+      // - that are enclosed by a class with a generic signature.
+
+      // In compat mode we always keep all InnerClass attributes (if requested).
+      // If not requested we never keep any. In these cases don't compute eligible classes.
+      Set<DexType> result = Sets.newIdentityHashSet();
+      if (!appView.options().forceProguardCompatibility
+          && appView.options().getProguardConfiguration().getKeepAttributes().innerClasses) {
+        // Build lookup table and set of the interesting classes.
+        // enclosingClasses.get(clazz) gives the enclosing class of 'clazz'
+        Map<DexType, DexProgramClass> enclosingClasses = new IdentityHashMap<>();
+        Set<DexProgramClass> genericClasses = Sets.newIdentityHashSet();
+        for (DexProgramClass clazz : appView.appInfo().classes()) {
+          if (hasSignatureAnnotation(clazz, appView.dexItemFactory())) {
+            genericClasses.add(clazz);
+          }
+          for (InnerClassAttribute innerClassAttribute : clazz.getInnerClasses()) {
+            if ((innerClassAttribute.getAccess() & Constants.ACC_STATIC) == 0
+                && innerClassAttribute.getOuter() == clazz.type) {
+              enclosingClasses.put(innerClassAttribute.getInner(), clazz);
+            }
+          }
+        }
+        for (DexProgramClass clazz : appView.appInfo().classes()) {
+          // If [clazz] is mentioned by a keep rule, it could be used for reflection, and we
+          // therefore need to keep the enclosing method and inner classes attributes, if requested.
+          if (appView.appInfo().isPinned(clazz.type)) {
+            for (InnerClassAttribute innerClassAttribute : clazz.getInnerClasses()) {
+              DexType inner = innerClassAttribute.getInner();
+              if (appView.appInfo().isNonProgramTypeOrLiveProgramType(inner)) {
+                result.add(inner);
+              }
+              DexType context = innerClassAttribute.getLiveContext(appView.appInfo());
+              if (context != null && appView.appInfo().isNonProgramTypeOrLiveProgramType(context)) {
+                result.add(context);
+              }
+            }
+          }
+          if (clazz.getInnerClassAttributeForThisClass() != null
+              && appView.appInfo().isNonProgramTypeOrLiveProgramType(clazz.type)
+              && hasGenericEnclosingClass(clazz, enclosingClasses, genericClasses)) {
+            result.add(clazz.type);
+          }
+        }
+      }
+      classesToRetainInnerClassAttributeFor = result;
+      return this;
+    }
+
+    public Builder setClassesToRetainInnerClassAttributeFor(
+        Set<DexType> classesToRetainInnerClassAttributeFor) {
+      this.classesToRetainInnerClassAttributeFor = classesToRetainInnerClassAttributeFor;
+      return this;
+    }
+
+    public void retainAnnotation(DexAnnotation annotation) {
+      annotationsToRetain.add(annotation);
+    }
+
+    public AnnotationRemover build(
+        AppView<AppInfoWithLiveness> appView, Set<DexType> removedClasses) {
+      assert classesToRetainInnerClassAttributeFor != null;
+      return new AnnotationRemover(
+          appView, classesToRetainInnerClassAttributeFor, annotationsToRetain, removedClasses);
     }
   }
 }

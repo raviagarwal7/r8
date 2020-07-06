@@ -3,33 +3,21 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.naming;
 
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
-import static org.hamcrest.CoreMatchers.not;
-import static org.junit.Assert.assertThat;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndNotRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 import com.android.tools.r8.ToolHelper.KotlinTargetVersion;
 import com.android.tools.r8.kotlin.AbstractR8KotlinTestBase;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
-import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.FieldSubject;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
-import java.util.Collection;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.Parameters;
 
-@RunWith(Parameterized.class)
 public abstract class AbstractR8KotlinNamingTestBase extends AbstractR8KotlinTestBase {
 
   protected final boolean minification;
-
-  @Parameters(name = "target: {0}, allowAccessModification: {1}, minification: {2}")
-  public static Collection<Object[]> data() {
-    return buildParameters(
-        KotlinTargetVersion.values(), BooleanUtils.values(), BooleanUtils.values());
-  }
 
   AbstractR8KotlinNamingTestBase(
       KotlinTargetVersion kotlinTargetVersion,
@@ -41,65 +29,65 @@ public abstract class AbstractR8KotlinNamingTestBase extends AbstractR8KotlinTes
 
   protected ClassSubject checkClassIsRenamed(CodeInspector inspector, String className) {
     ClassSubject classSubject = inspector.clazz(className);
-    assertThat(classSubject, isRenamed());
+    assertThat(classSubject, isPresentAndRenamed());
     return classSubject;
   }
 
   protected ClassSubject checkClassIsNotRenamed(CodeInspector inspector, String className) {
     ClassSubject classSubject = inspector.clazz(className);
-    assertThat(classSubject, not(isRenamed()));
+    assertThat(classSubject, isPresentAndNotRenamed());
     return classSubject;
   }
 
   protected FieldSubject checkFieldIsRenamed(
       ClassSubject classSubject, String fieldType, String fieldName) {
     FieldSubject fieldSubject = checkFieldIsKept(classSubject, fieldType, fieldName);
-    assertThat(fieldSubject, isRenamed());
+    assertThat(fieldSubject, isPresentAndRenamed());
     return fieldSubject;
   }
 
   protected FieldSubject checkFieldIsRenamed(ClassSubject classSubject, String fieldName) {
     FieldSubject fieldSubject = checkFieldIsKept(classSubject, fieldName);
-    assertThat(fieldSubject, isRenamed());
+    assertThat(fieldSubject, isPresentAndRenamed());
     return fieldSubject;
   }
 
   protected FieldSubject checkFieldIsNotRenamed(
       ClassSubject classSubject, String fieldType, String fieldName) {
     FieldSubject fieldSubject = checkFieldIsKept(classSubject, fieldType, fieldName);
-    assertThat(fieldSubject, not(isRenamed()));
+    assertThat(fieldSubject, isPresentAndNotRenamed());
     return fieldSubject;
   }
 
   protected FieldSubject checkFieldIsNotRenamed(ClassSubject classSubject, String fieldName) {
     FieldSubject fieldSubject = checkFieldIsKept(classSubject, fieldName);
-    assertThat(fieldSubject, not(isRenamed()));
+    assertThat(fieldSubject, isPresentAndNotRenamed());
     return fieldSubject;
   }
 
   protected MethodSubject checkMethodIsRenamed(
       ClassSubject classSubject, MethodSignature methodSignature) {
     MethodSubject methodSubject = checkMethodIsKept(classSubject, methodSignature);
-    assertThat(methodSubject, isRenamed());
+    assertThat(methodSubject, isPresentAndRenamed());
     return methodSubject;
   }
 
   protected MethodSubject checkMethodIsRenamed(ClassSubject classSubject, String methodName) {
     MethodSubject methodSubject = checkMethodIsKept(classSubject, methodName);
-    assertThat(methodSubject, isRenamed());
+    assertThat(methodSubject, isPresentAndRenamed());
     return methodSubject;
   }
 
   protected MethodSubject checkMethodIsNotRenamed(
       ClassSubject classSubject, MethodSignature methodSignature) {
     MethodSubject methodSubject = checkMethodIsKept(classSubject, methodSignature);
-    assertThat(methodSubject, not(isRenamed()));
+    assertThat(methodSubject, isPresentAndNotRenamed());
     return methodSubject;
   }
 
   protected MethodSubject checkMethodIsNotRenamed(ClassSubject classSubject, String methodName) {
     MethodSubject methodSubject = checkMethodIsKept(classSubject, methodName);
-    assertThat(methodSubject, not(isRenamed()));
+    assertThat(methodSubject, isPresentAndNotRenamed());
     return methodSubject;
   }
 

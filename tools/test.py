@@ -22,6 +22,7 @@ import utils
 
 ALL_ART_VMS = [
     "default",
+    "10.0.0",
     "9.0.0",
     "8.1.0",
     "7.0.0",
@@ -43,6 +44,12 @@ BUCKET = 'r8-test-results'
 NUMBER_OF_TEST_REPORTS = 5
 REPORTS_PATH = os.path.join(utils.BUILD, 'reports')
 REPORT_INDEX = ['tests', 'test', 'index.html']
+VALID_RUNTIMES = [
+  'none',
+  'jdk8',
+  'jdk9',
+  'jdk11',
+] + [ 'dex-%s' % dexvm for dexvm in ALL_ART_VMS ]
 
 def ParseOptions():
   result = optparse.OptionParser()
@@ -57,6 +64,9 @@ def ParseOptions():
       default=False, action='store_true')
   result.add_option('--all-tests', '--all_tests',
       help='Run tests in all configurations.',
+      default=False, action='store_true')
+  result.add_option('--slow-tests', '--slow_tests',
+      help='Also run slow tests.',
       default=False, action='store_true')
   result.add_option('-v', '--verbose',
       help='Print test stdout to, well, stdout.',
@@ -100,7 +110,8 @@ def ParseOptions():
   result.add_option('--java-home', '--java_home',
       help='Use a custom java version to run tests.')
   result.add_option('--java-max-memory-size', '--java_max_memory_size',
-      help='Use a custom max memory size for the gradle java instance, eg, 4g')
+      help='Set memory for running tests, default 4G',
+      default='4G')
   result.add_option('--shard-count', '--shard_count',
       help='We are running this many shards.')
   result.add_option('--shard-number', '--shard_number',
@@ -124,6 +135,14 @@ def ParseOptions():
   result.add_option('--fail-fast', '--fail_fast',
       default=False, action='store_true',
       help='Stop on first failure. Passes --fail-fast to gradle test runner.')
+  result.add_option('--worktree',
+      default=False, action='store_true',
+      help='Tests are run in worktree and should not use gradle user home.')
+  result.add_option('--runtimes',
+      default=None,
+      help='Test parameter runtimes to use, separated by : (eg, none:jdk9).'
+          ' Special values include: all (for all runtimes)'
+          ' and empty (for no runtimes).')
   return result.parse_args()
 
 def archive_failures():
@@ -131,18 +150,19 @@ def archive_failures():
   u_dir = uuid.uuid4()
   destination = 'gs://%s/%s' % (BUCKET, u_dir)
   utils.upload_dir_to_cloud_storage(upload_dir, destination, is_html=True)
-  url = 'http://storage.googleapis.com/%s/%s/test/index.html' % (BUCKET, u_dir)
+  url = 'https://storage.googleapis.com/%s/%s/test/index.html' % (BUCKET, u_dir)
   print 'Test results available at: %s' % url
   print '@@@STEP_LINK@Test failures@%s@@@' % url
 
 def Main():
   (options, args) = ParseOptions()
+
   if utils.is_bot():
     gradle.RunGradle(['--no-daemon', 'clean'])
 
   gradle_args = ['--stacktrace']
   if utils.is_bot():
-    # Bots don't like dangling processes
+    # Bots don't like dangling processes.
     gradle_args.append('--no-daemon')
 
   # Set all necessary Gradle properties and options first.
@@ -158,6 +178,8 @@ def Main():
     gradle_args.append('-Ponly_internal')
   if options.all_tests:
     gradle_args.append('-Pall_tests')
+  if options.slow_tests:
+    gradle_args.append('-Pslow_tests=1')
   if options.tool:
     gradle_args.append('-Ptool=%s' % options.tool)
   if options.one_line_per_test:
@@ -188,7 +210,7 @@ def Main():
   if options.java_home:
     gradle_args.append('-Dorg.gradle.java.home=' + options.java_home)
   if options.java_max_memory_size:
-    gradle_args.append('-Dorg.gradle.jvmargs=-Xmx' + options.java_max_memory_size)
+    gradle_args.append('-Ptest_xmx=' + options.java_max_memory_size)
   if options.generate_golden_files_to:
     gradle_args.append('-Pgenerate_golden_files_to=' + options.generate_golden_files_to)
     if not os.path.exists(options.generate_golden_files_to):
@@ -209,9 +231,15 @@ def Main():
     gradle_args.append('R8LibNoDeps')
   if options.r8lib_no_deps:
     gradle_args.append('-Pr8lib_no_deps')
+  if options.worktree:
+    gradle_args.append('-g=' + os.path.join(utils.REPO_ROOT, ".gradle_user_home"))
+    gradle_args.append('--no-daemon')
 
   # Build an R8 with dependencies for bootstrapping tests before adding test sources.
+  gradle_args.append('r8WithDeps')
+  gradle_args.append('r8WithDeps11')
   gradle_args.append('r8WithRelocatedDeps')
+  gradle_args.append('r8WithRelocatedDeps11')
 
   # Add Gradle tasks
   gradle_args.append('cleanTest')
@@ -253,9 +281,36 @@ def Main():
   if options.only_jctf:
     # Note: not setting -Pruntimes will run with all available runtimes.
     return_code = gradle.RunGradle(gradle_args, throw_on_failure=False)
-    return 0
+    return archive_and_return(return_code, options)
 
   # Now run tests on selected runtime(s).
+  if options.runtimes:
+    if options.dex_vm != 'default':
+      print 'Unexpected runtimes and dex_vm argument: ' + options.dex_vm
+      sys.exit(1)
+    if options.runtimes == 'empty':
+      # Set runtimes with no content will configure no runtimes.
+      gradle_args.append('-Pruntimes=')
+    elif options.runtimes == 'all':
+      # An unset runtimes will configure all runtimes
+      pass
+    else:
+      prefixes = [prefix.strip() for prefix in options.runtimes.split(':')]
+      runtimes = []
+      for prefix in prefixes:
+        matches = [ rt for rt in VALID_RUNTIMES if rt.startswith(prefix) ]
+        if len(matches) == 0:
+          print "Invalid runtime prefix '%s'." % prefix
+          print "Must be just 'all', 'empty'," \
+                " or a prefix of %s" % ', '.join(VALID_RUNTIMES)
+          sys.exit(1)
+        runtimes.extend(matches)
+      gradle_args.append('-Pruntimes=%s' % ':'.join(runtimes))
+
+    return_code = gradle.RunGradle(gradle_args, throw_on_failure=False)
+    return archive_and_return(return_code, options)
+
+  # Legacy testing populates the runtimes based on dex_vm.
   vms_to_test = [options.dex_vm] if options.dex_vm != "all" else ALL_ART_VMS
 
   for art_vm in vms_to_test:
@@ -263,7 +318,7 @@ def Main():
     runtimes = ['dex-' + art_vm]
     # Only append the "none" runtime and JVMs if running on the "default" DEX VM.
     if art_vm == "default":
-      runtimes.extend(['jdk8', 'jdk9', 'none'])
+      runtimes.extend(['jdk8', 'jdk9', 'jdk11', 'none'])
     return_code = gradle.RunGradle(
         gradle_args + [
           '-Pdex_vm=%s' % art_vm + vm_suffix,
@@ -278,12 +333,16 @@ def Main():
                                            'gs://r8-test-results/golden-files/' + archive)
 
     if return_code != 0:
-      if options.archive_failures and os.name != 'nt':
-        archive_failures()
-      return return_code
+      return archive_and_return(return_code, options)
 
   return 0
 
+
+def archive_and_return(return_code, options):
+  if return_code != 0:
+    if options.archive_failures and os.name != 'nt':
+      archive_failures()
+  return return_code
 
 def print_jstacks():
   processes = subprocess.check_output(['ps', 'aux'])
@@ -379,7 +438,6 @@ def compute_failed_tests(args):
         test = href.replace('.html','').replace('#', '.').replace('.classMethod', '')
         failing.add(test)
   return list(failing)
-
 if __name__ == '__main__':
   return_code = Main()
   if return_code != 0:

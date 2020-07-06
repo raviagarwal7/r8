@@ -5,6 +5,7 @@
 # Different utility functions used accross scripts
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -32,54 +33,62 @@ BUILD_TEST_DIR = os.path.join(BUILD, 'classes', 'test')
 LIBS = os.path.join(BUILD, 'libs')
 GENERATED_LICENSE_DIR = os.path.join(BUILD, 'generatedLicense')
 SRC_ROOT = os.path.join(REPO_ROOT, 'src', 'main', 'java')
+TEST_ROOT = os.path.join(REPO_ROOT, 'src', 'test', 'java')
+REPO_SOURCE = 'https://r8.googlesource.com/r8'
 
 D8 = 'd8'
 R8 = 'r8'
 R8LIB = 'r8lib'
 R8LIB_NO_DEPS = 'r8LibNoDeps'
 R8_SRC = 'sourceJar'
-COMPATDX = 'compatdx'
-COMPATDXLIB = 'compatdxlib'
-COMPATPROGUARD = 'compatproguard'
-COMPATPROGUARDLIB = 'compatproguardlib'
+LIBRARY_DESUGAR_CONVERSIONS = 'buildLibraryDesugarConversions'
 
 D8_JAR = os.path.join(LIBS, 'd8.jar')
 R8_JAR = os.path.join(LIBS, 'r8.jar')
 R8LIB_JAR = os.path.join(LIBS, 'r8lib.jar')
+R8LIB_MAP = os.path.join(LIBS, 'r8lib.jar.map')
 R8_SRC_JAR = os.path.join(LIBS, 'r8-src.jar')
 R8LIB_EXCLUDE_DEPS_JAR = os.path.join(LIBS, 'r8lib-exclude-deps.jar')
 R8_FULL_EXCLUDE_DEPS_JAR = os.path.join(LIBS, 'r8-full-exclude-deps.jar')
-COMPATDX_JAR = os.path.join(LIBS, 'compatdx.jar')
-COMPATDXLIB_JAR = os.path.join(LIBS, 'compatdxlib.jar')
-COMPATPROGUARD_JAR = os.path.join(LIBS, 'compatproguard.jar')
-COMPATPROGUARDLIB_JAR = os.path.join(LIBS, 'compatproguardlib.jar')
 MAVEN_ZIP = os.path.join(LIBS, 'r8.zip')
 MAVEN_ZIP_LIB = os.path.join(LIBS, 'r8lib.zip')
+LIBRARY_DESUGAR_CONVERSIONS_ZIP = os.path.join(LIBS, 'library_desugar_conversions.zip')
+
+DESUGAR_CONFIGURATION = os.path.join(
+      'src', 'library_desugar', 'desugar_jdk_libs.json')
+DESUGAR_CONFIGURATION_MAVEN_ZIP = os.path.join(
+  LIBS, 'desugar_jdk_libs_configuration.zip')
 GENERATED_LICENSE = os.path.join(GENERATED_LICENSE_DIR, 'LICENSE')
 RT_JAR = os.path.join(REPO_ROOT, 'third_party/openjdk/openjdk-rt-1.8/rt.jar')
 R8LIB_KEEP_RULES = os.path.join(REPO_ROOT, 'src/main/keep.txt')
-RETRACE_JAR = os.path.join(
-    THIRD_PARTY,
-    'proguard',
-    'proguard6.0.1',
-    'lib',
-    'retrace.jar')
-PROGUARD_JAR = os.path.join(
-    THIRD_PARTY,
-    'proguard',
-    'proguard6.0.1',
-    'lib',
-    'proguard.jar')
 CF_SEGMENTS_TOOL = os.path.join(THIRD_PARTY, 'cf_segments')
 PINNED_R8_JAR = os.path.join(REPO_ROOT, 'third_party/r8/r8.jar')
 PINNED_PGR8_JAR = os.path.join(REPO_ROOT, 'third_party/r8/r8-pg6.0.1.jar')
+SAMPLE_LIBRARIES_SHA_FILE = os.path.join(
+    THIRD_PARTY, 'sample_libraries.tar.gz.sha1')
 OPENSOURCE_APPS_SHA_FILE = os.path.join(
     THIRD_PARTY, 'opensource_apps.tar.gz.sha1')
 OPENSOURCE_APPS_FOLDER = os.path.join(THIRD_PARTY, 'opensource_apps')
+BAZEL_SHA_FILE = os.path.join(THIRD_PARTY, 'bazel.tar.gz.sha1')
+BAZEL_TOOL = os.path.join(THIRD_PARTY, 'bazel')
+JAVA8_SHA_FILE = os.path.join(THIRD_PARTY, 'openjdk', 'jdk8', 'linux-x86.tar.gz.sha1')
 
 ANDROID_HOME_ENVIROMENT_NAME = "ANDROID_HOME"
 ANDROID_TOOLS_VERSION_ENVIRONMENT_NAME = "ANDROID_TOOLS_VERSION"
 USER_HOME = os.path.expanduser('~')
+
+R8_TEST_RESULTS_BUCKET = 'r8-test-results'
+
+def archive_file(name, gs_dir, src_file):
+  gs_file = '%s/%s' % (gs_dir, name)
+  upload_file_to_cloud_storage(src_file, gs_file, public_read=False)
+
+def archive_value(name, gs_dir, value):
+  with TempDir() as temp:
+    tempfile = os.path.join(temp, name);
+    with open(tempfile, 'w') as f:
+      f.write(str(value))
+    archive_file(name, gs_dir, tempfile)
 
 def getAndroidHome():
   return os.environ.get(
@@ -158,7 +167,10 @@ def RunCmd(cmd, env_vars=None, quiet=False, fail=True, logging=True):
       if ('AssertionError:' in stripped
           or 'CompilationError:' in stripped
           or 'CompilationFailedException:' in stripped
-          or 'Compilation failed' in stripped):
+          or 'Compilation failed' in stripped
+          or 'FAILURE:' in stripped
+          or 'org.gradle.api.ProjectConfigurationException' in stripped
+          or 'BUILD FAILED' in stripped):
         failed = True
     else:
       if logger:
@@ -337,16 +349,18 @@ def cloud_storage_exists(destination):
   return exit_code == 0
 
 class TempDir(object):
- def __init__(self, prefix=''):
+ def __init__(self, prefix='', delete=True):
    self._temp_dir = None
    self._prefix = prefix
+   self._delete = delete
 
  def __enter__(self):
    self._temp_dir = tempfile.mkdtemp(self._prefix)
    return self._temp_dir
 
  def __exit__(self, *_):
-   shutil.rmtree(self._temp_dir, ignore_errors=True)
+   if self._delete:
+     shutil.rmtree(self._temp_dir, ignore_errors=True)
 
 class ChangedWorkingDirectory(object):
  def __init__(self, working_directory, quiet=False):
@@ -467,8 +481,8 @@ def getCfSegmentSizes(cfFile):
 
   return result
 
-def get_maven_path(version):
-  return os.path.join('com', 'android', 'tools', 'r8', version)
+def get_maven_path(artifact, version):
+  return os.path.join('com', 'android', 'tools', artifact, version)
 
 def print_cfsegments(prefix, cf_files):
   for cf_file in cf_files:
@@ -522,5 +536,62 @@ def getR8Version(path):
   cmd = [jdk.GetJavaExecutable(), '-cp', path, 'com.android.tools.r8.R8',
         '--version']
   output = subprocess.check_output(cmd, stderr = subprocess.STDOUT)
-  # output is on form 'R8 <version>' so we just strip of 'R8 '.
-  return output.splitlines()[0][3:]
+  # output is of the form 'R8 <version> (with additional info)'
+  # so we split on '('; clean up tailing spaces; and strip off 'R8 '.
+  return output.split('(')[0].strip()[3:]
+
+def desugar_configuration_version():
+  with open(DESUGAR_CONFIGURATION, 'r') as f:
+    configuration_json = json.loads(f.read())
+    configuration_format_version = \
+        configuration_json.get('configuration_format_version')
+    version = configuration_json.get('version')
+    if not version:
+      raise Exception(
+          'No "version" found in ' + utils.DESUGAR_CONFIGURATION)
+    check_basic_semver_version(version, 'in ' + DESUGAR_CONFIGURATION)
+    return version
+
+class SemanticVersion:
+  def __init__(self, major, minor, patch):
+    self.major = major
+    self.minor = minor
+    self.patch = patch
+    # Build metadata currently not suppported
+
+  def larger_than(self, other):
+    if self.major > other.major:
+      return True
+    if self.major == other.major and self.minor > other.minor:
+      return True
+    if self.patch:
+      return (self.major == other.major
+        and self.minor == other.minor
+        and self.patch > other.patch)
+    else:
+      return False
+
+
+# Check that the passed string is formatted as a basic semver version (x.y.z)
+# See https://semver.org/.
+def check_basic_semver_version(version, error_context = '', components = 3):
+    regexp = '^'
+    for x in range(components):
+      regexp += '([0-9]+)'
+      if x < components - 1:
+        regexp += '\\.'
+    regexp += '$'
+    reg = re.compile(regexp)
+    match = reg.match(version)
+    if not match:
+      raise Exception("Invalid version '"
+            + version
+            + "'"
+            + (' ' + error_context) if len(error_context) > 0 else '')
+    if components == 2:
+      return SemanticVersion(int(match.group(1)), int(match.group(2)), None)
+    elif components == 3:
+      return SemanticVersion(
+        int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    else:
+      raise Exception('Argument "components" must be 2 or 3')

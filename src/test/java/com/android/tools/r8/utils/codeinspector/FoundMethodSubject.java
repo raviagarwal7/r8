@@ -4,7 +4,8 @@
 
 package com.android.tools.r8.utils.codeinspector;
 
-import com.android.tools.r8.DexIndexedConsumer;
+import static com.android.tools.r8.ir.desugar.InterfaceMethodRewriter.DEFAULT_METHOD_PREFIX;
+
 import com.android.tools.r8.cf.code.CfInstruction;
 import com.android.tools.r8.cf.code.CfPosition;
 import com.android.tools.r8.code.Instruction;
@@ -13,6 +14,7 @@ import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.CfCode;
+import com.android.tools.r8.graph.CfCode.LocalVariableInfo;
 import com.android.tools.r8.graph.Code;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexCode;
@@ -21,20 +23,28 @@ import com.android.tools.r8.graph.DexDebugInfo;
 import com.android.tools.r8.graph.DexDebugPositionState;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexString;
-import com.android.tools.r8.graph.JarCode;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.naming.MemberNaming;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.naming.signature.GenericSignatureParser;
-import com.android.tools.r8.origin.Origin;
-import com.android.tools.r8.utils.InternalOptions;
-import com.android.tools.r8.utils.Reporter;
-import it.unimi.dsi.fastutil.objects.Reference2IntMap;
-import it.unimi.dsi.fastutil.objects.Reference2IntOpenHashMap;
+import com.android.tools.r8.references.MethodReference;
+import com.android.tools.r8.references.Reference;
+import com.android.tools.r8.references.TypeReference;
+import com.android.tools.r8.utils.StringUtils;
+import com.android.tools.r8.utils.codeinspector.LocalVariableTable.LocalVariableTableEntry;
+import com.google.common.base.Predicates;
+import com.google.common.collect.ImmutableList;
+import it.unimi.dsi.fastutil.objects.Object2IntMap;
+import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.List;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 public class FoundMethodSubject extends MethodSubject {
 
@@ -50,17 +60,9 @@ public class FoundMethodSubject extends MethodSubject {
   }
 
   @Override
-  public IRCode buildIR(DexItemFactory dexItemFactory) {
-    InternalOptions options = new InternalOptions(dexItemFactory, new Reporter());
-    options.programConsumer = DexIndexedConsumer.emptyConsumer();
-
-    DexEncodedMethod method = getMethod();
-    return method
-        .getCode()
-        .buildIR(
-            method,
-            AppView.createForD8(new AppInfo(codeInspector.application), options),
-            Origin.unknown());
+  public IRCode buildIR() {
+    assert codeInspector.application.options.programConsumer != null;
+    return getProgramMethod().buildIR(AppView.createForD8(new AppInfo(codeInspector.application)));
   }
 
   @Override
@@ -130,12 +132,17 @@ public class FoundMethodSubject extends MethodSubject {
 
   @Override
   public boolean isVirtual() {
-    return dexMethod.isVirtualMethod();
+    return dexMethod.isNonPrivateVirtualMethod();
   }
 
   @Override
   public DexEncodedMethod getMethod() {
     return dexMethod;
+  }
+
+  @Override
+  public ProgramMethod getProgramMethod() {
+    return new ProgramMethod(clazz.getDexProgramClass(), getMethod());
   }
 
   @Override
@@ -173,12 +180,29 @@ public class FoundMethodSubject extends MethodSubject {
   @Override
   public String getOriginalSignatureAttribute() {
     return codeInspector.getOriginalSignatureAttribute(
-        dexMethod.annotations, GenericSignatureParser::parseMethodSignature);
+        dexMethod.annotations(), GenericSignatureParser::parseMethodSignature);
+  }
+
+  public DexMethod getOriginalDexMethod(DexItemFactory dexItemFactory) {
+    MethodSignature methodSignature = getOriginalSignature();
+    if (methodSignature.isQualified()) {
+      methodSignature = methodSignature.toUnqualified();
+    }
+    return methodSignature.toDexMethod(
+        dexItemFactory, dexItemFactory.createType(clazz.getOriginalDescriptor()));
   }
 
   @Override
   public String getFinalSignatureAttribute() {
-    return codeInspector.getFinalSignatureAttribute(dexMethod.annotations);
+    return codeInspector.getFinalSignatureAttribute(dexMethod.annotations());
+  }
+
+  public Iterable<InstructionSubject> instructions() {
+    return instructions(Predicates.alwaysTrue());
+  }
+
+  public Iterable<InstructionSubject> instructions(Predicate<InstructionSubject> predicate) {
+    return () -> iterateInstructions(predicate);
   }
 
   @Override
@@ -206,6 +230,9 @@ public class FoundMethodSubject extends MethodSubject {
   @Override
   public boolean hasLocalVariableTable() {
     Code code = getMethod().getCode();
+    if (code == null) {
+      return false;
+    }
     if (code.isDexCode()) {
       DexCode dexCode = code.asDexCode();
       if (dexCode.getDebugInfo() != null) {
@@ -225,41 +252,34 @@ public class FoundMethodSubject extends MethodSubject {
     if (code.isCfCode()) {
       return !code.asCfCode().getLocalVariables().isEmpty();
     }
-    if (code.isJarCode()) {
-      return code.asJarCode().hasLocalVariableTable();
-    }
     throw new Unreachable("Unexpected code type: " + code.getClass().getSimpleName());
   }
 
   @Override
   public LineNumberTable getLineNumberTable() {
     Code code = getMethod().getCode();
+    if (code == null) {
+      return null;
+    }
     if (code.isDexCode()) {
       return getDexLineNumberTable(code.asDexCode());
     }
     if (code.isCfCode()) {
       return getCfLineNumberTable(code.asCfCode());
     }
-    if (code.isJarCode()) {
-      return getJarLineNumberTable(code.asJarCode());
-    }
     throw new Unreachable("Unexpected code type: " + code.getClass().getSimpleName());
-  }
-
-  private LineNumberTable getJarLineNumberTable(JarCode code) {
-    throw new Unimplemented("No support for inspecting the line number table for JarCode");
   }
 
   private LineNumberTable getCfLineNumberTable(CfCode code) {
     int currentLine = -1;
-    Reference2IntMap<InstructionSubject> lineNumberTable =
-        new Reference2IntOpenHashMap<>(code.getInstructions().size());
+    Object2IntMap<InstructionSubject> lineNumberTable =
+        new Object2IntOpenHashMap<>(code.getInstructions().size());
     for (CfInstruction insn : code.getInstructions()) {
       if (insn instanceof CfPosition) {
         currentLine = ((CfPosition) insn).getPosition().line;
       }
       if (currentLine != -1) {
-        lineNumberTable.put(new CfInstructionSubject(insn), currentLine);
+        lineNumberTable.put(new CfInstructionSubject(insn, this), currentLine);
       }
     }
     return currentLine == -1 ? null : new LineNumberTable(lineNumberTable);
@@ -270,8 +290,7 @@ public class FoundMethodSubject extends MethodSubject {
     if (debugInfo == null) {
       return null;
     }
-    Reference2IntMap<InstructionSubject> lineNumberTable =
-        new Reference2IntOpenHashMap<>(code.instructions.length);
+    Object2IntMap<InstructionSubject> lineNumberTable = new Object2IntOpenHashMap<>();
     DexDebugPositionState state =
         new DexDebugPositionState(debugInfo.startLine, getMethod().method);
     Iterator<DexDebugEvent> iterator = Arrays.asList(debugInfo.events).iterator();
@@ -280,9 +299,42 @@ public class FoundMethodSubject extends MethodSubject {
       while (state.getCurrentPc() < offset && iterator.hasNext()) {
         iterator.next().accept(state);
       }
-      lineNumberTable.put(new DexInstructionSubject(insn), state.getCurrentLine());
+      lineNumberTable.put(new DexInstructionSubject(insn, this), state.getCurrentLine());
     }
     return new LineNumberTable(lineNumberTable);
+  }
+
+  @Override
+  public LocalVariableTable getLocalVariableTable() {
+    Code code = getMethod().getCode();
+    if (code.isDexCode()) {
+      return getDexLocalVariableTable(code.asDexCode());
+    }
+    if (code.isCfCode()) {
+      return getCfLocalVariableTable(code.asCfCode());
+    }
+    throw new Unreachable("Unexpected code type: " + code.getClass().getSimpleName());
+  }
+
+  private LocalVariableTable getCfLocalVariableTable(CfCode code) {
+    ImmutableList.Builder<LocalVariableTableEntry> builder = ImmutableList.builder();
+    for (LocalVariableInfo localVariable : code.getLocalVariables()) {
+      builder.add(
+          new LocalVariableTableEntry(
+              localVariable.getIndex(),
+              localVariable.getLocal().name.toString(),
+              new TypeSubject(codeInspector, localVariable.getLocal().type),
+              localVariable.getLocal().signature == null
+                  ? null
+                  : localVariable.getLocal().signature.toString(),
+              new CfInstructionSubject(localVariable.getStart(), this),
+              new CfInstructionSubject(localVariable.getEnd(), this)));
+    }
+    return new LocalVariableTable(builder.build());
+  }
+
+  private LocalVariableTable getDexLocalVariableTable(DexCode code) {
+    throw new Unimplemented("No support for inspecting the line number table for DexCode");
   }
 
   @Override
@@ -292,9 +344,51 @@ public class FoundMethodSubject extends MethodSubject {
 
   @Override
   public AnnotationSubject annotation(String name) {
-    DexAnnotation annotation = codeInspector.findAnnotation(name, dexMethod.annotations);
+    DexAnnotation annotation = codeInspector.findAnnotation(name, dexMethod.annotations());
     return annotation == null
         ? new AbsentAnnotationSubject()
         : new FoundAnnotationSubject(annotation);
+  }
+
+  @Override
+  public FoundMethodSubject asFoundMethodSubject() {
+    return this;
+  }
+
+  public MethodReference asMethodReference() {
+    DexMethod method = dexMethod.method;
+    return Reference.method(
+        Reference.classFromDescriptor(method.holder.toDescriptorString()),
+        method.name.toString(),
+        Arrays.stream(method.proto.parameters.values)
+            .map(type -> Reference.typeFromDescriptor(type.toDescriptorString()))
+            .collect(Collectors.toList()),
+        Reference.returnTypeFromDescriptor(method.proto.returnType.toDescriptorString()));
+  }
+
+  @Override
+  public String getJvmMethodSignatureAsString() {
+    return dexMethod.method.name.toString()
+        + "("
+        + StringUtils.join(
+            Arrays.stream(dexMethod.method.proto.parameters.values)
+                .map(DexType::toDescriptorString).collect(Collectors.toList()), "")
+        + ")"
+        + dexMethod.method.proto.returnType.toDescriptorString();
+  }
+
+  @Override
+  public MethodSubject toMethodOnCompanionClass() {
+    ClassSubject companionClass = clazz.toCompanionClass();
+    MethodReference reference = asMethodReference();
+    List<String> p =
+        ImmutableList.<String>builder()
+            .add(clazz.getFinalName())
+            .addAll(reference.getFormalTypes().stream().map(TypeReference::getTypeName).iterator())
+            .build();
+    return companionClass.method(
+        reference.getReturnType().getTypeName(),
+        DEFAULT_METHOD_PREFIX + reference.getMethodName(),
+        p);
   }
 }

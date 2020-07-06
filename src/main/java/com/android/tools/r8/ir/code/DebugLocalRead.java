@@ -5,11 +5,11 @@ package com.android.tools.r8.ir.code;
 
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 
@@ -18,6 +18,11 @@ public class DebugLocalRead extends Instruction {
 
   public DebugLocalRead() {
     super(null);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.DEBUG_LOCAL_READ;
   }
 
   @Override
@@ -62,15 +67,15 @@ public class DebugLocalRead extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forDebugLocalRead();
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
     // Reads are never dead code.
     // They should also have a non-empty set of debug values (see RegAlloc::computeDebugInfo)
-    return false;
+    return DeadInstructionResult.notDead();
   }
 
   @Override
@@ -81,5 +86,15 @@ public class DebugLocalRead extends Instruction {
   @Override
   public void insertLoadAndStores(InstructionListIterator it, LoadStoreHelper helper) {
     // Non-materializing so no stack values are needed.
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
+  }
+
+  @Override
+  public boolean isAllowedAfterThrowingInstruction() {
+    return true;
   }
 }

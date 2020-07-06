@@ -8,7 +8,6 @@ import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNul
 
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.CompilationError;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexCallSite;
 import com.android.tools.r8.graph.DexItemFactory;
@@ -16,7 +15,8 @@ import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexValue;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.DexValue.DexValueString;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.BasicBlock.ThrowingInfo;
 import com.android.tools.r8.ir.code.ConstString;
@@ -48,7 +48,7 @@ public class StringConcatRewriter {
   private static final String TO_STRING = "toString";
   private static final String APPEND = "append";
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   private final DexItemFactory factory;
 
   private final DexMethod makeConcat;
@@ -60,7 +60,7 @@ public class StringConcatRewriter {
   private final Map<DexType, DexMethod> paramTypeToAppendMethod = new IdentityHashMap<>();
   private final DexMethod defaultAppendMethod;
 
-  public StringConcatRewriter(AppView<? extends AppInfo> appView) {
+  public StringConcatRewriter(AppView<?> appView) {
     this.appView = appView;
     this.factory = appView.dexItemFactory();
 
@@ -118,7 +118,7 @@ public class StringConcatRewriter {
     ListIterator<BasicBlock> blocks = code.listIterator();
     while (blocks.hasNext()) {
       BasicBlock block = blocks.next();
-      InstructionListIterator instructions = block.listIterator();
+      InstructionListIterator instructions = block.listIterator(code);
       while (instructions.hasNext()) {
         Instruction instruction = instructions.next();
         if (!instruction.isInvokeCustom()) {
@@ -213,11 +213,11 @@ public class StringConcatRewriter {
     }
 
     // Extract recipe.
-    DexValue recipeValue = bootstrapArgs.get(0);
-    if (!(recipeValue instanceof DexValue.DexValueString)) {
+    DexValueString recipeValue = bootstrapArgs.get(0).asDexValueString();
+    if (recipeValue == null) {
       throw error(method, "bootstrap method argument `recipe` must be a string");
     }
-    String recipe = ((DexValue.DexValueString) recipeValue).getValue().toString();
+    String recipe = recipeValue.getValue().toString();
 
     // Collect chunks and patch the instruction.
     ConcatBuilder builder = new ConcatBuilder(appView, code, blocks, instructions);
@@ -274,15 +274,15 @@ public class StringConcatRewriter {
   }
 
   private static String convertToString(DexMethod method, DexValue value) {
-    if (value instanceof DexValue.DexValueString) {
-      return ((DexValue.DexValueString) value).getValue().toString();
+    if (value.isDexValueString()) {
+      return value.asDexValueString().getValue().toString();
     }
     throw error(method,
         "const arg referenced from `recipe` is not supported: " + value.getClass().getName());
   }
 
   private final class ConcatBuilder {
-    private final AppView<? extends AppInfo> appView;
+    private final AppView<?> appView;
     private final IRCode code;
     private final ListIterator<BasicBlock> blocks;
     private final InstructionListIterator instructions;
@@ -291,7 +291,7 @@ public class StringConcatRewriter {
     private final List<Chunk> chunks = new ArrayList<>();
 
     private ConcatBuilder(
-        AppView<? extends AppInfo> appView,
+        AppView<?> appView,
         IRCode code,
         ListIterator<BasicBlock> blocks,
         InstructionListIterator instructions) {
@@ -339,8 +339,8 @@ public class StringConcatRewriter {
       instructions.previous();
 
       // new-instance v0, StringBuilder
-      TypeLatticeElement stringBuilderTypeLattice =
-          TypeLatticeElement.fromDexType(factory.stringBuilderType, definitelyNotNull(), appView);
+      TypeElement stringBuilderTypeLattice =
+          TypeElement.fromDexType(factory.stringBuilderType, definitelyNotNull(), appView);
       Value sbInstance = code.createValue(stringBuilderTypeLattice);
       appendInstruction(new NewInstance(factory.stringBuilderType, sbInstance));
 
@@ -362,8 +362,7 @@ public class StringConcatRewriter {
       Value concatValue = invokeCustom.outValue();
       if (concatValue == null) {
         // The out value might be empty in case it was optimized out.
-        concatValue =
-            code.createValue(TypeLatticeElement.stringClassType(appView, definitelyNotNull()));
+        concatValue = code.createValue(TypeElement.stringClassType(appView, definitelyNotNull()));
       }
 
       // Replace the instruction.
@@ -383,7 +382,7 @@ public class StringConcatRewriter {
       // located right before the iterator point and new blocks created while copying
       // handles break this expectation.
       List<BasicBlock> newBlocks = new ArrayList<>();
-      InstructionListIterator it = currentBlock.listIterator();
+      InstructionListIterator it = currentBlock.listIterator(code);
       while (it.hasNext()) {
         Instruction instruction = it.next();
         if (instruction.instructionTypeCanThrow() && it.hasNext()) {
@@ -392,7 +391,7 @@ public class StringConcatRewriter {
           BasicBlock newBlock = it.split(code, blocks);
           newBlocks.add(newBlock);
           // Follow with the next block.
-          it = newBlock.listIterator();
+          it = newBlock.listIterator(code);
         }
       }
       // Copy catch handlers after all blocks are split.
@@ -441,8 +440,7 @@ public class StringConcatRewriter {
 
       @Override
       Value getOrCreateValue() {
-        Value value =
-            code.createValue(TypeLatticeElement.stringClassType(appView, definitelyNotNull()));
+        Value value = code.createValue(TypeElement.stringClassType(appView, definitelyNotNull()));
         appendInstruction(
             new ConstString(
                 value,

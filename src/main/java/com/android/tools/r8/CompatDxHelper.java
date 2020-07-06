@@ -12,8 +12,6 @@ public class CompatDxHelper {
       throws CompilationFailedException {
     AndroidApp app = command.getInputApp();
     InternalOptions options = command.getInternalOptions();
-    // DX does not desugar.
-    options.enableDesugaring = false;
     // DX allows --multi-dex without specifying a main dex list for legacy devices.
     // That is broken, but for CompatDX we do the same to not break existing builds
     // that are trying to transition.
@@ -26,5 +24,9 @@ public class CompatDxHelper {
 
   public static void ignoreDexInArchive(BaseCommand.Builder builder) {
     builder.setIgnoreDexInArchive(true);
+  }
+
+  public static void enableDesugarBackportStatics(D8Command.Builder builder) {
+    builder.enableDesugarBackportStatics();
   }
 }

@@ -6,6 +6,8 @@ package com.android.tools.r8.utils.codeinspector;
 
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexEncodedField;
+import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexValue;
 import com.android.tools.r8.naming.MemberNaming;
 import com.android.tools.r8.naming.MemberNaming.FieldSignature;
@@ -22,6 +24,11 @@ public class FoundFieldSubject extends FieldSubject {
     this.codeInspector = codeInspector;
     this.clazz = clazz;
     this.dexField = dexField;
+  }
+
+  @Override
+  public FoundFieldSubject asFoundFieldSubject() {
+    return this;
   }
 
   @Override
@@ -94,7 +101,14 @@ public class FoundFieldSubject extends FieldSubject {
     FieldSignature lookupSignature = new FieldSignature(signature.name, fieldType);
 
     MemberNaming memberNaming = clazz.naming.lookup(lookupSignature);
-    return memberNaming != null ? (FieldSignature) memberNaming.getOriginalSignature() : signature;
+    return memberNaming != null
+        ? (FieldSignature) memberNaming.getOriginalSignature()
+        : lookupSignature;
+  }
+
+  public DexField getOriginalDexField(DexItemFactory dexItemFactory) {
+    FieldSignature fieldSignature = getOriginalSignature();
+    return fieldSignature.toDexField(dexItemFactory, clazz.getOriginalDexType(dexItemFactory));
   }
 
   @Override
@@ -120,17 +134,17 @@ public class FoundFieldSubject extends FieldSubject {
   @Override
   public String getOriginalSignatureAttribute() {
     return codeInspector.getOriginalSignatureAttribute(
-        dexField.annotations, GenericSignatureParser::parseFieldSignature);
+        dexField.annotations(), GenericSignatureParser::parseFieldSignature);
   }
 
   @Override
   public String getFinalSignatureAttribute() {
-    return codeInspector.getFinalSignatureAttribute(dexField.annotations);
+    return codeInspector.getFinalSignatureAttribute(dexField.annotations());
   }
 
   @Override
   public AnnotationSubject annotation(String name) {
-    DexAnnotation annotation = codeInspector.findAnnotation(name, dexField.annotations);
+    DexAnnotation annotation = codeInspector.findAnnotation(name, dexField.annotations());
     return annotation == null
         ? new AbsentAnnotationSubject()
         : new FoundAnnotationSubject(annotation);
@@ -139,5 +153,10 @@ public class FoundFieldSubject extends FieldSubject {
   @Override
   public String toString() {
     return dexField.toSourceString();
+  }
+
+  @Override
+  public String getJvmFieldSignatureAsString() {
+    return dexField.field.name.toString() + ":" + dexField.field.type.toDescriptorString();
   }
 }

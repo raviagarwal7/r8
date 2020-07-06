@@ -4,7 +4,7 @@
 package com.android.tools.r8.ir.regalloc;
 
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Argument;
 import com.android.tools.r8.ir.code.ConstInstruction;
 import com.android.tools.r8.ir.code.ConstNumber;
@@ -114,7 +114,7 @@ public class RegisterMoveScheduler {
     return usedTempRegisters;
   }
 
-  private List<RegisterMove> findMovesWithSrc(int src, TypeLatticeElement type) {
+  private List<RegisterMove> findMovesWithSrc(int src, TypeElement type) {
     List<RegisterMove> result = new ArrayList<>();
     assert src != LiveIntervals.NO_REGISTER;
     for (RegisterMove move : moveSet) {
@@ -124,9 +124,9 @@ public class RegisterMoveScheduler {
       int moveSrc = valueMap.get(move.src);
       if (moveSrc == src) {
         result.add(move);
-      } else if (move.type.isWide() && (moveSrc + 1) == src) {
+      } else if (move.type.isWidePrimitive() && (moveSrc + 1) == src) {
         result.add(move);
-      } else if (type.isWide() && (moveSrc - 1) == src) {
+      } else if (type.isWidePrimitive() && (moveSrc - 1) == src) {
         result.add(move);
       }
     }
@@ -139,17 +139,14 @@ public class RegisterMoveScheduler {
       if (move.definition.isArgument()) {
         Argument argument = move.definition.asArgument();
         int argumentRegister = argument.outValue().getLiveIntervals().getRegister();
-        Value to =
-            new FixedRegisterValue(argument.outValue().getTypeLattice(), move.dst);
-        Value from =
-            new FixedRegisterValue(argument.outValue().getTypeLattice(), argumentRegister);
+        Value to = new FixedRegisterValue(argument.getOutType(), move.dst);
+        Value from = new FixedRegisterValue(argument.getOutType(), argumentRegister);
         instruction = new Move(to, from);
       } else {
         assert move.definition.isOutConstant();
         ConstInstruction definition = move.definition.getOutConstantConstInstruction();
         if (definition.isConstNumber()) {
-          Value to =
-              new FixedRegisterValue(move.definition.outValue().getTypeLattice(), move.dst);
+          Value to = new FixedRegisterValue(move.definition.getOutType(), move.dst);
           instruction = new ConstNumber(to, definition.asConstNumber().getRawValue());
         } else {
           throw new Unreachable("Unexpected definition");
@@ -194,7 +191,7 @@ public class RegisterMoveScheduler {
     // Pick a non-wide move to unblock if possible.
     while (iterator.hasNext()) {
       move = iterator.next();
-      if (!move.type.isWide()) {
+      if (!move.type.isWidePrimitive()) {
         break;
       }
     }

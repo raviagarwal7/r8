@@ -12,7 +12,6 @@ import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import com.google.common.collect.ImmutableList;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import org.junit.Assert;
@@ -50,12 +49,8 @@ public class TreeShaking13Test extends TreeShakingTest {
 
   private static void shaking13EnsureFieldWritesCorrect(CodeInspector inspector) {
     ClassSubject mainClass = inspector.clazz("shaking13.Shaking");
-    MethodSubject testMethod = mainClass.method("void", "fieldTest", Collections.emptyList());
+    MethodSubject testMethod = mainClass.uniqueMethodWithName("fieldTest");
     Assert.assertTrue(testMethod.isPresent());
-    if (testMethod.getMethod().getCode().isJarCode()) {
-      // TODO(mathiasr): Implement iterateInstructions() for JarCode/CfCode
-      return;
-    }
     Iterator<FieldAccessInstructionSubject> iterator =
         testMethod.iterateInstructions(InstructionSubject::isFieldAccess);
     Assert.assertTrue(iterator.hasNext() && iterator.next().holder().is("shakinglib.LibraryClass"));

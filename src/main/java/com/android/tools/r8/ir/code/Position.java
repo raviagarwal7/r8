@@ -3,8 +3,10 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
+import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexString;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.google.common.annotations.VisibleForTesting;
 import java.util.Objects;
 
@@ -76,6 +78,19 @@ public class Position {
     return new Position(-1, null, method, callerPosition, false);
   }
 
+  public static Position getPositionForInlining(
+      AppView<?> appView, InvokeMethod invoke, ProgramMethod context) {
+    Position position = invoke.getPosition();
+    if (position.method == null) {
+      assert position.isNone();
+      position = Position.noneWithMethod(context.getReference(), null);
+    }
+    assert position.callerPosition == null
+        || position.getOutermostCaller().method
+            == appView.graphLense().getOriginalMethodSignature(context.getReference());
+    return position;
+  }
+
   public boolean isNone() {
     return line == -1;
   }
@@ -108,6 +123,7 @@ public class Position {
       return line == o.line
           && file == o.file
           && method == o.method
+          && synthetic == o.synthetic
           && Objects.equals(callerPosition, o.callerPosition);
     }
     return false;

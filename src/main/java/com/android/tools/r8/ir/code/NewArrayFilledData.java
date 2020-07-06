@@ -8,9 +8,8 @@ import com.android.tools.r8.code.FillArrayData;
 import com.android.tools.r8.code.FillArrayDataPayload;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -31,6 +30,11 @@ public class NewArrayFilledData extends Instruction {
     this.element_width = element_width;
     this.size = size;
     this.data = data;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.NEW_ARRAY_FILLED_DATA;
   }
 
   @Override
@@ -80,19 +84,6 @@ public class NewArrayFilledData extends Instruction {
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    if (!src().getTypeLattice().isNullable() && src().numberOfAllUsers() == 1) {
-      // The NewArrayFilledData instruction is only inserted by an R8 optimization following
-      // a NewArrayEmpty when there are more than one entry.
-      assert src().uniqueUsers().iterator().next() == this;
-      assert src().definition != null;
-      assert src().definition.isNewArrayEmpty();
-      return true;
-    }
-    return false;
-  }
-
-  @Override
   public boolean instructionTypeCanThrow() {
     return true;
   }
@@ -109,7 +100,7 @@ public class NewArrayFilledData extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forNewArrayFilledData();
   }
 
@@ -121,5 +112,30 @@ public class NewArrayFilledData extends Instruction {
   @Override
   public boolean hasInvariantOutType() {
     return true;
+  }
+
+  @Override
+  public boolean instructionInstanceCanThrow(AppView<?> appView, ProgramMethod context) {
+    return appView.options().debug || src().getType().isNullable();
+  }
+
+  @Override
+  public boolean instructionMayHaveSideEffects(
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    // Treat the instruction as possibly having side-effects if it may throw or the array is used.
+    if (instructionInstanceCanThrow(appView, context) || src().numberOfAllUsers() > 1) {
+      return true;
+    }
+
+    assert src().singleUniqueUser() == this;
+    assert !src().isPhi();
+    assert src().definition.isNewArrayEmpty();
+
+    return false;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

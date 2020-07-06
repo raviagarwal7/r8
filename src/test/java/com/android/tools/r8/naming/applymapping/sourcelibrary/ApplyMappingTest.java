@@ -5,9 +5,9 @@
 package com.android.tools.r8.naming.applymapping.sourcelibrary;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.CompilationFailedException;
 import com.android.tools.r8.R8Command;
@@ -29,7 +29,6 @@ import java.nio.file.Paths;
 import java.util.Iterator;
 import java.util.concurrent.ExecutionException;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -70,7 +69,6 @@ public class ApplyMappingTest extends TestBase {
     out = temp.newFolder("out").toPath();
   }
 
-  @Ignore("b/128516926")
   @Test
   public void test044_apply() throws Exception {
     Path flag =
@@ -172,13 +170,12 @@ public class ApplyMappingTest extends TestBase {
     AndroidApp outputApp =
         runR8(
             ToolHelper.addProguardConfigurationConsumer(
-                getCommandForApps(out, flag, NAMING001_JAR).setDisableMinification(true),
-                pgConfig -> {
-                  pgConfig.disableShrinking();
-                  pgConfig.disableObfuscation();
-                  pgConfig.setPrintMapping(true);
-                  pgConfig.setPrintMappingFile(proguardMap);
-                })
+                    getCommandForApps(out, flag, NAMING001_JAR),
+                    pgConfig -> {
+                      pgConfig.disableShrinking();
+                      pgConfig.setPrintMapping(true);
+                      pgConfig.setPrintMappingFile(proguardMap);
+                    })
                 .build());
 
     // Make sure the given proguard map is indeed applied.

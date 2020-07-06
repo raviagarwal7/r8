@@ -8,21 +8,15 @@ import static com.android.tools.r8.ir.desugar.LambdaRewriter.LAMBDA_CLASS_NAME_P
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
 
-import com.android.tools.r8.NeverInline;
-import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
 import com.android.tools.r8.TestRunResult;
-import com.android.tools.r8.ToolHelper;
 import com.android.tools.r8.ToolHelper.ProcessResult;
-import com.android.tools.r8.ir.optimize.classinliner.builders.BuildersTestClass;
-import com.android.tools.r8.ir.optimize.classinliner.builders.ControlFlow;
-import com.android.tools.r8.ir.optimize.classinliner.builders.Pair;
-import com.android.tools.r8.ir.optimize.classinliner.builders.PairBuilder;
-import com.android.tools.r8.ir.optimize.classinliner.builders.Tuple;
 import com.android.tools.r8.ir.optimize.classinliner.code.C;
 import com.android.tools.r8.ir.optimize.classinliner.code.CodeTestClass;
 import com.android.tools.r8.ir.optimize.classinliner.invalidroot.InvalidRootsTestClass;
@@ -40,39 +34,32 @@ import com.android.tools.r8.ir.optimize.classinliner.trivial.ReferencedFields;
 import com.android.tools.r8.ir.optimize.classinliner.trivial.TrivialTestClass;
 import com.android.tools.r8.jasmin.JasminBuilder;
 import com.android.tools.r8.jasmin.JasminBuilder.ClassBuilder;
-import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.utils.AndroidApp;
-import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
-import com.android.tools.r8.utils.codeinspector.FieldAccessInstructionSubject;
 import com.android.tools.r8.utils.codeinspector.FoundClassSubject;
-import com.android.tools.r8.utils.codeinspector.InstructionSubject;
-import com.android.tools.r8.utils.codeinspector.NewInstanceInstructionSubject;
 import com.google.common.collect.Sets;
-import com.google.common.collect.Streams;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.Set;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
 @RunWith(Parameterized.class)
-public class ClassInlinerTest extends TestBase {
-  private Backend backend;
+public class ClassInlinerTest extends ClassInlinerTestBase {
 
-  @Parameterized.Parameters(name = "Backend: {0}")
-  public static Backend[] data() {
-    return ToolHelper.getBackends();
+  private final TestParameters parameters;
+
+  @Parameterized.Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
   }
 
-  public ClassInlinerTest(Backend backend) {
-    this.backend = backend;
+  public ClassInlinerTest(TestParameters parameters) {
+    this.parameters = parameters;
   }
 
   @Test
@@ -94,12 +81,13 @@ public class ClassInlinerTest extends TestBase {
     };
     String javaOutput = runOnJava(main);
     TestRunResult result =
-        testForR8(backend)
+        testForR8(parameters.getBackend())
             .addProgramClasses(classes)
             .enableInliningAnnotations()
+            .enableSideEffectAnnotations()
             .addKeepMainRule(main)
-            .addKeepRules("-allowaccessmodification", "-keepattributes LineNumberTable")
-            .addOptionsModification(this::configure)
+            .addKeepAttributes("LineNumberTable")
+            .allowAccessModification()
             .noMinification()
             .run(main)
             .assertSuccessWithOutput(javaOutput);
@@ -109,124 +97,53 @@ public class ClassInlinerTest extends TestBase {
 
     assertEquals(
         Collections.singleton("java.lang.StringBuilder"),
-        collectTypes(clazz, "testInner", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testInner")));
 
     assertEquals(
         Collections.emptySet(),
-        collectTypes(clazz, "testConstructorMapping1", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testConstructorMapping1")));
 
     assertEquals(
         Collections.emptySet(),
-        collectTypes(clazz, "testConstructorMapping2", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testConstructorMapping2")));
 
     assertEquals(
         Collections.singleton("java.lang.StringBuilder"),
-        collectTypes(clazz, "testConstructorMapping3", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testConstructorMapping3")));
 
     assertEquals(
-        Collections.emptySet(),
-        collectTypes(clazz, "testEmptyClass", "void"));
+        Collections.emptySet(), collectTypes(clazz.uniqueMethodWithName("testEmptyClass")));
 
     assertEquals(
         Collections.singleton(
             "com.android.tools.r8.ir.optimize.classinliner.trivial.EmptyClassWithInitializer"),
-        collectTypes(clazz, "testEmptyClassWithInitializer", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testEmptyClassWithInitializer")));
 
     assertEquals(
         Collections.singleton(
             "com.android.tools.r8.ir.optimize.classinliner.trivial.ClassWithFinal"),
-        collectTypes(clazz, "testClassWithFinalizer", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testClassWithFinalizer")));
 
     assertEquals(
-        Collections.emptySet(),
-        collectTypes(clazz, "testCallOnIface1", "void"));
+        Collections.emptySet(), collectTypes(clazz.uniqueMethodWithName("testCallOnIface1")));
 
     assertEquals(
-        Collections.singleton(
-            "com.android.tools.r8.ir.optimize.classinliner.trivial.Iface2Impl"),
-        collectTypes(clazz, "testCallOnIface2", "void"));
+        Collections.singleton("com.android.tools.r8.ir.optimize.classinliner.trivial.Iface2Impl"),
+        collectTypes(clazz.uniqueMethodWithName("testCallOnIface2")));
 
     assertEquals(
         Sets.newHashSet(
             "com.android.tools.r8.ir.optimize.classinliner.trivial.CycleReferenceAB",
             "java.lang.StringBuilder"),
-        collectTypes(clazz, "testCycles", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testCycles")));
 
     assertEquals(
-        Sets.newHashSet("java.lang.StringBuilder",
+        Sets.newHashSet(
+            "java.lang.StringBuilder",
             "com.android.tools.r8.ir.optimize.classinliner.trivial.CycleReferenceAB"),
-        collectTypes(inspector.clazz(CycleReferenceAB.class), "foo", "void", "int"));
+        collectTypes(inspector.clazz(CycleReferenceAB.class).uniqueMethodWithName("foo")));
 
     assertFalse(inspector.clazz(CycleReferenceBA.class).isPresent());
-  }
-
-  @Test
-  public void testBuilders() throws Exception {
-    Class<?> main = BuildersTestClass.class;
-    Class<?>[] classes = {
-        NeverInline.class,
-        BuildersTestClass.class,
-        BuildersTestClass.Pos.class,
-        Tuple.class,
-        Pair.class,
-        PairBuilder.class,
-        ControlFlow.class,
-    };
-    String javaOutput = runOnJava(main);
-    TestRunResult result =
-        testForR8(backend)
-            .addProgramClasses(classes)
-            .enableInliningAnnotations()
-            .addKeepMainRule(main)
-            .addKeepRules(
-                "-dontobfuscate", "-allowaccessmodification", "-keepattributes LineNumberTable")
-            .addOptionsModification(this::configure)
-            .run(main)
-            .assertSuccessWithOutput(javaOutput);
-
-    CodeInspector inspector = result.inspector();
-    ClassSubject clazz = inspector.clazz(main);
-
-    for (int i = 1; i <= 3; i++) {
-      Set<String> expected =
-          Sets.newHashSet(
-              "com.android.tools.r8.ir.optimize.classinliner.builders.Pair",
-              "java.lang.StringBuilder");
-      if (backend == Backend.CF) {
-        // const-string canonicalization is disabled in CF, which helps ClassInliner identify
-        // PairBuilder as candidate.
-        expected.add("com.android.tools.r8.ir.optimize.classinliner.builders.PairBuilder");
-      }
-      assertEquals(expected, collectTypes(clazz, "testSimpleBuilder" + i, "void"));
-    }
-
-    // Note that Pair created instances were also inlined in the following method since
-    // we use 'System.out.println(pX.toString())', if we used 'System.out.println(pX)'
-    // as in the above method, the instance of pair would be passed to println() which
-    // would make it not eligible for inlining.
-    assertEquals(
-        Collections.singleton("java.lang.StringBuilder"),
-        collectTypes(clazz, "testSimpleBuilderWithMultipleBuilds", "void"));
-
-    if (backend == Backend.DEX) {
-      assertFalse(inspector.clazz(PairBuilder.class).isPresent());
-    }
-
-    assertEquals(
-        Collections.singleton("java.lang.StringBuilder"),
-        collectTypes(clazz, "testBuilderConstructors", "void"));
-
-    assertFalse(inspector.clazz(Tuple.class).isPresent());
-
-    assertEquals(
-        Collections.singleton("java.lang.StringBuilder"),
-        collectTypes(clazz, "testWithControlFlow", "void"));
-
-    assertFalse(inspector.clazz(ControlFlow.class).isPresent());
-
-    assertEquals(Collections.emptySet(), collectTypes(clazz, "testWithMoreControlFlow", "void"));
-
-    assertFalse(inspector.clazz(BuildersTestClass.Pos.class).isPresent());
   }
 
   @Test
@@ -250,7 +167,8 @@ public class ClassInlinerTest extends TestBase {
         "  return");
 
     AndroidApp compiled =
-        compileWithR8(builder.build(), getProguardConfig(mainClass.name), this::configure, backend);
+        compileWithR8(
+            builder.build(), getProguardConfig(mainClass.name), null, parameters.getBackend());
 
     // Check that the code fails with an IncompatibleClassChangeError with Java.
     ProcessResult javaResult =
@@ -259,7 +177,7 @@ public class ClassInlinerTest extends TestBase {
 
     // Check that the code fails with an IncompatibleClassChangeError with ART.
     ProcessResult result =
-        backend == Backend.DEX
+        parameters.isDexRuntime()
             ? runOnArtRaw(compiled, mainClass.name)
             : runOnJavaRaw(compiled, mainClass.name, Collections.emptyList());
     assertThat(result.stderr, containsString("IncompatibleClassChangeError"));
@@ -275,30 +193,26 @@ public class ClassInlinerTest extends TestBase {
         CodeTestClass.class
     };
     String javaOutput = runOnJava(main);
-    TestRunResult result = testForR8(backend)
-        .addProgramClasses(classes)
-        .enableInliningAnnotations()
-        .addKeepMainRule(main)
-        .addKeepRules(
-            "-dontobfuscate", "-allowaccessmodification", "-keepattributes LineNumberTable")
-        .addOptionsModification(this::configure)
-        .run(main)
-        .assertSuccessWithOutput(javaOutput);
+    TestRunResult result =
+        testForR8(parameters.getBackend())
+            .addProgramClasses(classes)
+            .enableInliningAnnotations()
+            .enableSideEffectAnnotations()
+            .addKeepMainRule(main)
+            .addKeepAttributes("LineNumberTable")
+            .allowAccessModification()
+            .noMinification()
+            .run(main)
+            .assertSuccessWithOutput(javaOutput);
 
     CodeInspector inspector = result.inspector();
     ClassSubject clazz = inspector.clazz(C.class);
 
-    assertEquals(
-        Collections.emptySet(),
-        collectTypes(clazz, "method1", "int"));
+    assertEquals(Collections.emptySet(), collectTypes(clazz.uniqueMethodWithName("method1")));
 
-    assertEquals(
-        Collections.emptySet(),
-        collectTypes(clazz, "method2", "int"));
+    assertEquals(Collections.emptySet(), collectTypes(clazz.uniqueMethodWithName("method2")));
 
-    assertEquals(
-        Collections.emptySet(),
-        collectTypes(clazz, "method3", "int"));
+    assertEquals(Collections.emptySet(), collectTypes(clazz.uniqueMethodWithName("method3")));
 
     assertFalse(inspector.clazz(C.L.class).isPresent());
     assertFalse(inspector.clazz(C.F.class).isPresent());
@@ -315,49 +229,56 @@ public class ClassInlinerTest extends TestBase {
         InvalidRootsTestClass.InitNeverReturnsNormally.class
     };
     String javaOutput = runOnJava(main);
-    TestRunResult result = testForR8(backend)
-        .addProgramClasses(classes)
-        .enableProguardTestOptions()
-        .enableInliningAnnotations()
-        .addKeepMainRule(main)
-        .addKeepRules(
-            "-dontobfuscate", "-allowaccessmodification", "-keepattributes LineNumberTable")
-        .addOptionsModification(this::configure)
-        .run(main)
-        .assertSuccessWithOutput(javaOutput);
+    TestRunResult result =
+        testForR8(parameters.getBackend())
+            .addProgramClasses(classes)
+            .enableProguardTestOptions()
+            .enableInliningAnnotations()
+            .addKeepMainRule(main)
+            .addKeepAttributes("LineNumberTable")
+            .addOptionsModification(
+                o -> {
+                  // TODO(b/143129517, 141719453): The limit seems to only be needed for DEX...
+                  o.classInliningInstructionLimit = 100;
+                  o.classInliningInstructionAllowance = 1000;
+                })
+            .allowAccessModification()
+            .noMinification()
+            .run(main)
+            .assertSuccessWithOutput(javaOutput);
 
     CodeInspector inspector = result.inspector();
     ClassSubject clazz = inspector.clazz(main);
 
+    // TODO(b/143129517, 141719453): This expectation relies on the class inlining limits.
     assertEquals(
         Sets.newHashSet("java.lang.StringBuilder", "java.lang.RuntimeException"),
-        collectTypes(clazz, "testExtraNeverReturnsNormally", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testExtraNeverReturnsNormally")));
 
     assertEquals(
         Sets.newHashSet("java.lang.StringBuilder", "java.lang.RuntimeException"),
-        collectTypes(clazz, "testDirectNeverReturnsNormally", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testDirectNeverReturnsNormally")));
 
     assertEquals(
         Sets.newHashSet("java.lang.StringBuilder", "java.lang.RuntimeException"),
-        collectTypes(clazz, "testInitNeverReturnsNormally", "void"));
+        collectTypes(clazz.uniqueMethodWithName("testInitNeverReturnsNormally")));
 
     assertThat(inspector.clazz(InvalidRootsTestClass.NeverReturnsNormally.class), isPresent());
     assertThat(
         inspector.clazz(InvalidRootsTestClass.InitNeverReturnsNormally.class), not(isPresent()));
 
+    // TODO(b/143129517, b/141719453): This expectation relies on the class inlining limits.
     assertEquals(
-        Sets.newHashSet(
-            "java.lang.StringBuilder",
-            "java.lang.RuntimeException"),
-        collectTypes(clazz, "testRootInvalidatesAfterInlining", "void"));
+        Sets.newHashSet("java.lang.StringBuilder", "java.lang.RuntimeException"),
+        collectTypes(clazz.uniqueMethodWithName("testRootInvalidatesAfterInlining")));
 
-    assertFalse(inspector.clazz(InvalidRootsTestClass.A.class).isPresent());
-    assertFalse(inspector.clazz(InvalidRootsTestClass.B.class).isPresent());
+    assertThat(inspector.clazz(InvalidRootsTestClass.A.class), not(isPresent()));
+    assertThat(inspector.clazz(InvalidRootsTestClass.B.class), not(isPresent()));
   }
 
   @Test
   public void testDesugaredLambdas() throws Exception {
-    Assume.assumeFalse("No desugaring with CF backend", backend == Backend.CF);
+    Assume.assumeFalse("No desugaring with CF backend", parameters.isCfRuntime());
     Class<?> main = LambdasTestClass.class;
     Class<?>[] classes = {
         LambdasTestClass.class,
@@ -365,22 +286,28 @@ public class ClassInlinerTest extends TestBase {
         LambdasTestClass.IfaceUtil.class
     };
     String javaOutput = runOnJava(main);
-    TestRunResult result = testForR8(backend)
-        .addProgramClasses(classes)
-        .addKeepMainRule(main)
-        .addKeepRules(
-            "-dontobfuscate", "-allowaccessmodification", "-keepattributes LineNumberTable")
-        .addOptionsModification(this::configure)
-        .run(main)
-        .assertSuccessWithOutput(javaOutput);
+    TestRunResult result =
+        testForR8(parameters.getBackend())
+            .addProgramClasses(classes)
+            .addKeepMainRule(main)
+            .addKeepAttributes("LineNumberTable")
+            .addOptionsModification(
+                o -> {
+                  // TODO(b/141719453): Identify single instances instead of increasing the limit.
+                  o.classInliningInstructionLimit = 20;
+                })
+            .allowAccessModification()
+            .enableInliningAnnotations()
+            .noMinification()
+            .run(main)
+            .assertSuccessWithOutput(javaOutput);
 
     CodeInspector inspector = result.inspector();
     ClassSubject clazz = inspector.clazz(main);
 
     assertEquals(
-        Sets.newHashSet(
-            "java.lang.StringBuilder"),
-        collectTypes(clazz, "testStatelessLambda", "void"));
+        Sets.newHashSet("java.lang.StringBuilder"),
+        collectTypes(clazz.uniqueMethodWithName("testStatelessLambda")));
 
     // TODO(b/120814598): Should only be "java.lang.StringBuilder". Lambdas are not class inlined
     // because parameter usage is not available for each lambda constructor.
@@ -390,45 +317,9 @@ public class ClassInlinerTest extends TestBase {
             .map(FoundClassSubject::getFinalName)
             .filter(name -> name.contains(LAMBDA_CLASS_NAME_PREFIX))
             .collect(Collectors.toList()));
-    assertEquals(
-        expectedTypes,
-        collectTypes(clazz, "testStatefulLambda", "void", "java.lang.String", "java.lang.String"));
-
-    // TODO(b/120814598): Should be 0. Lambdas are not class inlined because parameter usage is not
-    // available for each lambda constructor.
-    assertEquals(
-        3,
-        inspector.allClasses().stream().filter(ClassSubject::isSynthesizedJavaLambdaClass).count());
-  }
-
-  private Set<String> collectTypes(
-      ClassSubject clazz, String methodName, String retValue, String... params) {
-    return Stream.concat(
-        collectNewInstanceTypesWithRetValue(clazz, methodName, retValue, params),
-        collectStaticGetTypesWithRetValue(clazz, methodName, retValue, params)
-    ).collect(Collectors.toSet());
-  }
-
-  private Stream<String> collectNewInstanceTypesWithRetValue(
-      ClassSubject clazz, String methodName, String retValue, String... params) {
-    assertNotNull(clazz);
-    MethodSignature signature = new MethodSignature(methodName, retValue, params);
-    Iterator<InstructionSubject> iterator = clazz.method(signature).iterateInstructions();
-    return Streams.stream(iterator)
-        .filter(InstructionSubject::isNewInstance)
-        .map(is -> ((NewInstanceInstructionSubject) is).getType().toSourceString());
-  }
-
-  private Stream<String> collectStaticGetTypesWithRetValue(
-      ClassSubject clazz, String methodName, String retValue, String... params) {
-    assertNotNull(clazz);
-    MethodSignature signature = new MethodSignature(methodName, retValue, params);
-    Iterator<InstructionSubject> iterator = clazz.method(signature).iterateInstructions();
-    return Streams.stream(iterator)
-        .filter(InstructionSubject::isStaticGet)
-        .map(is -> (FieldAccessInstructionSubject) is)
-        .filter(fais -> fais.holder().is(fais.type()))
-        .map(fais -> fais.holder().toString());
+    assertEquals(expectedTypes, collectTypes(clazz.uniqueMethodWithName("testStatefulLambda")));
+    assertTrue(
+        inspector.allClasses().stream().noneMatch(ClassSubject::isSynthesizedJavaLambdaClass));
   }
 
   private String getProguardConfig(String main) {
@@ -437,11 +328,5 @@ public class ClassInlinerTest extends TestBase {
         "-dontobfuscate",
         "-allowaccessmodification",
         "-keepattributes LineNumberTable");
-  }
-
-  private void configure(InternalOptions options) {
-    options.enableSideEffectAnalysis = false;
-    options.classInliningInstructionLimit = 10000;
-    options.inliningInstructionLimit = 6;
   }
 }

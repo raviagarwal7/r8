@@ -7,14 +7,37 @@ import static com.android.tools.r8.graph.UseRegistry.MethodHandleUse.ARGUMENT_TO
 import static com.android.tools.r8.graph.UseRegistry.MethodHandleUse.NOT_ARGUMENT_TO_LAMBDA_METAFACTORY;
 import static com.android.tools.r8.ir.code.Invoke.Type.STATIC;
 import static com.android.tools.r8.ir.code.Invoke.Type.VIRTUAL;
+import static com.android.tools.r8.ir.code.Opcodes.CHECK_CAST;
+import static com.android.tools.r8.ir.code.Opcodes.CONST_CLASS;
+import static com.android.tools.r8.ir.code.Opcodes.CONST_METHOD_HANDLE;
+import static com.android.tools.r8.ir.code.Opcodes.INIT_CLASS;
+import static com.android.tools.r8.ir.code.Opcodes.INSTANCE_GET;
+import static com.android.tools.r8.ir.code.Opcodes.INSTANCE_OF;
+import static com.android.tools.r8.ir.code.Opcodes.INSTANCE_PUT;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_CUSTOM;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_DIRECT;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_INTERFACE;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_MULTI_NEW_ARRAY;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_NEW_ARRAY;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_POLYMORPHIC;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_STATIC;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_SUPER;
+import static com.android.tools.r8.ir.code.Opcodes.INVOKE_VIRTUAL;
+import static com.android.tools.r8.ir.code.Opcodes.MOVE_EXCEPTION;
+import static com.android.tools.r8.ir.code.Opcodes.NEW_ARRAY_EMPTY;
+import static com.android.tools.r8.ir.code.Opcodes.NEW_INSTANCE;
+import static com.android.tools.r8.ir.code.Opcodes.RETURN;
+import static com.android.tools.r8.ir.code.Opcodes.STATIC_GET;
+import static com.android.tools.r8.ir.code.Opcodes.STATIC_PUT;
+import static com.android.tools.r8.utils.ObjectUtils.getBooleanOrElse;
 
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexCallSite;
 import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexMethodHandle;
 import com.android.tools.r8.graph.DexMethodHandle.MethodHandleType;
@@ -26,10 +49,15 @@ import com.android.tools.r8.graph.DexValue.DexValueMethodType;
 import com.android.tools.r8.graph.DexValue.DexValueType;
 import com.android.tools.r8.graph.GraphLense;
 import com.android.tools.r8.graph.GraphLense.GraphLenseLookupResult;
-import com.android.tools.r8.graph.GraphLense.RewrittenPrototypeDescription;
-import com.android.tools.r8.graph.GraphLense.RewrittenPrototypeDescription.RemovedArgumentsInfo;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.RewrittenPrototypeDescription;
+import com.android.tools.r8.graph.RewrittenPrototypeDescription.ArgumentInfo;
+import com.android.tools.r8.graph.RewrittenPrototypeDescription.ArgumentInfoCollection;
+import com.android.tools.r8.graph.RewrittenPrototypeDescription.RewrittenTypeInfo;
 import com.android.tools.r8.graph.UseRegistry.MethodHandleUse;
-import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
+import com.android.tools.r8.graph.classmerging.VerticallyMergedClasses;
+import com.android.tools.r8.ir.analysis.type.DestructivePhiTypeUpdater;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.CatchHandlers;
 import com.android.tools.r8.ir.code.CheckCast;
@@ -37,26 +65,30 @@ import com.android.tools.r8.ir.code.ConstClass;
 import com.android.tools.r8.ir.code.ConstInstruction;
 import com.android.tools.r8.ir.code.ConstMethodHandle;
 import com.android.tools.r8.ir.code.IRCode;
+import com.android.tools.r8.ir.code.InitClass;
 import com.android.tools.r8.ir.code.InstanceGet;
 import com.android.tools.r8.ir.code.InstanceOf;
 import com.android.tools.r8.ir.code.InstancePut;
 import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.Invoke;
-import com.android.tools.r8.ir.code.Invoke.Type;
 import com.android.tools.r8.ir.code.InvokeCustom;
 import com.android.tools.r8.ir.code.InvokeDirect;
 import com.android.tools.r8.ir.code.InvokeMethod;
 import com.android.tools.r8.ir.code.InvokeMultiNewArray;
 import com.android.tools.r8.ir.code.InvokeNewArray;
+import com.android.tools.r8.ir.code.InvokeStatic;
 import com.android.tools.r8.ir.code.MoveException;
 import com.android.tools.r8.ir.code.NewArrayEmpty;
 import com.android.tools.r8.ir.code.NewInstance;
+import com.android.tools.r8.ir.code.Phi;
+import com.android.tools.r8.ir.code.Return;
 import com.android.tools.r8.ir.code.StaticGet;
 import com.android.tools.r8.ir.code.StaticPut;
 import com.android.tools.r8.ir.code.Value;
+import com.android.tools.r8.ir.code.ValueType;
+import com.android.tools.r8.ir.optimize.enums.EnumUnboxer;
 import com.android.tools.r8.logging.Log;
-import com.android.tools.r8.shaking.VerticalClassMerger.VerticallyMergedClasses;
 import com.google.common.collect.Sets;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -65,34 +97,38 @@ import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiFunction;
 
 public class LensCodeRewriter {
 
-  private final AppView<? extends AppInfoWithSubtyping> appView;
+  private final AppView<? extends AppInfoWithClassHierarchy> appView;
 
+  private final EnumUnboxer enumUnboxer;
   private final Map<DexProto, DexProto> protoFixupCache = new ConcurrentHashMap<>();
 
-  public LensCodeRewriter(AppView<? extends AppInfoWithSubtyping> appView) {
+  LensCodeRewriter(AppView<? extends AppInfoWithClassHierarchy> appView, EnumUnboxer enumUnboxer) {
     this.appView = appView;
+    this.enumUnboxer = enumUnboxer;
   }
 
-  private Value makeOutValue(Instruction insn, IRCode code, Set<Value> collector) {
-    if (insn.outValue() == null) {
-      return null;
-    } else {
-      Value newValue = code.createValue(insn.outValue().getTypeLattice(), insn.getLocalInfo());
-      collector.add(newValue);
-      return newValue;
+  private Value makeOutValue(Instruction insn, IRCode code) {
+    if (insn.outValue() != null) {
+      TypeElement oldType = insn.getOutType();
+      TypeElement newType =
+          oldType.fixupClassTypeReferences(appView.graphLense()::lookupType, appView);
+      return code.createValue(newType, insn.getLocalInfo());
     }
+    return null;
   }
 
-  /**
-   * Replace type appearances, invoke targets and field accesses with actual definitions.
-   */
-  public void rewrite(IRCode code, DexEncodedMethod method) {
+  /** Replace type appearances, invoke targets and field accesses with actual definitions. */
+  public void rewrite(IRCode code, ProgramMethod method) {
+    Set<Phi> affectedPhis =
+        enumUnboxer != null ? enumUnboxer.rewriteCode(code) : Sets.newIdentityHashSet();
     GraphLense graphLense = appView.graphLense();
-
-    Set<Value> newSSAValues = Sets.newIdentityHashSet();
+    DexItemFactory factory = appView.dexItemFactory();
+    // Rewriting types that affects phi can cause us to compute TOP for cyclic phi's. To solve this
+    // we track all phi's that needs to be re-computed.
     ListIterator<BasicBlock> blocks = code.listIterator();
     boolean mayHaveUnreachableBlocks = false;
     while (blocks.hasNext()) {
@@ -103,276 +139,480 @@ public class LensCodeRewriter {
           mayHaveUnreachableBlocks |= unlinkDeadCatchHandlers(block);
         }
       }
-      InstructionListIterator iterator = block.listIterator();
+      InstructionListIterator iterator = block.listIterator(code);
       while (iterator.hasNext()) {
         Instruction current = iterator.next();
-        if (current.isInvokeCustom()) {
-          InvokeCustom invokeCustom = current.asInvokeCustom();
-          DexCallSite callSite = invokeCustom.getCallSite();
-          DexProto newMethodProto =
-              appView
-                  .dexItemFactory()
-                  .applyClassMappingToProto(
-                      callSite.methodProto, graphLense::lookupType, protoFixupCache);
-          DexMethodHandle newBootstrapMethod = rewriteDexMethodHandle(
-              callSite.bootstrapMethod, method, NOT_ARGUMENT_TO_LAMBDA_METAFACTORY);
-          boolean isLambdaMetaFactory =
-              appView
-                  .dexItemFactory()
-                  .isLambdaMetafactoryMethod(callSite.bootstrapMethod.asMethod());
-          MethodHandleUse methodHandleUse = isLambdaMetaFactory
-              ? ARGUMENT_TO_LAMBDA_METAFACTORY
-              : NOT_ARGUMENT_TO_LAMBDA_METAFACTORY;
-          List<DexValue> newArgs =
-              rewriteBootstrapArgs(callSite.bootstrapArgs, method, methodHandleUse);
-          if (!newMethodProto.equals(callSite.methodProto)
-              || newBootstrapMethod != callSite.bootstrapMethod
-              || !newArgs.equals(callSite.bootstrapArgs)) {
-            DexCallSite newCallSite =
-                appView
-                    .dexItemFactory()
-                    .createCallSite(
-                        callSite.methodName, newMethodProto, newBootstrapMethod, newArgs);
-            InvokeCustom newInvokeCustom = new InvokeCustom(newCallSite, invokeCustom.outValue(),
-                invokeCustom.inValues());
-            iterator.replaceCurrentInstruction(newInvokeCustom);
-          }
-        } else if (current.isConstMethodHandle()) {
-          DexMethodHandle handle = current.asConstMethodHandle().getValue();
-          DexMethodHandle newHandle = rewriteDexMethodHandle(
-              handle, method, NOT_ARGUMENT_TO_LAMBDA_METAFACTORY);
-          if (newHandle != handle) {
-            ConstMethodHandle newInstruction =
-                new ConstMethodHandle(makeOutValue(current, code, newSSAValues), newHandle);
-            iterator.replaceCurrentInstruction(newInstruction);
-          }
-        } else if (current.isInvokeMethod()) {
-          InvokeMethod invoke = current.asInvokeMethod();
-          DexMethod invokedMethod = invoke.getInvokedMethod();
-          DexType invokedHolder = invokedMethod.holder;
-          if (invokedHolder.isArrayType()) {
-            DexType baseType = invokedHolder.toBaseType(appView.dexItemFactory());
-            DexType mappedBaseType = graphLense.lookupType(baseType);
-            if (baseType != mappedBaseType) {
-              DexType mappedHolder =
-                  invokedHolder.replaceBaseType(mappedBaseType, appView.dexItemFactory());
-              // Just reuse proto and name, as no methods on array types can be renamed nor
-              // change signature.
-              DexMethod actualTarget =
-                  appView
-                      .dexItemFactory()
-                      .createMethod(mappedHolder, invokedMethod.proto, invokedMethod.name);
-              Invoke newInvoke =
-                  Invoke.create(
-                      VIRTUAL,
-                      actualTarget,
-                      null,
-                      makeOutValue(invoke, code, newSSAValues),
-                      invoke.inValues());
-              iterator.replaceCurrentInstruction(newInvoke);
-            }
-            continue;
-          }
-          if (!invokedHolder.isClassType()) {
-            assert false;
-            continue;
-          }
-          if (invoke.isInvokeDirect()) {
-            checkInvokeDirect(method.method, invoke.asInvokeDirect());
-          }
-          GraphLenseLookupResult lenseLookup =
-              graphLense.lookupMethod(invokedMethod, method.method, invoke.getType());
-          DexMethod actualTarget = lenseLookup.getMethod();
-          Invoke.Type actualInvokeType = lenseLookup.getType();
-          if (actualInvokeType == Type.VIRTUAL) {
-            actualTarget =
-                rebindVirtualInvokeToMostSpecific(
-                    actualTarget, invoke.inValues().get(0), method.method.holder);
-          }
-          if (actualTarget != invokedMethod || invoke.getType() != actualInvokeType) {
-            RewrittenPrototypeDescription prototypeChanges =
-                graphLense.lookupPrototypeChanges(actualTarget);
-            RemovedArgumentsInfo removedArgumentsInfo = prototypeChanges.getRemovedArgumentsInfo();
-
-            ConstInstruction constantReturnMaterializingInstruction = null;
-            if (prototypeChanges.hasBeenChangedToReturnVoid() && invoke.outValue() != null) {
-              constantReturnMaterializingInstruction =
-                  prototypeChanges.getConstantReturn(code, invoke.getPosition());
-              invoke.outValue().replaceUsers(constantReturnMaterializingInstruction.outValue());
-            }
-
-            Value newOutValue =
-                prototypeChanges.hasBeenChangedToReturnVoid()
-                    ? null
-                    : makeOutValue(invoke, code, newSSAValues);
-
-            List<Value> newInValues;
-            if (removedArgumentsInfo.hasRemovedArguments()) {
-              if (Log.ENABLED) {
-                Log.info(
-                    getClass(),
-                    "Invoked method "
-                        + invokedMethod.toSourceString()
-                        + " with "
-                        + removedArgumentsInfo.numberOfRemovedArguments()
-                        + " arguments removed");
-              }
-              // Remove removed arguments from the invoke.
-              newInValues = new ArrayList<>(actualTarget.proto.parameters.size());
-              for (int i = 0; i < invoke.inValues().size(); i++) {
-                if (!removedArgumentsInfo.isArgumentRemoved(i)) {
-                  newInValues.add(invoke.inValues().get(i));
+        switch (current.opcode()) {
+          case INVOKE_CUSTOM:
+            {
+              InvokeCustom invokeCustom = current.asInvokeCustom();
+              DexCallSite callSite = invokeCustom.getCallSite();
+              DexCallSite newCallSite = rewriteCallSite(callSite, method);
+              if (newCallSite != callSite) {
+                Value newOutValue = makeOutValue(invokeCustom, code);
+                InvokeCustom newInvokeCustom =
+                    new InvokeCustom(newCallSite, newOutValue, invokeCustom.inValues());
+                iterator.replaceCurrentInstruction(newInvokeCustom);
+                if (newOutValue != null && newOutValue.getType() != invokeCustom.getOutType()) {
+                  affectedPhis.addAll(newOutValue.uniquePhiUsers());
                 }
               }
-              assert newInValues.size()
-                  == actualTarget.proto.parameters.size() + (actualInvokeType == STATIC ? 0 : 1);
-            } else {
-              newInValues = invoke.inValues();
             }
+            break;
 
-            Invoke newInvoke =
-                Invoke.create(actualInvokeType, actualTarget, null, newOutValue, newInValues);
-            iterator.replaceCurrentInstruction(newInvoke);
-
-            if (constantReturnMaterializingInstruction != null) {
-              if (block.hasCatchHandlers()) {
-                // Split the block to ensure no instructions after throwing instructions.
-                iterator
-                    .split(code, blocks)
-                    .listIterator()
-                    .add(constantReturnMaterializingInstruction);
-              } else {
-                iterator.add(constantReturnMaterializingInstruction);
+          case CONST_METHOD_HANDLE:
+            {
+              DexMethodHandle handle = current.asConstMethodHandle().getValue();
+              DexMethodHandle newHandle =
+                  rewriteDexMethodHandle(handle, method, NOT_ARGUMENT_TO_LAMBDA_METAFACTORY);
+              if (newHandle != handle) {
+                Value newOutValue = makeOutValue(current, code);
+                iterator.replaceCurrentInstruction(new ConstMethodHandle(newOutValue, newHandle));
+                if (newOutValue != null && newOutValue.getType() != current.getOutType()) {
+                  affectedPhis.addAll(newOutValue.uniquePhiUsers());
+                }
               }
             }
+            break;
 
-            DexType actualReturnType = actualTarget.proto.returnType;
-            DexType expectedReturnType = graphLense.lookupType(invokedMethod.proto.returnType);
-            if (newInvoke.outValue() != null && actualReturnType != expectedReturnType) {
-              throw new Unreachable(
-                  "Unexpected need to insert a cast. Possibly related to resolving b/79143143.\n"
-                      + invokedMethod
-                      + " type changed from " + expectedReturnType
-                      + " to " + actualReturnType);
+          case INIT_CLASS:
+            {
+              InitClass initClass = current.asInitClass();
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(
+                      initClass.getClassValue(), (t, v) -> new InitClass(v, t));
             }
-          }
-        } else if (current.isInstanceGet()) {
-          InstanceGet instanceGet = current.asInstanceGet();
-          DexField field = instanceGet.getField();
-          DexField actualField = graphLense.lookupField(field);
-          if (actualField != field) {
-            InstanceGet newInstanceGet =
-                new InstanceGet(
-                    makeOutValue(instanceGet, code, newSSAValues),
-                    instanceGet.object(),
-                    actualField);
-            iterator.replaceCurrentInstruction(newInstanceGet);
-          }
-        } else if (current.isInstancePut()) {
-          InstancePut instancePut = current.asInstancePut();
-          DexField field = instancePut.getField();
-          DexField actualField = graphLense.lookupField(field);
-          if (actualField != field) {
-            InstancePut newInstancePut =
-                new InstancePut(actualField, instancePut.object(), instancePut.value());
-            iterator.replaceCurrentInstruction(newInstancePut);
-          }
-        } else if (current.isStaticGet()) {
-          StaticGet staticGet = current.asStaticGet();
-          DexField field = staticGet.getField();
-          DexField actualField = graphLense.lookupField(field);
-          if (actualField != field) {
-            StaticGet newStaticGet =
-                new StaticGet(makeOutValue(staticGet, code, newSSAValues), actualField);
-            iterator.replaceCurrentInstruction(newStaticGet);
-          }
-        } else if (current.isStaticPut()) {
-          StaticPut staticPut = current.asStaticPut();
-          DexField field = staticPut.getField();
-          DexField actualField = graphLense.lookupField(field);
-          if (actualField != field) {
-            StaticPut newStaticPut = new StaticPut(staticPut.inValue(), actualField);
-            iterator.replaceCurrentInstruction(newStaticPut);
-          }
-        } else if (current.isCheckCast()) {
-          CheckCast checkCast = current.asCheckCast();
-          DexType newType = graphLense.lookupType(checkCast.getType());
-          if (newType != checkCast.getType()) {
-            CheckCast newCheckCast = new CheckCast(
-                makeOutValue(checkCast, code, newSSAValues), checkCast.object(), newType);
-            iterator.replaceCurrentInstruction(newCheckCast);
-          }
-        } else if (current.isConstClass()) {
-          ConstClass constClass = current.asConstClass();
-          DexType newType = graphLense.lookupType(constClass.getValue());
-          if (newType != constClass.getValue()) {
-            ConstClass newConstClass = new ConstClass(
-                makeOutValue(constClass, code, newSSAValues), newType);
-            iterator.replaceCurrentInstruction(newConstClass);
-          }
-        } else if (current.isInstanceOf()) {
-          InstanceOf instanceOf = current.asInstanceOf();
-          DexType newType = graphLense.lookupType(instanceOf.type());
-          if (newType != instanceOf.type()) {
-            InstanceOf newInstanceOf = new InstanceOf(
-                makeOutValue(instanceOf, code, newSSAValues), instanceOf.value(), newType);
-            iterator.replaceCurrentInstruction(newInstanceOf);
-          }
-        } else if (current.isInvokeMultiNewArray()) {
-          InvokeMultiNewArray multiNewArray = current.asInvokeMultiNewArray();
-          DexType newType = graphLense.lookupType(multiNewArray.getArrayType());
-          if (newType != multiNewArray.getArrayType()) {
-            InvokeMultiNewArray newMultiNewArray =
-                new InvokeMultiNewArray(
-                    newType,
-                    makeOutValue(multiNewArray, code, newSSAValues),
-                    multiNewArray.inValues());
-            iterator.replaceCurrentInstruction(newMultiNewArray);
-          }
-        } else if (current.isInvokeNewArray()) {
-          InvokeNewArray newArray = current.asInvokeNewArray();
-          DexType newType = graphLense.lookupType(newArray.getArrayType());
-          if (newType != newArray.getArrayType()) {
-            InvokeNewArray newNewArray = new InvokeNewArray(
-                newType, makeOutValue(newArray, code, newSSAValues), newArray.inValues());
-            iterator.replaceCurrentInstruction(newNewArray);
-          }
-        } else if (current.isMoveException()) {
-          MoveException moveException = current.asMoveException();
-          DexType newExceptionType = graphLense.lookupType(moveException.getExceptionType());
-          if (newExceptionType != moveException.getExceptionType()) {
-            iterator.replaceCurrentInstruction(
-                new MoveException(
-                    makeOutValue(moveException, code, newSSAValues),
-                    newExceptionType,
-                    appView.options()));
-          }
-        } else if (current.isNewArrayEmpty()) {
-          NewArrayEmpty newArrayEmpty = current.asNewArrayEmpty();
-          DexType newType = graphLense.lookupType(newArrayEmpty.type);
-          if (newType != newArrayEmpty.type) {
-            NewArrayEmpty newNewArray = new NewArrayEmpty(
-                makeOutValue(newArrayEmpty, code, newSSAValues), newArrayEmpty.size(), newType);
-            iterator.replaceCurrentInstruction(newNewArray);
-          }
-        } else if (current.isNewInstance()) {
-          NewInstance newInstance = current.asNewInstance();
-          DexType newClazz = graphLense.lookupType(newInstance.clazz);
-          if (newClazz != newInstance.clazz) {
-            NewInstance newNewInstance = new NewInstance(
-                newClazz, makeOutValue(newInstance, code, newSSAValues));
-            iterator.replaceCurrentInstruction(newNewInstance);
-          }
+            break;
+
+          case INVOKE_DIRECT:
+          case INVOKE_INTERFACE:
+          case INVOKE_POLYMORPHIC:
+          case INVOKE_STATIC:
+          case INVOKE_SUPER:
+          case INVOKE_VIRTUAL:
+            {
+              InvokeMethod invoke = current.asInvokeMethod();
+              DexMethod invokedMethod = invoke.getInvokedMethod();
+              DexType invokedHolder = invokedMethod.holder;
+              if (invokedHolder.isArrayType()) {
+                DexType baseType = invokedHolder.toBaseType(factory);
+                new InstructionReplacer(code, current, iterator, affectedPhis)
+                    .replaceInstructionIfTypeChanged(
+                        baseType,
+                        (t, v) -> {
+                          DexType mappedHolder = invokedHolder.replaceBaseType(t, factory);
+                          // Just reuse proto and name, as no methods on array types cant be renamed
+                          // nor change signature.
+                          DexMethod actualTarget =
+                              factory.createMethod(
+                                  mappedHolder, invokedMethod.proto, invokedMethod.name);
+                          return Invoke.create(VIRTUAL, actualTarget, null, v, invoke.inValues());
+                        });
+                continue;
+              }
+              if (!invokedHolder.isClassType()) {
+                assert false;
+                continue;
+              }
+              if (invoke.isInvokeDirect()) {
+                checkInvokeDirect(method.getReference(), invoke.asInvokeDirect());
+              }
+              GraphLenseLookupResult lenseLookup =
+                  graphLense.lookupMethod(invokedMethod, method.getReference(), invoke.getType());
+              DexMethod actualTarget = lenseLookup.getMethod();
+              Invoke.Type actualInvokeType = lenseLookup.getType();
+              if (actualTarget != invokedMethod || invoke.getType() != actualInvokeType) {
+                RewrittenPrototypeDescription prototypeChanges =
+                    graphLense.lookupPrototypeChanges(actualTarget);
+
+                List<Value> newInValues;
+                ArgumentInfoCollection argumentInfoCollection =
+                    prototypeChanges.getArgumentInfoCollection();
+                if (argumentInfoCollection.isEmpty()) {
+                  newInValues = invoke.inValues();
+                } else {
+                  if (argumentInfoCollection.hasRemovedArguments()) {
+                    if (Log.ENABLED) {
+                      Log.info(
+                          getClass(),
+                          "Invoked method "
+                              + invokedMethod.toSourceString()
+                              + " with "
+                              + argumentInfoCollection.numberOfRemovedArguments()
+                              + " arguments removed");
+                    }
+                  }
+                  newInValues = new ArrayList<>(actualTarget.proto.parameters.size());
+                  for (int i = 0; i < invoke.inValues().size(); i++) {
+                    ArgumentInfo argumentInfo = argumentInfoCollection.getArgumentInfo(i);
+                    if (argumentInfo.isRewrittenTypeInfo()) {
+                      RewrittenTypeInfo argInfo = argumentInfo.asRewrittenTypeInfo();
+                      Value rewrittenValue =
+                          rewriteValueIfDefault(
+                              code,
+                              iterator,
+                              argInfo.getOldType(),
+                              argInfo.getNewType(),
+                              invoke.inValues().get(i));
+                      newInValues.add(rewrittenValue);
+                    } else if (!argumentInfo.isRemovedArgumentInfo()) {
+                      newInValues.add(invoke.inValues().get(i));
+                    }
+                  }
+                }
+
+                ConstInstruction constantReturnMaterializingInstruction = null;
+                if (prototypeChanges.hasBeenChangedToReturnVoid(appView)
+                    && invoke.outValue() != null) {
+                  constantReturnMaterializingInstruction =
+                      prototypeChanges.getConstantReturn(code, invoke.getPosition());
+                  if (invoke.outValue().hasLocalInfo()) {
+                    constantReturnMaterializingInstruction
+                        .outValue()
+                        .setLocalInfo(invoke.outValue().getLocalInfo());
+                  }
+                  invoke.outValue().replaceUsers(constantReturnMaterializingInstruction.outValue());
+                  if (graphLense.lookupType(invoke.getReturnType()) != invoke.getReturnType()) {
+                    affectedPhis.addAll(
+                        constantReturnMaterializingInstruction.outValue().uniquePhiUsers());
+                  }
+                }
+
+                Value newOutValue =
+                    prototypeChanges.hasBeenChangedToReturnVoid(appView)
+                        ? null
+                        : makeOutValue(invoke, code);
+
+                if (prototypeChanges.hasExtraNullParameter()) {
+                  iterator.previous();
+                  Value extraNullValue =
+                      iterator.insertConstNullInstruction(code, appView.options());
+                  iterator.next();
+                  newInValues.add(extraNullValue);
+                }
+
+                assert newInValues.size()
+                    == actualTarget.proto.parameters.size() + (actualInvokeType == STATIC ? 0 : 1);
+
+                // TODO(b/157111832): This bit should be part of the graph lens lookup result.
+                boolean isInterface =
+                    getBooleanOrElse(
+                        appView.definitionFor(actualTarget.holder), DexClass::isInterface, false);
+                Invoke newInvoke =
+                    Invoke.create(
+                        actualInvokeType,
+                        actualTarget,
+                        null,
+                        newOutValue,
+                        newInValues,
+                        isInterface);
+                iterator.replaceCurrentInstruction(newInvoke);
+                if (newOutValue != null && newOutValue.getType() != current.getOutType()) {
+                  affectedPhis.addAll(newOutValue.uniquePhiUsers());
+                }
+
+                if (constantReturnMaterializingInstruction != null) {
+                  if (block.hasCatchHandlers()) {
+                    // Split the block to ensure no instructions after throwing instructions.
+                    iterator
+                        .split(code, blocks)
+                        .listIterator(code)
+                        .add(constantReturnMaterializingInstruction);
+                  } else {
+                    iterator.add(constantReturnMaterializingInstruction);
+                  }
+                }
+
+                DexType actualReturnType = actualTarget.proto.returnType;
+                DexType expectedReturnType = graphLense.lookupType(invokedMethod.proto.returnType);
+                if (newInvoke.outValue() != null && actualReturnType != expectedReturnType) {
+                  throw new Unreachable(
+                      "Unexpected need to insert a cast. Possibly related to resolving"
+                          + " b/79143143.\n"
+                          + invokedMethod
+                          + " type changed from "
+                          + expectedReturnType
+                          + " to "
+                          + actualReturnType);
+                }
+              }
+            }
+            break;
+
+          case INSTANCE_GET:
+            {
+              InstanceGet instanceGet = current.asInstanceGet();
+              DexField field = instanceGet.getField();
+              DexField actualField = graphLense.lookupField(field);
+              DexMethod replacementMethod =
+                  graphLense.lookupGetFieldForMethod(actualField, method.getReference());
+              if (replacementMethod != null) {
+                Value newOutValue = makeOutValue(current, code);
+                iterator.replaceCurrentInstruction(
+                    new InvokeStatic(replacementMethod, newOutValue, current.inValues()));
+                if (newOutValue != null && newOutValue.getType() != current.getOutType()) {
+                  affectedPhis.addAll(current.outValue().uniquePhiUsers());
+                }
+              } else if (actualField != field) {
+                Value newOutValue = makeOutValue(instanceGet, code);
+                iterator.replaceCurrentInstruction(
+                    new InstanceGet(newOutValue, instanceGet.object(), actualField));
+                if (newOutValue != null && newOutValue.getType() != current.getOutType()) {
+                  affectedPhis.addAll(newOutValue.uniquePhiUsers());
+                }
+              }
+            }
+            break;
+
+          case INSTANCE_PUT:
+            {
+              InstancePut instancePut = current.asInstancePut();
+              DexField field = instancePut.getField();
+              DexField actualField = graphLense.lookupField(field);
+              DexMethod replacementMethod =
+                  graphLense.lookupPutFieldForMethod(actualField, method.getReference());
+              if (replacementMethod != null) {
+                iterator.replaceCurrentInstruction(
+                    new InvokeStatic(replacementMethod, null, current.inValues()));
+              } else if (actualField != field) {
+                Value rewrittenValue =
+                    rewriteValueIfDefault(
+                        code, iterator, field.type, actualField.type, instancePut.value());
+                InstancePut newInstancePut =
+                    InstancePut.createPotentiallyInvalid(
+                        actualField, instancePut.object(), rewrittenValue);
+                iterator.replaceCurrentInstruction(newInstancePut);
+              }
+            }
+            break;
+
+          case STATIC_GET:
+            {
+              StaticGet staticGet = current.asStaticGet();
+              DexField field = staticGet.getField();
+              DexField actualField = graphLense.lookupField(field);
+              DexMethod replacementMethod =
+                  graphLense.lookupGetFieldForMethod(actualField, method.getReference());
+              if (replacementMethod != null) {
+                Value newOutValue = makeOutValue(current, code);
+                iterator.replaceCurrentInstruction(
+                    new InvokeStatic(replacementMethod, newOutValue, current.inValues()));
+                if (newOutValue != null && newOutValue.getType() != current.getOutType()) {
+                  affectedPhis.addAll(newOutValue.uniquePhiUsers());
+                }
+              } else if (actualField != field) {
+                Value newOutValue = makeOutValue(staticGet, code);
+                iterator.replaceCurrentInstruction(new StaticGet(newOutValue, actualField));
+                if (newOutValue != null && newOutValue.getType() != current.getOutType()) {
+                  affectedPhis.addAll(newOutValue.uniquePhiUsers());
+                }
+              }
+            }
+            break;
+
+          case STATIC_PUT:
+            {
+              StaticPut staticPut = current.asStaticPut();
+              DexField field = staticPut.getField();
+              DexField actualField = graphLense.lookupField(field);
+              DexMethod replacementMethod =
+                  graphLense.lookupPutFieldForMethod(actualField, method.getReference());
+              if (replacementMethod != null) {
+                iterator.replaceCurrentInstruction(
+                    new InvokeStatic(replacementMethod, current.outValue(), current.inValues()));
+              } else if (actualField != field) {
+                Value rewrittenValue =
+                    rewriteValueIfDefault(
+                        code, iterator, field.type, actualField.type, staticPut.value());
+                StaticPut newStaticPut = new StaticPut(rewrittenValue, actualField);
+                iterator.replaceCurrentInstruction(newStaticPut);
+              }
+            }
+            break;
+
+          case CHECK_CAST:
+            {
+              CheckCast checkCast = current.asCheckCast();
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(
+                      checkCast.getType(), (t, v) -> new CheckCast(v, checkCast.object(), t));
+            }
+            break;
+
+          case CONST_CLASS:
+            {
+              ConstClass constClass = current.asConstClass();
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(
+                      constClass.getValue(), (t, v) -> new ConstClass(v, t));
+            }
+            break;
+
+          case INSTANCE_OF:
+            {
+              InstanceOf instanceOf = current.asInstanceOf();
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(
+                      instanceOf.type(), (t, v) -> new InstanceOf(v, instanceOf.value(), t));
+            }
+            break;
+
+          case INVOKE_MULTI_NEW_ARRAY:
+            {
+              InvokeMultiNewArray multiNewArray = current.asInvokeMultiNewArray();
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(
+                      multiNewArray.getArrayType(),
+                      (t, v) -> new InvokeMultiNewArray(t, v, multiNewArray.inValues()));
+            }
+            break;
+
+          case INVOKE_NEW_ARRAY:
+            {
+              InvokeNewArray newArray = current.asInvokeNewArray();
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(
+                      newArray.getArrayType(),
+                      (t, v) -> new InvokeNewArray(t, v, newArray.inValues()));
+            }
+            break;
+
+          case MOVE_EXCEPTION:
+            {
+              MoveException moveException = current.asMoveException();
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(
+                      moveException.getExceptionType(),
+                      (t, v) -> new MoveException(v, t, appView.options()));
+            }
+            break;
+
+          case NEW_ARRAY_EMPTY:
+            {
+              NewArrayEmpty newArrayEmpty = current.asNewArrayEmpty();
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(
+                      newArrayEmpty.type, (t, v) -> new NewArrayEmpty(v, newArrayEmpty.size(), t));
+            }
+            break;
+
+          case NEW_INSTANCE:
+            {
+              DexType type = current.asNewInstance().clazz;
+              new InstructionReplacer(code, current, iterator, affectedPhis)
+                  .replaceInstructionIfTypeChanged(type, NewInstance::new);
+            }
+            break;
+
+          case RETURN:
+            {
+              Return ret = current.asReturn();
+              if (ret.isReturnVoid()) {
+                break;
+              }
+              DexType returnType = code.method().method.proto.returnType;
+              Value retValue = ret.returnValue();
+              DexType initialType =
+                  retValue.getType().isPrimitiveType()
+                      ? retValue.getType().asPrimitiveType().toDexType(factory)
+                      : factory.objectType; // Place holder, any reference type will do.
+              Value rewrittenValue =
+                  rewriteValueIfDefault(code, iterator, initialType, returnType, retValue);
+              if (retValue != rewrittenValue) {
+                Return newReturn = new Return(rewrittenValue);
+                iterator.replaceCurrentInstruction(newReturn);
+              }
+            }
+            break;
+
+          default:
+            if (current.hasOutValue()) {
+              // For all other instructions, substitute any changed type.
+              TypeElement type = current.getOutType();
+              TypeElement substituted =
+                  type.fixupClassTypeReferences(graphLense::lookupType, appView);
+              if (substituted != type) {
+                current.outValue().setType(substituted);
+                affectedPhis.addAll(current.outValue().uniquePhiUsers());
+              }
+            }
+            break;
         }
       }
     }
     if (mayHaveUnreachableBlocks) {
       code.removeUnreachableBlocks();
     }
-    if (!newSSAValues.isEmpty()) {
-      new TypeAnalysis(appView, method).widening(newSSAValues);
+    if (!affectedPhis.isEmpty()) {
+      new DestructivePhiTypeUpdater(appView).recomputeAndPropagateTypes(code, affectedPhis);
     }
-    assert code.isConsistentSSA();
+    assert code.isConsistentSSABeforeTypesAreCorrect();
+    assert code.hasNoVerticallyMergedClasses(appView);
+  }
+
+  // If the initialValue is a default value and its type is rewritten from a reference type to a
+  // primitive type, then the default value type lattice needs to be changed.
+  private Value rewriteValueIfDefault(
+      IRCode code,
+      InstructionListIterator iterator,
+      DexType oldType,
+      DexType newType,
+      Value initialValue) {
+    if (initialValue.isConstNumber()
+        && initialValue.definition.asConstNumber().isZero()
+        && defaultValueHasChanged(oldType, newType)) {
+      iterator.previous();
+      Value rewrittenDefaultValue =
+          iterator.insertConstNumberInstruction(
+              code, appView.options(), 0, defaultValueLatticeElement(newType));
+      iterator.next();
+      return rewrittenDefaultValue;
+    }
+    return initialValue;
+  }
+
+  private boolean defaultValueHasChanged(DexType oldType, DexType newType) {
+    if (newType.isPrimitiveType()) {
+      if (oldType.isPrimitiveType()) {
+        return ValueType.fromDexType(newType) != ValueType.fromDexType(oldType);
+      }
+      return true;
+    } else if (oldType.isPrimitiveType()) {
+      return true;
+    }
+    // All reference types uses null as default value.
+    assert newType.isReferenceType();
+    assert oldType.isReferenceType();
+    return false;
+  }
+
+  private TypeElement defaultValueLatticeElement(DexType type) {
+    if (type.isPrimitiveType()) {
+      return TypeElement.fromDexType(type, null, appView);
+    }
+    return TypeElement.getNull();
+  }
+
+  public DexCallSite rewriteCallSite(DexCallSite callSite, ProgramMethod context) {
+    DexItemFactory dexItemFactory = appView.dexItemFactory();
+    DexProto newMethodProto =
+        dexItemFactory.applyClassMappingToProto(
+            callSite.methodProto, appView.graphLense()::lookupType, protoFixupCache);
+    DexMethodHandle newBootstrapMethod =
+        rewriteDexMethodHandle(
+            callSite.bootstrapMethod, context, NOT_ARGUMENT_TO_LAMBDA_METAFACTORY);
+    boolean isLambdaMetaFactory =
+        dexItemFactory.isLambdaMetafactoryMethod(callSite.bootstrapMethod.asMethod());
+    MethodHandleUse methodHandleUse =
+        isLambdaMetaFactory ? ARGUMENT_TO_LAMBDA_METAFACTORY : NOT_ARGUMENT_TO_LAMBDA_METAFACTORY;
+    List<DexValue> newArgs = rewriteBootstrapArgs(callSite.bootstrapArgs, context, methodHandleUse);
+    if (!newMethodProto.equals(callSite.methodProto)
+        || newBootstrapMethod != callSite.bootstrapMethod
+        || !newArgs.equals(callSite.bootstrapArgs)) {
+      return dexItemFactory.createCallSite(
+          callSite.methodName, newMethodProto, newBootstrapMethod, newArgs);
+    }
+    return callSite;
   }
 
   // If the given invoke is on the form "invoke-direct A.<init>, v0, ..." and the definition of
@@ -453,22 +693,28 @@ public class LensCodeRewriter {
   }
 
   private List<DexValue> rewriteBootstrapArgs(
-      List<DexValue> bootstrapArgs, DexEncodedMethod method, MethodHandleUse use) {
+      List<DexValue> bootstrapArgs, ProgramMethod method, MethodHandleUse use) {
     List<DexValue> newBootstrapArgs = null;
     boolean changed = false;
     for (int i = 0; i < bootstrapArgs.size(); i++) {
       DexValue argument = bootstrapArgs.get(i);
       DexValue newArgument = null;
-      if (argument instanceof DexValueMethodHandle) {
-        newArgument = rewriteDexValueMethodHandle(argument.asDexValueMethodHandle(), method, use);
-      } else if (argument instanceof DexValueMethodType) {
-        newArgument = rewriteDexMethodType(argument.asDexValueMethodType());
-      } else if (argument instanceof DexValueType) {
-        DexType oldType = ((DexValueType) argument).value;
-        DexType newType = appView.graphLense().lookupType(oldType);
-        if (newType != oldType) {
-          newArgument = new DexValueType(newType);
-        }
+      switch (argument.getValueKind()) {
+        case METHOD_HANDLE:
+          newArgument = rewriteDexValueMethodHandle(argument.asDexValueMethodHandle(), method, use);
+          break;
+        case METHOD_TYPE:
+          newArgument = rewriteDexMethodType(argument.asDexValueMethodType());
+          break;
+        case TYPE:
+          DexType oldType = argument.asDexValueType().value;
+          DexType newType = appView.graphLense().lookupType(oldType);
+          if (newType != oldType) {
+            newArgument = new DexValueType(newType);
+          }
+          break;
+        default:
+          // Intentionally empty.
       }
       if (newArgument != null) {
         if (newBootstrapArgs == null) {
@@ -484,19 +730,21 @@ public class LensCodeRewriter {
   }
 
   private DexValueMethodHandle rewriteDexValueMethodHandle(
-      DexValueMethodHandle methodHandle, DexEncodedMethod context, MethodHandleUse use) {
+      DexValueMethodHandle methodHandle, ProgramMethod context, MethodHandleUse use) {
     DexMethodHandle oldHandle = methodHandle.value;
     DexMethodHandle newHandle = rewriteDexMethodHandle(oldHandle, context, use);
     return newHandle != oldHandle ? new DexValueMethodHandle(newHandle) : methodHandle;
   }
 
   private DexMethodHandle rewriteDexMethodHandle(
-      DexMethodHandle methodHandle, DexEncodedMethod context, MethodHandleUse use) {
+      DexMethodHandle methodHandle, ProgramMethod context, MethodHandleUse use) {
     if (methodHandle.isMethodHandle()) {
       DexMethod invokedMethod = methodHandle.asMethod();
       MethodHandleType oldType = methodHandle.type;
       GraphLenseLookupResult lenseLookup =
-          appView.graphLense().lookupMethod(invokedMethod, context.method, oldType.toInvokeType());
+          appView
+              .graphLense()
+              .lookupMethod(invokedMethod, context.getReference(), oldType.toInvokeType());
       DexMethod rewrittenTarget = lenseLookup.getMethod();
       DexMethod actualTarget;
       MethodHandleType newType;
@@ -554,71 +802,41 @@ public class LensCodeRewriter {
     return newProto != oldProto ? new DexValueMethodType(newProto) : type;
   }
 
-  /**
-   * This rebinds invoke-virtual instructions to their most specific target.
-   *
-   * <p>As a simple example, consider the instruction "invoke-virtual A.foo(v0)", and assume that v0
-   * is defined by an instruction "new-instance v0, B". If B is a subtype of A, and B overrides the
-   * method foo(), then we rewrite the invocation into "invoke-virtual B.foo(v0)".
-   *
-   * <p>If A.foo() ends up being unused, this helps to ensure that we can get rid of A.foo()
-   * entirely. Without this rewriting, we would have to keep A.foo() because the method is targeted.
-   */
-  private DexMethod rebindVirtualInvokeToMostSpecific(
-      DexMethod target, Value receiver, DexType context) {
-    if (!receiver.getTypeLattice().isClassType()) {
-      return target;
-    }
-    DexEncodedMethod encodedTarget = appView.definitionFor(target);
-    if (encodedTarget == null
-        || !canInvokeTargetWithInvokeVirtual(encodedTarget)
-        || !hasAccessToInvokeTargetFromContext(encodedTarget, context)) {
-      // Don't rewrite this instruction as it could remove an error from the program.
-      return target;
-    }
-    DexType receiverType =
-        appView
-            .graphLense()
-            .lookupType(receiver.getTypeLattice().asClassTypeLatticeElement().getClassType());
-    if (receiverType == target.holder) {
-      // Virtual invoke is already as specific as it can get.
-      return target;
-    }
-    DexEncodedMethod newTarget = appView.appInfo().lookupVirtualTarget(receiverType, target);
-    if (newTarget == null || newTarget.method == target) {
-      // Most likely due to a missing class, or invoke is already as specific as it gets.
-      return target;
-    }
-    if (!canInvokeTargetWithInvokeVirtual(newTarget)
-        || !hasAccessToInvokeTargetFromContext(newTarget, context)) {
-      // Not safe to invoke `newTarget` with virtual invoke from the current context.
-      return target;
-    }
-    return newTarget.method;
-  }
+  class InstructionReplacer {
 
-  private boolean canInvokeTargetWithInvokeVirtual(DexEncodedMethod target) {
-    return target.isVirtualMethod() && appView.isInterface(target.method.holder).isFalse();
-  }
+    private final IRCode code;
+    private final Instruction current;
+    private final InstructionListIterator iterator;
+    private final Set<Phi> affectedPhis;
 
-  private boolean hasAccessToInvokeTargetFromContext(DexEncodedMethod target, DexType context) {
-    assert !target.accessFlags.isPrivate();
-    DexType holder = target.method.holder;
-    if (holder == context) {
-      // It is always safe to invoke a method from the same enclosing class.
-      return true;
+    InstructionReplacer(
+        IRCode code, Instruction current, InstructionListIterator iterator, Set<Phi> affectedPhis) {
+      this.code = code;
+      this.current = current;
+      this.iterator = iterator;
+      this.affectedPhis = affectedPhis;
     }
-    DexClass clazz = appView.definitionFor(holder);
-    if (clazz == null) {
-      // Conservatively report an illegal access.
-      return false;
+
+    void replaceInstructionIfTypeChanged(
+        DexType type, BiFunction<DexType, Value, Instruction> constructor) {
+      DexType newType = appView.graphLense().lookupType(type);
+      if (newType != type) {
+        Value newOutValue = makeOutValue(current, code);
+        Instruction newInstruction = constructor.apply(newType, newOutValue);
+        iterator.replaceCurrentInstruction(newInstruction);
+        if (newOutValue != null) {
+          if (newOutValue.getType() != current.getOutType()) {
+            affectedPhis.addAll(newOutValue.uniquePhiUsers());
+          } else {
+            assert current.hasInvariantOutType();
+            assert current.isConstClass()
+                || current.isInitClass()
+                || current.isInstanceOf()
+                || (current.isInvokeVirtual()
+                    && current.asInvokeVirtual().getInvokedMethod().holder.isArrayType());
+          }
+        }
+      }
     }
-    if (holder.isSamePackage(context)) {
-      // The class must be accessible (note that we have already established that the method is not
-      // private).
-      return !clazz.accessFlags.isPrivate();
-    }
-    // If the method is in another package, then the method and its holder must be public.
-    return clazz.accessFlags.isPublic() && target.accessFlags.isPublic();
   }
 }

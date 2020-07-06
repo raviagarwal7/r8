@@ -5,10 +5,12 @@
 package com.android.tools.r8.graph;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 
-import com.android.tools.r8.CompilationFailedException;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
 import com.android.tools.r8.ToolHelper;
 import com.android.tools.r8.ToolHelper.DexVm;
 import com.android.tools.r8.ToolHelper.ProcessResult;
@@ -29,11 +31,24 @@ import com.google.common.collect.ImmutableList;
 import java.nio.file.Path;
 import java.util.Collections;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
+@RunWith(Parameterized.class)
 public class TargetLookupTest extends SmaliTestBase {
 
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withNoneRuntime().build();
+  }
+
+  public TargetLookupTest(TestParameters parameters) {
+    parameters.assertNoneRuntime();
+  }
+
   @Test
-  public void lookupDirect() {
+  public void lookupDirect() throws Exception {
     SmaliBuilder builder = new SmaliBuilder(DEFAULT_CLASS_NAME);
 
     builder.addDefaultConstructor();
@@ -77,13 +92,13 @@ public class TargetLookupTest extends SmaliTestBase {
     );
 
     AndroidApp application = buildApplication(builder);
-    AppInfo appInfo = getAppInfo(application);
+    AppInfoWithClassHierarchy appInfo = computeAppInfoWithClassHierarchy(application);
     CodeInspector inspector = new CodeInspector(appInfo.app());
-    DexEncodedMethod method = getMethod(inspector, DEFAULT_CLASS_NAME, "int", "x",
-        ImmutableList.of());
-    assertNull(appInfo.lookupVirtualTarget(method.method.holder, method.method));
-    assertNull(appInfo.lookupDirectTarget(method.method));
-    assertNotNull(appInfo.lookupStaticTarget(method.method));
+    ProgramMethod method = getMethod(inspector, DEFAULT_CLASS_NAME, "int", "x", ImmutableList.of());
+    assertFalse(
+        appInfo.resolveMethodOnClass(method.getReference()).getSingleTarget().isVirtualMethod());
+    assertNull(appInfo.lookupDirectTarget(method.getReference(), method));
+    assertNotNull(appInfo.lookupStaticTarget(method.getReference(), method));
 
     if (ToolHelper.getDexVm().getVersion().isOlderThanOrEqual(DexVm.Version.V4_4_4)) {
       // Dalvik rejects at verification time instead of producing the
@@ -99,7 +114,7 @@ public class TargetLookupTest extends SmaliTestBase {
   }
 
   @Test
-  public void lookupDirectSuper() {
+  public void lookupDirectSuper() throws Exception {
     SmaliBuilder builder = new SmaliBuilder("TestSuper");
 
     builder.addDefaultConstructor();
@@ -147,36 +162,44 @@ public class TargetLookupTest extends SmaliTestBase {
     );
 
     AndroidApp application = buildApplication(builder);
-    AppInfo appInfo = getAppInfo(application);
+    AppInfoWithClassHierarchy appInfo = computeAppInfoWithClassHierarchy(application);
     CodeInspector inspector = new CodeInspector(appInfo.app());
 
-    DexMethod methodXOnTestSuper =
-        getMethod(inspector, "TestSuper", "int", "x", ImmutableList.of()).method;
-    DexMethod methodYOnTest =
-        getMethod(inspector, "Test", "int", "y", ImmutableList.of()).method;
+    ProgramMethod methodXOnTestSuper =
+        getMethod(inspector, "TestSuper", "int", "x", ImmutableList.of());
+    ProgramMethod methodYOnTest = getMethod(inspector, "Test", "int", "y", ImmutableList.of());
 
-    DexType classTestSuper = methodXOnTestSuper.holder;
-    DexType classTest = methodYOnTest.holder;
-    DexProto methodXProto = methodXOnTestSuper.proto;
-    DexString methodXName = methodXOnTestSuper.name;
-    DexMethod methodXOnTest =
+    DexType classTestSuper = methodXOnTestSuper.getHolderType();
+    DexType classTest = methodYOnTest.getHolderType();
+    DexProto methodXProto = methodXOnTestSuper.getReference().proto;
+    DexString methodXName = methodXOnTestSuper.getReference().name;
+    DexMethod methodXOnTestReference =
         appInfo.dexItemFactory().createMethod(classTest, methodXProto, methodXName);
 
-    assertNull(appInfo.lookupVirtualTarget(classTestSuper, methodXOnTestSuper));
-    assertNull(appInfo.lookupVirtualTarget(classTest, methodXOnTestSuper));
-    assertNull(appInfo.lookupVirtualTarget(classTest, methodXOnTest));
+    assertFalse(
+        appInfo
+            .resolveMethodOnClass(methodXOnTestSuper.getReference(), classTestSuper)
+            .getSingleTarget()
+            .isVirtualMethod());
+    assertNull(
+        appInfo
+            .resolveMethodOnClass(methodXOnTestSuper.getReference(), classTest)
+            .getSingleTarget());
+    assertNull(appInfo.resolveMethodOnClass(methodXOnTestReference, classTest).getSingleTarget());
 
-    assertNull(appInfo.lookupDirectTarget(methodXOnTestSuper));
-    assertNull(appInfo.lookupDirectTarget(methodXOnTest));
+    assertNull(appInfo.lookupDirectTarget(methodXOnTestSuper.getReference(), methodXOnTestSuper));
+    assertNull(appInfo.lookupDirectTarget(methodXOnTestReference, methodYOnTest));
 
-    assertNotNull(appInfo.lookupStaticTarget(methodXOnTestSuper));
-    assertNotNull(appInfo.lookupStaticTarget(methodXOnTest));
+    assertNotNull(
+        appInfo.lookupStaticTarget(methodXOnTestSuper.getReference(), methodXOnTestSuper));
+    // Accessing a private target on a different type will fail resolution outright.
+    assertNull(appInfo.lookupStaticTarget(methodXOnTestReference, methodYOnTest));
 
     assertEquals("OK", runArt(application));
   }
 
   @Test
-  public void lookupFieldWithDefaultInInterface() throws CompilationFailedException {
+  public void lookupFieldWithDefaultInInterface() throws Exception {
     SmaliBuilder builder = new SmaliBuilder();
 
     builder.addInterface("Interface");
@@ -196,7 +219,7 @@ public class TargetLookupTest extends SmaliTestBase {
     );
 
     AndroidApp application = buildApplication(builder);
-    AppInfo appInfo = getAppInfo(application);
+    AppInfoWithClassHierarchy appInfo = computeAppInfoWithClassHierarchy(application);
     DexItemFactory factory = appInfo.dexItemFactory();
 
     DexField aFieldOnSubClass = factory
@@ -204,8 +227,7 @@ public class TargetLookupTest extends SmaliTestBase {
     DexField aFieldOnInterface = factory
         .createField(factory.createType("LInterface;"), factory.intType, "aField");
 
-    assertEquals(aFieldOnInterface,
-        appInfo.lookupStaticTarget(aFieldOnSubClass.holder, aFieldOnSubClass).field);
+    assertEquals(aFieldOnInterface, appInfo.lookupStaticTarget(aFieldOnSubClass).field);
 
     assertEquals("42", runArt(application));
 
@@ -228,7 +250,7 @@ public class TargetLookupTest extends SmaliTestBase {
       builder.addLibraryFiles(ToolHelper.getDefaultAndroidJar());
     }
     AndroidApp application = builder.build();
-    AppInfo appInfo = getAppInfo(application);
+    AppInfoWithClassHierarchy appInfo = computeAppInfoWithClassHierarchy(application);
     DexItemFactory factory = appInfo.dexItemFactory();
 
     DexType i0 = factory.createType("L" + pkg + "/I0;");
@@ -237,13 +259,13 @@ public class TargetLookupTest extends SmaliTestBase {
     DexType i3 = factory.createType("L" + pkg + "/I3;");
     DexType i4 = factory.createType("L" + pkg + "/I4;");
     DexType c0 = factory.createType("L" + pkg + "/C0;");
-    DexType c1 = factory.createType("L" + pkg + "/C1;");
-    DexType c2 = factory.createType("L" + pkg + "/C2;");
+    DexProgramClass c1 = appInfo.definitionForProgramType(factory.createType("L" + pkg + "/C1;"));
+    DexProgramClass c2 = appInfo.definitionForProgramType(factory.createType("L" + pkg + "/C2;"));
 
     DexProto mProto = factory.createProto(factory.intType);
     DexString m = factory.createString("m");
     DexMethod mOnC0 = factory.createMethod(c0, mProto, m);
-    DexMethod mOnC1 = factory.createMethod(c1, mProto, m);
+    DexMethod mOnC1 = factory.createMethod(c1.type, mProto, m);
     DexMethod mOnI0 = factory.createMethod(i0, mProto, m);
     DexMethod mOnI1 = factory.createMethod(i1, mProto, m);
     DexMethod mOnI2 = factory.createMethod(i2, mProto, m);
@@ -254,7 +276,7 @@ public class TargetLookupTest extends SmaliTestBase {
     assertEquals(mOnI1, appInfo.lookupSuperTarget(mOnI1, c1).method);
     assertEquals(mOnI2, appInfo.lookupSuperTarget(mOnI2, c1).method);
 
-    assertEquals(mOnI0, appInfo.lookupSuperTarget(mOnC1, c2).method);
+    assertNull(appInfo.lookupSuperTarget(mOnC1, c2)); // C2 is not a subclass of C1.
     assertEquals(mOnI1, appInfo.lookupSuperTarget(mOnI3, c2).method);
     assertEquals(mOnI2, appInfo.lookupSuperTarget(mOnI4, c2).method);
 

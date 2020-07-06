@@ -16,6 +16,7 @@ import com.android.tools.r8.utils.FileUtils;
 import com.android.tools.r8.utils.Reporter;
 import java.io.IOException;
 import java.nio.file.Path;
+import org.junit.Ignore;
 import org.junit.Test;
 
 public class SeedMapperTests extends TestBase {
@@ -51,7 +52,7 @@ public class SeedMapperTests extends TestBase {
     try {
       SeedMapper.seedMapperFromFile(reporter, applyMappingFile);
       fail("Should have thrown an error");
-    } catch (AbortException e) {
+    } catch (RuntimeException e) {
       assertEquals(1, testDiagnosticMessages.getErrors().size());
       Diagnostic diagnostic = testDiagnosticMessages.getErrors().get(0);
       assertEquals(
@@ -74,7 +75,7 @@ public class SeedMapperTests extends TestBase {
     try {
       SeedMapper.seedMapperFromFile(reporter, applyMappingFile);
       fail("Should have thrown an error");
-    } catch (AbortException e) {
+    } catch (RuntimeException e) {
       assertEquals(1, testDiagnosticMessages.getErrors().size());
       Diagnostic diagnostic = testDiagnosticMessages.getErrors().get(0);
       assertEquals(
@@ -97,7 +98,7 @@ public class SeedMapperTests extends TestBase {
     try {
       SeedMapper.seedMapperFromFile(reporter, applyMappingFile);
       fail("Should have thrown an error");
-    } catch (AbortException e) {
+    } catch (RuntimeException e) {
       assertEquals(1, testDiagnosticMessages.getErrors().size());
       Diagnostic diagnostic = testDiagnosticMessages.getErrors().get(0);
       assertEquals(
@@ -115,7 +116,7 @@ public class SeedMapperTests extends TestBase {
     try {
       SeedMapper.seedMapperFromFile(reporter, applyMappingFile);
       fail("Should have thrown an error");
-    } catch (AbortException e) {
+    } catch (RuntimeException e) {
       assertEquals(1, testDiagnosticMessages.getErrors().size());
       Diagnostic diagnostic = testDiagnosticMessages.getErrors().get(0);
       assertEquals(
@@ -141,6 +142,7 @@ public class SeedMapperTests extends TestBase {
   }
 
   @Test
+  @Ignore("b/136697829")
   public void testDuplicateMethodTargets() throws IOException {
     Path applyMappingFile =
         getApplyMappingFile(
@@ -161,5 +163,49 @@ public class SeedMapperTests extends TestBase {
           diagnostic.getDiagnosticMessage());
       assertEquals(2, ((TextPosition) diagnostic.getPosition()).getLine());
     }
+  }
+
+  @Test
+  public void testInliningFrames() throws IOException {
+    Path applyMappingFile =
+        getApplyMappingFile(
+            "A.B.C -> a:",
+            "  int foo(A) -> a",
+            "  1:2:int bar(A):3:4 -> a",
+            "  1:2:int baz(B):3 -> a");
+    TestDiagnosticMessagesImpl testDiagnosticMessages = new TestDiagnosticMessagesImpl();
+    Reporter reporter = new Reporter(testDiagnosticMessages);
+    SeedMapper.seedMapperFromFile(reporter, applyMappingFile);
+  }
+
+  @Test
+  public void testDuplicateInliningFrames() throws IOException {
+    Path applyMappingFile =
+        getApplyMappingFile(
+            "A.B.C -> a:",
+            "  int foo(Z) -> a",
+            "  1:1:int qux(A):3:3 -> a",
+            "  1:1:int bar(A):3 -> a",
+            "  2:2:int qux(A):3:3 -> a",
+            "  2:2:int bar(A):4 -> a",
+            "  3:3:int bar(A):5:5 -> a",
+            "  int qux(C) -> a");
+    TestDiagnosticMessagesImpl testDiagnosticMessages = new TestDiagnosticMessagesImpl();
+    Reporter reporter = new Reporter(testDiagnosticMessages);
+    SeedMapper.seedMapperFromFile(reporter, applyMappingFile);
+  }
+
+  @Test
+  public void testMultipleInitRanges() throws IOException {
+    Path applyMappingFile =
+        getApplyMappingFile(
+            "com.android.tools.r8.ArchiveClassFileProvider ->"
+                + " com.android.tools.r8.ArchiveClassFileProvider:",
+            "    1:1:void <init>(java.nio.file.Path):50:50 -> <init>",
+            "    2:2:void <init>(java.nio.file.Path):59:59 -> <init>",
+            "    boolean lambda$new$0(java.lang.String) -> a");
+    TestDiagnosticMessagesImpl testDiagnosticMessages = new TestDiagnosticMessagesImpl();
+    Reporter reporter = new Reporter(testDiagnosticMessages);
+    SeedMapper.seedMapperFromFile(reporter, applyMappingFile);
   }
 }

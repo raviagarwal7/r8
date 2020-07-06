@@ -5,21 +5,22 @@
 package com.android.tools.r8.ir.optimize.lambda;
 
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.CheckCast;
 import com.android.tools.r8.ir.code.ConstClass;
 import com.android.tools.r8.ir.code.ConstMethodHandle;
 import com.android.tools.r8.ir.code.ConstMethodType;
+import com.android.tools.r8.ir.code.DefaultInstructionVisitor;
 import com.android.tools.r8.ir.code.IRCode;
+import com.android.tools.r8.ir.code.InitClass;
 import com.android.tools.r8.ir.code.InstanceGet;
 import com.android.tools.r8.ir.code.InstancePut;
-import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.Invoke;
 import com.android.tools.r8.ir.code.InvokeMethod;
@@ -27,7 +28,9 @@ import com.android.tools.r8.ir.code.NewArrayEmpty;
 import com.android.tools.r8.ir.code.NewInstance;
 import com.android.tools.r8.ir.code.StaticGet;
 import com.android.tools.r8.ir.code.StaticPut;
+import com.android.tools.r8.ir.optimize.lambda.LambdaMerger.ApplyStrategy;
 import com.android.tools.r8.kotlin.Kotlin;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import java.util.ListIterator;
 import java.util.function.Function;
 
@@ -42,7 +45,7 @@ import java.util.function.Function;
 //
 // This class is also used inside particular strategies as a context of the instruction
 // being checked or patched, it provides access to code, block and instruction iterators.
-public abstract class CodeProcessor {
+public abstract class CodeProcessor extends DefaultInstructionVisitor<Void> {
   // Strategy (specific to lambda group) for detecting valid references to the
   // lambda classes (of this group) and patching them with group class references.
   public interface Strategy {
@@ -60,88 +63,89 @@ public abstract class CodeProcessor {
 
     boolean isValidNewInstance(CodeProcessor context, NewInstance invoke);
 
-    void patch(CodeProcessor context, NewInstance newInstance);
+    boolean isValidInitClass(CodeProcessor context, DexType clazz);
 
-    void patch(CodeProcessor context, InvokeMethod invoke);
+    void patch(ApplyStrategy context, NewInstance newInstance);
 
-    void patch(CodeProcessor context, InstancePut instancePut);
+    void patch(ApplyStrategy context, InvokeMethod invoke);
 
-    void patch(CodeProcessor context, InstanceGet instanceGet);
+    void patch(ApplyStrategy context, InstanceGet instanceGet);
 
-    void patch(CodeProcessor context, StaticPut staticPut);
+    void patch(ApplyStrategy context, StaticGet staticGet);
 
-    void patch(CodeProcessor context, StaticGet staticGet);
+    void patch(ApplyStrategy context, InitClass initClass);
   }
 
   // No-op strategy.
-  static final Strategy NoOp = new Strategy() {
-    @Override
-    public LambdaGroup group() {
-      return null;
-    }
+  static final Strategy NoOp =
+      new Strategy() {
+        @Override
+        public LambdaGroup group() {
+          return null;
+        }
 
-    @Override
-    public boolean isValidInstanceFieldWrite(CodeProcessor context, DexField field) {
-      return false;
-    }
+        @Override
+        public boolean isValidInstanceFieldWrite(CodeProcessor context, DexField field) {
+          return false;
+        }
 
-    @Override
-    public boolean isValidInstanceFieldRead(CodeProcessor context, DexField field) {
-      return false;
-    }
+        @Override
+        public boolean isValidInstanceFieldRead(CodeProcessor context, DexField field) {
+          return false;
+        }
 
-    @Override
-    public boolean isValidStaticFieldWrite(CodeProcessor context, DexField field) {
-      return false;
-    }
+        @Override
+        public boolean isValidStaticFieldWrite(CodeProcessor context, DexField field) {
+          return false;
+        }
 
-    @Override
-    public boolean isValidStaticFieldRead(CodeProcessor context, DexField field) {
-      return false;
-    }
+        @Override
+        public boolean isValidStaticFieldRead(CodeProcessor context, DexField field) {
+          return false;
+        }
 
-    @Override
-    public boolean isValidInvoke(CodeProcessor context, InvokeMethod invoke) {
-      return false;
-    }
+        @Override
+        public boolean isValidInvoke(CodeProcessor context, InvokeMethod invoke) {
+          return false;
+        }
 
-    @Override
-    public boolean isValidNewInstance(CodeProcessor context, NewInstance invoke) {
-      return false;
-    }
+        @Override
+        public boolean isValidNewInstance(CodeProcessor context, NewInstance invoke) {
+          return false;
+        }
 
-    @Override
-    public void patch(CodeProcessor context, NewInstance newInstance) {
-      throw new Unreachable();
-    }
+        @Override
+        public boolean isValidInitClass(CodeProcessor context, DexType clazz) {
+          return false;
+        }
 
-    @Override
-    public void patch(CodeProcessor context, InvokeMethod invoke) {
-      throw new Unreachable();
-    }
+        @Override
+        public void patch(ApplyStrategy context, NewInstance newInstance) {
+          throw new Unreachable();
+        }
 
-    @Override
-    public void patch(CodeProcessor context, InstancePut instancePut) {
-      throw new Unreachable();
-    }
+        @Override
+        public void patch(ApplyStrategy context, InvokeMethod invoke) {
+          throw new Unreachable();
+        }
 
-    @Override
-    public void patch(CodeProcessor context, InstanceGet instanceGet) {
-      throw new Unreachable();
-    }
+        @Override
+        public void patch(ApplyStrategy context, InstanceGet instanceGet) {
+          throw new Unreachable();
+        }
 
-    @Override
-    public void patch(CodeProcessor context, StaticPut staticPut) {
-      throw new Unreachable();
-    }
+        @Override
+        public void patch(ApplyStrategy context, StaticGet staticGet) {
+          throw new Unreachable();
+        }
 
-    @Override
-    public void patch(CodeProcessor context, StaticGet staticGet) {
-      throw new Unreachable();
-    }
-  };
+        @Override
+        public void patch(ApplyStrategy context, InitClass initClass) {
+          throw new Unreachable();
+        }
+      };
 
-  public final AppView<? extends AppInfo> appView;
+  public final AppView<AppInfoWithLiveness> appView;
   public final DexItemFactory factory;
   public final Kotlin kotlin;
 
@@ -154,17 +158,30 @@ public abstract class CodeProcessor {
   private final LambdaTypeVisitor lambdaChecker;
 
   // Specify the context of the current instruction: method/code/blocks/instructions.
-  public final DexEncodedMethod method;
+  public final ProgramMethod method;
   public final IRCode code;
   public final ListIterator<BasicBlock> blocks;
   private InstructionListIterator instructions;
 
+  // The inlining context (caller), if any.
+  private final ProgramMethod context;
+
   CodeProcessor(
-      AppView<? extends AppInfo> appView,
+      AppView<AppInfoWithLiveness> appView,
       Function<DexType, Strategy> strategyProvider,
       LambdaTypeVisitor lambdaChecker,
-      DexEncodedMethod method,
+      ProgramMethod method,
       IRCode code) {
+    this(appView, strategyProvider, lambdaChecker, method, code, null);
+  }
+
+  CodeProcessor(
+      AppView<AppInfoWithLiveness> appView,
+      Function<DexType, Strategy> strategyProvider,
+      LambdaTypeVisitor lambdaChecker,
+      ProgramMethod method,
+      IRCode code,
+      ProgramMethod context) {
     this.appView = appView;
     this.strategyProvider = strategyProvider;
     this.factory = appView.dexItemFactory();
@@ -173,6 +190,7 @@ public abstract class CodeProcessor {
     this.method = method;
     this.code = code;
     this.blocks = code.listIterator();
+    this.context = context;
   }
 
   public final InstructionListIterator instructions() {
@@ -180,54 +198,42 @@ public abstract class CodeProcessor {
     return instructions;
   }
 
-  final void processCode() {
+  void processCode() {
     while (blocks.hasNext()) {
       BasicBlock block = blocks.next();
-      instructions = block.listIterator();
+      instructions = block.listIterator(code);
       while (instructions.hasNext()) {
-        onInstruction(instructions.next());
+        instructions.next().accept(this);
       }
     }
   }
 
-  private void onInstruction(Instruction instruction) {
-    if (instruction.isInvoke()) {
-      handle(instruction.asInvoke());
-    } else if (instruction.isNewInstance()) {
-      handle(instruction.asNewInstance());
-    } else if (instruction.isCheckCast()) {
-      handle(instruction.asCheckCast());
-    } else if (instruction.isNewArrayEmpty()) {
-      handle(instruction.asNewArrayEmpty());
-    } else if (instruction.isConstClass()) {
-      handle(instruction.asConstClass());
-    } else if (instruction.isConstMethodType()) {
-      handle(instruction.asConstMethodType());
-    } else if (instruction.isConstMethodHandle()) {
-      handle(instruction.asConstMethodHandle());
-    } else if (instruction.isInstanceGet()) {
-      handle(instruction.asInstanceGet());
-    } else if (instruction.isInstancePut()) {
-      handle(instruction.asInstancePut());
-    } else if (instruction.isStaticGet()) {
-      handle(instruction.asStaticGet());
-    } else if (instruction.isStaticPut()) {
-      handle(instruction.asStaticPut());
-    }
+  private boolean shouldRewrite(DexField field) {
+    return shouldRewrite(field.holder);
   }
 
-  private void handle(Invoke invoke) {
+  private boolean shouldRewrite(DexMethod method) {
+    return shouldRewrite(method.holder);
+  }
+
+  private boolean shouldRewrite(DexType type) {
+    // Rewrite references to lambda classes if we are outside the class.
+    return type != (context != null ? context : method).getHolderType();
+  }
+
+  @Override
+  public Void handleInvoke(Invoke invoke) {
     if (invoke.isInvokeNewArray()) {
       lambdaChecker.accept(invoke.asInvokeNewArray().getReturnType());
-      return;
+      return null;
     }
     if (invoke.isInvokeMultiNewArray()) {
       lambdaChecker.accept(invoke.asInvokeMultiNewArray().getReturnType());
-      return;
+      return null;
     }
     if (invoke.isInvokeCustom()) {
       lambdaChecker.accept(invoke.asInvokeCustom().getCallSite());
-      return;
+      return null;
     }
 
     InvokeMethod invokeMethod = invoke.asInvokeMethod();
@@ -236,10 +242,10 @@ public abstract class CodeProcessor {
       // Invalidate signature, there still should not be lambda references.
       lambdaChecker.accept(invokeMethod.getInvokedMethod().proto);
       // Only rewrite references to lambda classes if we are outside the class.
-      if (invokeMethod.getInvokedMethod().holder != this.method.method.holder) {
+      if (shouldRewrite(invokeMethod.getInvokedMethod())) {
         process(strategy, invokeMethod);
       }
-      return;
+      return null;
     }
 
     // For the rest invalidate any references.
@@ -247,43 +253,57 @@ public abstract class CodeProcessor {
       lambdaChecker.accept(invoke.asInvokePolymorphic().getProto());
     }
     lambdaChecker.accept(invokeMethod.getInvokedMethod(), null);
+    return null;
   }
 
-  private void handle(NewInstance newInstance) {
+  @Override
+  public Void visit(NewInstance newInstance) {
     Strategy strategy = strategyProvider.apply(newInstance.clazz);
     if (strategy.isValidNewInstance(this, newInstance)) {
       // Only rewrite references to lambda classes if we are outside the class.
-      if (newInstance.clazz != this.method.method.holder) {
+      if (shouldRewrite(newInstance.clazz)) {
         process(strategy, newInstance);
       }
     }
+    return null;
   }
 
-  private void handle(CheckCast checkCast) {
+  @Override
+  public Void visit(CheckCast checkCast) {
     lambdaChecker.accept(checkCast.getType());
+    return null;
   }
 
-  private void handle(NewArrayEmpty newArrayEmpty) {
+  @Override
+  public Void visit(NewArrayEmpty newArrayEmpty) {
     lambdaChecker.accept(newArrayEmpty.type);
+    return null;
   }
 
-  private void handle(ConstClass constClass) {
+  @Override
+  public Void visit(ConstClass constClass) {
     lambdaChecker.accept(constClass.getValue());
+    return null;
   }
 
-  private void handle(ConstMethodType constMethodType) {
+  @Override
+  public Void visit(ConstMethodType constMethodType) {
     lambdaChecker.accept(constMethodType.getValue());
+    return null;
   }
 
-  private void handle(ConstMethodHandle constMethodHandle) {
+  @Override
+  public Void visit(ConstMethodHandle constMethodHandle) {
     lambdaChecker.accept(constMethodHandle.getValue());
+    return null;
   }
 
-  private void handle(InstanceGet instanceGet) {
+  @Override
+  public Void visit(InstanceGet instanceGet) {
     DexField field = instanceGet.getField();
     Strategy strategy = strategyProvider.apply(field.holder);
     if (strategy.isValidInstanceFieldRead(this, field)) {
-      if (field.holder != this.method.method.holder) {
+      if (shouldRewrite(field)) {
         // Only rewrite references to lambda classes if we are outside the class.
         process(strategy, instanceGet);
       }
@@ -294,13 +314,15 @@ public abstract class CodeProcessor {
     // We avoid fields with type being lambda class, it is possible for
     // a lambda to capture another lambda, but we don't support it for now.
     lambdaChecker.accept(field.type);
+    return null;
   }
 
-  private void handle(InstancePut instancePut) {
+  @Override
+  public Void visit(InstancePut instancePut) {
     DexField field = instancePut.getField();
     Strategy strategy = strategyProvider.apply(field.holder);
     if (strategy.isValidInstanceFieldWrite(this, field)) {
-      if (field.holder != this.method.method.holder) {
+      if (shouldRewrite(field)) {
         // Only rewrite references to lambda classes if we are outside the class.
         process(strategy, instancePut);
       }
@@ -311,13 +333,15 @@ public abstract class CodeProcessor {
     // We avoid fields with type being lambda class, it is possible for
     // a lambda to capture another lambda, but we don't support it for now.
     lambdaChecker.accept(field.type);
+    return null;
   }
 
-  private void handle(StaticGet staticGet) {
+  @Override
+  public Void visit(StaticGet staticGet) {
     DexField field = staticGet.getField();
     Strategy strategy = strategyProvider.apply(field.holder);
     if (strategy.isValidStaticFieldRead(this, field)) {
-      if (field.holder != this.method.method.holder) {
+      if (shouldRewrite(field)) {
         // Only rewrite references to lambda classes if we are outside the class.
         process(strategy, staticGet);
       }
@@ -325,13 +349,15 @@ public abstract class CodeProcessor {
       lambdaChecker.accept(field.type);
       lambdaChecker.accept(field.holder);
     }
+    return null;
   }
 
-  private void handle(StaticPut staticPut) {
+  @Override
+  public Void visit(StaticPut staticPut) {
     DexField field = staticPut.getField();
     Strategy strategy = strategyProvider.apply(field.holder);
     if (strategy.isValidStaticFieldWrite(this, field)) {
-      if (field.holder != this.method.method.holder) {
+      if (shouldRewrite(field)) {
         // Only rewrite references to lambda classes if we are outside the class.
         process(strategy, staticPut);
       }
@@ -339,6 +365,22 @@ public abstract class CodeProcessor {
       lambdaChecker.accept(field.type);
       lambdaChecker.accept(field.holder);
     }
+    return null;
+  }
+
+  @Override
+  public Void visit(InitClass initClass) {
+    DexType clazz = initClass.getClassValue();
+    Strategy strategy = strategyProvider.apply(clazz);
+    if (strategy.isValidInitClass(this, clazz)) {
+      if (shouldRewrite(clazz)) {
+        // Only rewrite references to lambda classes if we are outside the class.
+        process(strategy, initClass);
+      }
+    } else {
+      lambdaChecker.accept(clazz);
+    }
+    return null;
   }
 
   abstract void process(Strategy strategy, InvokeMethod invokeMethod);
@@ -352,4 +394,6 @@ public abstract class CodeProcessor {
   abstract void process(Strategy strategy, StaticPut staticPut);
 
   abstract void process(Strategy strategy, StaticGet staticGet);
+
+  abstract void process(Strategy strategy, InitClass initClass);
 }

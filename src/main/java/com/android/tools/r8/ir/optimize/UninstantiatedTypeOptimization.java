@@ -7,35 +7,24 @@ package com.android.tools.r8.ir.optimize;
 import static com.android.tools.r8.ir.optimize.UninstantiatedTypeOptimization.Strategy.ALLOW_ARGUMENT_REMOVAL;
 import static com.android.tools.r8.ir.optimize.UninstantiatedTypeOptimization.Strategy.DISALLOW_ARGUMENT_REMOVAL;
 
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.FieldAccessInfo;
+import com.android.tools.r8.graph.FieldAccessInfoCollection;
 import com.android.tools.r8.graph.GraphLense.NestedGraphLense;
-import com.android.tools.r8.graph.GraphLense.RewrittenPrototypeDescription;
-import com.android.tools.r8.graph.GraphLense.RewrittenPrototypeDescription.RemovedArgumentInfo;
-import com.android.tools.r8.graph.GraphLense.RewrittenPrototypeDescription.RemovedArgumentsInfo;
+import com.android.tools.r8.graph.RewrittenPrototypeDescription;
+import com.android.tools.r8.graph.RewrittenPrototypeDescription.ArgumentInfoCollection;
+import com.android.tools.r8.graph.RewrittenPrototypeDescription.RemovedArgumentInfo;
 import com.android.tools.r8.graph.TopDownClassHierarchyTraversal;
-import com.android.tools.r8.ir.analysis.AbstractError;
-import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
-import com.android.tools.r8.ir.code.BasicBlock;
-import com.android.tools.r8.ir.code.FieldInstruction;
-import com.android.tools.r8.ir.code.IRCode;
-import com.android.tools.r8.ir.code.Instruction;
-import com.android.tools.r8.ir.code.InstructionListIterator;
-import com.android.tools.r8.ir.code.InvokeMethod;
-import com.android.tools.r8.ir.code.Value;
+import com.android.tools.r8.ir.analysis.value.AbstractValue;
 import com.android.tools.r8.ir.optimize.MemberPoolCollection.MemberPool;
-import com.android.tools.r8.logging.Log;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackSimple;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.MethodSignatureEquivalence;
 import com.android.tools.r8.utils.Timing;
@@ -45,13 +34,9 @@ import com.google.common.collect.HashBiMap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
-import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
-import java.util.List;
-import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -63,14 +48,15 @@ public class UninstantiatedTypeOptimization {
     DISALLOW_ARGUMENT_REMOVAL
   }
 
-  static class UninstantiatedTypeOptimizationGraphLense extends NestedGraphLense {
+  public static class UninstantiatedTypeOptimizationGraphLense extends NestedGraphLense {
 
-    private final Map<DexMethod, RemovedArgumentsInfo> removedArgumentsInfoPerMethod;
+    private final AppView<?> appView;
+    private final Map<DexMethod, ArgumentInfoCollection> removedArgumentsInfoPerMethod;
 
     UninstantiatedTypeOptimizationGraphLense(
         BiMap<DexMethod, DexMethod> methodMap,
-        Map<DexMethod, RemovedArgumentsInfo> removedArgumentsInfoPerMethod,
-        AppView<? extends AppInfo> appView) {
+        Map<DexMethod, ArgumentInfoCollection> removedArgumentsInfoPerMethod,
+        AppView<?> appView) {
       super(
           ImmutableMap.of(),
           methodMap,
@@ -79,6 +65,7 @@ public class UninstantiatedTypeOptimization {
           methodMap.inverse(),
           appView.graphLense(),
           appView.dexItemFactory());
+      this.appView = appView;
       this.removedArgumentsInfoPerMethod = removedArgumentsInfoPerMethod;
     }
 
@@ -88,9 +75,9 @@ public class UninstantiatedTypeOptimization {
       RewrittenPrototypeDescription result = previousLense.lookupPrototypeChanges(originalMethod);
       if (originalMethod != method) {
         if (method.proto.returnType.isVoidType() && !originalMethod.proto.returnType.isVoidType()) {
-          result = result.withConstantReturn();
+          result = result.withConstantReturn(originalMethod.proto.returnType, appView);
         }
-        RemovedArgumentsInfo removedArgumentsInfo = removedArgumentsInfoPerMethod.get(method);
+        ArgumentInfoCollection removedArgumentsInfo = removedArgumentsInfoPerMethod.get(method);
         if (removedArgumentsInfo != null) {
           result = result.withRemovedArguments(removedArgumentsInfo);
         }
@@ -105,19 +92,39 @@ public class UninstantiatedTypeOptimization {
 
   private final AppView<AppInfoWithLiveness> appView;
 
-  private int numberOfInstanceGetOrInstancePutWithNullReceiver = 0;
-  private int numberOfArrayInstructionsWithNullArray = 0;
-  private int numberOfInvokesWithNullArgument = 0;
-  private int numberOfInvokesWithNullReceiver = 0;
-  private int numberOfMonitorWithNullReceiver = 0;
-
   public UninstantiatedTypeOptimization(AppView<AppInfoWithLiveness> appView) {
     this.appView = appView;
   }
 
-  public GraphLense run(
-      MethodPoolCollection methodPoolCollection, ExecutorService executorService, Timing timing) {
+  public UninstantiatedTypeOptimization strenghtenOptimizationInfo() {
+    OptimizationFeedback feedback = OptimizationFeedbackSimple.getInstance();
+    FieldAccessInfoCollection<?> fieldAccessInfoCollection =
+        appView.appInfo().getFieldAccessInfoCollection();
+    AbstractValue nullValue = appView.abstractValueFactory().createSingleNumberValue(0);
+    for (DexProgramClass clazz : appView.appInfo().classes()) {
+      clazz.forEachField(
+          field -> {
+            if (field.type().isAlwaysNull(appView)) {
+              FieldAccessInfo fieldAccessInfo = fieldAccessInfoCollection.get(field.field);
+              if (fieldAccessInfo != null) {
+                // Clear all writes since each write must write `null` to the field.
+                fieldAccessInfo.asMutable().clearWrites();
+              }
+              feedback.recordFieldHasAbstractValue(field, appView, nullValue);
+            }
+          });
+      clazz.forEachMethod(
+          method -> {
+            if (method.returnType().isAlwaysNull(appView)) {
+              feedback.methodReturnsAbstractValue(method, appView, nullValue);
+            }
+          });
+    }
+    return this;
+  }
 
+  public UninstantiatedTypeOptimizationGraphLense run(
+      MethodPoolCollection methodPoolCollection, ExecutorService executorService, Timing timing) {
     try {
       methodPoolCollection.buildAll(executorService, timing);
     } catch (Exception e) {
@@ -126,7 +133,7 @@ public class UninstantiatedTypeOptimization {
 
     Map<Wrapper<DexMethod>, Set<DexType>> changedVirtualMethods = new HashMap<>();
     BiMap<DexMethod, DexMethod> methodMapping = HashBiMap.create();
-    Map<DexMethod, RemovedArgumentsInfo> removedArgumentsInfoPerMethod = new IdentityHashMap<>();
+    Map<DexMethod, ArgumentInfoCollection> removedArgumentsInfoPerMethod = new IdentityHashMap<>();
 
     TopDownClassHierarchyTraversal.forProgramClasses(appView)
         .visit(
@@ -143,7 +150,7 @@ public class UninstantiatedTypeOptimization {
       return new UninstantiatedTypeOptimizationGraphLense(
           methodMapping, removedArgumentsInfoPerMethod, appView);
     }
-    return appView.graphLense();
+    return null;
   }
 
   private void processClass(
@@ -151,7 +158,7 @@ public class UninstantiatedTypeOptimization {
       Map<Wrapper<DexMethod>, Set<DexType>> changedVirtualMethods,
       BiMap<DexMethod, DexMethod> methodMapping,
       MethodPoolCollection methodPoolCollection,
-      Map<DexMethod, RemovedArgumentsInfo> removedArgumentsInfoPerMethod) {
+      Map<DexMethod, ArgumentInfoCollection> removedArgumentsInfoPerMethod) {
     MemberPool<DexMethod> methodPool = methodPoolCollection.get(clazz);
 
     if (clazz.isInterface()) {
@@ -159,8 +166,9 @@ public class UninstantiatedTypeOptimization {
       // This achieved by faking that there is already a method with the given signature.
       for (DexEncodedMethod virtualMethod : clazz.virtualMethods()) {
         RewrittenPrototypeDescription prototypeChanges =
-            new RewrittenPrototypeDescription(
-                virtualMethod.method.proto.returnType.isAlwaysNull(appView),
+            RewrittenPrototypeDescription.createForUninstantiatedTypes(
+                virtualMethod.method,
+                appView,
                 getRemovedArgumentsInfo(virtualMethod, ALLOW_ARGUMENT_REMOVAL));
         if (!prototypeChanges.isEmpty()) {
           DexMethod newMethod = getNewMethodSignature(virtualMethod, prototypeChanges);
@@ -192,29 +200,34 @@ public class UninstantiatedTypeOptimization {
     }
 
     // Change the return type of direct methods that return an uninstantiated type to void.
-    List<DexEncodedMethod> directMethods = clazz.directMethods();
-    for (int i = 0; i < directMethods.size(); ++i) {
-      DexEncodedMethod encodedMethod = directMethods.get(i);
-      DexMethod method = encodedMethod.method;
-      RewrittenPrototypeDescription prototypeChanges =
-          prototypeChangesPerMethod.getOrDefault(
-              encodedMethod, RewrittenPrototypeDescription.none());
-      RemovedArgumentsInfo removedArgumentsInfo = prototypeChanges.getRemovedArgumentsInfo();
-      DexMethod newMethod = getNewMethodSignature(encodedMethod, prototypeChanges);
-      if (newMethod != method) {
-        Wrapper<DexMethod> wrapper = equivalence.wrap(newMethod);
+    clazz
+        .getMethodCollection()
+        .replaceDirectMethods(
+            encodedMethod -> {
+              DexMethod method = encodedMethod.method;
+              RewrittenPrototypeDescription prototypeChanges =
+                  prototypeChangesPerMethod.getOrDefault(
+                      encodedMethod, RewrittenPrototypeDescription.none());
+              ArgumentInfoCollection removedArgumentsInfo =
+                  prototypeChanges.getArgumentInfoCollection();
+              DexMethod newMethod = getNewMethodSignature(encodedMethod, prototypeChanges);
+              if (newMethod != method) {
+                Wrapper<DexMethod> wrapper = equivalence.wrap(newMethod);
 
-        // TODO(b/110806787): Can be extended to handle collisions by renaming the given
-        // method.
-        if (usedSignatures.add(wrapper)) {
-          clazz.setDirectMethod(i, encodedMethod.toTypeSubstitutedMethod(newMethod));
-          methodMapping.put(method, newMethod);
-          if (removedArgumentsInfo.hasRemovedArguments()) {
-            removedArgumentsInfoPerMethod.put(newMethod, removedArgumentsInfo);
-          }
-        }
-      }
-    }
+                // TODO(b/110806787): Can be extended to handle collisions by renaming the given
+                // method.
+                if (usedSignatures.add(wrapper)) {
+                  methodMapping.put(method, newMethod);
+                  if (removedArgumentsInfo.hasRemovedArguments()) {
+                    removedArgumentsInfoPerMethod.put(newMethod, removedArgumentsInfo);
+                  }
+                  return encodedMethod.toTypeSubstitutedMethod(
+                      newMethod,
+                      removedArgumentsInfo.createParameterAnnotationsRemover(encodedMethod));
+                }
+              }
+              return encodedMethod;
+            });
 
     // Change the return type of virtual methods that return an uninstantiated type to void.
     // This is done in two steps. First we change the return type of all methods that override
@@ -222,56 +235,74 @@ public class UninstantiatedTypeOptimization {
     // all supertypes of the current class are always visited prior to the current class.
     // This is important to ensure that a method that used to override a method in its super
     // class will continue to do so after this optimization.
-    List<DexEncodedMethod> virtualMethods = clazz.virtualMethods();
-    for (int i = 0; i < virtualMethods.size(); ++i) {
-      DexEncodedMethod encodedMethod = virtualMethods.get(i);
-      DexMethod method = encodedMethod.method;
-      RewrittenPrototypeDescription prototypeChanges =
-          getPrototypeChanges(encodedMethod, DISALLOW_ARGUMENT_REMOVAL);
-      DexMethod newMethod = getNewMethodSignature(encodedMethod, prototypeChanges);
-      if (newMethod != method) {
-        Wrapper<DexMethod> wrapper = equivalence.wrap(newMethod);
+    clazz
+        .getMethodCollection()
+        .replaceVirtualMethods(
+            encodedMethod -> {
+              DexMethod method = encodedMethod.method;
+              RewrittenPrototypeDescription prototypeChanges =
+                  getPrototypeChanges(encodedMethod, DISALLOW_ARGUMENT_REMOVAL);
+              ArgumentInfoCollection removedArgumentsInfo =
+                  prototypeChanges.getArgumentInfoCollection();
+              DexMethod newMethod = getNewMethodSignature(encodedMethod, prototypeChanges);
+              if (newMethod != method) {
+                Wrapper<DexMethod> wrapper = equivalence.wrap(newMethod);
 
-        boolean isOverrideOfPreviouslyChangedMethodInSuperClass =
-            changedVirtualMethods.getOrDefault(equivalence.wrap(method), ImmutableSet.of()).stream()
-                .anyMatch(other -> appView.appInfo().isSubtype(clazz.type, other));
-        if (isOverrideOfPreviouslyChangedMethodInSuperClass) {
-          assert methodPool.hasSeen(wrapper);
+                boolean isOverrideOfPreviouslyChangedMethodInSuperClass =
+                    changedVirtualMethods
+                        .getOrDefault(equivalence.wrap(method), ImmutableSet.of())
+                        .stream()
+                        .anyMatch(other -> appView.appInfo().isSubtype(clazz.type, other));
+                if (isOverrideOfPreviouslyChangedMethodInSuperClass) {
+                  assert methodPool.hasSeen(wrapper);
 
-          boolean signatureIsAvailable = usedSignatures.add(wrapper);
-          assert signatureIsAvailable;
+                  boolean signatureIsAvailable = usedSignatures.add(wrapper);
+                  assert signatureIsAvailable;
 
-          clazz.setVirtualMethod(i, encodedMethod.toTypeSubstitutedMethod(newMethod));
-          methodMapping.put(method, newMethod);
-        }
-      }
-    }
-    for (int i = 0; i < virtualMethods.size(); ++i) {
-      DexEncodedMethod encodedMethod = virtualMethods.get(i);
-      DexMethod method = encodedMethod.method;
-      RewrittenPrototypeDescription prototypeChanges =
-          getPrototypeChanges(encodedMethod, DISALLOW_ARGUMENT_REMOVAL);
-      DexMethod newMethod = getNewMethodSignature(encodedMethod, prototypeChanges);
-      if (newMethod != method) {
-        Wrapper<DexMethod> wrapper = equivalence.wrap(newMethod);
+                  methodMapping.put(method, newMethod);
+                  return encodedMethod.toTypeSubstitutedMethod(
+                      newMethod,
+                      removedArgumentsInfo.createParameterAnnotationsRemover(encodedMethod));
+                }
+              }
+              return encodedMethod;
+            });
+    clazz
+        .getMethodCollection()
+        .replaceVirtualMethods(
+            encodedMethod -> {
+              DexMethod method = encodedMethod.method;
+              RewrittenPrototypeDescription prototypeChanges =
+                  getPrototypeChanges(encodedMethod, DISALLOW_ARGUMENT_REMOVAL);
+              ArgumentInfoCollection removedArgumentsInfo =
+                  prototypeChanges.getArgumentInfoCollection();
+              DexMethod newMethod = getNewMethodSignature(encodedMethod, prototypeChanges);
+              if (newMethod != method) {
+                Wrapper<DexMethod> wrapper = equivalence.wrap(newMethod);
 
-        // TODO(b/110806787): Can be extended to handle collisions by renaming the given
-        //  method. Note that this also requires renaming all of the methods that override this
-        //  method, though.
-        if (!methodPool.hasSeen(wrapper) && usedSignatures.add(wrapper)) {
-          methodPool.seen(wrapper);
+                // TODO(b/110806787): Can be extended to handle collisions by renaming the given
+                //  method. Note that this also requires renaming all of the methods that override
+                // this
+                //  method, though.
+                if (!methodPool.hasSeen(wrapper) && usedSignatures.add(wrapper)) {
+                  methodPool.seen(wrapper);
 
-          clazz.setVirtualMethod(i, encodedMethod.toTypeSubstitutedMethod(newMethod));
-          methodMapping.put(method, newMethod);
+                  methodMapping.put(method, newMethod);
 
-          boolean added =
-              changedVirtualMethods
-                  .computeIfAbsent(equivalence.wrap(method), key -> Sets.newIdentityHashSet())
-                  .add(clazz.type);
-          assert added;
-        }
-      }
-    }
+                  boolean added =
+                      changedVirtualMethods
+                          .computeIfAbsent(
+                              equivalence.wrap(method), key -> Sets.newIdentityHashSet())
+                          .add(clazz.type);
+                  assert added;
+
+                  return encodedMethod.toTypeSubstitutedMethod(
+                      newMethod,
+                      removedArgumentsInfo.createParameterAnnotationsRemover(encodedMethod));
+                }
+              }
+              return encodedMethod;
+            });
   }
 
   private RewrittenPrototypeDescription getPrototypeChanges(
@@ -280,265 +311,36 @@ public class UninstantiatedTypeOptimization {
         || appView.appInfo().keepConstantArguments.contains(encodedMethod.method)) {
       return RewrittenPrototypeDescription.none();
     }
-    return new RewrittenPrototypeDescription(
-        encodedMethod.method.proto.returnType.isAlwaysNull(appView),
-        getRemovedArgumentsInfo(encodedMethod, strategy));
+    return RewrittenPrototypeDescription.createForUninstantiatedTypes(
+        encodedMethod.method, appView, getRemovedArgumentsInfo(encodedMethod, strategy));
   }
 
-  private RemovedArgumentsInfo getRemovedArgumentsInfo(
+  private ArgumentInfoCollection getRemovedArgumentsInfo(
       DexEncodedMethod encodedMethod, Strategy strategy) {
     if (strategy == DISALLOW_ARGUMENT_REMOVAL) {
-      return RemovedArgumentsInfo.empty();
+      return ArgumentInfoCollection.empty();
     }
 
-    List<RemovedArgumentInfo> removedArgumentsInfo = null;
+    ArgumentInfoCollection.Builder argInfosBuilder = ArgumentInfoCollection.builder();
     DexProto proto = encodedMethod.method.proto;
     int offset = encodedMethod.isStatic() ? 0 : 1;
     for (int i = 0; i < proto.parameters.size(); ++i) {
       DexType type = proto.parameters.values[i];
       if (type.isAlwaysNull(appView)) {
-        if (removedArgumentsInfo == null) {
-          removedArgumentsInfo = new ArrayList<>();
-        }
-        removedArgumentsInfo.add(
-            RemovedArgumentInfo.builder()
-                .setArgumentIndex(i + offset)
-                .setIsAlwaysNull()
-                .setType(type)
-                .build());
+        RemovedArgumentInfo removedArg =
+            RemovedArgumentInfo.builder().setIsAlwaysNull().setType(type).build();
+        argInfosBuilder.addArgumentInfo(i + offset, removedArg);
       }
     }
-    return removedArgumentsInfo != null
-        ? new RemovedArgumentsInfo(removedArgumentsInfo)
-        : RemovedArgumentsInfo.empty();
+    return argInfosBuilder.build();
   }
 
   private DexMethod getNewMethodSignature(
       DexEncodedMethod encodedMethod, RewrittenPrototypeDescription prototypeChanges) {
     DexItemFactory dexItemFactory = appView.dexItemFactory();
-
     DexMethod method = encodedMethod.method;
-    RemovedArgumentsInfo removedArgumentsInfo = prototypeChanges.getRemovedArgumentsInfo();
+    DexProto newProto = prototypeChanges.rewriteProto(encodedMethod, dexItemFactory);
 
-    if (prototypeChanges.isEmpty()) {
-      return method;
-    }
-
-    DexType newReturnType =
-        prototypeChanges.hasBeenChangedToReturnVoid()
-            ? dexItemFactory.voidType
-            : method.proto.returnType;
-
-    DexType[] newParameters;
-    if (removedArgumentsInfo.hasRemovedArguments()) {
-      // Currently not allowed to remove the receiver of an instance method. This would involve
-      // changing invoke-direct/invoke-virtual into invoke-static.
-      assert encodedMethod.isStatic() || !removedArgumentsInfo.isArgumentRemoved(0);
-      newParameters =
-          new DexType
-              [method.proto.parameters.size() - removedArgumentsInfo.numberOfRemovedArguments()];
-      int offset = encodedMethod.isStatic() ? 0 : 1;
-      int newParametersIndex = 0;
-      for (int argumentIndex = 0; argumentIndex < method.proto.parameters.size(); ++argumentIndex) {
-        if (!removedArgumentsInfo.isArgumentRemoved(argumentIndex + offset)) {
-          newParameters[newParametersIndex] = method.proto.parameters.values[argumentIndex];
-          newParametersIndex++;
-        }
-      }
-    } else {
-      newParameters = method.proto.parameters.values;
-    }
-
-    return dexItemFactory.createMethod(
-        method.holder, dexItemFactory.createProto(newReturnType, newParameters), method.name);
+    return dexItemFactory.createMethod(method.holder, newProto, method.name);
   }
-
-  public void rewrite(IRCode code) {
-    Set<BasicBlock> blocksToBeRemoved = Sets.newIdentityHashSet();
-    ListIterator<BasicBlock> blockIterator = code.listIterator();
-    while (blockIterator.hasNext()) {
-      BasicBlock block = blockIterator.next();
-      if (blocksToBeRemoved.contains(block)) {
-        continue;
-      }
-      InstructionListIterator instructionIterator = block.listIterator();
-      while (instructionIterator.hasNext()) {
-        Instruction instruction = instructionIterator.next();
-        if (instruction.throwsOnNullInput()) {
-          Value couldBeNullValue = instruction.getNonNullInput();
-          if (isThrowNullCandidate(
-              couldBeNullValue, instruction, appView, code.method.method.holder)) {
-            if (instruction.isInstanceGet() || instruction.isInstancePut()) {
-              ++numberOfInstanceGetOrInstancePutWithNullReceiver;
-            } else if (instruction.isInvokeMethodWithReceiver()) {
-              ++numberOfInvokesWithNullReceiver;
-            } else if (instruction.isArrayGet()
-                || instruction.isArrayPut()
-                || instruction.isArrayLength()) {
-              ++numberOfArrayInstructionsWithNullArray;
-            } else if (instruction.isMonitor()) {
-              ++numberOfMonitorWithNullReceiver;
-            } else {
-              assert false;
-            }
-            instructionIterator.replaceCurrentInstructionWithThrowNull(
-                appView, code, blockIterator, blocksToBeRemoved);
-            continue;
-          }
-        }
-        if (instruction.isFieldInstruction()) {
-          rewriteFieldInstruction(
-              instruction.asFieldInstruction(),
-              blockIterator,
-              instructionIterator,
-              code,
-              blocksToBeRemoved);
-        } else if (instruction.isInvokeMethod()) {
-          rewriteInvoke(
-              instruction.asInvokeMethod(),
-              blockIterator,
-              instructionIterator,
-              code,
-              blocksToBeRemoved);
-        }
-      }
-    }
-    code.removeBlocks(blocksToBeRemoved);
-    code.removeAllTrivialPhis();
-    code.removeUnreachableBlocks();
-    assert code.isConsistentSSA();
-  }
-
-  private static boolean isThrowNullCandidate(
-      Value couldBeNullValue,
-      Instruction current,
-      AppView<? extends AppInfoWithSubtyping> appView,
-      DexType context) {
-    if (!couldBeNullValue.isAlwaysNull(appView)) {
-      return false;
-    }
-    if (current.isFieldInstruction()) {
-      // Other resolution-related errors come first.
-      AbstractError abstractError =
-          current.asFieldInstruction().instructionInstanceCanThrow(appView, context);
-      if (abstractError.isThrowing()
-          && abstractError.getSpecificError(appView.dexItemFactory())
-              != appView.dexItemFactory().npeType) {
-        // We can't replace the current instruction with `throw null` if it may throw another
-        // Error/Exception than NullPointerException.
-        return false;
-      }
-    }
-    return true;
-  }
-
-  public void logResults() {
-    assert Log.ENABLED;
-    Log.info(
-        getClass(),
-        "Number of instance-get/instance-put with null receiver: %s",
-        numberOfInstanceGetOrInstancePutWithNullReceiver);
-    Log.info(
-        getClass(),
-        "Number of array instructions with null reference: %s",
-        numberOfArrayInstructionsWithNullArray);
-    Log.info(
-        getClass(), "Number of invokes with null argument: %s", numberOfInvokesWithNullArgument);
-    Log.info(
-        getClass(), "Number of invokes with null receiver: %s", numberOfInvokesWithNullReceiver);
-    Log.info(
-        getClass(), "Number of monitor with null receiver: %s", numberOfMonitorWithNullReceiver);
-  }
-
-  // instance-{get|put} with a null receiver has already been rewritten to `throw null`.
-  // At this point, field-instruction whose target field type is uninstantiated will be handled.
-  private void rewriteFieldInstruction(
-      FieldInstruction instruction,
-      ListIterator<BasicBlock> blockIterator,
-      InstructionListIterator instructionIterator,
-      IRCode code,
-      Set<BasicBlock> blocksToBeRemoved) {
-    DexType fieldType = instruction.getField().type;
-    if (fieldType.isAlwaysNull(appView)) {
-      AbstractError abstractError =
-          instruction.instructionInstanceCanThrow(appView, code.method.method.holder);
-      if (abstractError.isThrowing()) {
-        return;
-      }
-
-      // TODO(b/123857022): Should be possible to use definitionFor().
-      DexEncodedField field = appView.appInfo().resolveField(instruction.getField());
-      if (field == null) {
-        assert false : "Expected field-instruction with non-existent field to throw";
-        return;
-      }
-      // We also need to be sure that this field instruction cannot trigger static class
-      // initialization.
-      if (field.field.holder != code.method.method.holder) {
-        DexClass enclosingClass = appView.definitionFor(code.method.method.holder);
-        if (enclosingClass == null
-            || enclosingClass.classInitializationMayHaveSideEffects(appView.appInfo())) {
-          return;
-        }
-      }
-
-      BasicBlock block = instruction.getBlock();
-      if (instruction.isFieldPut()) {
-        Value value =
-            instruction.isInstancePut()
-                ? instruction.asInstancePut().value()
-                : instruction.asStaticPut().inValue();
-
-        TypeLatticeElement fieldLatticeType =
-            TypeLatticeElement.fromDexType(fieldType, Nullability.maybeNull(), appView);
-        if (!value.getTypeLattice().lessThanOrEqual(fieldLatticeType, appView)) {
-          // Broken type hierarchy. See FieldTypeTest#test_brokenTypeHierarchy.
-          assert appView.options().testing.allowTypeErrors;
-          return;
-        }
-
-        // We know that the right-hand side must be null, so this is a no-op.
-        instructionIterator.removeOrReplaceByDebugLocalRead();
-      } else {
-        // Replace the field read by the constant null.
-        instructionIterator.replaceCurrentInstruction(code.createConstNull());
-      }
-
-      if (block.hasCatchHandlers()) {
-        // This block can no longer throw.
-        block.getCatchHandlers().getUniqueTargets().forEach(BasicBlock::unlinkCatchHandler);
-      }
-    }
-  }
-
-  // invoke instructions with a null receiver has already been rewritten to `throw null`.
-  // At this point, we attempt to explore non-null-param-or-throw optimization info and replace
-  // the invocation with `throw null` if an argument is known to be null and the method is going to
-  // throw for that null argument.
-  private void rewriteInvoke(
-      InvokeMethod invoke,
-      ListIterator<BasicBlock> blockIterator,
-      InstructionListIterator instructionIterator,
-      IRCode code,
-      Set<BasicBlock> blocksToBeRemoved) {
-    DexEncodedMethod target =
-        invoke.lookupSingleTarget(appView.appInfo(), code.method.method.holder);
-    if (target == null) {
-      return;
-    }
-
-    BitSet facts = target.getOptimizationInfo().getNonNullParamOrThrow();
-    if (facts != null) {
-      for (int i = 0; i < invoke.arguments().size(); i++) {
-        Value argument = invoke.arguments().get(i);
-        if (argument.isAlwaysNull(appView) && facts.get(i)) {
-          instructionIterator.replaceCurrentInstructionWithThrowNull(
-              appView, code, blockIterator, blocksToBeRemoved);
-          ++numberOfInvokesWithNullArgument;
-          return;
-        }
-      }
-    }
-  }
-
 }

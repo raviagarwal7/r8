@@ -4,31 +4,47 @@
 package com.android.tools.r8;
 
 import static com.android.tools.r8.D8Command.USAGE_MESSAGE;
+import static com.android.tools.r8.utils.ExceptionUtils.unwrapExecutionException;
 
 import com.android.tools.r8.dex.ApplicationReader;
 import com.android.tools.r8.dex.ApplicationWriter;
 import com.android.tools.r8.dex.Marker;
 import com.android.tools.r8.dex.Marker.Tool;
 import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.InitClassLens;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.analysis.ClassInitializerAssertionEnablingAnalysis;
+import com.android.tools.r8.inspector.internal.InspectorImpl;
 import com.android.tools.r8.ir.conversion.IRConverter;
+import com.android.tools.r8.ir.desugar.PrefixRewritingMapper;
+import com.android.tools.r8.ir.optimize.AssertionsRewriter;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackSimple;
+import com.android.tools.r8.jar.CfApplicationWriter;
 import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.naming.PrefixRewritingNamingLens;
+import com.android.tools.r8.naming.signature.GenericSignatureRewriter;
 import com.android.tools.r8.origin.CommandLineOrigin;
+import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.CfgPrinter;
 import com.android.tools.r8.utils.ExceptionUtils;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.StringDiagnostic;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
-import com.android.tools.r8.utils.VersionProperties;
 import com.google.common.collect.ImmutableList;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -105,7 +121,7 @@ public final class D8 {
       return;
     }
     if (command.isPrintVersion()) {
-      Version.printToolVersion("D8");
+      System.out.println("D8 " + Version.getVersionString());
       return;
     }
     InternalOptions options = command.getInternalOptions();
@@ -116,7 +132,7 @@ public final class D8 {
   /**
    * Command-line entry to D8.
    *
-   * See {@link D8Command#USAGE_MESSAGE} or run {@code d8 --help} for usage information.
+   * <p>See {@link D8Command#USAGE_MESSAGE} or run {@code d8 --help} for usage information.
    */
   public static void main(String[] args) {
     if (args.length == 0) {
@@ -140,34 +156,53 @@ public final class D8 {
         });
   }
 
-  // Compute the marker to be placed in the main dex file.
-  static Marker getMarker(InternalOptions options) {
-    if (options.hasMarker()) {
-      return options.getMarker();
-    }
-    if (options.testing.dontCreateMarkerInD8) {
-      return null;
-    }
-    Marker marker = new Marker(Tool.D8)
-        .setVersion(Version.LABEL)
-        .setCompilationMode(options.debug ? CompilationMode.DEBUG : CompilationMode.RELEASE)
-        .setMinApi(options.minApiLevel);
-    if (Version.isDev()) {
-      marker.setSha1(VersionProperties.INSTANCE.getSha());
-    }
-    return marker;
-  }
-
   private static void run(AndroidApp inputApp, InternalOptions options, ExecutorService executor)
       throws IOException {
-    Timing timing = new Timing("D8");
+    Timing timing = Timing.create("D8", options);
     try {
       // Disable global optimizations.
       options.disableGlobalOptimizations();
 
       DexApplication app = new ApplicationReader(inputApp, options, timing).read(executor);
+      PrefixRewritingMapper rewritePrefix =
+          options.desugaredLibraryConfiguration.createPrefixRewritingMapper(options);
       AppInfo appInfo = new AppInfo(app, inputApp.getBucketId());
-      app = optimize(app, appInfo, options, timing, executor);
+
+      final CfgPrinter printer = options.printCfg ? new CfgPrinter() : null;
+
+      if (AssertionsRewriter.isEnabled(options)) {
+        // Run analysis to mark all <clinit> methods having the javac generated assertion
+        // enabling code.
+        ClassInitializerAssertionEnablingAnalysis analysis =
+            new ClassInitializerAssertionEnablingAnalysis(
+                appInfo.dexItemFactory(), OptimizationFeedbackSimple.getInstance());
+        ThreadUtils.processItems(
+            appInfo.classes(),
+            clazz -> {
+              ProgramMethod classInitializer = clazz.getProgramClassInitializer();
+              if (classInitializer != null) {
+                analysis.processNewlyLiveMethod(classInitializer);
+              }
+            },
+            executor);
+      }
+
+      AppView<?> appView = AppView.createForD8(appInfo, rewritePrefix);
+
+      IRConverter converter = new IRConverter(appView, timing, printer);
+      app = converter.convert(app, executor);
+
+      if (options.printCfg) {
+        if (options.printCfgFile == null || options.printCfgFile.isEmpty()) {
+          System.out.print(printer.toString());
+        } else {
+          try (OutputStreamWriter writer =
+              new OutputStreamWriter(
+                  new FileOutputStream(options.printCfgFile), StandardCharsets.UTF_8)) {
+            writer.write(printer.toString());
+          }
+        }
+      }
 
       // Close any internal archive providers now the application is fully processed.
       inputApp.closeInternalArchiveProviders();
@@ -181,32 +216,71 @@ public final class D8 {
       // Preserve markers from input dex code and add a marker with the current version
       // if there were class file inputs.
       boolean hasClassResources = false;
+      boolean hasDexResources = false;
       for (DexProgramClass dexProgramClass : app.classes()) {
         if (dexProgramClass.originatesFromClassResource()) {
           hasClassResources = true;
-          break;
+          if (hasDexResources) {
+            break;
+          }
+        } else if (dexProgramClass.originatesFromDexResource()) {
+          hasDexResources = true;
+          if (hasClassResources) {
+            break;
+          }
         }
       }
-      Marker marker = getMarker(options);
+      Marker marker = options.getMarker(Tool.D8);
       Set<Marker> markers = new HashSet<>(app.dexItemFactory.extractMarkers());
       if (marker != null && hasClassResources) {
         markers.add(marker);
       }
+      Marker.checkCompatibleDesugaredLibrary(markers, options.reporter);
 
-      new ApplicationWriter(
-              app,
-              null,
-              options,
-              marker == null ? null : ImmutableList.copyOf(markers),
-              null,
-              GraphLense.getIdentityLense(),
-              NamingLens.getIdentityLens(),
-              null,
-              null)
-          .write(executor);
+      InspectorImpl.runInspections(options.outputInspections, app);
+      if (options.isGeneratingClassFiles()) {
+        new CfApplicationWriter(
+                app,
+                appView,
+                options,
+                marker,
+                GraphLense.getIdentityLense(),
+                NamingLens.getIdentityLens(),
+                null)
+            .write(options.getClassFileConsumer());
+      } else {
+        NamingLens namingLens;
+        DexApplication finalApp = app;
+        if (!hasDexResources || !hasClassResources || !appView.rewritePrefix.isRewriting()) {
+          // All inputs are either dex or cf, or there is nothing to rewrite.
+          namingLens =
+              hasDexResources
+                  ? NamingLens.getIdentityLens()
+                  : PrefixRewritingNamingLens.createPrefixRewritingNamingLens(appView);
+          new GenericSignatureRewriter(appView, namingLens)
+              .run(appView.appInfo().classes(), executor);
+        } else {
+          // There are both cf and dex inputs in the program, and rewriting is required for
+          // desugared library only on cf inputs. We cannot easily rewrite part of the program
+          // without iterating again the IR. We fall-back to writing one app with rewriting and
+          // merging it with the other app in rewriteNonDexInputs.
+          finalApp = rewriteNonDexInputs(appView, inputApp, options, executor, timing, app);
+          namingLens = NamingLens.getIdentityLens();
+        }
+        new ApplicationWriter(
+                finalApp,
+                appView,
+                options,
+                marker == null ? null : ImmutableList.copyOf(markers),
+                GraphLense.getIdentityLense(),
+                InitClassLens.getDefault(),
+                namingLens,
+                null)
+            .write(executor);
+      }
       options.printWarnings();
     } catch (ExecutionException e) {
-      throw R8.unwrapExecutionException(e);
+      throw unwrapExecutionException(e);
     } finally {
       options.signalFinishedToConsumers();
       // Dump timings.
@@ -214,6 +288,61 @@ public final class D8 {
         timing.report();
       }
     }
+  }
+
+  private static DexApplication rewriteNonDexInputs(
+      AppView<?> appView,
+      AndroidApp inputApp,
+      InternalOptions options,
+      ExecutorService executor,
+      Timing timing,
+      DexApplication app)
+      throws IOException, ExecutionException {
+    // TODO(b/154575955): Remove the naming lens in D8.
+    appView
+        .options()
+        .reporter
+        .warning(
+            new StringDiagnostic(
+                "The compilation is slowed down due to a mix of class file and dex file inputs in"
+                    + " the context of desugared library. This can be fixed by pre-compiling to"
+                    + " dex the class file inputs and dex merging only dex files."));
+    List<DexProgramClass> dexProgramClasses = new ArrayList<>();
+    List<DexProgramClass> nonDexProgramClasses = new ArrayList<>();
+    for (DexProgramClass aClass : app.classes()) {
+      if (aClass.originatesFromDexResource()) {
+        dexProgramClasses.add(aClass);
+      } else {
+        nonDexProgramClasses.add(aClass);
+      }
+    }
+    DexApplication cfApp = app.builder().replaceProgramClasses(nonDexProgramClasses).build();
+    ConvertedCfFiles convertedCfFiles = new ConvertedCfFiles();
+    NamingLens prefixRewritingNamingLens =
+        PrefixRewritingNamingLens.createPrefixRewritingNamingLens(appView);
+    new GenericSignatureRewriter(appView, prefixRewritingNamingLens)
+        .run(appView.appInfo().classes(), executor);
+    new ApplicationWriter(
+            cfApp,
+            null,
+            options,
+            null,
+            GraphLense.getIdentityLense(),
+            InitClassLens.getDefault(),
+            prefixRewritingNamingLens,
+            null,
+            convertedCfFiles)
+        .write(executor);
+    AndroidApp.Builder builder = AndroidApp.builder(inputApp);
+    builder.getProgramResourceProviders().clear();
+    builder.addProgramResourceProvider(convertedCfFiles);
+    AndroidApp newAndroidApp = builder.build();
+    DexApplication newApp = new ApplicationReader(newAndroidApp, options, timing).read(executor);
+    DexApplication.Builder<?> finalDexApp = newApp.builder();
+    for (DexProgramClass dexProgramClass : dexProgramClasses) {
+      finalDexApp.addProgramClass(dexProgramClass);
+    }
+    return finalDexApp.build();
   }
 
   static DexApplication optimize(
@@ -225,20 +354,42 @@ public final class D8 {
       throws IOException, ExecutionException {
     final CfgPrinter printer = options.printCfg ? new CfgPrinter() : null;
 
-    IRConverter converter = new IRConverter(appInfo, options, timing, printer);
-    application = converter.convertToDex(application, executor);
+    IRConverter converter = new IRConverter(appInfo, timing, printer);
+    application = converter.convert(application, executor);
 
     if (options.printCfg) {
       if (options.printCfgFile == null || options.printCfgFile.isEmpty()) {
         System.out.print(printer.toString());
       } else {
-        try (OutputStreamWriter writer = new OutputStreamWriter(
-            new FileOutputStream(options.printCfgFile),
-            StandardCharsets.UTF_8)) {
+        try (OutputStreamWriter writer =
+            new OutputStreamWriter(
+                new FileOutputStream(options.printCfgFile), StandardCharsets.UTF_8)) {
           writer.write(printer.toString());
         }
       }
     }
     return application;
+  }
+
+  static class ConvertedCfFiles implements DexIndexedConsumer, ProgramResourceProvider {
+
+    private final List<ProgramResource> resources = new ArrayList<>();
+
+    @Override
+    public synchronized void accept(
+        int fileIndex, ByteDataView data, Set<String> descriptors, DiagnosticsHandler handler) {
+      // TODO(b/154106502): Map Origin information.
+      resources.add(
+          ProgramResource.fromBytes(
+              Origin.unknown(), ProgramResource.Kind.DEX, data.copyByteData(), descriptors));
+    }
+
+    @Override
+    public Collection<ProgramResource> getProgramResources() throws ResourceException {
+      return resources;
+    }
+
+    @Override
+    public void finished(DiagnosticsHandler handler) {}
   }
 }

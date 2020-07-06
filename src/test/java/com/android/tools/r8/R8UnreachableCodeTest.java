@@ -7,7 +7,7 @@ package com.android.tools.r8;
 import static org.junit.Assert.assertEquals;
 
 import com.android.tools.r8.dex.ApplicationReader;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexProgramClass;
@@ -38,16 +38,16 @@ public class R8UnreachableCodeTest {
             .addProgramFiles(SMALI_DIR.resolve(name).resolve(name + ".dex"))
             .build();
     ExecutorService executorService = Executors.newSingleThreadExecutor();
-    Timing timing = new Timing("R8UnreachableCodeTest");
+    Timing timing = Timing.empty();
     InternalOptions options = new InternalOptions();
     options.programConsumer = DexIndexedConsumer.emptyConsumer();
     DirectMappedDexApplication application =
         new ApplicationReader(input, options, timing).read(executorService).toDirect();
     IRConverter converter =
-        new IRConverter(AppView.createForR8(new AppInfoWithSubtyping(application), options));
-    converter.optimize(application);
+        new IRConverter(AppView.createForR8(new AppInfoWithClassHierarchy(application)), null);
+    converter.optimize();
     DexProgramClass clazz = application.classes().iterator().next();
-    assertEquals(4, clazz.directMethods().size());
+    assertEquals(4, clazz.getMethodCollection().numberOfDirectMethods());
     for (DexEncodedMethod method : clazz.directMethods()) {
       if (!method.method.name.toString().equals("main")) {
         assertEquals(2, method.getCode().asDexCode().instructions.length);

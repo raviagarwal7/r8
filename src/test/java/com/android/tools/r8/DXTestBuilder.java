@@ -29,6 +29,8 @@ public class DXTestBuilder
   // Ordered list of injar entries.
   private List<Path> injars = new ArrayList<>();
 
+  private int minApiLevel = -1;
+
   private DXTestBuilder(TestState state) {
     super(state, D8Command.builder(), Backend.DEX);
   }
@@ -51,9 +53,15 @@ public class DXTestBuilder
       Path outJar = dxOutputFolder.resolve("output.jar");
 
       List<String> args = new ArrayList<>();
+      if (minApiLevel >= 0) {
+        args.add("--min-sdk-version=" + minApiLevel);
+      }
       args.add("--output=" + outJar.toString());
       args.addAll(injars.stream().map(Path::toString).collect(Collectors.toList()));
-      ProcessResult result = ToolHelper.runDX(args.toArray(StringUtils.EMPTY_ARRAY));
+      ProcessResult result =
+          ToolHelper.runProcess(
+              ToolHelper.createProcessBuilderForRunningDx(args.toArray(StringUtils.EMPTY_ARRAY)),
+              getStdoutForTesting());
       if (result.exitCode != 0) {
         throw new CompilationFailedException(result.toString());
       }
@@ -113,6 +121,12 @@ public class DXTestBuilder
   @Override
   public DXTestBuilder addProgramFiles(Collection<Path> files) {
     injars.addAll(files);
+    return self();
+  }
+
+  @Override
+  public DXTestBuilder setMinApi(int minApiLevel) {
+    this.minApiLevel = minApiLevel;
     return self();
   }
 }

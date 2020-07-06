@@ -14,10 +14,10 @@ import com.android.tools.r8.code.AputShort;
 import com.android.tools.r8.code.AputWide;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexItemFactory;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.ArrayTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.conversion.TypeConstraintResolver;
@@ -26,11 +26,9 @@ import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.ir.regalloc.RegisterAllocator;
 import java.util.Arrays;
 
-public class ArrayPut extends Instruction implements ImpreciseMemberTypeInstruction {
+public class ArrayPut extends ArrayAccess {
 
   // Input values are ordered according to the stack order of the Java bytecode astore.
-  private static final int ARRAY_INDEX = 0;
-  private static final int INDEX_INDEX = 1;
   private static final int VALUE_INDEX = 2;
 
   private MemberType type;
@@ -44,16 +42,13 @@ public class ArrayPut extends Instruction implements ImpreciseMemberTypeInstruct
   }
 
   @Override
+  public int opcode() {
+    return Opcodes.ARRAY_PUT;
+  }
+
+  @Override
   public <T> T accept(InstructionVisitor<T> visitor) {
     return visitor.visit(this);
-  }
-
-  public Value array() {
-    return inValues.get(ARRAY_INDEX);
-  }
-
-  public Value index() {
-    return inValues.get(INDEX_INDEX);
   }
 
   public Value value() {
@@ -83,11 +78,15 @@ public class ArrayPut extends Instruction implements ImpreciseMemberTypeInstruct
       case OBJECT:
         instruction = new AputObject(value, array, index);
         break;
-      case BOOLEAN:
-        instruction = new AputBoolean(value, array, index);
-        break;
-      case BYTE:
-        instruction = new AputByte(value, array, index);
+      case BOOLEAN_OR_BYTE:
+        ArrayTypeElement arrayType = array().getType().asArrayType();
+        if (arrayType != null && arrayType.getMemberType() == TypeElement.getBoolean()) {
+          instruction = new AputBoolean(value, array, index);
+        } else {
+          assert array().getType().isDefinitelyNull()
+              || arrayType.getMemberType() == TypeElement.getByte();
+          instruction = new AputByte(value, array, index);
+        }
         break;
       case CHAR:
         instruction = new AputChar(value, array, index);
@@ -134,8 +133,60 @@ public class ArrayPut extends Instruction implements ImpreciseMemberTypeInstruct
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    // ArrayPut has side-effects on input values.
+  public boolean instructionMayHaveSideEffects(
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    // In debug mode, ArrayPut has a side-effect on the locals.
+    if (appView.options().debug) {
+      return true;
+    }
+
+    // In release mode, ArrayPut has side-effects on the input array, unless the index is in bounds
+    // and the array is never used.
+    Value array = array().getAliasedValue();
+    if (array.isPhi() || !array.definition.isNewArrayEmpty()) {
+      return true;
+    }
+
+    NewArrayEmpty definition = array.definition.asNewArrayEmpty();
+    Value sizeValue = definition.size().getAliasedValue();
+    if (sizeValue.isPhi() || !sizeValue.definition.isConstNumber()) {
+      return true;
+    }
+
+    Value indexValue = index().getAliasedValue();
+    if (indexValue.isPhi() || !indexValue.definition.isConstNumber()) {
+      return true;
+    }
+
+    long index = indexValue.definition.asConstNumber().getRawValue();
+    long size = sizeValue.definition.asConstNumber().getRawValue();
+    if (index < 0 || index >= size) {
+      return true;
+    }
+
+    // Check for type errors.
+    TypeElement arrayType = array.getType();
+    TypeElement valueType = value().getType();
+    if (!arrayType.isArrayType()) {
+      return true;
+    }
+    TypeElement memberType = arrayType.asArrayType().getMemberTypeAsValueType();
+    if (!valueType.lessThanOrEqualUpToNullability(memberType, appView)) {
+      return true;
+    }
+
+    // Check that all usages of the array are array stores.
+    for (Instruction user : array.uniqueUsers()) {
+      if (!user.isArrayPut() || user.asArrayPut().array() != array) {
+        return true;
+      }
+    }
+
+    if (array.numberOfPhiUsers() > 0) {
+      // The array could be used indirectly.
+      return true;
+    }
+
     return false;
   }
 
@@ -164,7 +215,7 @@ public class ArrayPut extends Instruction implements ImpreciseMemberTypeInstruct
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forArrayPut();
   }
 
@@ -184,7 +235,7 @@ public class ArrayPut extends Instruction implements ImpreciseMemberTypeInstruct
   }
 
   @Override
-  public boolean throwsNpeIfValueIsNull(Value value, DexItemFactory dexItemFactory) {
+  public boolean throwsNpeIfValueIsNull(Value value, AppView<?> appView, ProgramMethod context) {
     return array() == value;
   }
 
@@ -201,5 +252,15 @@ public class ArrayPut extends Instruction implements ImpreciseMemberTypeInstruct
   @Override
   public void constrainType(TypeConstraintResolver constraintResolver) {
     constraintResolver.constrainArrayMemberType(type, value(), array(), t -> type = t);
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
+  }
+
+  @Override
+  public ArrayAccess withMemberType(MemberType newMemberType) {
+    return new ArrayPut(newMemberType, array(), index(), value());
   }
 }

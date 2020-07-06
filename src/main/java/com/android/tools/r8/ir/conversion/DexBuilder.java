@@ -42,7 +42,7 @@ import com.android.tools.r8.graph.DexCode.TryHandler;
 import com.android.tools.r8.graph.DexCode.TryHandler.TypeAddrPair;
 import com.android.tools.r8.graph.DexDebugEventBuilder;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Argument;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.CatchHandlers;
@@ -50,13 +50,14 @@ import com.android.tools.r8.ir.code.DebugPosition;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.If;
 import com.android.tools.r8.ir.code.InstructionIterator;
+import com.android.tools.r8.ir.code.InstructionListIterator;
+import com.android.tools.r8.ir.code.IntSwitch;
 import com.android.tools.r8.ir.code.JumpInstruction;
 import com.android.tools.r8.ir.code.Move;
 import com.android.tools.r8.ir.code.NewArrayFilledData;
 import com.android.tools.r8.ir.code.Position;
 import com.android.tools.r8.ir.code.Return;
 import com.android.tools.r8.ir.code.StackValue;
-import com.android.tools.r8.ir.code.Switch;
 import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.ir.optimize.CodeRewriter;
 import com.android.tools.r8.ir.regalloc.RegisterAllocator;
@@ -182,12 +183,12 @@ public class DexBuilder {
       // large for the if encoding.
       rewriteIfs();
 
-      // Reset the state of the builder to start from scratch.
-      reset();
-
       // Remove redundant debug position instructions. They would otherwise materialize as
       // unnecessary nops.
       removeRedundantDebugPositions(ir);
+
+      // Reset the state of the builder to start from scratch.
+      reset();
 
       // Populate the builder info objects.
       numberOfInstructions = 0;
@@ -203,9 +204,8 @@ public class DexBuilder {
 
       // Compute offsets.
       offset = 0;
-      InstructionIterator it = ir.instructionIterator();
-      while (it.hasNext()) {
-        Info info = getInfo(it.next());
+      for (com.android.tools.r8.ir.code.Instruction instruction : ir.instructions()) {
+        Info info = getInfo(instruction);
         info.setOffset(offset);
         offset += info.computeSize(this);
         ++numberOfInstructions;
@@ -216,21 +216,17 @@ public class DexBuilder {
     DexDebugEventBuilder debugEventBuilder = new DexDebugEventBuilder(ir, options);
     List<Instruction> dexInstructions = new ArrayList<>(numberOfInstructions);
     int instructionOffset = 0;
-    InstructionIterator instructionIterator = ir.instructionIterator();
-    while (instructionIterator.hasNext()) {
-      com.android.tools.r8.ir.code.Instruction ir = instructionIterator.next();
-      Info info = getInfo(ir);
+    for (com.android.tools.r8.ir.code.Instruction irInstruction : ir.instructions()) {
+      Info info = getInfo(irInstruction);
       int previousInstructionCount = dexInstructions.size();
       info.addInstructions(this, dexInstructions);
       int instructionStartOffset = instructionOffset;
-      if (previousInstructionCount < dexInstructions.size()) {
-        while (previousInstructionCount < dexInstructions.size()) {
-          Instruction instruction = dexInstructions.get(previousInstructionCount++);
-          instruction.setOffset(instructionOffset);
-          instructionOffset += instruction.getSize();
-        }
+      while (previousInstructionCount < dexInstructions.size()) {
+        Instruction dexInstruction = dexInstructions.get(previousInstructionCount++);
+        dexInstruction.setOffset(instructionOffset);
+        instructionOffset += dexInstruction.getSize();
       }
-      debugEventBuilder.add(instructionStartOffset, instructionOffset, ir);
+      debugEventBuilder.add(instructionStartOffset, instructionOffset, irInstruction);
     }
 
     // Workaround dalvik tracing bug, where the dalvik tracing JIT can end up tracing
@@ -336,7 +332,7 @@ public class DexBuilder {
   // After this pass all remaining debug positions mark places where we must ensure a materializing
   // instruction, eg, for two successive lines without intermediate instructions.
   public static void removeRedundantDebugPositions(IRCode code) {
-    if (!code.hasDebugPositions) {
+    if (!code.metadata().mayHaveDebugPosition()) {
       return;
     }
     // Current position known to have a materializing instruction associated with it.
@@ -399,9 +395,7 @@ public class DexBuilder {
       BasicBlock nextBlock =
           blockIndex + 1 < code.blocks.size() ? code.blocks.get(blockIndex + 1) : null;
 
-      InstructionIterator iterator = currentBlock.iterator();
-      while (iterator.hasNext()) {
-        com.android.tools.r8.ir.code.Instruction instruction = iterator.next();
+      for (com.android.tools.r8.ir.code.Instruction instruction : currentBlock.getInstructions()) {
         if (instruction.isDebugPosition()) {
           if (unresolvedPosition == null
               && currentMaterializedPosition == instruction.getPosition()) {
@@ -446,7 +440,7 @@ public class DexBuilder {
     }
     // Remove all unneeded positions.
     if (!toRemove.isEmpty()) {
-      InstructionIterator it = code.instructionIterator();
+      InstructionListIterator it = code.instructionListIterator();
       int i = 0;
       while (it.hasNext() && i < toRemove.size()) {
         if (it.next() == toRemove.get(i)) {
@@ -503,7 +497,8 @@ public class DexBuilder {
         If theIf = block.exit().asIf();
         BasicBlock trueTarget = theIf.getTrueTarget();
         BasicBlock newBlock =
-            BasicBlock.createGotoBlock(ir.blocks.size(), theIf.getPosition(), trueTarget);
+            BasicBlock.createGotoBlock(
+                ir.blocks.size(), theIf.getPosition(), ir.metadata(), trueTarget);
         theIf.setTrueTarget(newBlock);
         theIf.invert();
         it.add(newBlock);
@@ -611,9 +606,6 @@ public class DexBuilder {
 
   public void add(com.android.tools.r8.ir.code.Instruction instr, Instruction dex) {
     assert !instr.isGoto();
-    assert isBuildingForComparison()
-        || !instr.isDexItemBasedConstString()
-        || ir.method.getOptimizationInfo().useIdentifierNameString();
     add(instr, new FixedSizeInfo(instr, dex));
   }
 
@@ -622,7 +614,7 @@ public class DexBuilder {
     add(ir, new MultiFixedSizeInfo(ir, dex));
   }
 
-  public void addSwitch(Switch s, Format31t dex) {
+  public void addSwitch(IntSwitch s, Format31t dex) {
     assert nextBlock == s.fallthroughBlock();
     switchPayloadInfos.add(new SwitchPayloadInfo(s, dex));
     add(s, dex);
@@ -669,10 +661,12 @@ public class DexBuilder {
 
   // Helper used by the info objects.
   private Info getInfo(com.android.tools.r8.ir.code.Instruction instruction) {
+    assert instruction.getNumber() >= 0;
     return instructionToInfo[instructionNumberToIndex(instruction.getNumber())];
   }
 
   private void setInfo(com.android.tools.r8.ir.code.Instruction instruction, Info info) {
+    assert instruction.getNumber() >= 0;
     if (!(info instanceof FallThroughInfo)) {
       previousNonFallthroughInfo = info;
     }
@@ -714,7 +708,7 @@ public class DexBuilder {
 
   // Helper for computing switch payloads.
   private Nop createSwitchPayload(SwitchPayloadInfo info, int offset) {
-    Switch ir = info.ir;
+    IntSwitch ir = info.ir;
     // Patch the payload offset in the generated switch instruction now
     // that the location is known.
     info.dex.setPayloadOffset(offset - getInfo(ir).getOffset());
@@ -1410,7 +1404,7 @@ public class DexBuilder {
     @Override
     public void addInstructions(DexBuilder builder, List<Instruction> instructions) {
       Move move = getMove();
-      TypeLatticeElement moveType = move.outValue().getTypeLattice();
+      TypeElement moveType = move.getOutType();
       int src = srcRegister(builder);
       int dest = destRegister(builder);
       Instruction instruction;
@@ -1420,33 +1414,33 @@ public class DexBuilder {
             instruction = new Nop();
             break;
           }
-          if (moveType.isSingle()) {
+          if (moveType.isSinglePrimitive()) {
             instruction = new com.android.tools.r8.code.Move(dest, src);
-          } else if (moveType.isWide()) {
+          } else if (moveType.isWidePrimitive()) {
             instruction = new MoveWide(dest, src);
-          } else if (moveType.isReference()) {
+          } else if (moveType.isReferenceType()) {
             instruction = new MoveObject(dest, src);
           } else {
             throw new Unreachable("Unexpected type: " + move.outType());
           }
           break;
         case 2:
-          if (moveType.isSingle()) {
+          if (moveType.isSinglePrimitive()) {
             instruction = new MoveFrom16(dest, src);
-          } else if (moveType.isWide()) {
+          } else if (moveType.isWidePrimitive()) {
             instruction = new MoveWideFrom16(dest, src);
-          } else if (moveType.isReference()) {
+          } else if (moveType.isReferenceType()) {
             instruction = new MoveObjectFrom16(dest, src);
           } else {
             throw new Unreachable("Unexpected type: " + move.outType());
           }
           break;
         case 3:
-          if (moveType.isSingle()) {
+          if (moveType.isSinglePrimitive()) {
             instruction = new Move16(dest, src);
-          } else if (moveType.isWide()) {
+          } else if (moveType.isWidePrimitive()) {
             instruction = new MoveWide16(dest, src);
-          } else if (moveType.isReference()) {
+          } else if (moveType.isReferenceType()) {
             instruction = new MoveObject16(dest, src);
           } else {
             throw new Unreachable("Unexpected type: " + move.outType());
@@ -1511,10 +1505,10 @@ public class DexBuilder {
 
   private static class SwitchPayloadInfo {
 
-    public final Switch ir;
+    public final IntSwitch ir;
     public final Format31t dex;
 
-    public SwitchPayloadInfo(Switch ir, Format31t dex) {
+    public SwitchPayloadInfo(IntSwitch ir, Format31t dex) {
       this.ir = ir;
       this.dex = dex;
     }

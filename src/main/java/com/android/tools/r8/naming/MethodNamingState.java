@@ -3,316 +3,191 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.naming;
 
-import static com.android.tools.r8.naming.Minifier.MinifierMemberNamingStrategy.EMPTY_CHAR_ARRAY;
-
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
-import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexString;
-import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.utils.StringUtils;
-import com.google.common.collect.HashBasedTable;
-import com.google.common.collect.Sets;
-import com.google.common.collect.Table;
-import java.io.PrintStream;
+import com.android.tools.r8.naming.MethodNamingState.InternalNewNameState;
+import com.android.tools.r8.utils.MethodSignatureEquivalence;
+import com.google.common.base.Equivalence.Wrapper;
 import java.util.HashMap;
-import java.util.Iterator;
+import java.util.HashSet;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Set;
+import java.util.function.BiPredicate;
 import java.util.function.Function;
 
-class MethodNamingState<KeyType> {
+class MethodNamingState<KeyType> extends MethodNamingStateBase<KeyType, InternalNewNameState> {
 
-  private final AppView<? extends AppInfo> appView;
-  private final MethodNamingState<KeyType> parent;
-  private final Map<KeyType, InternalState> usedNames = new HashMap<>();
-  private final Function<DexProto, KeyType> keyTransform;
-  private final MemberNamingStrategy strategy;
-
-  static <S> MethodNamingState<S> createRoot(
-      AppView<? extends AppInfo> appView,
-      Function<DexProto, S> keyTransform,
-      MemberNamingStrategy strategy) {
-    return new MethodNamingState<>(null, appView, keyTransform, strategy);
-  }
+  private final MethodReservationState<?> reservationState;
+  private final MethodNamingState<KeyType> parentNamingState;
+  private final MemberNamingStrategy namingStrategy;
 
   private MethodNamingState(
-      MethodNamingState<KeyType> parent,
-      AppView<? extends AppInfo> appView,
-      Function<DexProto, KeyType> keyTransform,
-      MemberNamingStrategy strategy) {
-    this.appView = appView;
-    this.parent = parent;
-    this.keyTransform = keyTransform;
-    this.strategy = strategy;
+      MethodNamingState<KeyType> parentNamingState,
+      Function<DexMethod, KeyType> keyTransform,
+      MemberNamingStrategy strategy,
+      MethodReservationState<?> reservationState) {
+    super(keyTransform);
+    this.parentNamingState = parentNamingState;
+    this.namingStrategy = strategy;
+    this.reservationState = reservationState;
   }
 
-  public MethodNamingState<KeyType> createChild() {
-    return new MethodNamingState<>(this, appView, keyTransform, strategy);
+  static <KeyType> MethodNamingState<KeyType> createRoot(
+      Function<DexMethod, KeyType> keyTransform,
+      MemberNamingStrategy namingStrategy,
+      MethodReservationState<?> reservationState) {
+    return new MethodNamingState<>(null, keyTransform, namingStrategy, reservationState);
   }
 
-  private InternalState findInternalStateFor(KeyType key) {
-    InternalState result = usedNames.get(key);
-    if (result == null && parent != null) {
-      result = parent.findInternalStateFor(key);
+  MethodNamingState<KeyType> createChild(MethodReservationState<?> frontierReservationState) {
+    return new MethodNamingState<>(
+        this, this.keyTransform, this.namingStrategy, frontierReservationState);
+  }
+
+  DexString newOrReservedNameFor(DexEncodedMethod method) {
+    return newOrReservedNameFor(method, this::isAvailable);
+  }
+
+  DexString newOrReservedNameFor(
+      DexEncodedMethod method, BiPredicate<DexString, DexMethod> isAvailable) {
+    DexString newName = getAssignedName(method.getReference());
+    if (newName != null) {
+      return newName;
     }
-    return result;
-  }
-
-  private InternalState getOrCreateInternalStateFor(KeyType key) {
-    // TODO(herhut): Maybe allocate these sparsely and search via state chain.
-    InternalState result = usedNames.get(key);
-    if (result == null) {
-      InternalState parentState = parent != null ? parent.getOrCreateInternalStateFor(key) : null;
-      result = new InternalState(appView, parentState);
-      usedNames.put(key, result);
+    Set<DexString> reservedNamesFor = reservationState.getReservedNamesFor(method.getReference());
+    // Reservations with applymapping can cause multiple reserved names added to the frontier. In
+    // that case, the strategy will return the correct one.
+    if (reservedNamesFor != null && reservedNamesFor.size() == 1) {
+      DexString candidate = reservedNamesFor.iterator().next();
+      if (isAvailable(candidate, method.getReference())) {
+        return candidate;
+      }
     }
-    return result;
+    return nextName(method, isAvailable);
   }
 
-  private DexString getAssignedNameFor(DexString name, KeyType key) {
-    InternalState state = findInternalStateFor(key);
-    if (state == null) {
-      return null;
-    }
-    return state.getAssignedNameFor(name, key);
+  DexString nextName(DexEncodedMethod method, BiPredicate<DexString, DexMethod> isAvailable) {
+    InternalNewNameState internalState = getOrCreateInternalState(method.getReference());
+    DexString newName = namingStrategy.next(method, internalState, isAvailable);
+    assert newName != null;
+    return newName;
   }
 
-  public DexString assignNewNameFor(DexMethod source, DexString original, DexProto proto) {
-    KeyType key = keyTransform.apply(proto);
-    DexString result = getAssignedNameFor(original, key);
-    if (result == null) {
-      InternalState state = getOrCreateInternalStateFor(key);
-      result = state.getNewNameFor(source);
-    }
-    return result;
+  void addRenaming(DexString newName, DexEncodedMethod method) {
+    InternalNewNameState internalState = getOrCreateInternalState(method.getReference());
+    internalState.addRenaming(newName, method.getReference());
   }
 
-  public void reserveName(DexString name, DexProto proto) {
-    KeyType key = keyTransform.apply(proto);
-    InternalState state = getOrCreateInternalStateFor(key);
-    state.reserveName(name);
-  }
-
-  public boolean isReserved(DexString name, DexProto proto) {
-    KeyType key = keyTransform.apply(proto);
-    InternalState state = findInternalStateFor(key);
-    if (state == null) {
-      return false;
-    }
-    return state.isReserved(name);
-  }
-
-  public boolean isAvailable(DexProto proto, DexString candidate) {
-    KeyType key = keyTransform.apply(proto);
-    InternalState state = findInternalStateFor(key);
-    if (state == null) {
+  boolean isAvailable(DexString candidate, DexMethod method) {
+    Set<Wrapper<DexMethod>> usedBy = getUsedBy(candidate, method);
+    if (usedBy != null && usedBy.contains(MethodSignatureEquivalence.get().wrap(method))) {
       return true;
     }
-    return state.isAvailable(candidate);
-  }
-
-  public void addRenaming(DexString original, DexProto proto, DexString newName) {
-    KeyType key = keyTransform.apply(proto);
-    InternalState state = getOrCreateInternalStateFor(key);
-    state.addRenaming(original, key, newName);
-  }
-
-  void printState(
-      DexProto proto,
-      Function<MethodNamingState<?>, DexType> stateKeyGetter,
-      String indentation,
-      PrintStream out) {
-    KeyType key = keyTransform.apply(proto);
-    InternalState state = getOrCreateInternalStateFor(key);
-    out.print(indentation);
-    out.print("NamingState(node=`");
-    out.print(stateKeyGetter.apply(this).toSourceString());
-    out.print("`, proto=`");
-    out.print(proto.toSourceString());
-    out.print("`, key=`");
-    out.print(key.toString());
-    out.println("`)");
-    if (state != null) {
-      state.printInternalState(this, stateKeyGetter, indentation + "  ", out);
-    } else {
-      out.print(indentation);
-      out.println("<NO STATE>");
+    boolean isReserved = reservationState.isReserved(candidate, method);
+    if (!isReserved && usedBy == null) {
+      return true;
     }
+    // We now have a reserved name. We therefore have to check if the reservation is
+    // equal to candidate, otherwise the candidate is not available.
+    Set<DexString> methodReservedNames = reservationState.getReservedNamesFor(method);
+    return methodReservedNames != null && methodReservedNames.contains(candidate);
   }
 
-  class InternalState {
+  private Set<Wrapper<DexMethod>> getUsedBy(DexString name, DexMethod method) {
+    InternalNewNameState internalState = getInternalState(method);
+    Set<Wrapper<DexMethod>> nameUsedBy = null;
+    if (internalState != null) {
+      nameUsedBy = internalState.getUsedBy(name);
+    }
+    if (nameUsedBy == null && parentNamingState != null) {
+      return parentNamingState.getUsedBy(name, method);
+    }
+    return nameUsedBy;
+  }
+
+  private DexString getAssignedName(DexMethod method) {
+    DexString assignedName = null;
+    InternalNewNameState internalState = getInternalState(method);
+    if (internalState != null) {
+      assignedName = internalState.getAssignedName(method);
+    }
+    if (assignedName == null && parentNamingState != null) {
+      assignedName = parentNamingState.getAssignedName(method);
+    }
+    return assignedName;
+  }
+
+  @Override
+  InternalNewNameState createInternalState(DexMethod method) {
+    InternalNewNameState parentInternalState = null;
+    if (this.parentNamingState != null) {
+      parentInternalState = parentNamingState.getOrCreateInternalState(method);
+    }
+    return new InternalNewNameState(parentInternalState);
+  }
+
+  static class InternalNewNameState implements InternalNamingState {
+
+    private final InternalNewNameState parentInternalState;
+    private Map<Wrapper<DexMethod>, DexString> originalToRenamedNames = new HashMap<>();
+    private Map<DexString, Set<Wrapper<DexMethod>>> usedBy = new HashMap<>();
 
     private static final int INITIAL_NAME_COUNT = 1;
+    private static final int INITIAL_DICTIONARY_INDEX = 0;
 
-    protected final DexItemFactory itemFactory;
-    private final InternalState parentInternalState;
-    private Set<DexString> reservedNames = null;
-    private Table<DexString, KeyType, DexString> renamings = null;
     private int nameCount;
-    private final Iterator<String> dictionaryIterator;
+    private int dictionaryIndex;
 
-    private InternalState(
-        DexItemFactory itemFactory,
-        InternalState parentInternalState,
-        Iterator<String> dictionaryIterator) {
-      this.itemFactory = itemFactory;
+    private InternalNewNameState(InternalNewNameState parentInternalState) {
       this.parentInternalState = parentInternalState;
+      this.dictionaryIndex =
+          parentInternalState == null
+              ? INITIAL_DICTIONARY_INDEX
+              : parentInternalState.dictionaryIndex;
       this.nameCount =
           parentInternalState == null ? INITIAL_NAME_COUNT : parentInternalState.nameCount;
-      this.dictionaryIterator = dictionaryIterator;
     }
 
-    private InternalState(AppView<? extends AppInfo> appView, InternalState parentInternalState) {
-      this(
-          appView.dexItemFactory(),
-          parentInternalState,
-          appView.options().getProguardConfiguration().getObfuscationDictionary().iterator());
+    @Override
+    public int getDictionaryIndex() {
+      return dictionaryIndex;
     }
 
-    private boolean isReserved(DexString name) {
-      return (reservedNames != null && reservedNames.contains(name))
-          || (parentInternalState != null && parentInternalState.isReserved(name));
+    @Override
+    public int incrementDictionaryIndex() {
+      return dictionaryIndex++;
     }
 
-    private boolean isAvailable(DexString name) {
-      return !(renamings != null && renamings.containsValue(name))
-          && !(reservedNames != null && reservedNames.contains(name))
-          && (parentInternalState == null || parentInternalState.isAvailable(name));
+    Set<Wrapper<DexMethod>> getUsedBy(DexString name) {
+      return usedBy.get(name);
     }
 
-    void reserveName(DexString name) {
-      if (reservedNames == null) {
-        reservedNames = Sets.newIdentityHashSet();
-      }
-      reservedNames.add(name);
+    DexString getAssignedName(DexMethod method) {
+      return originalToRenamedNames.get(MethodSignatureEquivalence.get().wrap(method));
     }
 
-    public int incrementAndGet() {
-      int parentNameCount = 0;
-      InternalState tmp = parentInternalState;
+    void addRenaming(DexString newName, DexMethod method) {
+      final Wrapper<DexMethod> wrappedMethod = MethodSignatureEquivalence.get().wrap(method);
+      originalToRenamedNames.put(wrappedMethod, newName);
+      usedBy.computeIfAbsent(newName, ignore -> new HashSet<>()).add(wrappedMethod);
+    }
+
+    private boolean checkParentPublicNameCountIsLessThanOrEqual() {
+      int maxParentCount = 0;
+      InternalNewNameState tmp = parentInternalState;
       while (tmp != null) {
-        if (tmp.nameCount > parentNameCount) {
-          parentNameCount = tmp.nameCount;
-        }
+        maxParentCount = Math.max(tmp.nameCount, maxParentCount);
         tmp = tmp.parentInternalState;
       }
-      if (parentNameCount > nameCount) {
-        nameCount = parentNameCount;
-      }
+      assert maxParentCount <= nameCount;
+      return true;
+    }
+
+    @Override
+    public int incrementNameIndex(boolean isDirectMethodCall) {
+      assert checkParentPublicNameCountIsLessThanOrEqual();
       return nameCount++;
-    }
-
-    DexString getAssignedNameFor(DexString original, KeyType proto) {
-      DexString result = null;
-      if (renamings != null) {
-        result = renamings.get(original, proto);
-      }
-      if (result == null && parentInternalState != null) {
-        result = parentInternalState.getAssignedNameFor(original, proto);
-      }
-      return result;
-    }
-
-    private DexString getNewNameFor(DexMethod source) {
-      DexString name;
-      do {
-        name = nextSuggestedName(source);
-      } while (!isAvailable(name) && !strategy.breakOnNotAvailable(source, name));
-      return name;
-    }
-
-    void addRenaming(DexString original, KeyType proto, DexString newName) {
-      if (renamings == null) {
-        renamings = HashBasedTable.create();
-      }
-      renamings.put(original, proto, newName);
-    }
-
-    DexString nextSuggestedName(DexMethod source) {
-      if (!strategy.bypassDictionary() && dictionaryIterator.hasNext()) {
-        return itemFactory.createString(dictionaryIterator.next());
-      } else {
-        return strategy.next(source, this);
-      }
-    }
-
-    void printInternalState(
-        MethodNamingState<?> expectedNamingState,
-        Function<MethodNamingState<?>, DexType> stateKeyGetter,
-        String indentation,
-        PrintStream out) {
-      assert expectedNamingState == MethodNamingState.this;
-
-      DexType stateKey = stateKeyGetter.apply(expectedNamingState);
-      out.print(indentation);
-      out.print("InternalState(node=`");
-      out.print(stateKey != null ? stateKey.toSourceString() : "<GLOBAL>");
-      out.println("`)");
-
-      printLastName(indentation + "  ", out);
-      printReservedNames(indentation + "  ", out);
-      printRenamings(indentation + "  ", out);
-
-      if (parentInternalState != null) {
-        parentInternalState.printInternalState(
-            expectedNamingState.parent, stateKeyGetter, indentation + "  ", out);
-      }
-    }
-
-    void printLastName(String indentation, PrintStream out) {
-      out.print(indentation);
-      out.print("Last name: ");
-      if (nameCount > 1) {
-        out.print(StringUtils.numberToIdentifier(EMPTY_CHAR_ARRAY, nameCount - 1, false));
-        out.print(" (name count: ");
-        out.print(nameCount);
-        out.print(")");
-      } else {
-        out.print("<NONE>");
-      }
-      out.println();
-    }
-
-    void printReservedNames(String indentation, PrintStream out) {
-      out.print(indentation);
-      out.print("Reserved names:");
-      if (reservedNames == null || reservedNames.isEmpty()) {
-        out.print(" <NO RESERVED NAMES>");
-      } else {
-        for (DexString reservedName : reservedNames) {
-          out.print(System.lineSeparator());
-          out.print(indentation);
-          out.print("  ");
-          out.print(reservedName.toSourceString());
-        }
-      }
-      out.println();
-    }
-
-    void printRenamings(String indentation, PrintStream out) {
-      out.print(indentation);
-      out.print("Renamings:");
-      if (renamings == null || renamings.isEmpty()) {
-        out.print(" <NO RENAMINGS>");
-      } else {
-        for (DexString original : renamings.rowKeySet()) {
-          Map<KeyType, DexString> row = renamings.row(original);
-          for (Entry<KeyType, DexString> entry : row.entrySet()) {
-            out.print(System.lineSeparator());
-            out.print(indentation);
-            out.print("  ");
-            out.print(original.toSourceString());
-            out.print(entry.getKey().toString());
-            out.print(" -> ");
-            out.print(entry.getValue().toSourceString());
-          }
-        }
-      }
-      out.println();
     }
   }
 }

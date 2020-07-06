@@ -5,7 +5,7 @@ package com.android.tools.r8.graph;
 
 import static org.hamcrest.CoreMatchers.hasItems;
 import static org.hamcrest.CoreMatchers.not;
-import static org.junit.Assert.assertThat;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 import com.android.tools.r8.ToolHelper;
 import com.android.tools.r8.dex.ApplicationReader;
@@ -19,23 +19,23 @@ import org.junit.Test;
 public class DexTypeTest {
 
   private static DexItemFactory factory;
-  private static AppInfoWithSubtyping appInfo;
+  private static AppInfoWithClassHierarchy appInfo;
 
   @BeforeClass
   public static void makeAppInfo() throws Exception {
     InternalOptions options = new InternalOptions();
-    DexApplication application =
+    DirectMappedDexApplication application =
         new ApplicationReader(
-            AndroidApp.builder()
-                .addLibraryFiles(ToolHelper.getDefaultAndroidJar())
-                .addLibraryFiles(ToolHelper.getKotlinStdlibJar())
-                .build(),
-            options,
-            new Timing(DexType.class.getName()))
-        .read()
-        .toDirect();
+                AndroidApp.builder()
+                    .addLibraryFiles(ToolHelper.getDefaultAndroidJar())
+                    .addLibraryFiles(ToolHelper.getKotlinStdlibJar())
+                    .build(),
+                options,
+                Timing.empty())
+            .read()
+            .toDirect();
     factory = options.itemFactory;
-    appInfo = new AppInfoWithSubtyping(application);
+    appInfo = new AppInfoWithClassHierarchy(application);
   }
 
   @Test

@@ -16,17 +16,26 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
 import java.util.stream.Collectors;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
-public class R8ApiBinaryCompatibilityTests {
+@RunWith(Parameterized.class)
+public class R8ApiBinaryCompatibilityTests extends TestBase {
 
-  static final Path JAR = Paths.get("tests", "r8_api_usage_sample.jar");
+  static final Path JAR = ToolHelper.API_SAMPLE_JAR;
   static final String MAIN = "com.android.tools.apiusagesample.R8ApiUsageSample";
   static final AndroidApiLevel MIN_API = AndroidApiLevel.K;
 
-  @Rule public TemporaryFolder temp = ToolHelper.getTemporaryFolderForTest();
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withNoneRuntime().build();
+  }
+
+  public R8ApiBinaryCompatibilityTests(TestParameters parameters) {
+    parameters.assertNoneRuntime();
+  }
 
   @Test
   public void testCompatibility() throws IOException {

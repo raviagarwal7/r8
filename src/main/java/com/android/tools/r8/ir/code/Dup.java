@@ -8,7 +8,8 @@ import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.code.CfStackInstruction;
 import com.android.tools.r8.cf.code.CfStackInstruction.Opcode;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -23,6 +24,11 @@ public class Dup extends Instruction {
   private Dup(StackValues dest, Value src) {
     super(dest, src);
     assert src.isValueOnStack() && !(src instanceof StackValues);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.DUP;
   }
 
   @Override
@@ -64,7 +70,7 @@ public class Dup extends Instruction {
 
   @Override
   public void buildCf(CfBuilder builder) {
-    if (this.inValues.get(0).getTypeLattice().isWide()) {
+    if (this.inValues.get(0).getType().isWidePrimitive()) {
       builder.add(new CfStackInstruction(Opcode.Dup2));
     } else {
       builder.add(new CfStackInstruction(Opcode.Dup));
@@ -88,7 +94,7 @@ public class Dup extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forDup();
   }
 
@@ -110,5 +116,10 @@ public class Dup extends Instruction {
   @Override
   public Dup asDup() {
     return this;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

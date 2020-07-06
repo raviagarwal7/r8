@@ -8,13 +8,14 @@ import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.cf.code.CfNewArray;
 import com.android.tools.r8.code.NewArray;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 
@@ -25,6 +26,11 @@ public class NewArrayEmpty extends Instruction {
   public NewArrayEmpty(Value dest, Value size, DexType type) {
     super(dest, size);
     this.type = type;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.NEW_ARRAY_EMPTY;
   }
 
   @Override
@@ -77,13 +83,16 @@ public class NewArrayEmpty extends Instruction {
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
     if (instructionInstanceCanThrow()) {
-      return false;
+      return DeadInstructionResult.notDead();
     }
     // This would belong better in instructionInstanceCanThrow, but that is not passed an appInfo.
     DexType baseType = type.toBaseType(appView.dexItemFactory());
-    return baseType.isPrimitiveType() || appView.definitionFor(baseType) != null;
+    if (baseType.isPrimitiveType() || appView.definitionFor(baseType) != null) {
+      return DeadInstructionResult.deadIfOutValueIsDead();
+    }
+    return DeadInstructionResult.notDead();
   }
 
   @Override
@@ -103,8 +112,8 @@ public class NewArrayEmpty extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forNewArrayEmpty(type, invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forNewArrayEmpty(type, context.getHolder());
   }
 
   @Override
@@ -113,8 +122,7 @@ public class NewArrayEmpty extends Instruction {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return type;
   }
 
@@ -131,7 +139,12 @@ public class NewArrayEmpty extends Instruction {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.fromDexType(type, Nullability.definitelyNotNull(), appView);
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.fromDexType(type, Nullability.definitelyNotNull(), appView);
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

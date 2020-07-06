@@ -3,13 +3,19 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static com.android.tools.r8.utils.InternalOptions.DETERMINISTIC_DEBUGGING;
+
+import com.android.tools.r8.AssertionsConfiguration.AssertionTransformation;
 import com.android.tools.r8.ProgramResource.Kind;
 import com.android.tools.r8.errors.DexFileOverflowDiagnostic;
 import com.android.tools.r8.experimental.graphinfo.GraphConsumer;
+import com.android.tools.r8.features.FeatureSplitConfiguration;
 import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.inspector.Inspector;
+import com.android.tools.r8.inspector.internal.InspectorImpl;
+import com.android.tools.r8.ir.desugar.DesugaredLibraryConfiguration;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.origin.PathOrigin;
-import com.android.tools.r8.origin.StandardOutOrigin;
 import com.android.tools.r8.shaking.ProguardConfiguration;
 import com.android.tools.r8.shaking.ProguardConfigurationParser;
 import com.android.tools.r8.shaking.ProguardConfigurationRule;
@@ -19,12 +25,15 @@ import com.android.tools.r8.shaking.ProguardConfigurationSourceFile;
 import com.android.tools.r8.shaking.ProguardConfigurationSourceStrings;
 import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.AssertionConfigurationWithDefault;
 import com.android.tools.r8.utils.ExceptionDiagnostic;
 import com.android.tools.r8.utils.FileUtils;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.InternalOptions.DesugarState;
 import com.android.tools.r8.utils.InternalOptions.LineNumberOptimization;
 import com.android.tools.r8.utils.Reporter;
 import com.android.tools.r8.utils.StringDiagnostic;
+import com.android.tools.r8.utils.ThreadUtils;
 import com.google.common.collect.ImmutableList;
 import java.io.InputStream;
 import java.nio.file.Path;
@@ -33,7 +42,10 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * Immutable command structure for an invocation of the {@link R8} compiler.
@@ -78,22 +90,27 @@ public final class R8Command extends BaseCompilerCommand {
     }
 
     private final List<ProguardConfigurationSource> mainDexRules = new ArrayList<>();
-    private Consumer<ProguardConfiguration.Builder> proguardConfigurationConsumer = null;
+    private Consumer<ProguardConfiguration.Builder> proguardConfigurationConsumerForTesting = null;
     private Consumer<List<ProguardConfigurationRule>> syntheticProguardRulesConsumer = null;
+    private StringConsumer desugaredLibraryKeepRuleConsumer = null;
     private final List<ProguardConfigurationSource> proguardConfigs = new ArrayList<>();
     private boolean disableTreeShaking = false;
     private boolean disableMinification = false;
     private boolean disableVerticalClassMerging = false;
     private boolean forceProguardCompatibility = false;
     private StringConsumer proguardMapConsumer = null;
+    private StringConsumer proguardUsageConsumer = null;
+    private StringConsumer proguardSeedsConsumer = null;
+    private StringConsumer proguardConfigurationConsumer = null;
     private GraphConsumer keptGraphConsumer = null;
     private GraphConsumer mainDexKeptGraphConsumer = null;
-
-    // Internal compatibility mode for use from CompatProguard tool.
-    Path proguardCompatibilityRulesOutput = null;
+    private BiFunction<String, Long, Boolean> dexClassChecksumFilter = (name, checksum) -> true;
+    private final List<FeatureSplit> featureSplits = new ArrayList<>();
+    private String synthesizedClassPrefix = "";
 
     private boolean allowPartiallyImplementedProguardOptions = false;
-    private boolean allowTestProguardOptions = false;
+    private boolean allowTestProguardOptions =
+        System.getProperty("com.android.tools.r8.allowTestProguardOptions") != null;
 
     // TODO(zerny): Consider refactoring CompatProguardCommandBuilder to avoid subclassing.
     Builder() {
@@ -130,6 +147,11 @@ public final class R8Command extends BaseCompilerCommand {
     @Override
     CompilationMode defaultCompilationMode() {
       return CompilationMode.RELEASE;
+    }
+
+    Builder setSynthesizedClassesPrefix(String prefix) {
+      synthesizedClassPrefix = prefix;
+      return self();
     }
 
     /**
@@ -237,9 +259,53 @@ public final class R8Command extends BaseCompilerCommand {
     }
 
     /**
-     * Set a consumer for receiving kept-graph events.
+     * Set a consumer for receiving the keep rules to use when compiling the desugared library for
+     * the program being compiled in this compilation.
      *
-     * @param graphConsumer
+     * @param keepRuleConsumer Consumer to receive the content once produced.
+     */
+    public Builder setDesugaredLibraryKeepRuleConsumer(StringConsumer keepRuleConsumer) {
+      this.desugaredLibraryKeepRuleConsumer = keepRuleConsumer;
+      return self();
+    }
+
+    /**
+     * Set a consumer for receiving the proguard usage information.
+     *
+     * <p>Note that any subsequent calls to this method will replace the previous setting.
+     *
+     * @param proguardUsageConsumer Consumer to receive usage information.
+     */
+    public Builder setProguardUsageConsumer(StringConsumer proguardUsageConsumer) {
+      this.proguardUsageConsumer = proguardUsageConsumer;
+      return self();
+    }
+
+    /**
+     * Set a consumer for receiving the proguard seeds information.
+     *
+     * <p>Note that any subsequent calls to this method will replace the previous setting.
+     *
+     * @param proguardSeedsConsumer Consumer to receive seeds information.
+     */
+    public Builder setProguardSeedsConsumer(StringConsumer proguardSeedsConsumer) {
+      this.proguardSeedsConsumer = proguardSeedsConsumer;
+      return self();
+    }
+
+    /**
+     * Set a consumer for receiving the proguard configuration information.
+     *
+     * <p>Note that any subsequent calls to this method will replace the previous setting.
+     * @param proguardConfigurationConsumer
+     */
+    public Builder setProguardConfigurationConsumer(StringConsumer proguardConfigurationConsumer) {
+      this.proguardConfigurationConsumer = proguardConfigurationConsumer;
+      return self();
+    }
+
+    /**
+     * Set a consumer for receiving kept-graph events.
      */
     public Builder setKeptGraphConsumer(GraphConsumer graphConsumer) {
       this.keptGraphConsumer = graphConsumer;
@@ -248,8 +314,6 @@ public final class R8Command extends BaseCompilerCommand {
 
     /**
      * Set a consumer for receiving kept-graph events for the content of the main-dex output.
-     *
-     * @param graphConsumer
      */
     public Builder setMainDexKeptGraphConsumer(GraphConsumer graphConsumer) {
       this.mainDexKeptGraphConsumer = graphConsumer;
@@ -303,6 +367,36 @@ public final class R8Command extends BaseCompilerCommand {
           new EnsureNonDexProgramResourceProvider(programProvider));
     }
 
+    /**
+     * Add a {@link FeatureSplit} to the app. The {@link FeatureSplit} contains input and output
+     * providers, that enables us to generate dynamic apps with optional modules.
+     *
+     * @param featureSplitGenerator A function that uses the supplied {@link FeatureSplit.Builder}
+     *     to generate a {@link FeatureSplit}.
+     */
+    public Builder addFeatureSplit(
+        Function<FeatureSplit.Builder, FeatureSplit> featureSplitGenerator) {
+      FeatureSplit featureSplit = featureSplitGenerator.apply(FeatureSplit.builder(getReporter()));
+      featureSplits.add(featureSplit);
+      for (ProgramResourceProvider programResourceProvider : featureSplit
+          .getProgramResourceProviders()) {
+        // Data resources are handled separately and passed directly to the feature split consumer.
+        ProgramResourceProvider providerWithoutDataResources = new ProgramResourceProvider() {
+          @Override
+          public Collection<ProgramResource> getProgramResources() throws ResourceException {
+            return programResourceProvider.getProgramResources();
+          }
+
+          @Override
+          public DataResourceProvider getDataResourceProvider() {
+            return null;
+          }
+        };
+        addProgramResourceProvider(providerWithoutDataResources);
+      }
+      return self();
+    }
+
     @Override
     protected InternalProgramOutputPathConsumer createProgramOutputConsumer(
         Path path,
@@ -334,6 +428,13 @@ public final class R8Command extends BaseCompilerCommand {
                   + " and above");
         }
       }
+      for (FeatureSplit featureSplit : featureSplits) {
+        assert featureSplit.getProgramConsumer() instanceof DexIndexedConsumer;
+        if (!(getProgramConsumer() instanceof DexIndexedConsumer)) {
+          reporter.error("R8 does not support class file output when using feature splits");
+        }
+      }
+
       for (Path file : programFiles) {
         if (FileUtils.isDexFile(file)) {
           reporter.error(new StringDiagnostic(
@@ -342,6 +443,9 @@ public final class R8Command extends BaseCompilerCommand {
       }
       if (getProgramConsumer() instanceof ClassFileConsumer && isMinApiLevelSet()) {
         reporter.error("R8 does not support --min-api when compiling to class files");
+      }
+      if (hasDesugaredLibraryConfiguration() && getDisableDesugaring()) {
+        reporter.error("Using desugared library configuration requires desugaring to be enabled");
       }
       super.validate();
     }
@@ -368,6 +472,9 @@ public final class R8Command extends BaseCompilerCommand {
         mainDexKeepRules = parser.getConfig().getRules();
       }
 
+      DesugaredLibraryConfiguration libraryConfiguration =
+          getDesugaredLibraryConfiguration(factory, false);
+
       ProguardConfigurationParser parser =
           new ProguardConfigurationParser(factory, reporter, allowTestProguardOptions);
       if (!proguardConfigs.isEmpty()) {
@@ -379,8 +486,8 @@ public final class R8Command extends BaseCompilerCommand {
         configurationBuilder.enableKeepRuleSynthesisForRecompilation();
       }
 
-      if (proguardConfigurationConsumer != null) {
-        proguardConfigurationConsumer.accept(configurationBuilder);
+      if (proguardConfigurationConsumerForTesting != null) {
+        proguardConfigurationConsumerForTesting.accept(configurationBuilder);
       }
 
       // Process Proguard configurations supplied through data resources in the input.
@@ -408,17 +515,17 @@ public final class R8Command extends BaseCompilerCommand {
             }
           };
 
-      getAppBuilder().getProgramResourceProviders()
-          .stream()
+      getAppBuilder().getProgramResourceProviders().stream()
           .map(ProgramResourceProvider::getDataResourceProvider)
           .filter(Objects::nonNull)
-          .forEach(dataResourceProvider -> {
-              try {
-                dataResourceProvider.accept(embeddedProguardConfigurationVisitor);
-              } catch (ResourceException e) {
-                reporter.error(new ExceptionDiagnostic(e));
-              }
-          });
+          .forEach(
+              dataResourceProvider -> {
+                try {
+                  dataResourceProvider.accept(embeddedProguardConfigurationVisitor);
+                } catch (ResourceException e) {
+                  reporter.error(new ExceptionDiagnostic(e));
+                }
+              });
 
       if (disableTreeShaking) {
         configurationBuilder.disableShrinking();
@@ -435,8 +542,13 @@ public final class R8Command extends BaseCompilerCommand {
 
       assert getProgramConsumer() != null;
 
-      boolean desugaring =
-          (getProgramConsumer() instanceof ClassFileConsumer) ? false : !getDisableDesugaring();
+      DesugarState desugaring =
+          (getProgramConsumer() instanceof ClassFileConsumer)
+              ? DesugarState.OFF
+              : getDesugaringState();
+
+      FeatureSplitConfiguration featureSplitConfiguration =
+          !featureSplits.isEmpty() ? new FeatureSplitConfiguration(featureSplits, reporter) : null;
 
       R8Command command =
           new R8Command(
@@ -454,19 +566,30 @@ public final class R8Command extends BaseCompilerCommand {
               disableVerticalClassMerging,
               forceProguardCompatibility,
               proguardMapConsumer,
-              proguardCompatibilityRulesOutput,
+              proguardUsageConsumer,
+              proguardSeedsConsumer,
+              proguardConfigurationConsumer,
               keptGraphConsumer,
               mainDexKeptGraphConsumer,
               syntheticProguardRulesConsumer,
-              isOptimizeMultidexForLinearAlloc());
+              isOptimizeMultidexForLinearAlloc(),
+              getIncludeClassesChecksum(),
+              getDexClassChecksumFilter(),
+              desugaredLibraryKeepRuleConsumer,
+              libraryConfiguration,
+              featureSplitConfiguration,
+              getAssertionsConfiguration(),
+              getOutputInspections(),
+              synthesizedClassPrefix,
+              getThreadCount());
 
       return command;
     }
 
     // Internal for-testing method to add post-processors of the proguard configuration.
     void addProguardConfigurationConsumerForTesting(Consumer<ProguardConfiguration.Builder> c) {
-      Consumer<ProguardConfiguration.Builder> oldConsumer = proguardConfigurationConsumer;
-      proguardConfigurationConsumer =
+      Consumer<ProguardConfiguration.Builder> oldConsumer = proguardConfigurationConsumerForTesting;
+      proguardConfigurationConsumerForTesting =
           builder -> {
             if (oldConsumer != null) {
               oldConsumer.accept(builder);
@@ -531,10 +654,16 @@ public final class R8Command extends BaseCompilerCommand {
   private final boolean disableVerticalClassMerging;
   private final boolean forceProguardCompatibility;
   private final StringConsumer proguardMapConsumer;
-  private final Path proguardCompatibilityRulesOutput;
+  private final StringConsumer proguardUsageConsumer;
+  private final StringConsumer proguardSeedsConsumer;
+  private final StringConsumer proguardConfigurationConsumer;
   private final GraphConsumer keptGraphConsumer;
   private final GraphConsumer mainDexKeptGraphConsumer;
   private final Consumer<List<ProguardConfigurationRule>> syntheticProguardRulesConsumer;
+  private final StringConsumer desugaredLibraryKeepRuleConsumer;
+  private final DesugaredLibraryConfiguration libraryConfiguration;
+  private final FeatureSplitConfiguration featureSplitConfiguration;
+  private final String synthesizedClassPrefix;
 
   /** Get a new {@link R8Command.Builder}. */
   public static Builder builder() {
@@ -592,19 +721,42 @@ public final class R8Command extends BaseCompilerCommand {
       CompilationMode mode,
       int minApiLevel,
       Reporter reporter,
-      boolean enableDesugaring,
+      DesugarState enableDesugaring,
       boolean enableTreeShaking,
       boolean enableMinification,
       boolean disableVerticalClassMerging,
       boolean forceProguardCompatibility,
       StringConsumer proguardMapConsumer,
-      Path proguardCompatibilityRulesOutput,
+      StringConsumer proguardUsageConsumer,
+      StringConsumer proguardSeedsConsumer,
+      StringConsumer proguardConfigurationConsumer,
       GraphConsumer keptGraphConsumer,
       GraphConsumer mainDexKeptGraphConsumer,
       Consumer<List<ProguardConfigurationRule>> syntheticProguardRulesConsumer,
-      boolean optimizeMultidexForLinearAlloc) {
-    super(inputApp, mode, programConsumer, mainDexListConsumer, minApiLevel, reporter,
-        enableDesugaring, optimizeMultidexForLinearAlloc);
+      boolean optimizeMultidexForLinearAlloc,
+      boolean encodeChecksum,
+      BiPredicate<String, Long> dexClassChecksumFilter,
+      StringConsumer desugaredLibraryKeepRuleConsumer,
+      DesugaredLibraryConfiguration libraryConfiguration,
+      FeatureSplitConfiguration featureSplitConfiguration,
+      List<AssertionsConfiguration> assertionsConfiguration,
+      List<Consumer<Inspector>> outputInspections,
+      String synthesizedClassPrefix,
+      int threadCount) {
+    super(
+        inputApp,
+        mode,
+        programConsumer,
+        mainDexListConsumer,
+        minApiLevel,
+        reporter,
+        enableDesugaring,
+        optimizeMultidexForLinearAlloc,
+        encodeChecksum,
+        dexClassChecksumFilter,
+        assertionsConfiguration,
+        outputInspections,
+        threadCount);
     assert proguardConfiguration != null;
     assert mainDexKeepRules != null;
     this.mainDexKeepRules = mainDexKeepRules;
@@ -614,10 +766,16 @@ public final class R8Command extends BaseCompilerCommand {
     this.disableVerticalClassMerging = disableVerticalClassMerging;
     this.forceProguardCompatibility = forceProguardCompatibility;
     this.proguardMapConsumer = proguardMapConsumer;
-    this.proguardCompatibilityRulesOutput = proguardCompatibilityRulesOutput;
+    this.proguardUsageConsumer = proguardUsageConsumer;
+    this.proguardSeedsConsumer = proguardSeedsConsumer;
+    this.proguardConfigurationConsumer = proguardConfigurationConsumer;
     this.keptGraphConsumer = keptGraphConsumer;
     this.mainDexKeptGraphConsumer = mainDexKeptGraphConsumer;
     this.syntheticProguardRulesConsumer = syntheticProguardRulesConsumer;
+    this.desugaredLibraryKeepRuleConsumer = desugaredLibraryKeepRuleConsumer;
+    this.libraryConfiguration = libraryConfiguration;
+    this.featureSplitConfiguration = featureSplitConfiguration;
+    this.synthesizedClassPrefix = synthesizedClassPrefix;
   }
 
   private R8Command(boolean printHelp, boolean printVersion) {
@@ -629,10 +787,16 @@ public final class R8Command extends BaseCompilerCommand {
     disableVerticalClassMerging = false;
     forceProguardCompatibility = false;
     proguardMapConsumer = null;
-    proguardCompatibilityRulesOutput = null;
+    proguardUsageConsumer = null;
+    proguardSeedsConsumer = null;
+    proguardConfigurationConsumer = null;
     keptGraphConsumer = null;
     mainDexKeptGraphConsumer = null;
     syntheticProguardRulesConsumer = null;
+    desugaredLibraryKeepRuleConsumer = null;
+    libraryConfiguration = null;
+    featureSplitConfiguration = null;
+    synthesizedClassPrefix = null;
   }
 
   /** Get the enable-tree-shaking state. */
@@ -648,11 +812,12 @@ public final class R8Command extends BaseCompilerCommand {
   @Override
   InternalOptions getInternalOptions() {
     InternalOptions internal = new InternalOptions(proguardConfiguration, getReporter());
+    assert !internal.testing.allowOutlinerInterfaceArrayArguments;  // Only allow in tests.
     assert !internal.debug;
     internal.debug = getMode() == CompilationMode.DEBUG;
     internal.programConsumer = getProgramConsumer();
     internal.minApiLevel = getMinApiLevel();
-    internal.enableDesugaring = getEnableDesugaring();
+    internal.desugarState = getDesugarState();
     assert internal.isShrinking() == getEnableTreeShaking();
     assert internal.isMinifying() == getEnableMinification();
     // In current implementation we only enable lambda merger if the tree
@@ -660,12 +825,13 @@ public final class R8Command extends BaseCompilerCommand {
     // shaking for removing the lambda classes which should be revised later.
     internal.enableLambdaMerging = getEnableTreeShaking();
     assert !internal.ignoreMissingClasses;
-    internal.ignoreMissingClasses = proguardConfiguration.isIgnoreWarnings()
-        // TODO(70706667): We probably only want this in Proguard compatibility mode.
-        || (forceProguardCompatibility
-            && !proguardConfiguration.isOptimizing()
-            && !internal.isShrinking()
-            && !internal.isMinifying());
+    internal.ignoreMissingClasses =
+        proguardConfiguration.isIgnoreWarnings()
+            // TODO(70706667): We probably only want this in Proguard compatibility mode.
+            || (forceProguardCompatibility
+                && !proguardConfiguration.isOptimizing()
+                && !internal.isShrinking()
+                && !internal.isMinifying());
 
     assert !internal.verbose;
     internal.mainDexKeepRules = mainDexKeepRules;
@@ -676,8 +842,8 @@ public final class R8Command extends BaseCompilerCommand {
             ? LineNumberOptimization.ON
             : LineNumberOptimization.OFF;
 
-    assert internal.enableDynamicTypeOptimization || !proguardConfiguration.isOptimizing();
     assert internal.enableHorizontalClassMerging || !proguardConfiguration.isOptimizing();
+    assert !internal.enableTreeShakingOfLibraryMethodOverrides;
     assert internal.enableVerticalClassMerging || !proguardConfiguration.isOptimizing();
     if (internal.debug) {
       internal.getProguardConfiguration().getKeepAttributes().lineNumberTable = true;
@@ -689,62 +855,69 @@ public final class R8Command extends BaseCompilerCommand {
       internal.enableVerticalClassMerging = false;
       internal.enableClassStaticizer = false;
       internal.outline.enabled = false;
+      internal.enableEnumUnboxing = false;
     }
-
-    // Setup a configuration consumer.
-    if (proguardConfiguration.isPrintConfiguration()) {
-      internal.configurationConsumer = proguardConfiguration.getPrintConfigurationFile() != null
-          ? new StringConsumer.FileConsumer(proguardConfiguration.getPrintConfigurationFile())
-          : new StringConsumer.StreamConsumer(StandardOutOrigin.instance(), System.out);
-    }
-
-    // Setup a usage information consumer.
-    if (proguardConfiguration.isPrintUsage()) {
-      internal.usageInformationConsumer = proguardConfiguration.getPrintUsageFile() != null
-          ? new StringConsumer.FileConsumer(proguardConfiguration.getPrintUsageFile())
-          : new StringConsumer.StreamConsumer(StandardOutOrigin.instance(), System.out);
-    }
-
-    // Setup pg-seeds consumer.
-    if (proguardConfiguration.isPrintSeeds()) {
-      internal.proguardSeedsConsumer =  proguardConfiguration.getSeedFile() != null
-          ? new StringConsumer.FileConsumer(proguardConfiguration.getSeedFile())
-          : new StringConsumer.StreamConsumer(StandardOutOrigin.instance(), System.out);
+    if (!internal.isShrinking()) {
+      // If R8 is not shrinking, there is no point in unboxing enums since the unboxed enums
+      // will still remain in the program (The application size would actually increase).
+      internal.enableEnumUnboxing = false;
     }
 
     // Amend the proguard-map consumer with options from the proguard configuration.
-    {
-      StringConsumer wrappedConsumer;
-      if (proguardConfiguration.isPrintMapping()) {
-        if (proguardConfiguration.getPrintMappingFile() != null) {
-          wrappedConsumer =
-              new StringConsumer.FileConsumer(
-                  proguardConfiguration.getPrintMappingFile(), proguardMapConsumer);
-        } else {
-          wrappedConsumer =
-              new StringConsumer.StreamConsumer(
-                  StandardOutOrigin.instance(), System.out, proguardMapConsumer);
-        }
-      } else {
-        wrappedConsumer = proguardMapConsumer;
-      }
-      internal.proguardMapConsumer = wrappedConsumer;
-    }
+    internal.proguardMapConsumer =
+        wrapStringConsumer(
+            proguardMapConsumer,
+            proguardConfiguration.isPrintMapping(),
+            proguardConfiguration.getPrintMappingFile());
+
+    // Amend the usage information consumer with options from the proguard configuration.
+    internal.usageInformationConsumer =
+        wrapStringConsumer(
+            proguardUsageConsumer,
+            proguardConfiguration.isPrintUsage(),
+            proguardConfiguration.getPrintUsageFile());
+
+    // Amend the pg-seeds consumer with options from the proguard configuration.
+    internal.proguardSeedsConsumer =
+        wrapStringConsumer(
+            proguardSeedsConsumer,
+            proguardConfiguration.isPrintSeeds(),
+            proguardConfiguration.getSeedFile());
+
+    // Amend the configuration consumer with options from the proguard configuration.
+    internal.configurationConsumer =
+        wrapStringConsumer(
+            proguardConfigurationConsumer,
+            proguardConfiguration.isPrintConfiguration(),
+            proguardConfiguration.getPrintConfigurationFile());
 
     // Set the kept-graph consumer if any. It will only be actively used if the enqueuer triggers.
     internal.keptGraphConsumer = keptGraphConsumer;
     internal.mainDexKeptGraphConsumer = mainDexKeptGraphConsumer;
 
-    internal.proguardCompatibilityRulesOutput = proguardCompatibilityRulesOutput;
     internal.dataResourceConsumer = internal.programConsumer.getDataResourceConsumer();
+
+    internal.featureSplitConfiguration = featureSplitConfiguration;
 
     internal.syntheticProguardRulesConsumer = syntheticProguardRulesConsumer;
 
-    // Default is to remove Java assertion code as Dalvik and Art does not reliable support
-    // Java assertions. When generation class file output always keep the Java assertions code.
-    assert internal.disableAssertions;
+    internal.outputInspections = InspectorImpl.wrapInspections(getOutputInspections());
+
+    // Default is to remove all javac generated assertion code when generating dex.
+    assert internal.assertionsConfiguration == null;
+    internal.assertionsConfiguration =
+        new AssertionConfigurationWithDefault(
+            getProgramConsumer() instanceof ClassFileConsumer
+                ? AssertionTransformation.PASSTHROUGH
+                : AssertionTransformation.DISABLE,
+            getAssertionsConfiguration());
+
+    // When generating class files the build is "intermediate" and we cannot pollute the namespace
+    // with the a hard-coded outline / enum unboxing utility class. Doing so would prohibit
+    // subsequent merging of two R8 produced libraries.
     if (internal.isGeneratingClassFiles()) {
-      internal.disableAssertions = false;
+      internal.outline.enabled = false;
+      internal.enableEnumUnboxing = false;
     }
 
     // EXPERIMENTAL flags.
@@ -756,6 +929,40 @@ public final class R8Command extends BaseCompilerCommand {
 
     internal.enableInheritanceClassInDexDistributor = isOptimizeMultidexForLinearAlloc();
 
+    internal.desugaredLibraryConfiguration = libraryConfiguration;
+    internal.synthesizedClassPrefix = synthesizedClassPrefix;
+    internal.desugaredLibraryKeepRuleConsumer = desugaredLibraryKeepRuleConsumer;
+
+    if (!DETERMINISTIC_DEBUGGING) {
+      assert internal.threadCount == ThreadUtils.NOT_SPECIFIED;
+      internal.threadCount = getThreadCount();
+    }
+
     return internal;
+  }
+
+  private static StringConsumer wrapStringConsumer(
+      StringConsumer optionConsumer, boolean optionsFlag, Path optionFile) {
+    if (optionsFlag) {
+      if (optionFile != null) {
+        return new StringConsumer.FileConsumer(optionFile, optionConsumer);
+      } else {
+        return new StandardOutConsumer(optionConsumer);
+      }
+    }
+    return optionConsumer;
+  }
+
+  private static class StandardOutConsumer extends StringConsumer.ForwardingConsumer {
+
+    public StandardOutConsumer(StringConsumer consumer) {
+      super(consumer);
+    }
+
+    @Override
+    public void accept(String string, DiagnosticsHandler handler) {
+      super.accept(string, handler);
+      System.out.print(string);
+    }
   }
 }

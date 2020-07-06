@@ -3,7 +3,7 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.optimize;
 
-import com.android.tools.r8.graph.AccessFlags;
+import com.android.tools.r8.graph.AccessControl;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedField;
@@ -12,17 +12,17 @@ import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.FieldAccessInfo;
+import com.android.tools.r8.graph.FieldAccessInfoCollection;
+import com.android.tools.r8.graph.FieldResolutionResult.SuccessfulFieldResolutionResult;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.code.Invoke.Type;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.InternalOptions;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Sets;
-import java.util.Collections;
-import java.util.IdentityHashMap;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
@@ -55,7 +55,9 @@ public class MemberRebindingAnalysis {
     } else {
       newHolder = firstLibraryClass(target.holder, original.holder);
     }
-    return appView.dexItemFactory().createMethod(newHolder, original.proto, original.name);
+    return newHolder == null
+        ? original
+        : appView.dexItemFactory().createMethod(newHolder, original.proto, original.name);
   }
 
   private DexField validTargetFor(DexField target, DexField original,
@@ -71,12 +73,17 @@ public class MemberRebindingAnalysis {
     } else {
       newHolder = firstLibraryClass(target.holder, original.holder);
     }
-    return appView.dexItemFactory().createField(newHolder, original.type, original.name);
+    return newHolder == null
+        ? original
+        : appView.dexItemFactory().createField(newHolder, original.type, original.name);
   }
 
   private <T> DexType firstLibraryClassForInterfaceTarget(T target, DexType current,
       BiFunction<DexClass, T, ?> lookup) {
     DexClass clazz = appView.definitionFor(current);
+    if (clazz == null) {
+      return null;
+    }
     Object potential = lookup.apply(clazz, target);
     if (potential != null) {
       // Found, return type.
@@ -109,19 +116,19 @@ public class MemberRebindingAnalysis {
   }
 
   private DexEncodedMethod classLookup(DexMethod method) {
-    return appView.appInfo().resolveMethodOnClass(method.holder, method).asResultOfResolve();
+    return appView.appInfo().resolveMethodOnClass(method, method.holder).getSingleTarget();
   }
 
   private DexEncodedMethod interfaceLookup(DexMethod method) {
-    return appView.appInfo().resolveMethodOnInterface(method.holder, method).asResultOfResolve();
+    return appView.appInfo().resolveMethodOnInterface(method.holder, method).getSingleTarget();
   }
 
   private DexEncodedMethod anyLookup(DexMethod method) {
-    return appView.appInfo().resolveMethod(method.holder, method).asResultOfResolve();
+    return appView.appInfo().unsafeResolveMethodDueToDexFormat(method).getSingleTarget();
   }
 
   private void computeMethodRebinding(
-      Map<DexMethod, Set<DexEncodedMethod>> methodsWithContexts,
+      Map<DexMethod, ProgramMethodSet> methodsWithContexts,
       Function<DexMethod, DexEncodedMethod> lookupTarget,
       Type invokeType) {
     for (DexMethod method : methodsWithContexts.keySet()) {
@@ -137,7 +144,7 @@ public class MemberRebindingAnalysis {
       // TODO(b/128404854) Rebind to the lowest library class or program class. For now we allow
       //  searching in library for methods, but this should be done on classpath instead.
       if (target != null && target.method != method) {
-        DexClass targetClass = appView.definitionFor(target.method.holder);
+        DexClass targetClass = appView.definitionFor(target.holder());
         if (originalClass.isProgramClass()) {
           // In Java bytecode, it is only possible to target interface methods that are in one of
           // the immediate super-interfaces via a super-invocation (see IndirectSuperInterfaceTest).
@@ -153,15 +160,15 @@ public class MemberRebindingAnalysis {
           // If the target class is not public but the targeted method is, we might run into
           // visibility problems when rebinding.
           final DexEncodedMethod finalTarget = target;
-          Set<DexEncodedMethod> contexts = methodsWithContexts.get(method);
-          if (contexts.stream().anyMatch(context ->
-              mayNeedBridgeForVisibility(context.method.holder, finalTarget))) {
+          ProgramMethodSet contexts = methodsWithContexts.get(method);
+          if (contexts.stream()
+              .anyMatch(context -> mayNeedBridgeForVisibility(context, finalTarget))) {
             target =
                 insertBridgeForVisibilityIfNeeded(
                     method, target, originalClass, targetClass, lookupTarget);
           }
         }
-        builder.map(method, lense.lookupMethod(validTargetFor(target.method, method)));
+        builder.map(method, lense.lookupMethod(validTargetFor(target.method, method)), invokeType);
       }
     }
   }
@@ -211,16 +218,18 @@ public class MemberRebindingAnalysis {
     return findHolderForInterfaceMethodBridge(superClass.asProgramClass(), iface);
   }
 
-  private boolean mayNeedBridgeForVisibility(DexType context, DexEncodedMethod method) {
-    DexType holderType = method.method.holder;
+  private boolean mayNeedBridgeForVisibility(ProgramMethod context, DexEncodedMethod method) {
+    DexType holderType = method.holder();
     DexClass holder = appView.definitionFor(holderType);
     if (holder == null) {
       return false;
     }
     ConstraintWithTarget classVisibility =
-        ConstraintWithTarget.deriveConstraint(context, holderType, holder.accessFlags, appView);
+        ConstraintWithTarget.deriveConstraint(
+            context.getHolder(), holderType, holder.accessFlags, appView);
     ConstraintWithTarget methodVisibility =
-        ConstraintWithTarget.deriveConstraint(context, holderType, method.accessFlags, appView);
+        ConstraintWithTarget.deriveConstraint(
+            context.getHolder(), holderType, method.accessFlags, appView);
     // We may need bridge for visibility if the target class is not visible while the target method
     // is visible from the calling context.
     return classVisibility == ConstraintWithTarget.NEVER
@@ -280,59 +289,50 @@ public class MemberRebindingAnalysis {
     return null;
   }
 
-  private void computeFieldRebinding(
-      Map<DexField, Set<DexEncodedMethod>> fieldsWithContexts,
-      BiFunction<DexType, DexField, DexEncodedField> lookup,
-      BiFunction<DexClass, DexField, DexEncodedField> lookupTargetOnClass) {
-    for (DexField field : fieldsWithContexts.keySet()) {
-      DexEncodedField target = lookup.apply(field.holder, field);
-      // Rebind to the lowest library class or program class. Do not rebind accesses to fields that
-      // are not visible from the access context.
-      Set<DexEncodedMethod> contexts = fieldsWithContexts.get(field);
-      if (target != null
-          && target.field != field
-          && contexts.stream()
-              .allMatch(
-                  context ->
-                      isMemberVisibleFromOriginalContext(
-                          appView,
-                          context.method.holder,
-                          target.field.holder,
-                          target.accessFlags))) {
-        builder.map(field,
-            lense.lookupField(validTargetFor(target.field, field, lookupTargetOnClass)));
+  private void computeFieldRebinding() {
+    FieldAccessInfoCollection<?> fieldAccessInfoCollection =
+        appView.appInfo().getFieldAccessInfoCollection();
+    fieldAccessInfoCollection.forEach(this::computeFieldRebindingForIndirectAccesses);
+  }
+
+  private void computeFieldRebindingForIndirectAccesses(FieldAccessInfo fieldAccessInfo) {
+    fieldAccessInfo.forEachIndirectAccessWithContexts(
+        this::computeFieldRebindingForIndirectAccessWithContexts);
+  }
+
+  private void computeFieldRebindingForIndirectAccessWithContexts(
+      DexField field, ProgramMethodSet contexts) {
+    SuccessfulFieldResolutionResult resolutionResult =
+        appView.appInfo().resolveField(field).asSuccessfulResolution();
+    if (resolutionResult == null) {
+      return;
+    }
+
+    DexEncodedField resolvedField = resolutionResult.getResolvedField();
+    if (resolvedField.field == field) {
+      assert false;
+      return;
+    }
+
+    // Rebind to the lowest library class or program class. Do not rebind accesses to fields that
+    // are not visible from the access context.
+    boolean accessibleInAllContexts = true;
+    for (ProgramMethod context : contexts) {
+      boolean inaccessibleInContext =
+          AccessControl.isFieldAccessible(
+                  resolvedField, resolutionResult.getResolvedHolder(), context, appView)
+              .isPossiblyFalse();
+      if (inaccessibleInContext) {
+        accessibleInAllContexts = false;
+        break;
       }
     }
-  }
 
-  public static boolean isMemberVisibleFromOriginalContext(
-      AppView<?> appView, DexType context, DexType holder, AccessFlags<?> memberAccessFlags) {
-    DexClass clazz = appView.definitionFor(holder);
-    if (clazz == null) {
-      return false;
+    if (accessibleInAllContexts) {
+      builder.map(
+          field,
+          lense.lookupField(validTargetFor(resolvedField.field, field, DexClass::lookupField)));
     }
-    ConstraintWithTarget classVisibility =
-        ConstraintWithTarget.deriveConstraint(context, holder, clazz.accessFlags, appView);
-    if (classVisibility == ConstraintWithTarget.NEVER) {
-      return false;
-    }
-    ConstraintWithTarget memberVisibility =
-        ConstraintWithTarget.deriveConstraint(context, holder, memberAccessFlags, appView);
-    return memberVisibility != ConstraintWithTarget.NEVER;
-  }
-
-  private Map<DexField, Set<DexEncodedMethod>> mergeFieldAccessContexts(
-      Map<DexField, Set<DexEncodedMethod>> reads,
-      Map<DexField, Set<DexEncodedMethod>> writes) {
-    Map<DexField, Set<DexEncodedMethod>> result = new IdentityHashMap<>();
-    Set<DexField> fields = Sets.union(reads.keySet(), writes.keySet());
-    for (DexField field : fields) {
-      Set<DexEncodedMethod> contexts = Sets.newIdentityHashSet();
-      contexts.addAll(reads.getOrDefault(field, ImmutableSet.of()));
-      contexts.addAll(writes.getOrDefault(field, ImmutableSet.of()));
-      result.put(field, contexts);
-    }
-    return Collections.unmodifiableMap(result);
   }
 
   public GraphLense run() {
@@ -347,14 +347,9 @@ public class MemberRebindingAnalysis {
     computeMethodRebinding(appInfo.directInvokes, this::anyLookup, Type.DIRECT);
     // Likewise static invokes.
     computeMethodRebinding(appInfo.staticInvokes, this::anyLookup, Type.STATIC);
-
-    computeFieldRebinding(
-        mergeFieldAccessContexts(appInfo.staticFieldReads, appInfo.staticFieldWrites),
-        appInfo::resolveFieldOn, DexClass::lookupField);
-    computeFieldRebinding(
-        mergeFieldAccessContexts(appInfo.instanceFieldReads, appInfo.instanceFieldWrites),
-        appInfo::resolveFieldOn, DexClass::lookupField);
-
-    return builder.build(lense);
+    computeFieldRebinding();
+    GraphLense lens = builder.build(lense);
+    appInfo.getFieldAccessInfoCollection().flattenAccessContexts();
+    return lens;
   }
 }

@@ -9,6 +9,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.IsNot.not;
 import static org.junit.Assert.assertTrue;
 
+import com.android.tools.r8.R8FullTestBuilder;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -25,6 +26,16 @@ public class ImplementsMergedTypeDirectlyTest extends MergedTypeBaseTest {
   public ImplementsMergedTypeDirectlyTest(
       TestParameters parameters, boolean enableVerticalClassMerging) {
     super(parameters, enableVerticalClassMerging);
+  }
+
+  @Override
+  public void configure(R8FullTestBuilder builder) {
+    super.configure(builder);
+
+    // If unused interface removal is enabled, the `implements K` clause will be removed prior to
+    // vertical class merging (by the tree pruner).
+    // TODO(b/135083634): Should handle unused interfaces similar to vertically merged classes.
+    builder.addOptionsModification(options -> options.enableUnusedInterfaceRemoval = false);
   }
 
   @Override
@@ -51,7 +62,7 @@ public class ImplementsMergedTypeDirectlyTest extends MergedTypeBaseTest {
       // Check that TestClass no longer implements K.
       ClassSubject testClassSubject = inspector.clazz(TestClass.class);
       assertThat(testClassSubject, isPresent());
-      assertTrue(testClassSubject.getDexClass().interfaces.isEmpty());
+      assertTrue(testClassSubject.getDexProgramClass().interfaces.isEmpty());
 
       // Check that K is no longer present.
       assertThat(inspector.clazz(K.class), not(isPresent()));

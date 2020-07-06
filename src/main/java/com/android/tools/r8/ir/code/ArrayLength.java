@@ -7,11 +7,9 @@ package com.android.tools.r8.ir.code;
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.code.CfArrayLength;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexItemFactory;
-import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -22,6 +20,11 @@ public class ArrayLength extends Instruction {
 
   public ArrayLength(Value dest, Value array) {
     super(dest, array);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.ARRAY_LENGTH;
   }
 
   @Override
@@ -70,6 +73,17 @@ public class ArrayLength extends Instruction {
   }
 
   @Override
+  public boolean instructionInstanceCanThrow(AppView<?> appView, ProgramMethod context) {
+    return array().type.isNullable();
+  }
+
+  @Override
+  public boolean instructionMayHaveSideEffects(
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    return instructionInstanceCanThrow(appView, context);
+  }
+
+  @Override
   public boolean identicalAfterRegisterAllocation(Instruction other, RegisterAllocator allocator) {
     if (super.identicalAfterRegisterAllocation(other, allocator)) {
       // The array length instruction doesn't carry the element type. The art verifier doesn't
@@ -90,7 +104,7 @@ public class ArrayLength extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forArrayLength();
   }
 
@@ -106,8 +120,8 @@ public class ArrayLength extends Instruction {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.INT;
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.getInt();
   }
 
   @Override
@@ -116,7 +130,7 @@ public class ArrayLength extends Instruction {
   }
 
   @Override
-  public boolean throwsNpeIfValueIsNull(Value value, DexItemFactory dexItemFactory) {
+  public boolean throwsNpeIfValueIsNull(Value value, AppView<?> appView, ProgramMethod context) {
     return array() == value;
   }
 
@@ -130,4 +144,8 @@ public class ArrayLength extends Instruction {
     return array();
   }
 
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
+  }
 }

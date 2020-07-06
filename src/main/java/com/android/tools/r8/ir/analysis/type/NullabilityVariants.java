@@ -7,13 +7,14 @@ package com.android.tools.r8.ir.analysis.type;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
-public class NullabilityVariants<T extends ReferenceTypeLatticeElement> {
+public class NullabilityVariants<T extends ReferenceTypeElement> {
 
   private T maybeNullVariant;
   private T definitelyNullVariant;
   private T definitelyNotNullVariant;
+  private T bottomVariant;
 
-  public static <T extends ReferenceTypeLatticeElement> T create(
+  public static <T extends ReferenceTypeElement> T create(
       Nullability nullability, Function<NullabilityVariants<T>, T> callback) {
     NullabilityVariants<T> variants = new NullabilityVariants<>();
     T newElement = callback.apply(variants);
@@ -26,9 +27,11 @@ public class NullabilityVariants<T extends ReferenceTypeLatticeElement> {
       maybeNullVariant = element;
     } else if (nullability == Nullability.definitelyNull()) {
       definitelyNullVariant = element;
-    } else {
-      assert nullability == Nullability.definitelyNotNull();
+    } else if (nullability == Nullability.definitelyNotNull()) {
       definitelyNotNullVariant = element;
+    } else {
+      assert nullability == Nullability.bottom();
+      bottomVariant = element;
     }
   }
 
@@ -37,9 +40,11 @@ public class NullabilityVariants<T extends ReferenceTypeLatticeElement> {
       return maybeNullVariant;
     } else if (nullability == Nullability.definitelyNull()) {
       return definitelyNullVariant;
-    } else {
-      assert nullability == Nullability.definitelyNotNull();
+    } else if (nullability == Nullability.definitelyNotNull()) {
       return definitelyNotNullVariant;
+    } else {
+      assert nullability == Nullability.bottom();
+      return bottomVariant;
     }
   }
 

@@ -6,6 +6,7 @@ package com.android.tools.r8.errors;
 import com.android.tools.r8.Diagnostic;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.position.Position;
+import com.android.tools.r8.utils.StringDiagnostic;
 
 /**
  * Exception to signal an compilation error.
@@ -13,7 +14,7 @@ import com.android.tools.r8.position.Position;
  * <p>This is always an expected error and considered a user input issue. A user-understandable
  * message must be provided.
  */
-public class CompilationError extends RuntimeException implements Diagnostic {
+public class CompilationError extends RuntimeException {
 
   private final Origin origin;
   private final Position position;
@@ -29,6 +30,10 @@ public class CompilationError extends RuntimeException implements Diagnostic {
     this(message, null, origin);
   }
 
+  public CompilationError(String message, Origin origin, Position position) {
+    this(message, null, origin, position);
+  }
+
   public CompilationError(String message, Throwable cause, Origin origin) {
     this(message, cause, origin, Position.UNKNOWN);
   }
@@ -39,18 +44,15 @@ public class CompilationError extends RuntimeException implements Diagnostic {
     this.position = position;
   }
 
-  @Override
   public Origin getOrigin() {
     return origin;
   }
 
-  @Override
   public Position getPosition() {
     return position;
   }
 
-  @Override
-  public String getDiagnosticMessage() {
-    return getMessage();
+  public Diagnostic toStringDiagnostic() {
+    return new StringDiagnostic(getMessage(), origin, position);
   }
 }

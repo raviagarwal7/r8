@@ -4,7 +4,6 @@
 package com.android.tools.r8.cf;
 
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.ir.code.BasicBlock;
@@ -32,15 +31,14 @@ import java.util.Map;
 
 public class LoadStoreHelper {
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   private final IRCode code;
   private final TypeVerificationHelper typesHelper;
 
   private Map<Value, ConstInstruction> clonableConstants = null;
   private ListIterator<BasicBlock> blockIterator = null;
 
-  public LoadStoreHelper(
-      AppView<? extends AppInfo> appView, IRCode code, TypeVerificationHelper typesHelper) {
+  public LoadStoreHelper(AppView<?> appView, IRCode code, TypeVerificationHelper typesHelper) {
     this.appView = appView;
     this.code = code;
     this.typesHelper = typesHelper;
@@ -101,7 +99,7 @@ public class LoadStoreHelper {
     clonableConstants = new IdentityHashMap<>();
     blockIterator = code.listIterator();
     while (blockIterator.hasNext()) {
-      InstructionListIterator it = blockIterator.next().listIterator();
+      InstructionListIterator it = blockIterator.next().listIterator(code);
       while (it.hasNext()) {
         it.next().insertLoadAndStores(it, this);
       }
@@ -130,7 +128,7 @@ public class LoadStoreHelper {
               moves.add(new PhiMove(phi, value));
             }
           }
-          InstructionListIterator it = pred.listIterator(pred.getInstructions().size());
+          InstructionListIterator it = pred.listIterator(code, pred.getInstructions().size());
           Instruction exit = it.previous();
           assert pred.exit() == exit;
           movePhis(moves, it, exit.getPosition());
@@ -170,6 +168,9 @@ public class LoadStoreHelper {
   }
 
   public void storeOutValue(Instruction instruction, InstructionListIterator it) {
+    if (!instruction.hasOutValue()) {
+      return;
+    }
     assert !(instruction.outValue() instanceof StackValue);
     if (instruction.isConstInstruction()) {
       ConstInstruction constInstruction = instruction.asConstInstruction();
@@ -200,7 +201,7 @@ public class LoadStoreHelper {
     boolean hasCatchHandlers = instruction.getBlock().hasCatchHandlers();
     if (hasCatchHandlers && instruction.instructionTypeCanThrow()) {
       storeBlock = it.split(this.code, this.blockIterator);
-      it = storeBlock.listIterator();
+      it = storeBlock.listIterator(code);
     }
     add(store, storeBlock, instruction.getPosition(), it);
     if (hasCatchHandlers && !instruction.instructionTypeCanThrow()) {
@@ -222,7 +223,7 @@ public class LoadStoreHelper {
     BasicBlock insertBlock = instruction.getBlock();
     if (insertBlock.hasCatchHandlers() && instruction.instructionTypeCanThrow()) {
       insertBlock = it.split(this.code, this.blockIterator);
-      it = insertBlock.listIterator();
+      it = insertBlock.listIterator(code);
     }
     instruction.swapOutValue(newOutValue);
     add(new Pop(newOutValue), insertBlock, instruction.getPosition(), it);
@@ -266,8 +267,12 @@ public class LoadStoreHelper {
         return new ConstString(
             stackValue, constant.asConstString().getValue(), ThrowingInfo.NO_THROW);
       } else if (constant.isDexItemBasedConstString()) {
+        DexItemBasedConstString computedConstant = constant.asDexItemBasedConstString();
         return new DexItemBasedConstString(
-            stackValue, constant.asDexItemBasedConstString().getItem(), ThrowingInfo.NO_THROW);
+            stackValue,
+            computedConstant.getItem(),
+            computedConstant.getNameComputationInfo(),
+            ThrowingInfo.NO_THROW);
       } else if (constant.isConstClass()) {
         return new ConstClass(stackValue, constant.asConstClass().getValue());
       } else {

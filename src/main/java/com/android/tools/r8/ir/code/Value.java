@@ -3,113 +3,127 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
+import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
+import static com.android.tools.r8.ir.code.Opcodes.ARGUMENT;
+import static com.android.tools.r8.ir.code.Opcodes.CHECK_CAST;
+import static com.android.tools.r8.ir.code.Opcodes.CONST_CLASS;
+import static com.android.tools.r8.ir.code.Opcodes.CONST_NUMBER;
+import static com.android.tools.r8.ir.code.Opcodes.CONST_STRING;
+import static com.android.tools.r8.ir.code.Opcodes.DEX_ITEM_BASED_CONST_STRING;
+import static com.android.tools.r8.ir.code.Opcodes.INSTANCE_OF;
+
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DebugLocalInfo;
+import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexMethod;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
+import com.android.tools.r8.ir.analysis.value.AbstractValue;
+import com.android.tools.r8.ir.analysis.value.UnknownValue;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.regalloc.LiveIntervals;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.position.MethodPosition;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.LongInterval;
 import com.android.tools.r8.utils.Reporter;
+import com.android.tools.r8.utils.SetUtils;
 import com.android.tools.r8.utils.StringDiagnostic;
 import com.google.common.base.Predicates;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import it.unimi.dsi.fastutil.ints.IntList;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
-import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
-public class Value {
+public class Value implements Comparable<Value> {
 
   public void constrainType(
       ValueTypeConstraint constraint, DexMethod method, Origin origin, Reporter reporter) {
-    TypeLatticeElement constrainedType = constrainedType(constraint);
+    TypeElement constrainedType = constrainedType(constraint);
     if (constrainedType == null) {
       throw reporter.fatalError(
           new StringDiagnostic(
               "Cannot constrain type: "
-                  + typeLattice
+                  + type
                   + " for value: "
                   + this
                   + " by constraint: "
                   + constraint,
               origin,
-              new MethodPosition(method)));
-    } else if (constrainedType != typeLattice) {
-      typeLattice = constrainedType;
+              new MethodPosition(method.asMethodReference())));
+    } else if (constrainedType != type) {
+      setType(constrainedType);
     }
   }
 
-  public TypeLatticeElement constrainedType(ValueTypeConstraint constraint) {
-    if (constraint == ValueTypeConstraint.INT_OR_FLOAT_OR_OBJECT && !typeLattice.isWide()) {
-      return typeLattice;
+  public TypeElement constrainedType(ValueTypeConstraint constraint) {
+    if (constraint == ValueTypeConstraint.INT_OR_FLOAT_OR_OBJECT && !type.isWidePrimitive()) {
+      return type;
     }
     switch (constraint) {
       case OBJECT:
-        if (typeLattice.isTop()) {
+        if (type.isTop()) {
           if (definition != null && definition.isConstNumber()) {
             assert definition.asConstNumber().isZero();
-            return TypeLatticeElement.NULL;
+            return TypeElement.getNull();
           } else {
-            return TypeLatticeElement.BOTTOM;
+            return TypeElement.getBottom();
           }
         }
-        if (typeLattice.isReference()) {
-          return typeLattice;
+        if (type.isReferenceType()) {
+          return type;
         }
-        if (typeLattice.isBottom()) {
+        if (type.isBottom()) {
           // Only a few instructions may propagate a bottom input to a bottom output.
           assert isPhi()
               || definition.isDebugLocalWrite()
               || (definition.isArrayGet()
                   && definition.asArrayGet().getMemberType() == MemberType.OBJECT);
-          return typeLattice;
+          return type;
         }
         break;
       case INT:
-        if (typeLattice.isTop() || (typeLattice.isSingle() && !typeLattice.isFloat())) {
-          return TypeLatticeElement.INT;
+        if (type.isTop() || (type.isSinglePrimitive() && !type.isFloat())) {
+          return TypeElement.getInt();
         }
         break;
       case FLOAT:
-        if (typeLattice.isTop() || (typeLattice.isSingle() && !typeLattice.isInt())) {
-          return TypeLatticeElement.FLOAT;
+        if (type.isTop() || (type.isSinglePrimitive() && !type.isInt())) {
+          return TypeElement.getFloat();
         }
         break;
       case INT_OR_FLOAT:
-        if (typeLattice.isTop()) {
-          return TypeLatticeElement.SINGLE;
+        if (type.isTop()) {
+          return TypeElement.getSingle();
         }
-        if (typeLattice.isSingle()) {
-          return typeLattice;
+        if (type.isSinglePrimitive()) {
+          return type;
         }
         break;
       case LONG:
-        if (typeLattice.isWide()) {
-          return TypeLatticeElement.LONG;
+        if (type.isWidePrimitive() && !type.isDouble()) {
+          return TypeElement.getLong();
         }
         break;
       case DOUBLE:
-        if (typeLattice.isWide()) {
-          return TypeLatticeElement.DOUBLE;
+        if (type.isWidePrimitive() && !type.isLong()) {
+          return TypeElement.getDouble();
         }
         break;
       case LONG_OR_DOUBLE:
-        if (typeLattice.isWide()) {
-          return typeLattice;
+        if (type.isWidePrimitive()) {
+          return type;
         }
         break;
       default:
@@ -136,67 +150,16 @@ public class Value {
   private static class DebugData {
 
     final DebugLocalInfo local;
-    Map<Instruction, DebugUse> users = new HashMap<>();
+    Set<Instruction> users = Sets.newIdentityHashSet();
 
     DebugData(DebugLocalInfo local) {
       this.local = local;
     }
   }
 
-  // A debug-value user represents a point where the value is live, ends or starts.
-  // If a point is marked as both ending and starting then it is simply live, but we maintain
-  // the marker so as not to unintentionally end it if marked again.
-  private enum DebugUse {
-    LIVE, START, END, LIVE_FINAL;
-
-    DebugUse start() {
-      switch (this) {
-        case LIVE:
-        case START:
-          return START;
-        case END:
-        case LIVE_FINAL:
-          return LIVE_FINAL;
-        default:
-          throw new Unreachable();
-      }
-    }
-
-    DebugUse end() {
-      switch (this) {
-        case LIVE:
-        case END:
-          return END;
-        case START:
-        case LIVE_FINAL:
-          return LIVE_FINAL;
-        default:
-          throw new Unreachable();
-      }
-    }
-
-    static DebugUse join(DebugUse a, DebugUse b) {
-      if (a == LIVE_FINAL || b == LIVE_FINAL) {
-        return LIVE_FINAL;
-      }
-      if (a == b) {
-        return a;
-      }
-      if (a == LIVE) {
-        return b;
-      }
-      if (b == LIVE) {
-        return a;
-      }
-      assert (a == START && b == END) || (a == END && b == START);
-      return LIVE_FINAL;
-    }
-  }
-
   public static final int UNDEFINED_NUMBER = -1;
 
-  public static final Value UNDEFINED =
-      new Value(UNDEFINED_NUMBER, TypeLatticeElement.BOTTOM, null);
+  public static final Value UNDEFINED = new Value(UNDEFINED_NUMBER, TypeElement.getBottom(), null);
 
   protected final int number;
   public Instruction definition = null;
@@ -209,16 +172,15 @@ public class Value {
   private LiveIntervals liveIntervals;
   private int needsRegister = -1;
   private boolean isThis = false;
-  private boolean isArgument = false;
-  private boolean knownToBeBoolean = false;
   private LongInterval valueRange;
   private DebugData debugData;
-  protected TypeLatticeElement typeLattice;
+  protected TypeElement type;
 
-  public Value(int number, TypeLatticeElement typeLattice, DebugLocalInfo local) {
+  public Value(int number, TypeElement type, DebugLocalInfo local) {
+    assert type != null;
     this.number = number;
     this.debugData = local == null ? null : new DebugData(local);
-    this.typeLattice = typeLattice;
+    this.type = type;
   }
 
   public boolean isFixedRegisterValue() {
@@ -234,6 +196,10 @@ public class Value {
     return definition;
   }
 
+  public boolean hasAliasedValue() {
+    return getAliasedValue() != this;
+  }
+
   /**
    * If this value is defined by an instruction that defines an alias of another value, such as the
    * {@link Assume} instruction, then the incoming value to the {@link Assume} instruction is
@@ -245,6 +211,17 @@ public class Value {
    * <p>This method is useful to find the "true" definition of a value inside the current method.
    */
   public Value getAliasedValue() {
+    return getAliasedValue(
+        DefaultAliasedValueConfiguration.getInstance(), Predicates.alwaysFalse());
+  }
+
+  public Value getAliasedValue(AliasedValueConfiguration configuration) {
+    return getAliasedValue(configuration, Predicates.alwaysFalse());
+  }
+
+  public Value getAliasedValue(
+      AliasedValueConfiguration configuration, Predicate<Value> stoppingCriterion) {
+    assert stoppingCriterion != null;
     Set<Value> visited = Sets.newIdentityHashSet();
     Value lastAliasedValue;
     Value aliasedValue = this;
@@ -253,9 +230,12 @@ public class Value {
       if (aliasedValue.isPhi()) {
         return aliasedValue;
       }
+      if (stoppingCriterion.test(aliasedValue)) {
+        return aliasedValue;
+      }
       Instruction definitionOfAliasedValue = aliasedValue.definition;
-      if (definitionOfAliasedValue.isIntroducingAnAlias()) {
-        aliasedValue = definitionOfAliasedValue.getAliasForOutValue();
+      if (configuration.isIntroducingAnAlias(definitionOfAliasedValue)) {
+        aliasedValue = configuration.getAliasForOutValue(definitionOfAliasedValue);
 
         // There shouldn't be a cycle.
         assert visited.add(aliasedValue);
@@ -265,12 +245,18 @@ public class Value {
     return aliasedValue;
   }
 
+  public Value getSpecificAliasedValue(Predicate<Value> stoppingCriterion) {
+    Value aliasedValue =
+        getAliasedValue(DefaultAliasedValueConfiguration.getInstance(), stoppingCriterion);
+    return stoppingCriterion.test(aliasedValue) ? aliasedValue : null;
+  }
+
   public int getNumber() {
     return number;
   }
 
   public int requiredRegisters() {
-    return typeLattice.requiredRegisters();
+    return type.requiredRegisters();
   }
 
   public DebugLocalInfo getLocalInfo() {
@@ -287,62 +273,16 @@ public class Value {
     debugData = new DebugData(local);
   }
 
-  public void clearLocalInfo() {
-    assert debugData.users.isEmpty();
-    debugData = null;
-  }
-
-  public boolean hasSameOrNoLocal(Value other) {
-    assert other != null;
-    return hasLocalInfo()
-        ? other.getLocalInfo() == this.getLocalInfo()
-        : !other.hasLocalInfo();
-  }
-
-  public List<Instruction> getDebugLocalStarts() {
-    if (debugData == null) {
-      return Collections.emptyList();
-    }
-    List<Instruction> starts = new ArrayList<>(debugData.users.size());
-    for (Entry<Instruction, DebugUse> entry : debugData.users.entrySet()) {
-      if (entry.getValue() == DebugUse.START) {
-        starts.add(entry.getKey());
-      }
-    }
-    return starts;
-  }
-
-  public List<Instruction> getDebugLocalEnds() {
-    if (debugData == null) {
-      return Collections.emptyList();
-    }
-    List<Instruction> ends = new ArrayList<>(debugData.users.size());
-    for (Entry<Instruction, DebugUse> entry : debugData.users.entrySet()) {
-      if (entry.getValue() == DebugUse.END) {
-        ends.add(entry.getKey());
-      }
-    }
-    return ends;
-  }
-
-  public void addDebugLocalStart(Instruction start) {
-    assert start != null;
-    debugData.users.put(start, markStart(debugData.users.get(start)));
-  }
-
-  private DebugUse markStart(DebugUse use) {
-    assert use != null;
-    return use == null ? DebugUse.START : use.start();
+  public Set<Instruction> getDebugLocalEnds() {
+    return debugData == null
+        ? Collections.emptySet()
+        : Collections.unmodifiableSet(debugData.users);
   }
 
   public void addDebugLocalEnd(Instruction end) {
     assert end != null;
-    debugData.users.put(end, markEnd(debugData.users.get(end)));
-  }
-
-  private DebugUse markEnd(DebugUse use) {
-    assert use != null;
-    return use == null ? DebugUse.END : use.end();
+    debugData.users.add(end);
+    end.addDebugValue(this);
   }
 
   public void linkTo(Value other) {
@@ -386,6 +326,15 @@ public class Value {
     return previousConsecutive;
   }
 
+  public boolean onlyUsedInBlock(BasicBlock block) {
+    for (Instruction user : uniqueUsers()) {
+      if (user.getBlock() != block) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   public Set<Instruction> uniqueUsers() {
     if (uniqueUsers != null) {
       return uniqueUsers;
@@ -393,9 +342,41 @@ public class Value {
     return uniqueUsers = ImmutableSet.copyOf(users);
   }
 
+  public boolean hasSingleUniqueUser() {
+    return uniqueUsers().size() == 1;
+  }
+
   public Instruction singleUniqueUser() {
     assert ImmutableSet.copyOf(users).size() == 1;
     return users.getFirst();
+  }
+
+  public Set<Instruction> aliasedUsers() {
+    return aliasedUsers(DefaultAliasedValueConfiguration.getInstance());
+  }
+
+  public Set<Instruction> aliasedUsers(AliasedValueConfiguration configuration) {
+    Set<Instruction> users = SetUtils.newIdentityHashSet(uniqueUsers());
+    Set<Instruction> visited = Sets.newIdentityHashSet();
+    collectAliasedUsersViaAssume(configuration, visited, uniqueUsers(), users);
+    return users;
+  }
+
+  private static void collectAliasedUsersViaAssume(
+      AliasedValueConfiguration configuration,
+      Set<Instruction> visited,
+      Set<Instruction> usersToTest,
+      Set<Instruction> collectedUsers) {
+    for (Instruction user : usersToTest) {
+      if (!visited.add(user)) {
+        continue;
+      }
+      if (configuration.isIntroducingAnAlias(user)) {
+        collectedUsers.addAll(user.outValue().uniqueUsers());
+        collectAliasedUsersViaAssume(
+            configuration, visited, user.outValue().uniqueUsers(), collectedUsers);
+      }
+    }
   }
 
   public Phi firstPhiUser() {
@@ -411,7 +392,36 @@ public class Value {
   }
 
   public Set<Instruction> debugUsers() {
-    return debugData == null ? null : Collections.unmodifiableSet(debugData.users.keySet());
+    return debugData == null ? null : Collections.unmodifiableSet(debugData.users);
+  }
+
+  public boolean hasAnyUsers() {
+    return hasUsers() || hasPhiUsers() || hasDebugUsers();
+  }
+
+  public boolean hasDebugUsers() {
+    return debugData != null && !debugData.users.isEmpty();
+  }
+
+  public boolean hasNonDebugUsers() {
+    return hasUsers() || hasPhiUsers();
+  }
+
+  public boolean hasPhiUsers() {
+    return !phiUsers.isEmpty();
+  }
+
+  public boolean hasUsers() {
+    return !users.isEmpty();
+  }
+
+  public boolean hasUserThatMatches(Predicate<Instruction> predicate) {
+    for (Instruction user : uniqueUsers()) {
+      if (predicate.test(user)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public int numberOfUsers() {
@@ -446,19 +456,16 @@ public class Value {
     return !users.isEmpty() || !phiUsers.isEmpty() || numberOfDebugUsers() > 0;
   }
 
-  public boolean isAlwaysNull(AppView<? extends AppInfo> appView) {
+  public boolean isAlwaysNull(AppView<?> appView) {
     if (hasLocalInfo()) {
       // Not always null as the value can be changed via the debugger.
       return false;
     }
-    if (typeLattice.isDefinitelyNull()) {
+    if (type.isDefinitelyNull()) {
       return true;
     }
-    if (typeLattice.isClassType() && appView.appInfo().hasLiveness()) {
-      return typeLattice
-          .asClassTypeLatticeElement()
-          .getClassType()
-          .isAlwaysNull(appView.withLiveness());
+    if (type.isClassType() && appView.appInfo().hasLiveness()) {
+      return type.asClassType().getClassType().isAlwaysNull(appView.withLiveness());
     }
     return false;
   }
@@ -490,11 +497,15 @@ public class Value {
   public void clearUsers() {
     users.clear();
     uniqueUsers = null;
-    phiUsers.clear();
-    uniquePhiUsers = null;
+    clearPhiUsers();
     if (debugData != null) {
       debugData.users.clear();
     }
+  }
+
+  public void clearPhiUsers() {
+    phiUsers.clear();
+    uniquePhiUsers = null;
   }
 
   public void addPhiUser(Phi user) {
@@ -510,11 +521,6 @@ public class Value {
   private void fullyRemovePhiUser(Phi user) {
     phiUsers.removeIf(u -> u == user);
     uniquePhiUsers = null;
-  }
-
-  public void addDebugUser(Instruction user) {
-    assert hasLocalInfo();
-    debugData.users.putIfAbsent(user, DebugUse.LIVE);
   }
 
   public boolean isUninitializedLocal() {
@@ -550,13 +556,21 @@ public class Value {
   // Returns the set of Value that are affected if the current value's type lattice is updated.
   public Set<Value> affectedValues() {
     ImmutableSet.Builder<Value> affectedValues = ImmutableSet.builder();
+    forEachAffectedValue(affectedValues::add);
+    return affectedValues.build();
+  }
+
+  public void addAffectedValuesTo(Set<Value> affectedValues) {
+    forEachAffectedValue(affectedValues::add);
+  }
+
+  public void forEachAffectedValue(Consumer<Value> consumer) {
     for (Instruction user : uniqueUsers()) {
-      if (user.outValue() != null) {
-        affectedValues.add(user.outValue());
+      if (user.hasOutValue()) {
+        consumer.accept(user.outValue());
       }
     }
-    affectedValues.addAll(uniquePhiUsers());
-    return affectedValues.build();
+    uniquePhiUsers().forEach(consumer::accept);
   }
 
   public void replaceUsers(Value newValue) {
@@ -570,12 +584,34 @@ public class Value {
       user.replaceOperand(this, newValue);
     }
     if (debugData != null) {
-      for (Entry<Instruction, DebugUse> user : debugData.users.entrySet()) {
+      for (Instruction user : debugData.users) {
         replaceUserInDebugData(user, newValue);
       }
       debugData.users.clear();
     }
     clearUsers();
+  }
+
+  public void replacePhiUsers(Value newValue) {
+    if (this == newValue) {
+      return;
+    }
+    for (Phi user : uniquePhiUsers()) {
+      user.replaceOperand(this, newValue);
+    }
+    clearPhiUsers();
+  }
+
+  public void replaceSelectiveInstructionUsers(Value newValue, Predicate<Instruction> predicate) {
+    if (this == newValue) {
+      return;
+    }
+    for (Instruction user : uniqueUsers()) {
+      if (predicate.test(user)) {
+        fullyRemoveUser(user);
+        user.replaceValue(this, newValue);
+      }
+    }
   }
 
   public void replaceSelectiveUsers(
@@ -610,10 +646,10 @@ public class Value {
       }
     }
     if (debugData != null) {
-      Iterator<Entry<Instruction, DebugUse>> users = debugData.users.entrySet().iterator();
+      Iterator<Instruction> users = debugData.users.iterator();
       while (users.hasNext()) {
-        Entry<Instruction, DebugUse> user = users.next();
-        if (selectedInstructions.contains(user.getKey())) {
+        Instruction user = users.next();
+        if (selectedInstructions.contains(user)) {
           replaceUserInDebugData(user, newValue);
           users.remove();
         }
@@ -621,30 +657,18 @@ public class Value {
     }
   }
 
-  private void replaceUserInDebugData(Entry<Instruction, DebugUse> user, Value newValue) {
-    Instruction instruction = user.getKey();
-    DebugUse debugUse = user.getValue();
-    instruction.replaceDebugValue(this, newValue);
+  private void replaceUserInDebugData(Instruction user, Value newValue) {
+    user.replaceDebugValue(this, newValue);
     // If user is a DebugLocalRead and now has no debug values, we would like to remove it.
     // However, replaceUserInDebugData() is called in contexts where the instruction list is being
     // iterated, so we cannot remove user from the instruction list at this point.
-    if (newValue.hasLocalInfo()) {
-      DebugUse existing = newValue.debugData.users.get(instruction);
-      assert existing != null;
-      newValue.debugData.users.put(instruction, DebugUse.join(debugUse, existing));
-    }
   }
 
   public void replaceDebugUser(Instruction oldUser, Instruction newUser) {
-    DebugUse use = debugData.users.remove(oldUser);
-    if (use == DebugUse.START && newUser.outValue == this) {
-      // Register allocation requires that debug values are live at the entry to the instruction.
-      // Remove this debug use since it is starting at the instruction that defines it.
-      return;
-    }
-    if (use != null) {
-      newUser.addDebugValue(this);
-      debugData.users.put(newUser, use);
+    boolean removed = debugData.users.remove(oldUser);
+    assert removed;
+    if (removed) {
+      addDebugLocalEnd(newUser);
     }
   }
 
@@ -702,6 +726,11 @@ public class Value {
   }
 
   @Override
+  public int compareTo(Value value) {
+    return Integer.compare(this.number, value.number);
+  }
+
+  @Override
   public int hashCode() {
     return number;
   }
@@ -716,7 +745,7 @@ public class Value {
       builder.append("(");
       if (isConstant && definition.asConstNumber().outValue != null) {
         ConstNumber constNumber = definition.asConstNumber();
-        if (constNumber.outValue().getTypeLattice().isSingle()) {
+        if (constNumber.getOutType().isSinglePrimitive()) {
           builder.append((int) constNumber.getRawValue());
         } else {
           builder.append(constNumber.getRawValue());
@@ -737,7 +766,7 @@ public class Value {
   }
 
   public ValueType outType() {
-    return ValueType.fromTypeLattice(typeLattice);
+    return ValueType.fromType(type);
   }
 
   public ConstInstruction getConstInstruction() {
@@ -747,6 +776,10 @@ public class Value {
 
   public boolean isConstNumber() {
     return isConstant() && getConstInstruction().isConstNumber();
+  }
+
+  public boolean isConstZero() {
+    return isConstNumber() && definition.asConstNumber().isZero();
   }
 
   public boolean isConstString() {
@@ -759,8 +792,10 @@ public class Value {
 
   public boolean isDexItemBasedConstStringThatNeedsToComputeClassName() {
     return isDexItemBasedConstString()
-        && getConstInstruction().asDexItemBasedConstString()
-            .getClassNameComputationInfo().needsToComputeClassName();
+        && getConstInstruction()
+            .asDexItemBasedConstString()
+            .getNameComputationInfo()
+            .needsToComputeName();
   }
 
   public boolean isConstClass() {
@@ -769,6 +804,23 @@ public class Value {
 
   public boolean isConstant() {
     return definition.isOutConstant() && !hasLocalInfo();
+  }
+
+  public AbstractValue getAbstractValue(AppView<?> appView, ProgramMethod context) {
+    if (!appView.enableWholeProgramOptimizations()) {
+      return UnknownValue.getInstance();
+    }
+
+    Value root = getAliasedValue();
+    if (root.isPhi()) {
+      return UnknownValue.getInstance();
+    }
+
+    return root.definition.getAbstractValue(appView.withLiveness(), context);
+  }
+
+  public boolean isDefinedByInstructionSatisfying(Predicate<Instruction> predicate) {
+    return predicate.test(definition);
   }
 
   public boolean isPhi() {
@@ -783,46 +835,68 @@ public class Value {
    * Returns whether this value is known to never be <code>null</code>.
    */
   public boolean isNeverNull() {
-    assert typeLattice.isReference();
-    return (definition != null && definition.isAssumeNonNull())
-        || typeLattice.nullability().isDefinitelyNotNull();
-  }
-
-  public boolean canBeNull() {
-    assert typeLattice.isReference();
-    return typeLattice.isNullable();
-  }
-
-  public void markAsArgument() {
-    assert !isArgument;
-    assert !isThis;
-    isArgument = true;
+    assert type.isReferenceType();
+    return isDefinedByInstructionSatisfying(Instruction::isAssumeWithNonNullAssumption)
+        || type.isDefinitelyNotNull();
   }
 
   public boolean isArgument() {
-    return isArgument;
+    return isDefinedByInstructionSatisfying(Instruction::isArgument);
   }
 
-  public void setKnownToBeBoolean(boolean knownToBeBoolean) {
-    this.knownToBeBoolean = knownToBeBoolean;
+  public boolean onlyDependsOnArgument() {
+    if (isPhi()) {
+      return false;
+    }
+    switch (definition.opcode()) {
+      case ARGUMENT:
+      case CONST_CLASS:
+      case CONST_NUMBER:
+      case CONST_STRING:
+      case DEX_ITEM_BASED_CONST_STRING:
+        // Constants don't depend on anything.
+        return true;
+      case CHECK_CAST:
+        return definition.asCheckCast().object().onlyDependsOnArgument();
+      case INSTANCE_OF:
+        return definition.asInstanceOf().value().onlyDependsOnArgument();
+      default:
+        return false;
+    }
   }
 
   public boolean knownToBeBoolean() {
-    if (knownToBeBoolean) {
+    return knownToBeBoolean(null);
+  }
+
+  public boolean knownToBeBoolean(Set<Phi> seen) {
+    if (!getType().isInt()) {
+      return false;
+    }
+
+    if (isPhi()) {
+      Phi self = this.asPhi();
+      if (seen == null) {
+        seen = Sets.newIdentityHashSet();
+      }
+      if (seen.contains(self)) {
+        return true;
+      }
+      seen.add(self);
+      for (Value operand : self.getOperands()) {
+        if (!operand.knownToBeBoolean(seen)) {
+          operand.knownToBeBoolean(seen);
+          return false;
+        }
+      }
       return true;
     }
-    if (getTypeLattice().isInt()) {
-      Value aliasedValue = getAliasedValue();
-      if (!aliasedValue.isPhi() && aliasedValue.definition.isConstNumber()) {
-        ConstNumber definition = aliasedValue.definition.asConstNumber();
-        return definition.isZero() || definition.getRawValue() == 1;
-      }
-    }
-    return false;
+    assert definition != null;
+    return definition.outTypeKnownToBeBoolean(seen);
   }
 
   public void markAsThis() {
-    assert isArgument;
+    assert isArgument();
     assert !isThis;
     isThis = true;
   }
@@ -854,11 +928,11 @@ public class Value {
 
   public LongInterval getValueRange() {
     if (isConstNumber()) {
-      if (typeLattice.isSingle()) {
+      if (type.isSinglePrimitive()) {
         int value = getConstInstruction().asConstNumber().getIntValue();
         return new LongInterval(value, value);
       } else {
-        assert typeLattice.isWide();
+        assert type.isWidePrimitive();
         long value = getConstInstruction().asConstNumber().getLongValue();
         return new LongInterval(value, value);
       }
@@ -867,15 +941,14 @@ public class Value {
     }
   }
 
-  public boolean isDead(AppView<? extends AppInfo> appView, IRCode code) {
+  public boolean isDead(AppView<?> appView, IRCode code) {
     // Totally unused values are trivially dead.
     return !isUsed() || isDead(appView, code, Predicates.alwaysFalse());
   }
 
-  public boolean isDead(
-      AppView<? extends AppInfo> appView, IRCode code, Predicate<Instruction> ignoreUser) {
+  public boolean isDead(AppView<?> appView, IRCode code, Predicate<Instruction> ignoreUser) {
     // Totally unused values are trivially dead.
-    return !isUsed() || isDead(appView, code, ignoreUser, new HashSet<>());
+    return !isUsed() || isDead(appView, code, ignoreUser, Sets.newIdentityHashSet());
   }
 
   /**
@@ -889,10 +962,7 @@ public class Value {
    * constructor call.
    */
   protected boolean isDead(
-      AppView<? extends AppInfo> appView,
-      IRCode code,
-      Predicate<Instruction> ignoreUser,
-      Set<Value> active) {
+      AppView<?> appView, IRCode code, Predicate<Instruction> ignoreUser, Set<Value> active) {
     // Give up when the dependent set of values reach a given threshold (otherwise this fails with
     // a StackOverflowError on Art003_omnibus_opcodesTest).
     if (active.size() > 100) {
@@ -901,7 +971,7 @@ public class Value {
 
     // If the value has debug users we cannot eliminate it since it represents a value in a local
     // variable that should be visible in the debugger.
-    if (numberOfDebugUsers() != 0) {
+    if (hasDebugUsers()) {
       return false;
     }
     // This is a candidate for a dead value. Guard against looping by adding it to the set of
@@ -911,8 +981,17 @@ public class Value {
       if (ignoreUser.test(instruction)) {
         continue;
       }
-      if (!instruction.canBeDeadCode(appView, code)) {
+      DeadInstructionResult result = instruction.canBeDeadCode(appView, code);
+      if (result.isNotDead()) {
         return false;
+      }
+      if (result.isMaybeDead()) {
+        for (Value valueRequiredToBeDead : result.getValuesRequiredToBeDead()) {
+          if (!active.contains(valueRequiredToBeDead)
+              && !valueRequiredToBeDead.isDead(appView, code, ignoreUser, active)) {
+            return false;
+          }
+        }
       }
       Value outValue = instruction.outValue();
       if (outValue != null
@@ -935,27 +1014,136 @@ public class Value {
         && getConstInstruction().asConstNumber().isZero();
   }
 
-  public void widening(AppView<? extends AppInfo> appView, TypeLatticeElement newType) {
-    // TODO(b/72693244): Enable assertion.
+  /**
+   * Overwrites the current type lattice value without any assertions.
+   *
+   * @param newType The new type lattice element
+   */
+  public void setType(TypeElement newType) {
+    assert newType != null;
+    type = newType;
+  }
+
+  public void widening(AppView<?> appView, TypeElement newType) {
     // During WIDENING (due to fix-point iteration), type update is monotonically upwards,
     //   i.e., towards something wider.
-    //assert !TypeLatticeElement.strictlyLessThan(appInfo, newType, typeLattice)
-    //    : "During WIDENING, " + newType + " < " + typeLattice
-    //    + " at " + (isPhi() ? asPhi().printPhi() : definition.toString());
-    typeLattice = newType;
+    assert this.type.lessThanOrEqual(newType, appView)
+        : "During WIDENING, "
+            + newType
+            + " < "
+            + type
+            + " at "
+            + (isPhi() ? asPhi().printPhi() : definition.toString());
+    setType(newType);
   }
 
-  public void narrowing(AppView<? extends AppInfo> appView, TypeLatticeElement newType) {
-    // TODO(b/72693244): Enable assertion.
+  public void narrowing(AppView<?> appView, TypeElement newType) {
     // During NARROWING (e.g., after inlining), type update is monotonically downwards,
     //   i.e., towards something narrower, with more specific type info.
-    //assert !TypeLatticeElement.strictlyLessThan(appInfo, typeLattice, newType)
-    //    : "During NARROWING, " + typeLattice + " < " + newType
-    //    + " at " + (isPhi() ? asPhi().printPhi() : definition.toString());
-    typeLattice = newType;
+    assert (!appView.options().testing.enableNarrowingChecksInD8
+                && !appView.enableWholeProgramOptimizations())
+            || !this.type.strictlyLessThan(newType, appView)
+        : "During NARROWING, "
+            + type
+            + " < "
+            + newType
+            + " at "
+            + (isPhi() ? asPhi().printPhi() : definition.toString());
+    setType(newType);
   }
 
-  public TypeLatticeElement getTypeLattice() {
-    return typeLattice;
+  public BasicBlock getBlock() {
+    return definition.getBlock();
+  }
+
+  public TypeElement getType() {
+    return type;
+  }
+
+  public TypeElement getDynamicUpperBoundType(
+      AppView<? extends AppInfoWithClassHierarchy> appView) {
+    Value root = getAliasedValue();
+    if (root.isPhi()) {
+      assert getSpecificAliasedValue(
+              value ->
+                  value.isDefinedByInstructionSatisfying(
+                      Instruction::isAssumeWithDynamicTypeAssumption))
+          == null;
+      TypeElement result = root.getDynamicUpperBoundType(appView);
+      if (getType().isReferenceType() && getType().isDefinitelyNotNull()) {
+        return result.asReferenceType().asMeetWithNotNull();
+      }
+      return result;
+    }
+
+    // Try to find an alias of the receiver, which is defined by an instruction of the type Assume.
+    Value aliasedValue =
+        getSpecificAliasedValue(
+            value ->
+                value.isDefinedByInstructionSatisfying(
+                    Instruction::isAssumeWithDynamicTypeAssumption));
+    TypeElement lattice;
+    if (aliasedValue != null) {
+      // If there is an alias of the receiver, which is defined by an Assume instruction that
+      // carries a dynamic type, then use the dynamic type as the refined receiver type.
+      lattice =
+          aliasedValue.definition.asAssume().getDynamicTypeAssumption().getDynamicUpperBoundType();
+
+      // For precision, verify that the dynamic type is at least as precise as the static type.
+      assert lattice.lessThanOrEqualUpToNullability(type, appView) : type + " < " + lattice;
+    } else {
+      // Otherwise, simply use the static type.
+      lattice = type;
+    }
+
+    // Account for nullability, which could be flown from non-null assumption in between dynamic
+    // type assumption or simply from array/object creation.
+    if (type.isDefinitelyNotNull() && lattice.isNullable()) {
+      // Having non-null assumption means it is a reference type.
+      assert lattice.isReferenceType();
+      // Then, we can return the non-null variant of dynamic type if both assumptions are aliased.
+      return lattice.asReferenceType().asMeetWithNotNull();
+    }
+    return lattice;
+  }
+
+  public ClassTypeElement getDynamicLowerBoundType(AppView<AppInfoWithLiveness> appView) {
+    // If it is a final or effectively-final class type, then we know the lower bound.
+    if (getType().isClassType()) {
+      ClassTypeElement classType = getType().asClassType();
+      DexType type = classType.getClassType();
+      DexClass clazz = appView.definitionFor(type);
+      if (clazz != null && clazz.isEffectivelyFinal(appView)) {
+        return classType;
+      }
+    }
+
+    Value root = getAliasedValue();
+    if (root.isPhi()) {
+      return null;
+    }
+
+    Instruction definition = root.definition;
+    if (definition.isNewInstance()) {
+      DexType type = definition.asNewInstance().clazz;
+      DexClass clazz = appView.definitionFor(type);
+      if (clazz != null && !clazz.isInterface()) {
+        return ClassTypeElement.create(type, definitelyNotNull(), appView);
+      }
+      return null;
+    }
+
+    // Try to find an alias of the receiver, which is defined by an instruction of the type Assume.
+    Value aliasedValue =
+        getSpecificAliasedValue(value -> value.definition.isAssumeWithDynamicTypeAssumption());
+    if (aliasedValue != null) {
+      ClassTypeElement lattice =
+          aliasedValue.definition.asAssume().getDynamicTypeAssumption().getDynamicLowerBoundType();
+      return lattice != null && type.isDefinitelyNotNull() && lattice.isNullable()
+          ? lattice.asMeetWithNotNull()
+          : lattice;
+    }
+
+    return null;
   }
 }

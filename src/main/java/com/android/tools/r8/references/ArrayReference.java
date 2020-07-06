@@ -5,6 +5,7 @@ package com.android.tools.r8.references;
 
 import com.android.tools.r8.Keep;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.utils.DescriptorUtils;
 
 /** Reference to an array type. */
 @Keep
@@ -34,6 +35,13 @@ public final class ArrayReference implements TypeReference {
     throw new Unreachable("Invalid array type descriptor: " + descriptor);
   }
 
+  static ArrayReference fromBaseType(TypeReference baseType, int dimensions) {
+    return new ArrayReference(
+        dimensions,
+        baseType,
+        DescriptorUtils.toArrayDescriptor(dimensions, baseType.getDescriptor()));
+  }
+
   public int getDimensions() {
     return dimensions;
   }
@@ -49,6 +57,11 @@ public final class ArrayReference implements TypeReference {
   @Override
   public boolean isArray() {
     return true;
+  }
+
+  @Override
+  public ArrayReference asArray() {
+    return this;
   }
 
   @Override

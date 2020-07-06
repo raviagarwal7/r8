@@ -8,10 +8,10 @@ import com.android.tools.r8.code.Const16;
 import com.android.tools.r8.code.Const4;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 
 public class AlwaysMaterializingDefinition extends ConstInstruction {
 
@@ -20,14 +20,19 @@ public class AlwaysMaterializingDefinition extends ConstInstruction {
   }
 
   @Override
+  public int opcode() {
+    return Opcodes.ALWAYS_MATERIALIZING_DEFINITION;
+  }
+
+  @Override
   public <T> T accept(InstructionVisitor<T> visitor) {
     return visitor.visit(this);
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
     // This instruction may never be considered dead as it must remain.
-    return false;
+    return DeadInstructionResult.notDead();
   }
 
   @Override

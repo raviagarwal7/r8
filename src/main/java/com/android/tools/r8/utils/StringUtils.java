@@ -4,6 +4,8 @@
 package com.android.tools.r8.utils;
 
 import com.android.tools.r8.errors.Unreachable;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -11,14 +13,14 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class StringUtils {
+  public static char[] EMPTY_CHAR_ARRAY = {};
   public static final String[] EMPTY_ARRAY = {};
   public static final String LINE_SEPARATOR = System.getProperty("line.separator");
-
-  private static final char[] IDENTIFIER_LETTERS
-      = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_".toCharArray();
-  private static final int NUMBER_OF_LETTERS = IDENTIFIER_LETTERS.length;
+  public static final char BOM = '\uFEFF';
 
   public enum BraceType {
     PARENS,
@@ -167,6 +169,10 @@ public class StringUtils {
     return join(LINE_SEPARATOR, lines);
   }
 
+  public static <T> String joinLines(Collection<T> collection) {
+    return join(collection, LINE_SEPARATOR, BraceType.NONE);
+  }
+
   public static List<String> splitLines(String content) {
     int length = content.length();
     List<String> lines = new ArrayList<>();
@@ -256,33 +262,83 @@ public class StringUtils {
     return Arrays.toString(digest);
   }
 
-  public static String numberToIdentifier(char[] prefix, int nameCount) {
-    return numberToIdentifier(prefix, nameCount, false);
+
+  public static String times(String string, int count) {
+    StringBuilder builder = new StringBuilder();
+    while (--count >= 0) {
+      builder.append(string);
+    }
+    return builder.toString();
   }
 
-  public static String numberToIdentifier(char[] prefix, int nameCount, boolean addSemicolon) {
-    // TODO(herhut): Add support for using numbers.
-    int size = addSemicolon ? 1 : 0;
-    int number = nameCount;
-    while (number >= NUMBER_OF_LETTERS) {
-      number /= NUMBER_OF_LETTERS;
-      size++;
-    }
-    size++;
-    char characters[] = Arrays.copyOfRange(prefix, 0, prefix.length + size);
-    number = nameCount;
+  public static boolean isBOM(int codePoint) {
+    return codePoint == BOM;
+  }
 
-    int i = prefix.length;
-    while (number >= NUMBER_OF_LETTERS) {
-      characters[i++] = IDENTIFIER_LETTERS[number % NUMBER_OF_LETTERS];
-      number /= NUMBER_OF_LETTERS;
-    }
-    characters[i++] = IDENTIFIER_LETTERS[number - 1];
-    if (addSemicolon) {
-      characters[i++] = ';';
-    }
-    assert i == characters.length;
+  public static boolean isWhitespace(int codePoint) {
+    return Character.isWhitespace(codePoint) || isBOM(codePoint);
+  }
 
-    return new String(characters);
+  public static String stripLeadingBOM(String s) {
+    if (s.length() > 0 && s.charAt(0) == StringUtils.BOM) {
+      return s.substring(1);
+    } else {
+      return s;
+    }
+  }
+
+  public static String trim(String s) {
+    int beginIndex = 0;
+    int endIndex = s.length();
+    while (beginIndex < endIndex && isWhitespace(s.charAt(beginIndex))) {
+      beginIndex++;
+    }
+    while (endIndex - 1 > beginIndex && isWhitespace(s.charAt(endIndex - 1))) {
+      endIndex--;
+    }
+    if (beginIndex > 0 || endIndex < s.length()) {
+      return s.substring(beginIndex, endIndex);
+    } else {
+      return s;
+    }
+  }
+
+  /** Returns true if {@param s} only contains the characters [0-9]. */
+  public static boolean onlyContainsDigits(String s) {
+    for (int i = 0; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (!Character.isDigit(c)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  public static char lastChar(String s) {
+    return charFromEnd(s, 0);
+  }
+
+  public static char charFromEnd(String s, int charsFromEnd) {
+    assert s.length() > charsFromEnd;
+    return s.charAt(s.length() - (charsFromEnd + 1));
+  }
+
+  public static int firstNonWhitespaceCharacter(String string) {
+    for (int i = 0; i < string.length(); i++) {
+      if (!isWhitespace(string.charAt(i))) {
+        return i;
+      }
+    }
+    return string.length();
+  }
+
+  public static String replaceAll(String subject, String target, String replacement) {
+    return subject.replaceAll(Pattern.quote(target), Matcher.quoteReplacement(replacement));
+  }
+
+  public static String stacktraceAsString(Throwable throwable) {
+    StringWriter sw = new StringWriter();
+    throwable.printStackTrace(new PrintWriter(sw));
+    return sw.toString();
   }
 }

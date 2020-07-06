@@ -4,7 +4,7 @@
 
 package com.android.tools.r8.ir.optimize.peepholes;
 
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.Load;
@@ -85,8 +85,10 @@ public class MoveLoadUpPeephole implements BasicBlockPeephole {
 
     // Find the place to insert a new load.
     Instruction current = it.previous();
+    int moves = 1;
     while (current != insertPosition) {
       current = it.previous();
+      moves++;
     }
 
     // Insert directly above the other load.
@@ -94,8 +96,11 @@ public class MoveLoadUpPeephole implements BasicBlockPeephole {
     newLoad.setPosition(insertPosition.getPosition());
     it.add(newLoad);
 
-    // Do not reset the instruction pointer because the iterator should reset.
-    return true;
+    // This will run in a loop where we are only going backwards and there is no need to iterate
+    // the same instructions again since the StoreLoad peephole will not change the level of the
+    // stack.
+    PeepholeHelper.resetPrevious(it, moves + 1);
+    return false;
   }
 
   private static boolean isPotentionalIncInstruction(InstructionListIterator it) {
@@ -108,7 +113,7 @@ public class MoveLoadUpPeephole implements BasicBlockPeephole {
     Instruction current = it.next();
     if (position != current.getPosition()
         || !current.isConstNumber()
-        || current.outValue().getTypeLattice() != TypeLatticeElement.INT
+        || current.getOutType() != TypeElement.getInt()
         || current.asConstNumber().getIntValue() < -128
         || current.asConstNumber().getIntValue() > 127
         || !it.hasNext()) {
@@ -127,7 +132,7 @@ public class MoveLoadUpPeephole implements BasicBlockPeephole {
 
   @Override
   public boolean resetAfterMatch() {
-    return true;
+    return false;
   }
 
 }

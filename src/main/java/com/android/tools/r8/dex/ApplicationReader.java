@@ -6,9 +6,11 @@ package com.android.tools.r8.dex;
 import static com.android.tools.r8.graph.ClassKind.CLASSPATH;
 import static com.android.tools.r8.graph.ClassKind.LIBRARY;
 import static com.android.tools.r8.graph.ClassKind.PROGRAM;
+import static com.android.tools.r8.utils.ExceptionUtils.unwrapExecutionException;
 
 import com.android.tools.r8.ClassFileResourceProvider;
 import com.android.tools.r8.DataResourceProvider;
+import com.android.tools.r8.Diagnostic;
 import com.android.tools.r8.ProgramResource;
 import com.android.tools.r8.ProgramResource.Kind;
 import com.android.tools.r8.ProgramResourceProvider;
@@ -40,7 +42,9 @@ import com.android.tools.r8.utils.StringDiagnostic;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
 import java.io.IOException;
-import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -70,11 +74,11 @@ public class ApplicationReader {
     this.inputApp = inputApp;
   }
 
-  public DexApplication read() throws IOException, ExecutionException {
+  public LazyLoadedDexApplication read() throws IOException {
     return read((StringResource) null);
   }
 
-  public DexApplication read(StringResource proguardMap) throws IOException, ExecutionException {
+  public LazyLoadedDexApplication read(StringResource proguardMap) throws IOException {
     ExecutorService executor = Executors.newSingleThreadExecutor();
     try {
       return read(proguardMap, executor);
@@ -83,25 +87,53 @@ public class ApplicationReader {
     }
   }
 
-  public final DexApplication read(ExecutorService executorService)
-      throws IOException, ExecutionException {
-    return read(null, executorService, ProgramClassCollection::resolveClassConflictImpl);
+  public final LazyLoadedDexApplication read(ExecutorService executorService) throws IOException {
+    return read(
+        null, executorService, ProgramClassCollection.defaultConflictResolver(options.reporter));
   }
 
-  public final DexApplication read(StringResource proguardMap, ExecutorService executorService)
-      throws IOException, ExecutionException {
-    return read(proguardMap, executorService, ProgramClassCollection::resolveClassConflictImpl);
+  public final LazyLoadedDexApplication read(
+      StringResource proguardMap, ExecutorService executorService) throws IOException {
+    return read(
+        proguardMap,
+        executorService,
+        ProgramClassCollection.defaultConflictResolver(options.reporter));
   }
 
-  public final DexApplication read(
+  public final LazyLoadedDexApplication read(
       StringResource proguardMap,
       ExecutorService executorService,
       ProgramClassConflictResolver resolver)
-      throws IOException, ExecutionException {
+      throws IOException {
     assert verifyMainDexOptionsCompatible(inputApp, options);
+    Path dumpOutput = null;
+    boolean cleanDump = false;
+    if (options.dumpInputToFile != null) {
+      dumpOutput = Paths.get(options.dumpInputToFile);
+    } else if (options.dumpInputToDirectory != null) {
+      dumpOutput =
+          Paths.get(options.dumpInputToDirectory).resolve("dump" + System.nanoTime() + ".zip");
+    } else if (options.testing.dumpAll) {
+      cleanDump = true;
+      dumpOutput = Paths.get("/tmp").resolve("dump" + System.nanoTime() + ".zip");
+    }
+    if (dumpOutput != null) {
+      timing.begin("ApplicationReader.dump");
+      dumpInputToFile(inputApp, dumpOutput, options);
+      if (cleanDump) {
+        Files.delete(dumpOutput);
+      }
+      timing.end();
+      Diagnostic message = new StringDiagnostic("Dumped compilation inputs to: " + dumpOutput);
+      if (options.dumpInputToFile != null) {
+        throw options.reporter.fatalError(message);
+      } else if (!cleanDump) {
+        options.reporter.info(message);
+      }
+    }
     timing.begin("DexApplication.read");
     final LazyLoadedDexApplication.Builder builder =
-        DexApplication.builder(itemFactory, timing, resolver);
+        DexApplication.builder(options, timing, resolver);
     try {
       List<Future<?>> futures = new ArrayList<>();
       // Still preload some of the classes, primarily for two reasons:
@@ -114,7 +146,7 @@ public class ApplicationReader {
       readProguardMap(proguardMap, builder, executorService, futures);
       readMainDexList(builder, executorService, futures);
       ClassReader classReader = new ClassReader(executorService, futures);
-      classReader.readSources();
+      JarClassFileReader jcf = classReader.readSources();
       ThreadUtils.awaitFutures(futures);
       classReader.initializeLazyClassCollection(builder);
       for (ProgramResourceProvider provider : inputApp.getProgramResourceProviders()) {
@@ -123,12 +155,18 @@ public class ApplicationReader {
           builder.addDataResourceProvider(dataResourceProvider);
         }
       }
+    } catch (ExecutionException e) {
+      throw unwrapExecutionException(e);
     } catch (ResourceException e) {
       throw options.reporter.fatalError(new StringDiagnostic(e.getMessage(), e.getOrigin()));
     } finally {
       timing.end();
     }
     return builder.build();
+  }
+
+  private static void dumpInputToFile(AndroidApp app, Path output, InternalOptions options) {
+    app.dump(output, options);
   }
 
   private static boolean verifyMainDexOptionsCompatible(
@@ -147,7 +185,7 @@ public class ApplicationReader {
   }
 
   private int validateOrComputeMinApiLevel(int computedMinApiLevel, DexReader dexReader) {
-    DexVersion version = DexVersion.getDexVersion(dexReader.getDexVersion());
+    DexVersion version = dexReader.getDexVersion();
     if (options.minApiLevel == AndroidApiLevel.getDefault().getLevel()) {
       computedMinApiLevel = Math
           .max(computedMinApiLevel, AndroidApiLevel.getMinAndroidApiLevel(version).getLevel());
@@ -225,8 +263,9 @@ public class ApplicationReader {
           if (options.passthroughDexCode) {
             computedMinApiLevel = validateOrComputeMinApiLevel(computedMinApiLevel, dexReader);
           }
-          dexParsers.add(new DexParser(dexReader, classKind, itemFactory, options.reporter));
+          dexParsers.add(new DexParser(dexReader, classKind, options));
         }
+
         options.minApiLevel = computedMinApiLevel;
         for (DexParser dexParser : dexParsers) {
           dexParser.populateIndexTables();
@@ -243,7 +282,7 @@ public class ApplicationReader {
       }
     }
 
-    private <T extends DexClass> void readClassSources(
+    private <T extends DexClass> JarClassFileReader readClassSources(
         List<ProgramResource> classSources, ClassKind classKind, Queue<T> classes) {
       JarClassFileReader reader = new JarClassFileReader(
           application, classKind.bridgeConsumer(classes::add));
@@ -252,18 +291,16 @@ public class ApplicationReader {
         futures.add(
             executorService.submit(
                 () -> {
-                  try (InputStream is = input.getByteStream()) {
-                    reader.read(input.getOrigin(), classKind, is);
-                  }
-                  // No other way to have a void callable, but we want the IOException from the
-                  // previous
-                  // line to be wrapped into an ExecutionException.
+                  reader.read(input, classKind);
+                  // No other way to have a void callable, but we want the IOException from read
+                  // to be wrapped into an ExecutionException.
                   return null;
                 }));
       }
+      return reader;
     }
 
-    void readSources() throws IOException, ResourceException {
+    JarClassFileReader readSources() throws IOException, ResourceException {
       Collection<ProgramResource> resources = inputApp.computeAllProgramResources();
       List<ProgramResource> dexResources = new ArrayList<>(resources.size());
       List<ProgramResource> cfResources = new ArrayList<>(resources.size());
@@ -276,7 +313,7 @@ public class ApplicationReader {
         }
       }
       readDexSources(dexResources, PROGRAM, programClasses);
-      readClassSources(cfResources, PROGRAM, programClasses);
+      return readClassSources(cfResources, PROGRAM, programClasses);
     }
 
     private <T extends DexClass> ClassProvider<T> buildClassProvider(ClassKind classKind,

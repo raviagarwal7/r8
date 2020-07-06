@@ -12,6 +12,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import com.android.tools.r8.CompilationFailedException;
 import com.android.tools.r8.NeverInline;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.TestParameters;
@@ -27,6 +28,7 @@ import com.android.tools.r8.graph.DexCode;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.ir.optimize.staticizer.dualcallinline.Candidate;
+import com.android.tools.r8.ir.optimize.staticizer.dualcallinline.DualCallTest;
 import com.android.tools.r8.ir.optimize.staticizer.movetohost.CandidateConflictField;
 import com.android.tools.r8.ir.optimize.staticizer.movetohost.CandidateConflictMethod;
 import com.android.tools.r8.ir.optimize.staticizer.movetohost.CandidateOk;
@@ -41,18 +43,22 @@ import com.android.tools.r8.ir.optimize.staticizer.movetohost.MoveToHostFieldOnl
 import com.android.tools.r8.ir.optimize.staticizer.movetohost.MoveToHostTestClass;
 import com.android.tools.r8.ir.optimize.staticizer.trivial.Simple;
 import com.android.tools.r8.ir.optimize.staticizer.trivial.SimpleWithGetter;
+import com.android.tools.r8.ir.optimize.staticizer.trivial.SimpleWithLazyInit;
 import com.android.tools.r8.ir.optimize.staticizer.trivial.SimpleWithParams;
 import com.android.tools.r8.ir.optimize.staticizer.trivial.SimpleWithPhi;
 import com.android.tools.r8.ir.optimize.staticizer.trivial.SimpleWithSideEffects;
+import com.android.tools.r8.ir.optimize.staticizer.trivial.SimpleWithThrowingGetter;
 import com.android.tools.r8.ir.optimize.staticizer.trivial.TrivialTestClass;
-import com.android.tools.r8.ir.optimize.staticizer.dualcallinline.DualCallTest;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Streams;
+import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -62,10 +68,41 @@ import org.junit.runners.Parameterized;
 public class ClassStaticizerTest extends TestBase {
   private final TestParameters parameters;
 
+  private static final String EXPECTED =
+      StringUtils.lines(
+          "Simple::bar(Simple::foo())",
+          "Simple::bar(0)",
+          "SimpleWithPhi$Companion::bar(SimpleWithPhi$Companion::foo()) true",
+          "SimpleWithSideEffects::<clinit>()",
+          "SimpleWithSideEffects::bar(SimpleWithSideEffects::foo())",
+          "SimpleWithSideEffects::bar(1)",
+          "SimpleWithParams::bar(SimpleWithParams::foo())",
+          "SimpleWithParams::bar(2)",
+          "SimpleWithGetter::bar(SimpleWithGetter::foo())",
+          "SimpleWithGetter::bar(3)",
+          "Simple::bar(Simple::foo())",
+          "Simple::bar(4)",
+          "Simple::bar(Simple::foo())",
+          "Simple::bar(5)");
+
+  private static final Class<?> main = TrivialTestClass.class;
+  private static final Class<?>[] classes = {
+    NeverInline.class,
+    TrivialTestClass.class,
+    Simple.class,
+    SimpleWithGetter.class,
+    SimpleWithLazyInit.class,
+    SimpleWithParams.class,
+    SimpleWithPhi.class,
+    SimpleWithPhi.Companion.class,
+    SimpleWithSideEffects.class,
+    SimpleWithThrowingGetter.class
+  };
+
   @Parameterized.Parameters(name = "{0}")
   public static TestParametersCollection data() {
     // TODO(b/112831361): support for class staticizer in CF backend.
-    return getTestParameters().withDexRuntimes().build();
+    return getTestParameters().withDexRuntimes().withAllApiLevels().build();
   }
 
   public ClassStaticizerTest(TestParameters parameters) {
@@ -73,85 +110,128 @@ public class ClassStaticizerTest extends TestBase {
   }
 
   @Test
+  public void testWithoutAccessModification()
+      throws ExecutionException, CompilationFailedException, IOException {
+    testForR8(parameters.getBackend())
+        .addProgramClasses(classes)
+        .addKeepMainRule(main)
+        .addKeepAttributes("InnerClasses", "EnclosingMethod")
+        .addOptionsModification(this::configure)
+        .setMinApi(parameters.getApiLevel())
+        .run(parameters.getRuntime(), main)
+        .assertSuccessWithOutput(EXPECTED);
+  }
+
+  @Test
   public void testTrivial() throws Exception {
-    Class<?> main = TrivialTestClass.class;
-    Class<?>[] classes = {
-        NeverInline.class,
-        TrivialTestClass.class,
-        Simple.class,
-        SimpleWithSideEffects.class,
-        SimpleWithParams.class,
-        SimpleWithGetter.class,
-        SimpleWithPhi.class,
-        SimpleWithPhi.Companion.class
-    };
-    String javaOutput = runOnJava(main);
     TestRunResult result =
         testForR8(parameters.getBackend())
             .addProgramClasses(classes)
             .enableInliningAnnotations()
             .addKeepMainRule(main)
             .noMinification()
-            .addKeepRules("-allowaccessmodification")
-            .addKeepRules("-keepattributes InnerClasses,EnclosingMethod")
+            .addKeepAttributes("InnerClasses", "EnclosingMethod")
             .addOptionsModification(this::configure)
-            .setMinApi(parameters.getRuntime())
+            .allowAccessModification()
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), main)
-            .assertSuccessWithOutput(javaOutput);
+            .assertSuccessWithOutput(EXPECTED);
 
     CodeInspector inspector = result.inspector();
     ClassSubject clazz = inspector.clazz(main);
 
     assertEquals(
         Lists.newArrayList(
-            "STATIC: String trivial.Simple.bar(String)",
-            "STATIC: String trivial.Simple.foo()",
-            "STATIC: String trivial.TrivialTestClass.next()"),
+            "STATIC: String Simple.bar(String)",
+            "STATIC: String Simple.foo()",
+            "STATIC: String TrivialTestClass.next()"),
         references(clazz, "testSimple", "void"));
 
-    assertTrue(instanceMethods(inspector.clazz(Simple.class)).isEmpty());
+    ClassSubject simple = inspector.clazz(Simple.class);
+    assertTrue(instanceMethods(simple).isEmpty());
+    assertThat(simple.clinit(), not(isPresent()));
 
     assertEquals(
         Lists.newArrayList(
-            "STATIC: String trivial.SimpleWithPhi.bar(String)",
-            "STATIC: String trivial.SimpleWithPhi.foo()",
-            "STATIC: String trivial.SimpleWithPhi.foo()",
-            "STATIC: String trivial.TrivialTestClass.next()"),
+            "STATIC: String SimpleWithPhi.bar(String)",
+            "STATIC: String SimpleWithPhi.foo()",
+            "STATIC: String SimpleWithPhi.foo()",
+            "STATIC: String TrivialTestClass.next()"),
         references(clazz, "testSimpleWithPhi", "void", "int"));
 
-    assertTrue(instanceMethods(inspector.clazz(SimpleWithPhi.class)).isEmpty());
+    ClassSubject simpleWithPhi = inspector.clazz(SimpleWithPhi.class);
+    assertTrue(instanceMethods(simpleWithPhi).isEmpty());
+    assertThat(simpleWithPhi.clinit(), not(isPresent()));
 
     assertEquals(
         Lists.newArrayList(
-            "STATIC: String trivial.SimpleWithParams.bar(String)",
-            "STATIC: String trivial.SimpleWithParams.foo()",
-            "STATIC: String trivial.TrivialTestClass.next()"),
+            "STATIC: String SimpleWithParams.bar(String)",
+            "STATIC: String SimpleWithParams.foo()",
+            "STATIC: String TrivialTestClass.next()"),
         references(clazz, "testSimpleWithParams", "void"));
 
-    assertTrue(instanceMethods(inspector.clazz(SimpleWithParams.class)).isEmpty());
+    ClassSubject simpleWithParams = inspector.clazz(SimpleWithParams.class);
+    assertTrue(instanceMethods(simpleWithParams).isEmpty());
+    assertThat(simpleWithParams.clinit(), not(isPresent()));
 
     assertEquals(
         Lists.newArrayList(
-            "STATIC: String trivial.SimpleWithSideEffects.bar(String)",
-            "STATIC: String trivial.SimpleWithSideEffects.foo()",
-            "STATIC: String trivial.TrivialTestClass.next()",
-            "trivial.SimpleWithSideEffects trivial.SimpleWithSideEffects.INSTANCE",
-            "trivial.SimpleWithSideEffects trivial.SimpleWithSideEffects.INSTANCE"),
+            "STATIC: String SimpleWithSideEffects.bar(String)",
+            "STATIC: String SimpleWithSideEffects.foo()",
+            "STATIC: String TrivialTestClass.next()",
+            "SimpleWithSideEffects SimpleWithSideEffects.INSTANCE",
+            "SimpleWithSideEffects SimpleWithSideEffects.INSTANCE"),
         references(clazz, "testSimpleWithSideEffects", "void"));
 
-    assertTrue(instanceMethods(inspector.clazz(SimpleWithSideEffects.class)).isEmpty());
+    ClassSubject simpleWithSideEffects = inspector.clazz(SimpleWithSideEffects.class);
+    assertTrue(instanceMethods(simpleWithSideEffects).isEmpty());
+    // As its name implies, its clinit has side effects.
+    assertThat(simpleWithSideEffects.clinit(), isPresent());
 
-    // TODO(b/111832046): add support for singleton instance getters.
     assertEquals(
         Lists.newArrayList(
-            "STATIC: String trivial.TrivialTestClass.next()",
-            "VIRTUAL: String trivial.SimpleWithGetter.bar(String)",
-            "VIRTUAL: String trivial.SimpleWithGetter.foo()",
-            "trivial.SimpleWithGetter trivial.SimpleWithGetter.INSTANCE",
-            "trivial.SimpleWithGetter trivial.SimpleWithGetter.INSTANCE"),
+            "STATIC: String SimpleWithGetter.bar(String)",
+            "STATIC: String SimpleWithGetter.foo()",
+            "STATIC: String TrivialTestClass.next()"),
         references(clazz, "testSimpleWithGetter", "void"));
 
-    assertFalse(instanceMethods(inspector.clazz(SimpleWithGetter.class)).isEmpty());
+    ClassSubject simpleWithGetter = inspector.clazz(SimpleWithGetter.class);
+    assertTrue(instanceMethods(simpleWithGetter).isEmpty());
+    assertThat(simpleWithGetter.clinit(), not(isPresent()));
+
+    assertEquals(
+        Lists.newArrayList(
+            "STATIC: SimpleWithThrowingGetter SimpleWithThrowingGetter.getInstance()",
+            "STATIC: SimpleWithThrowingGetter SimpleWithThrowingGetter.getInstance()",
+            "STATIC: String TrivialTestClass.next()",
+            "SimpleWithThrowingGetter SimpleWithThrowingGetter.INSTANCE",
+            "VIRTUAL: String SimpleWithThrowingGetter.bar(String)",
+            "VIRTUAL: String SimpleWithThrowingGetter.foo()"),
+        references(clazz, "testSimpleWithThrowingGetter", "void"));
+
+    ClassSubject simpleWithThrowingGetter = inspector.clazz(SimpleWithThrowingGetter.class);
+    assertFalse(instanceMethods(simpleWithThrowingGetter).isEmpty());
+    assertThat(simpleWithThrowingGetter.clinit(), isPresent());
+
+    // TODO(b/143389508): add support for lazy init in singleton instance getter.
+    assertEquals(
+        Lists.newArrayList(
+            "DIRECT: void SimpleWithLazyInit.<init>()",
+            "DIRECT: void SimpleWithLazyInit.<init>()",
+            "STATIC: String TrivialTestClass.next()",
+            "SimpleWithLazyInit SimpleWithLazyInit.INSTANCE",
+            "SimpleWithLazyInit SimpleWithLazyInit.INSTANCE",
+            "SimpleWithLazyInit SimpleWithLazyInit.INSTANCE",
+            "SimpleWithLazyInit SimpleWithLazyInit.INSTANCE",
+            "SimpleWithLazyInit SimpleWithLazyInit.INSTANCE",
+            "SimpleWithLazyInit SimpleWithLazyInit.INSTANCE",
+            "VIRTUAL: String SimpleWithLazyInit.bar(String)",
+            "VIRTUAL: String SimpleWithLazyInit.foo()"),
+        references(clazz, "testSimpleWithLazyInit", "void"));
+
+    ClassSubject simpleWithLazyInit = inspector.clazz(SimpleWithLazyInit.class);
+    assertFalse(instanceMethods(simpleWithLazyInit).isEmpty());
+    assertThat(simpleWithLazyInit.clinit(), not(isPresent()));
   }
 
   @Test
@@ -167,11 +247,12 @@ public class ClassStaticizerTest extends TestBase {
         testForR8(parameters.getBackend())
             .addProgramClasses(classes)
             .enableInliningAnnotations()
+            .enableSideEffectAnnotations()
             .addKeepMainRule(main)
+            .allowAccessModification()
             .noMinification()
-            .addKeepRules("-allowaccessmodification")
             .addOptionsModification(this::configure)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), main);
 
     CodeInspector inspector = result.inspector();
@@ -181,7 +262,7 @@ public class ClassStaticizerTest extends TestBase {
         Lists.newArrayList(),
         references(clazz, "testOk_fieldOnly", "void"));
 
-    assertFalse(inspector.clazz(CandidateOkFieldOnly.class).isPresent());
+    assertThat(inspector.clazz(CandidateOkFieldOnly.class), not(isPresent()));
   }
 
   @Test
@@ -204,11 +285,12 @@ public class ClassStaticizerTest extends TestBase {
         testForR8(parameters.getBackend())
             .addProgramClasses(classes)
             .enableInliningAnnotations()
+            .enableMemberValuePropagationAnnotations()
             .addKeepMainRule(main)
+            .allowAccessModification()
             .noMinification()
-            .addKeepRules("-allowaccessmodification")
             .addOptionsModification(this::configure)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), main)
             .assertSuccessWithOutput(javaOutput);
 
@@ -224,7 +306,7 @@ public class ClassStaticizerTest extends TestBase {
             "STATIC: void movetohost.HostOk.blah(String)"),
         references(clazz, "testOk", "void"));
 
-    assertFalse(inspector.clazz(CandidateOk.class).isPresent());
+    assertThat(inspector.clazz(CandidateOk.class), not(isPresent()));
 
     assertEquals(
         Lists.newArrayList(
@@ -235,7 +317,7 @@ public class ClassStaticizerTest extends TestBase {
             "movetohost.HostOkSideEffects movetohost.HostOkSideEffects.INSTANCE"),
         references(clazz, "testOkSideEffects", "void"));
 
-    assertFalse(inspector.clazz(CandidateOkSideEffects.class).isPresent());
+    assertThat(inspector.clazz(CandidateOkSideEffects.class), not(isPresent()));
 
     assertEquals(
         Lists.newArrayList(
@@ -247,7 +329,7 @@ public class ClassStaticizerTest extends TestBase {
             "VIRTUAL: String movetohost.HostConflictMethod.bar(String)"),
         references(clazz, "testConflictMethod", "void"));
 
-    assertTrue(inspector.clazz(CandidateConflictMethod.class).isPresent());
+    assertThat(inspector.clazz(CandidateConflictMethod.class), isPresent());
 
     assertEquals(
         Lists.newArrayList(
@@ -258,13 +340,13 @@ public class ClassStaticizerTest extends TestBase {
             "String movetohost.CandidateConflictField.field"),
         references(clazz, "testConflictField", "void"));
 
-    assertTrue(inspector.clazz(CandidateConflictMethod.class).isPresent());
+    assertThat(inspector.clazz(CandidateConflictMethod.class), isPresent());
   }
 
   private List<String> instanceMethods(ClassSubject clazz) {
     assertNotNull(clazz);
-    assertTrue(clazz.isPresent());
-    return Streams.stream(clazz.getDexClass().methods())
+    assertThat(clazz, isPresent());
+    return Streams.stream(clazz.getDexProgramClass().methods())
         .filter(method -> !method.isStatic())
         .map(method -> method.method.toSourceString())
         .sorted()
@@ -274,7 +356,7 @@ public class ClassStaticizerTest extends TestBase {
   private List<String> references(
       ClassSubject clazz, String methodName, String retValue, String... params) {
     assertNotNull(clazz);
-    assertTrue(clazz.isPresent());
+    assertThat(clazz, isPresent());
 
     MethodSignature signature = new MethodSignature(methodName, retValue, params);
     DexCode code = clazz.method(signature).getMethod().getCode().asDexCode();
@@ -303,6 +385,7 @@ public class ClassStaticizerTest extends TestBase {
             .filter(method -> isTypeOfInterest(method.holder))
             .map(method -> "DIRECT: " + method.toSourceString()))
         .map(txt -> txt.replace("java.lang.", ""))
+        .map(txt -> txt.replace("com.android.tools.r8.ir.optimize.staticizer.trivial.", ""))
         .map(txt -> txt.replace("com.android.tools.r8.ir.optimize.staticizer.", ""))
         .sorted()
         .collect(Collectors.toList());
@@ -330,10 +413,10 @@ public class ClassStaticizerTest extends TestBase {
             .addProgramClasses(classes)
             .enableInliningAnnotations()
             .addKeepMainRule(main)
+            .allowAccessModification()
             .noMinification()
-            .addKeepRules("-allowaccessmodification")
             .addOptionsModification(this::configure)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), main)
             .assertSuccessWithOutput(javaOutput);
 

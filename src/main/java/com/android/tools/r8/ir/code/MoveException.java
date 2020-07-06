@@ -6,13 +6,14 @@ package com.android.tools.r8.ir.code;
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.utils.InternalOptions;
@@ -25,6 +26,11 @@ public class MoveException extends Instruction {
     super(dest);
     this.exceptionType = exceptionType;
     this.options = options;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.MOVE_EXCEPTION;
   }
 
   @Override
@@ -75,14 +81,19 @@ public class MoveException extends Instruction {
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    return !(appView.options().debug || code.method.getOptimizationInfo().isReachabilitySensitive())
-        && appView.options().isGeneratingDex();
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
+    InternalOptions options = appView.options();
+    if (options.debug
+        || code.context().getDefinition().getOptimizationInfo().isReachabilitySensitive()
+        || options.isGeneratingClassFiles()) {
+      return DeadInstructionResult.notDead();
+    }
+    return DeadInstructionResult.deadIfOutValueIsDead();
   }
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forMoveException();
   }
 
@@ -102,17 +113,21 @@ public class MoveException extends Instruction {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return exceptionType;
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.fromDexType(exceptionType, Nullability.definitelyNotNull(), appView);
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.fromDexType(exceptionType, Nullability.definitelyNotNull(), appView);
   }
 
   public DexType getExceptionType() {
     return exceptionType;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

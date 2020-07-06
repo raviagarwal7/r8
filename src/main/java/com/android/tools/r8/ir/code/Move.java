@@ -7,10 +7,9 @@ package com.android.tools.r8.ir.code;
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -22,6 +21,11 @@ public class Move extends Instruction {
 
   public Move(Value dest, Value src) {
     super(dest, src);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.MOVE;
   }
 
   @Override
@@ -38,8 +42,8 @@ public class Move extends Instruction {
   }
 
   @Override
-  public boolean couldIntroduceAnAlias() {
-    return true;
+  public boolean couldIntroduceAnAlias(AppView<?> appView, Value root) {
+    throw new Unreachable("as long as we're analyzing SSA IR.");
   }
 
   @Override
@@ -69,7 +73,7 @@ public class Move extends Instruction {
 
   @Override
   public String toString() {
-    return super.toString() + " (" + outType() + ")";
+    return super.toString() + " (" + getOutType() + ")";
   }
 
   @Override
@@ -95,13 +99,13 @@ public class Move extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forMove();
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return src().getTypeLattice();
+  public TypeElement evaluate(AppView<?> appView) {
+    return src().getType();
   }
 
   @Override
@@ -112,5 +116,20 @@ public class Move extends Instruction {
   @Override
   public void insertLoadAndStores(InstructionListIterator it, LoadStoreHelper helper) {
     throw new Unreachable(ERROR_MESSAGE);
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
+  }
+
+  @Override
+  public boolean verifyTypes(AppView<?> appView) {
+    super.verifyTypes(appView);
+    // DebugLocalWrite defines it's own verification of types but should be allowed to call super.
+    if (!this.isDebugLocalWrite()) {
+      assert src().getType().equals(getOutType());
+    }
+    return true;
   }
 }

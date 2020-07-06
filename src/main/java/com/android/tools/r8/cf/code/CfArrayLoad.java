@@ -5,12 +5,16 @@ package com.android.tools.r8.cf.code;
 
 import com.android.tools.r8.cf.CfPrinter;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.ir.code.MemberType;
 import com.android.tools.r8.ir.code.ValueType;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.CfState.Slot;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
@@ -32,8 +36,7 @@ public class CfArrayLoad extends CfInstruction {
     switch (type) {
       case OBJECT:
         return Opcodes.AALOAD;
-      case BYTE:
-      case BOOLEAN:
+      case BOOLEAN_OR_BYTE:
         return Opcodes.BALOAD;
       case CHAR:
         return Opcodes.CALOAD;
@@ -53,7 +56,7 @@ public class CfArrayLoad extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     visitor.visitInsn(getLoadType());
   }
 
@@ -81,5 +84,11 @@ public class CfArrayLoad extends CfInstruction {
       value = state.push(memberType);
     }
     builder.addArrayGet(type, value.register, array.register, index.register);
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return inliningConstraints.forArrayGet();
   }
 }

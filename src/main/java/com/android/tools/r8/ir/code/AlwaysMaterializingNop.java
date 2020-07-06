@@ -6,11 +6,11 @@ package com.android.tools.r8.ir.code;
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.code.CfNop;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 
@@ -21,13 +21,18 @@ public class AlwaysMaterializingNop extends Instruction {
   }
 
   @Override
+  public int opcode() {
+    return Opcodes.ALWAYS_MATERIALIZING_NOP;
+  }
+
+  @Override
   public <T> T accept(InstructionVisitor<T> visitor) {
     return visitor.visit(this);
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    return false;
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
+    return DeadInstructionResult.notDead();
   }
 
   @Override
@@ -57,7 +62,7 @@ public class AlwaysMaterializingNop extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return ConstraintWithTarget.ALWAYS;
   }
 
@@ -69,5 +74,10 @@ public class AlwaysMaterializingNop extends Instruction {
   @Override
   public boolean hasInvariantOutType() {
     return true;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

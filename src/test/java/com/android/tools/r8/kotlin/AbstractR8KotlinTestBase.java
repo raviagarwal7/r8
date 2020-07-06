@@ -25,9 +25,9 @@ import com.android.tools.r8.jasmin.JasminBuilder.ClassBuilder;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.AndroidApp;
-import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.DescriptorUtils;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.FieldSubject;
@@ -36,15 +36,11 @@ import com.google.common.collect.ImmutableList;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 import org.junit.Assume;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
-@RunWith(Parameterized.class)
 public abstract class AbstractR8KotlinTestBase extends KotlinTestBase {
 
   // This is the name of the Jasmin-generated class which contains the "main" method which will
@@ -56,9 +52,9 @@ public abstract class AbstractR8KotlinTestBase extends KotlinTestBase {
   private final List<Path> classpath = new ArrayList<>();
   private final List<Path> extraClasspath = new ArrayList<>();
 
-  @Parameterized.Parameters(name = "target: {0}, allowAccessModification: {1}")
-  public static Collection<Object[]> data() {
-    return buildParameters(KotlinTargetVersion.values(), BooleanUtils.values());
+  // Some tests defined in subclasses, e.g., Metadata tests, don't care about access relaxation.
+  protected AbstractR8KotlinTestBase(KotlinTargetVersion kotlinTargetVersion) {
+    this(kotlinTargetVersion, false);
   }
 
   protected AbstractR8KotlinTestBase(
@@ -232,15 +228,31 @@ public abstract class AbstractR8KotlinTestBase extends KotlinTestBase {
   }
 
   protected String keepAllMembers(String className) {
-    return "-keep class " + className + " {" + System.lineSeparator()
-        + "  *;" + System.lineSeparator()
-        + "}";
+    return StringUtils.lines(
+        "-keep class " + className + " {",
+        "  *;",
+        "}");
+  }
+
+  protected String keepMainMethod(String className) {
+    return StringUtils.lines(
+        "-keepclasseswithmembers class " + className + " {",
+        "  public static void main(...);",
+        "}");
   }
 
   protected String keepClassMethod(String className, MethodSignature methodSignature) {
-    return "-keep class " + className + " {" + System.lineSeparator()
-        + methodSignature.toString() + ";" + System.lineSeparator()
-        + "}";
+    return StringUtils.lines(
+        "-keep class " + className + " {",
+        methodSignature.toString() + ";",
+        "}");
+  }
+
+  protected String neverInlineMethod(String className, MethodSignature methodSignature) {
+    return StringUtils.lines(
+        "-neverinline class " + className + " {",
+        methodSignature.toString() + ";",
+        "}");
   }
 
   protected void runTest(String folder, String mainClass,

@@ -4,7 +4,7 @@
 package com.android.tools.r8.shaking.desugar.interfacemethods;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static org.junit.Assert.assertThat;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 import com.android.tools.r8.NeverMerge;
@@ -31,7 +31,7 @@ class BridgeInliningTestRunner {
   public static void main(String[] args) throws Exception {
     C obj = new C();
     for (Method m : obj.getClass().getDeclaredMethods()) {
-      m.invoke(obj, null);
+      m.invoke(obj);
     }
   }
 }

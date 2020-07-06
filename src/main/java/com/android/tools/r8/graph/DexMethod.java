@@ -6,33 +6,81 @@ package com.android.tools.r8.graph;
 import com.android.tools.r8.dex.IndexedItemCollection;
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.naming.NamingLens;
-import com.google.common.collect.Maps;
-import java.util.Map;
+import com.android.tools.r8.references.MethodReference;
+import com.android.tools.r8.references.Reference;
+import com.android.tools.r8.references.TypeReference;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
-public class DexMethod extends Descriptor<DexEncodedMethod, DexMethod>
-    implements PresortedComparable<DexMethod> {
+public class DexMethod extends DexMember<DexEncodedMethod, DexMethod> {
 
-  public final DexType holder;
   public final DexProto proto;
   public final DexString name;
 
-  // Caches used during processing.
-  private Map<DexType, DexEncodedMethod> singleTargetCache;
-
   DexMethod(DexType holder, DexProto proto, DexString name, boolean skipNameValidationForTesting) {
-    this.holder = holder;
+    super(holder);
     this.proto = proto;
     this.name = name;
     if (!skipNameValidationForTesting && !name.isValidMethodName()) {
       throw new CompilationError(
-          "Method name '" + name.toASCIIString() + "' in class '" + holder.toSourceString() +
+          "Method name '" + name + "' in class '" + holder.toSourceString() +
               "' cannot be represented in dex format.");
     }
   }
 
   @Override
+  public <T> T apply(
+      Function<DexType, T> classConsumer,
+      Function<DexField, T> fieldConsumer,
+      Function<DexMethod, T> methodConsumer) {
+    return methodConsumer.apply(this);
+  }
+
+  @Override
+  public void accept(
+      Consumer<DexType> classConsumer,
+      Consumer<DexField> fieldConsumer,
+      Consumer<DexMethod> methodConsumer) {
+    methodConsumer.accept(this);
+  }
+
+  @Override
+  public <T> void accept(
+      BiConsumer<DexType, T> classConsumer,
+      BiConsumer<DexField, T> fieldConsumer,
+      BiConsumer<DexMethod, T> methodConsumer,
+      T arg) {
+    methodConsumer.accept(this, arg);
+  }
+
+  @Override
+  public DexEncodedMethod lookupOnClass(DexClass clazz) {
+    return clazz != null ? clazz.lookupMember(this) : null;
+  }
+
+  @Override
   public String toString() {
     return "Method " + holder + "." + name + " " + proto.toString();
+  }
+
+  public MethodReference asMethodReference() {
+    List<TypeReference> parameters = new ArrayList<>();
+    for (DexType value : proto.parameters.values) {
+      parameters.add(Reference.typeFromDescriptor(value.toDescriptorString()));
+    }
+    String returnTypeDescriptor = proto.returnType.toDescriptorString();
+    TypeReference returnType =
+        returnTypeDescriptor.equals("V")
+            ? null
+            : Reference.typeFromDescriptor(returnTypeDescriptor);
+    return Reference.method(
+        Reference.classFromDescriptor(holder.toDescriptorString()),
+        name.toString(),
+        parameters,
+        returnType);
   }
 
   public int getArity() {
@@ -104,11 +152,6 @@ public class DexMethod extends Descriptor<DexEncodedMethod, DexMethod>
   }
 
   @Override
-  public int compareTo(DexMethod other) {
-    return sortedCompareTo(other.getSortedIndex());
-  }
-
-  @Override
   public int slowCompareTo(DexMethod other) {
     int result = holder.slowCompareTo(other.holder);
     if (result != 0) {
@@ -135,21 +178,13 @@ public class DexMethod extends Descriptor<DexEncodedMethod, DexMethod>
   }
 
   @Override
-  public int layeredCompareTo(DexMethod other, NamingLens namingLens) {
-    int result = holder.compareTo(other.holder);
-    if (result != 0) {
-      return result;
-    }
-    result = namingLens.lookupName(this).compareTo(namingLens.lookupName(other));
-    if (result != 0) {
-      return result;
-    }
-    return proto.compareTo(other.proto);
+  public boolean match(DexMethod method) {
+    return method.name == name && method.proto == proto;
   }
 
   @Override
-  public boolean match(DexEncodedMethod entry) {
-    return entry.method.name == name && entry.method.proto == proto;
+  public boolean match(DexEncodedMethod encodedMethod) {
+    return match(encodedMethod.method);
   }
 
   public String qualifiedName() {
@@ -163,21 +198,26 @@ public class DexMethod extends Descriptor<DexEncodedMethod, DexMethod>
 
   @Override
   public String toSourceString() {
-    StringBuilder builder = new StringBuilder();
-    builder.append(proto.returnType.toSourceString());
-    builder.append(" ");
-    builder.append(holder.toSourceString());
-    builder.append(".");
-    builder.append(name);
-    builder.append("(");
+    return toSourceString(true);
+  }
+
+  public String toSourceStringWithoutHolder() {
+    return toSourceString(false);
+  }
+
+  private String toSourceString(boolean includeHolder) {
+    StringBuilder builder = new StringBuilder(proto.returnType.toSourceString()).append(" ");
+    if (includeHolder) {
+      builder.append(holder.toSourceString()).append(".");
+    }
+    builder.append(name).append("(");
     for (int i = 0; i < getArity(); i++) {
       if (i != 0) {
         builder.append(", ");
       }
       builder.append(proto.parameters.values[i].toSourceString());
     }
-    builder.append(")");
-    return builder.toString();
+    return builder.append(")").toString();
   }
 
   public boolean isLambdaDeserializeMethod(DexItemFactory dexItemFactory) {
@@ -185,20 +225,7 @@ public class DexMethod extends Descriptor<DexEncodedMethod, DexMethod>
         && proto == dexItemFactory.deserializeLambdaMethodProto;
   }
 
-  synchronized public void setSingleVirtualMethodCache(
-      DexType receiverType, DexEncodedMethod method) {
-    if (singleTargetCache == null) {
-      singleTargetCache = Maps.newIdentityHashMap();
-    }
-    singleTargetCache.put(receiverType, method);
-  }
-
-  synchronized public boolean isSingleVirtualMethodCached(DexType receiverType) {
-    return singleTargetCache != null && singleTargetCache.containsKey(receiverType);
-  }
-
-  synchronized public DexEncodedMethod getSingleVirtualMethodCache(DexType receiverType) {
-    assert isSingleVirtualMethodCached(receiverType);
-    return singleTargetCache.get(receiverType);
+  public boolean isInstanceInitializer(DexDefinitionSupplier definitions) {
+    return definitions.dexItemFactory().isConstructor(this);
   }
 }

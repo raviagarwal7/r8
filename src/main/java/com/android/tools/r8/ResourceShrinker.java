@@ -54,7 +54,6 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Streams;
 import java.io.IOException;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -175,19 +174,25 @@ final public class ResourceShrinker {
     }
 
     private void processFieldValue(DexValue value) {
-      if (value instanceof DexValue.DexValueString) {
-        callback.referencedString(((DexValue.DexValueString) value).value.toString());
-      } else if (value instanceof DexValue.DexValueInt) {
-        int constantValue = ((DexValue.DexValueInt) value).getValue();
-        callback.referencedInt(constantValue);
-      } else if (value instanceof DexValue.DexValueArray) {
-        DexValue.DexValueArray arrayEncodedValue = (DexValue.DexValueArray) value;
-        for (DexValue encodedValue : arrayEncodedValue.getValues()) {
-          if (encodedValue instanceof DexValue.DexValueInt) {
-            int constantValue = ((DexValue.DexValueInt) encodedValue).getValue();
-            callback.referencedInt(constantValue);
+      switch (value.getValueKind()) {
+        case ARRAY:
+          for (DexValue elementValue : value.asDexValueArray().getValues()) {
+            if (elementValue.isDexValueInt()) {
+              callback.referencedInt(elementValue.asDexValueInt().getValue());
+            }
           }
-        }
+          break;
+
+        case INT:
+          callback.referencedInt(value.asDexValueInt().getValue());
+          break;
+
+        case STRING:
+          callback.referencedString(value.asDexValueString().value.toString());
+          break;
+
+        default:
+          // Intentionally empty.
       }
     }
 
@@ -232,36 +237,24 @@ final public class ResourceShrinker {
     }
 
     private void processAnnotations(DexProgramClass classDef) {
-      Stream<DexAnnotation> instanceFieldAnnotations =
-          classDef.instanceFields().stream()
+      Stream<DexAnnotation> classAnnotations = classDef.annotations().stream();
+      Stream<DexAnnotation> fieldAnnotations =
+          Streams.stream(classDef.fields())
               .filter(DexEncodedField::hasAnnotation)
-              .flatMap(f -> Arrays.stream(f.annotations.annotations));
-      Stream<DexAnnotation> staticFieldAnnotations =
-          classDef.staticFields().stream()
-              .filter(DexEncodedField::hasAnnotation)
-              .flatMap(f -> Arrays.stream(f.annotations.annotations));
-      Stream<DexAnnotation> virtualMethodAnnotations =
-          classDef.virtualMethods().stream()
+              .flatMap(f -> f.annotations().stream());
+      Stream<DexAnnotation> methodAnnotations =
+          Streams.stream(classDef.methods())
               .filter(DexEncodedMethod::hasAnnotation)
-              .flatMap(m -> Arrays.stream(m.annotations.annotations));
-      Stream<DexAnnotation> directMethodAnnotations =
-          classDef.directMethods().stream()
-              .filter(DexEncodedMethod::hasAnnotation)
-              .flatMap(m -> Arrays.stream(m.annotations.annotations));
-      Stream<DexAnnotation> classAnnotations = Arrays.stream(classDef.annotations.annotations);
+              .flatMap(m -> m.annotations().stream());
 
-      Streams.concat(
-          instanceFieldAnnotations,
-          staticFieldAnnotations,
-          virtualMethodAnnotations,
-          directMethodAnnotations,
-          classAnnotations)
-          .forEach(annotation -> {
-            for (DexAnnotationElement element : annotation.annotation.elements) {
-              DexValue value = element.value;
-              processAnnotationValue(value);
-            }
-          });
+      Streams.concat(classAnnotations, fieldAnnotations, methodAnnotations)
+          .forEach(
+              annotation -> {
+                for (DexAnnotationElement element : annotation.annotation.elements) {
+                  DexValue value = element.value;
+                  processAnnotationValue(value);
+                }
+              });
     }
 
     private void processIntArrayPayload(Instruction instruction) {
@@ -299,22 +292,29 @@ final public class ResourceShrinker {
     }
 
     private void processAnnotationValue(DexValue value) {
-      if (value instanceof DexValue.DexValueInt) {
-        DexValue.DexValueInt dexValueInt = (DexValue.DexValueInt) value;
-        callback.referencedInt(dexValueInt.value);
-      } else if (value instanceof DexValue.DexValueString) {
-        DexValue.DexValueString dexValueString = (DexValue.DexValueString) value;
-        callback.referencedString(dexValueString.value.toString());
-      } else if (value instanceof DexValue.DexValueArray) {
-        DexValue.DexValueArray dexValueArray = (DexValue.DexValueArray) value;
-        for (DexValue dexValue : dexValueArray.getValues()) {
-          processAnnotationValue(dexValue);
-        }
-      } else if (value instanceof DexValue.DexValueAnnotation) {
-        DexValue.DexValueAnnotation dexValueAnnotation = (DexValue.DexValueAnnotation) value;
-        for (DexAnnotationElement element : dexValueAnnotation.value.elements) {
-          processAnnotationValue(element.value);
-        }
+      switch (value.getValueKind()) {
+        case ANNOTATION:
+          for (DexAnnotationElement element : value.asDexValueAnnotation().value.elements) {
+            processAnnotationValue(element.value);
+          }
+          break;
+
+        case ARRAY:
+          for (DexValue elementValue : value.asDexValueArray().getValues()) {
+            processAnnotationValue(elementValue);
+          }
+          break;
+
+        case INT:
+          callback.referencedInt(value.asDexValueInt().value);
+          break;
+
+        case STRING:
+          callback.referencedString(value.asDexValueString().value.toString());
+          break;
+
+        default:
+          // Intentionally empty.
       }
     }
 

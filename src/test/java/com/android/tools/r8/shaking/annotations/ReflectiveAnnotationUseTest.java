@@ -4,15 +4,16 @@
 package com.android.tools.r8.shaking.annotations;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndNotRenamed;
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assume.assumeTrue;
 
 import com.android.tools.r8.KotlinTestBase;
-import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.ToolHelper.KotlinTargetVersion;
 import com.android.tools.r8.graph.DexAnnotationElement;
 import com.android.tools.r8.utils.AndroidApp;
@@ -56,24 +57,27 @@ public class ReflectiveAnnotationUseTest extends KotlinTestBase {
       "f4", "field4]"
   );
 
-  private final Backend backend;
+  private final TestParameters parameters;
   private final boolean minify;
 
-  @Parameterized.Parameters(name = "Backend: {0} target: {1} minify: {2}")
+  @Parameterized.Parameters(name = "{0} target: {1} minify: {2}")
   public static Collection<Object[]> data() {
-    return buildParameters(ToolHelper.getBackends(), KotlinTargetVersion.values(), BooleanUtils.values());
+    return buildParameters(
+        getTestParameters().withAllRuntimesAndApiLevels().build(),
+        KotlinTargetVersion.values(),
+        BooleanUtils.values());
   }
 
   public ReflectiveAnnotationUseTest(
-      Backend backend, KotlinTargetVersion targetVersion, boolean minify) {
+      TestParameters parameters, KotlinTargetVersion targetVersion, boolean minify) {
     super(targetVersion);
-    this.backend = backend;
+    this.parameters = parameters;
     this.minify = minify;
   }
 
   @Test
-  public void b120951621_JVMoutput() throws Exception {
-    assumeTrue("Only run JVM reference once (for CF backend)", backend == Backend.CF);
+  public void b120951621_JVMOutput() throws Exception {
+    assumeTrue("Only run JVM reference on CF runtimes", parameters.isCfRuntime());
     AndroidApp app = AndroidApp.builder()
         .addProgramFile(getKotlinJarFile(FOLDER))
         .addProgramFile(getJavaJarFile(FOLDER))
@@ -84,34 +88,32 @@ public class ReflectiveAnnotationUseTest extends KotlinTestBase {
 
   @Test
   public void b120951621_keepAll() throws Exception {
-    CodeInspector inspector = testForR8(backend)
-        .addProgramFiles(getKotlinJarFile(FOLDER))
-        .addProgramFiles(getJavaJarFile(FOLDER))
-        .addKeepMainRule(MAIN_CLASS_NAME)
-        .addKeepRules(KEEP_ANNOTATIONS)
-        .addKeepRules(
-            "-keep @interface " + ANNOTATION_NAME + " {",
-            "  *;",
-            "}"
-        )
-        .minification(minify)
-        .run(MAIN_CLASS_NAME)
-        .assertSuccessWithOutput(JAVA_OUTPUT).inspector();
+    CodeInspector inspector =
+        testForR8(parameters.getBackend())
+            .addProgramFiles(getKotlinJarFile(FOLDER))
+            .addProgramFiles(getJavaJarFile(FOLDER))
+            .addKeepMainRule(MAIN_CLASS_NAME)
+            .addKeepRules(KEEP_ANNOTATIONS)
+            .addKeepRules("-keep @interface " + ANNOTATION_NAME + " {", "  *;", "}")
+            .allowDiagnosticWarningMessages()
+            .minification(minify)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .assertAllWarningMessagesMatch(
+                equalTo("Resource 'META-INF/MANIFEST.MF' already exists."))
+            .run(parameters.getRuntime(), MAIN_CLASS_NAME)
+            .assertSuccessWithOutput(JAVA_OUTPUT)
+            .inspector();
     ClassSubject clazz = inspector.clazz(ANNOTATION_NAME);
-    assertThat(clazz, isPresent());
-    assertThat(clazz, not(isRenamed()));
+    assertThat(clazz, isPresentAndNotRenamed());
     MethodSubject f1 = clazz.uniqueMethodWithName("f1");
-    assertThat(f1, isPresent());
-    assertThat(f1, not(isRenamed()));
+    assertThat(f1, isPresentAndNotRenamed());
     MethodSubject f2 = clazz.uniqueMethodWithName("f2");
-    assertThat(f2, isPresent());
-    assertThat(f2, not(isRenamed()));
+    assertThat(f2, isPresentAndNotRenamed());
     MethodSubject f3 = clazz.uniqueMethodWithName("f3");
-    assertThat(f3, isPresent());
-    assertThat(f3, not(isRenamed()));
+    assertThat(f3, isPresentAndNotRenamed());
     MethodSubject f4 = clazz.uniqueMethodWithName("f4");
-    assertThat(f4, isPresent());
-    assertThat(f4, not(isRenamed()));
+    assertThat(f4, isPresentAndNotRenamed());
 
     ClassSubject impl = inspector.clazz(IMPL_CLASS_NAME);
     assertThat(impl, isPresent());
@@ -122,28 +124,32 @@ public class ReflectiveAnnotationUseTest extends KotlinTestBase {
 
   @Test
   public void b120951621_partiallyKeep() throws Exception {
-    CodeInspector inspector = testForR8(backend)
-        .addProgramFiles(getKotlinJarFile(FOLDER))
-        .addProgramFiles(getJavaJarFile(FOLDER))
-        .addKeepMainRule(MAIN_CLASS_NAME)
-        .addKeepRules(KEEP_ANNOTATIONS)
-        .addKeepRules(
-            "-keep,allowobfuscation @interface " + ANNOTATION_NAME + " {",
-            "  java.lang.String *f2();",
-            "}"
-        )
-        .minification(minify)
-        .run(MAIN_CLASS_NAME)
-        .assertSuccessWithOutput(JAVA_OUTPUT).inspector();
+    CodeInspector inspector =
+        testForR8(parameters.getBackend())
+            .addProgramFiles(getKotlinJarFile(FOLDER))
+            .addProgramFiles(getJavaJarFile(FOLDER))
+            .addKeepMainRule(MAIN_CLASS_NAME)
+            .addKeepRules(KEEP_ANNOTATIONS)
+            .addKeepRules(
+                "-keep,allowobfuscation @interface " + ANNOTATION_NAME + " {",
+                "  java.lang.String *f2();",
+                "}")
+            .allowDiagnosticWarningMessages()
+            .minification(minify)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .assertAllWarningMessagesMatch(
+                equalTo("Resource 'META-INF/MANIFEST.MF' already exists."))
+            .run(parameters.getRuntime(), MAIN_CLASS_NAME)
+            .assertSuccessWithOutput(JAVA_OUTPUT)
+            .inspector();
     ClassSubject clazz = inspector.clazz(ANNOTATION_NAME);
     assertThat(clazz, isPresent());
     assertEquals(minify, clazz.isRenamed());
     MethodSubject f1 = clazz.uniqueMethodWithName("f1");
-    assertThat(f1, isPresent());
-    assertThat(f1, not(isRenamed()));
+    assertThat(f1, isPresentAndNotRenamed());
     MethodSubject f2 = clazz.uniqueMethodWithName("f2");
-    assertThat(f2, isPresent());
-    assertThat(f2, not(isRenamed()));
+    assertThat(f2, isPresentAndNotRenamed());
     MethodSubject f3 = clazz.uniqueMethodWithName("f3");
     assertThat(f3, not(isPresent()));
     MethodSubject f4 = clazz.uniqueMethodWithName("f4");
@@ -158,23 +164,28 @@ public class ReflectiveAnnotationUseTest extends KotlinTestBase {
 
   @Test
   public void b120951621_keepAnnotation() throws Exception {
-    CodeInspector inspector = testForR8(backend)
-        .addProgramFiles(getKotlinJarFile(FOLDER))
-        .addProgramFiles(getJavaJarFile(FOLDER))
-        .addKeepMainRule(MAIN_CLASS_NAME)
-        .addKeepRules(KEEP_ANNOTATIONS)
-        .minification(minify)
-        .run(MAIN_CLASS_NAME)
-        .assertSuccessWithOutput(JAVA_OUTPUT).inspector();
+    CodeInspector inspector =
+        testForR8(parameters.getBackend())
+            .addProgramFiles(getKotlinJarFile(FOLDER))
+            .addProgramFiles(getJavaJarFile(FOLDER))
+            .addKeepMainRule(MAIN_CLASS_NAME)
+            .addKeepRules(KEEP_ANNOTATIONS)
+            .allowDiagnosticWarningMessages()
+            .minification(minify)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .assertAllWarningMessagesMatch(
+                equalTo("Resource 'META-INF/MANIFEST.MF' already exists."))
+            .run(parameters.getRuntime(), MAIN_CLASS_NAME)
+            .assertSuccessWithOutput(JAVA_OUTPUT)
+            .inspector();
     ClassSubject clazz = inspector.clazz(ANNOTATION_NAME);
     assertThat(clazz, isPresent());
     assertEquals(minify, clazz.isRenamed());
     MethodSubject f1 = clazz.uniqueMethodWithName("f1");
-    assertThat(f1, isPresent());
-    assertThat(f1, not(isRenamed()));
+    assertThat(f1, isPresentAndNotRenamed());
     MethodSubject f2 = clazz.uniqueMethodWithName("f2");
-    assertThat(f2, isPresent());
-    assertThat(f2, not(isRenamed()));
+    assertThat(f2, isPresentAndNotRenamed());
     MethodSubject f3 = clazz.uniqueMethodWithName("f3");
     assertThat(f3, not(isPresent()));
     MethodSubject f4 = clazz.uniqueMethodWithName("f4");
@@ -189,20 +200,27 @@ public class ReflectiveAnnotationUseTest extends KotlinTestBase {
 
   @Test
   public void b120951621_noKeep() throws Exception {
-    CodeInspector inspector = testForR8(backend)
-        .addProgramFiles(getKotlinJarFile(FOLDER))
-        .addProgramFiles(getJavaJarFile(FOLDER))
-        .addKeepMainRule(MAIN_CLASS_NAME)
-        .minification(minify)
-        .run(MAIN_CLASS_NAME)
-        .assertSuccessWithOutput(OUTPUT_WITHOUT_ANNOTATION).inspector();
+    CodeInspector inspector =
+        testForR8(parameters.getBackend())
+            .addProgramFiles(getKotlinJarFile(FOLDER))
+            .addProgramFiles(getJavaJarFile(FOLDER))
+            .addKeepMainRule(MAIN_CLASS_NAME)
+            .allowDiagnosticWarningMessages()
+            .minification(minify)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .assertAllWarningMessagesMatch(
+                equalTo("Resource 'META-INF/MANIFEST.MF' already exists."))
+            .run(parameters.getRuntime(), MAIN_CLASS_NAME)
+            .assertSuccessWithOutput(OUTPUT_WITHOUT_ANNOTATION)
+            .inspector();
     ClassSubject clazz = inspector.clazz(ANNOTATION_NAME);
     assertThat(clazz, isPresent());
     assertEquals(minify, clazz.isRenamed());
     MethodSubject f1 = clazz.uniqueMethodWithName("f1");
-    assertThat(f1, not(isPresent()));
+    assertThat(f1, isPresent());
     MethodSubject f2 = clazz.uniqueMethodWithName("f2");
-    assertThat(f2, not(isPresent()));
+    assertThat(f2, isPresent());
     MethodSubject f3 = clazz.uniqueMethodWithName("f3");
     assertThat(f3, not(isPresent()));
     MethodSubject f4 = clazz.uniqueMethodWithName("f4");

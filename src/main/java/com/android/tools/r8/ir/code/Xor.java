@@ -10,11 +10,17 @@ import com.android.tools.r8.code.XorIntLit16;
 import com.android.tools.r8.code.XorIntLit8;
 import com.android.tools.r8.code.XorLong;
 import com.android.tools.r8.code.XorLong2Addr;
+import java.util.Set;
 
 public class Xor extends LogicalBinop {
 
   public Xor(NumericType type, Value dest, Value left, Value right) {
     super(type, dest, left, right);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.XOR;
   }
 
   @Override
@@ -85,5 +91,10 @@ public class Xor extends LogicalBinop {
   @Override
   CfLogicalBinop.Opcode getCfOpcode() {
     return CfLogicalBinop.Opcode.Xor;
+  }
+
+  @Override
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return leftValue().knownToBeBoolean(seen) && rightValue().knownToBeBoolean(seen);
   }
 }

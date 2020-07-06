@@ -4,16 +4,18 @@
 package com.android.tools.r8.jar;
 
 import static com.android.tools.r8.utils.InternalOptions.ASM_VERSION;
+import static org.objectweb.asm.Opcodes.V1_6;
+import static org.objectweb.asm.Opcodes.V1_8;
 
 import com.android.tools.r8.ByteDataView;
 import com.android.tools.r8.ClassFileConsumer;
 import com.android.tools.r8.dex.ApplicationWriter;
 import com.android.tools.r8.dex.Marker;
+import com.android.tools.r8.errors.CodeSizeOverflowDiagnostic;
+import com.android.tools.r8.errors.ConstantPoolOverflowDiagnostic;
 import com.android.tools.r8.errors.Unimplemented;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.Code;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexAnnotationElement;
 import com.android.tools.r8.graph.DexAnnotationSet;
@@ -28,30 +30,28 @@ import com.android.tools.r8.graph.DexValue;
 import com.android.tools.r8.graph.DexValue.DexValueAnnotation;
 import com.android.tools.r8.graph.DexValue.DexValueArray;
 import com.android.tools.r8.graph.DexValue.DexValueEnum;
-import com.android.tools.r8.graph.DexValue.DexValueField;
-import com.android.tools.r8.graph.DexValue.DexValueMethod;
-import com.android.tools.r8.graph.DexValue.DexValueMethodHandle;
-import com.android.tools.r8.graph.DexValue.DexValueMethodType;
+import com.android.tools.r8.graph.DexValue.DexValueInt;
 import com.android.tools.r8.graph.DexValue.DexValueString;
-import com.android.tools.r8.graph.DexValue.DexValueType;
-import com.android.tools.r8.graph.DexValue.UnknownDexValue;
 import com.android.tools.r8.graph.GraphLense;
 import com.android.tools.r8.graph.InnerClassAttribute;
 import com.android.tools.r8.graph.NestMemberClassAttribute;
 import com.android.tools.r8.graph.ParameterAnnotationsList;
 import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.naming.ProguardMapSupplier;
+import com.android.tools.r8.references.Reference;
 import com.android.tools.r8.utils.ExceptionUtils;
 import com.android.tools.r8.utils.InternalOptions;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMap.Builder;
 import java.io.PrintWriter;
 import java.io.StringWriter;
-import java.util.concurrent.ExecutorService;
+import java.util.Optional;
 import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassTooLargeException;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.FieldVisitor;
+import org.objectweb.asm.MethodTooLargeException;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Type;
 import org.objectweb.asm.tree.ClassNode;
@@ -69,25 +69,21 @@ public class CfApplicationWriter {
   public static final int MARKER_STRING_CONSTANT_POOL_INDEX = 2;
 
   private final DexApplication application;
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   private final GraphLense graphLense;
   private final NamingLens namingLens;
   private final InternalOptions options;
   private final Marker marker;
 
   public final ProguardMapSupplier proguardMapSupplier;
-  public final String deadCode;
-  public final String proguardSeedsData;
 
   public CfApplicationWriter(
       DexApplication application,
-      AppView<? extends AppInfo> appView,
+      AppView<?> appView,
       InternalOptions options,
       Marker marker,
-      String deadCode,
       GraphLense graphLense,
       NamingLens namingLens,
-      String proguardSeedsData,
       ProguardMapSupplier proguardMapSupplier) {
     this.application = application;
     this.appView = appView;
@@ -97,56 +93,73 @@ public class CfApplicationWriter {
     assert marker != null;
     this.marker = marker;
     this.proguardMapSupplier = proguardMapSupplier;
-    this.deadCode = deadCode;
-    this.proguardSeedsData = proguardSeedsData;
   }
 
-  public void write(ClassFileConsumer consumer, ExecutorService executor) {
+  public void write(ClassFileConsumer consumer) {
     application.timing.begin("CfApplicationWriter.write");
     try {
-      writeApplication(consumer, executor);
+      writeApplication(consumer);
     } finally {
       application.timing.end();
     }
   }
 
-  private void writeApplication(ClassFileConsumer consumer, ExecutorService executor) {
-    ProguardMapSupplier.ProguardMapAndId proguardMapAndId = null;
+  private void writeApplication(ClassFileConsumer consumer) {
     if (proguardMapSupplier != null && options.proguardMapConsumer != null) {
-      proguardMapAndId = proguardMapSupplier.getProguardMapAndId();
-      if (proguardMapAndId != null) {
-        marker.setPgMapId(proguardMapAndId.id);
-      }
+      marker.setPgMapId(proguardMapSupplier.writeProguardMap().get());
     }
-    String markerString = marker.toString();
+    Optional<String> markerString =
+        marker.isRelocator() ? Optional.empty() : Optional.of(marker.toString());
     for (DexProgramClass clazz : application.classes()) {
-      if (clazz.getSynthesizedFrom().isEmpty()) {
-        writeClass(clazz, consumer, markerString);
+      if (clazz.getSynthesizedFrom().isEmpty()
+          || options.isDesugaredLibraryCompilation()
+          || options.cfToCfDesugar) {
+        try {
+          writeClass(clazz, consumer, markerString);
+        } catch (ClassTooLargeException e) {
+          throw appView
+              .options()
+              .reporter
+              .fatalError(
+                  new ConstantPoolOverflowDiagnostic(
+                      clazz.getOrigin(),
+                      Reference.classFromBinaryName(e.getClassName()),
+                      e.getConstantPoolCount()));
+        } catch (MethodTooLargeException e) {
+          throw appView
+              .options()
+              .reporter
+              .fatalError(
+                  new CodeSizeOverflowDiagnostic(
+                      clazz.getOrigin(),
+                      Reference.methodFromDescriptor(
+                          Reference.classFromBinaryName(e.getClassName()).getDescriptor(),
+                          e.getMethodName(),
+                          e.getDescriptor()),
+                      e.getCodeSize()));
+        }
       } else {
         throw new Unimplemented("No support for synthetics in the Java bytecode backend.");
       }
     }
     ApplicationWriter.supplyAdditionalConsumers(
-        application,
-        appView,
-        graphLense,
-        namingLens,
-        options,
-        deadCode,
-        proguardMapAndId == null ? null : proguardMapAndId.map,
-        proguardSeedsData);
+        application, appView, graphLense, namingLens, options);
   }
 
-  private void writeClass(DexProgramClass clazz, ClassFileConsumer consumer, String markerString) {
+  private void writeClass(
+      DexProgramClass clazz, ClassFileConsumer consumer, Optional<String> markerString) {
     ClassWriter writer = new ClassWriter(0);
-    int markerStringPoolIndex = writer.newConst(markerString);
-    assert markerStringPoolIndex == MARKER_STRING_CONSTANT_POOL_INDEX;
-    writer.visitSource(clazz.sourceFile != null ? clazz.sourceFile.toString() : null, null);
+    if (markerString.isPresent()) {
+      int markerStringPoolIndex = writer.newConst(markerString.get());
+      assert markerStringPoolIndex == MARKER_STRING_CONSTANT_POOL_INDEX;
+    }
+    String sourceDebug = getSourceDebugExtension(clazz.annotations());
+    writer.visitSource(clazz.sourceFile != null ? clazz.sourceFile.toString() : null, sourceDebug);
     int version = getClassFileVersion(clazz);
     int access = clazz.accessFlags.getAsCfAccessFlags();
     String desc = namingLens.lookupDescriptor(clazz.type).toString();
     String name = namingLens.lookupInternalName(clazz.type);
-    String signature = getSignature(clazz.annotations);
+    String signature = getSignature(clazz.annotations());
     String superName =
         clazz.type == options.itemFactory.objectType
             ? null
@@ -156,11 +169,11 @@ public class CfApplicationWriter {
       interfaces[i] = namingLens.lookupInternalName(clazz.interfaces.values[i]);
     }
     writer.visit(version, access, name, signature, superName, interfaces);
-    writeAnnotations(writer::visitAnnotation, clazz.annotations.annotations);
-    ImmutableMap<DexString, DexValue> defaults = getAnnotationDefaults(clazz.annotations);
+    writeAnnotations(writer::visitAnnotation, clazz.annotations().annotations);
+    ImmutableMap<DexString, DexValue> defaults = getAnnotationDefaults(clazz.annotations());
 
-    if (clazz.getEnclosingMethod() != null) {
-      clazz.getEnclosingMethod().write(writer, namingLens);
+    if (clazz.getEnclosingMethodAttribute() != null) {
+      clazz.getEnclosingMethodAttribute().write(writer, namingLens);
     }
 
     if (clazz.getNestHostClassAttribute() != null) {
@@ -169,6 +182,8 @@ public class CfApplicationWriter {
 
     for (NestMemberClassAttribute entry : clazz.getNestMembersClassAttributes()) {
       entry.write(writer, namingLens);
+      assert clazz.getNestHostClassAttribute() == null
+          : "A nest host cannot also be a nest member.";
     }
 
     for (InnerClassAttribute entry : clazz.getInnerClasses()) {
@@ -203,13 +218,27 @@ public class CfApplicationWriter {
         options.reporter, handler -> consumer.accept(ByteDataView.of(result), desc, handler));
   }
 
+  private int getClassFileVersion(DexEncodedMethod method) {
+    if (!method.hasClassFileVersion()) {
+      // In this case bridges have been introduced for the Cf back-end,
+      // which do not have class file version.
+      assert options.testing.enableForceNestBasedAccessDesugaringForTest
+          || options.isDesugaredLibraryCompilation()
+          || options.cfToCfDesugar;
+      // TODO(b/146424042): We may call static methods on interface classes so we have to go for
+      //  Java 8.
+      return options.cfToCfDesugar ? V1_8 : 0;
+    }
+    return method.getClassFileVersion();
+  }
+
   private int getClassFileVersion(DexProgramClass clazz) {
-    int version = clazz.hasClassFileVersion() ? clazz.getInitialClassFileVersion() : 50;
+    int version = clazz.hasClassFileVersion() ? clazz.getInitialClassFileVersion() : V1_6;
     for (DexEncodedMethod method : clazz.directMethods()) {
-      version = Math.max(version, method.getClassFileVersion());
+      version = Math.max(version, getClassFileVersion(method));
     }
     for (DexEncodedMethod method : clazz.virtualMethods()) {
-      version = Math.max(version, method.getClassFileVersion());
+      version = Math.max(version, getClassFileVersion(method));
     }
     return version;
   }
@@ -226,29 +255,36 @@ public class CfApplicationWriter {
   }
 
   private String getSignature(DexAnnotationSet annotations) {
-    DexValueArray value =
-        (DexValueArray)
-            getSystemAnnotationValue(annotations, application.dexItemFactory.annotationSignature);
+    DexValue value =
+        getSystemAnnotationValue(annotations, application.dexItemFactory.annotationSignature);
     if (value == null) {
       return null;
     }
     // Signature has already been minified by ClassNameMinifier.renameTypesInGenericSignatures().
-    DexValue[] parts = value.getValues();
     StringBuilder res = new StringBuilder();
-    for (DexValue part : parts) {
-      res.append(((DexValueString) part).getValue().toString());
+    for (DexValue part : value.asDexValueArray().getValues()) {
+      res.append(part.asDexValueString().getValue().toString());
     }
     return res.toString();
   }
 
+  private String getSourceDebugExtension(DexAnnotationSet annotations) {
+    DexValue debugExtensions =
+        getSystemAnnotationValue(
+            annotations, application.dexItemFactory.annotationSourceDebugExtension);
+    if (debugExtensions == null) {
+      return null;
+    }
+    return debugExtensions.asDexValueString().getValue().toString();
+  }
+
   private ImmutableMap<DexString, DexValue> getAnnotationDefaults(DexAnnotationSet annotations) {
-    DexValueAnnotation value =
-        (DexValueAnnotation)
-            getSystemAnnotationValue(annotations, application.dexItemFactory.annotationDefault);
+    DexValue value =
+        getSystemAnnotationValue(annotations, application.dexItemFactory.annotationDefault);
     if (value == null) {
       return ImmutableMap.of();
     }
-    DexEncodedAnnotation annotation = value.value;
+    DexEncodedAnnotation annotation = value.asDexValueAnnotation().value;
     Builder<DexString, DexValue> builder = ImmutableMap.builder();
     for (DexAnnotationElement element : annotation.elements) {
       builder.put(element.name, element.value);
@@ -257,16 +293,15 @@ public class CfApplicationWriter {
   }
 
   private String[] getExceptions(DexAnnotationSet annotations) {
-    DexValueArray value =
-        (DexValueArray)
-            getSystemAnnotationValue(annotations, application.dexItemFactory.annotationThrows);
+    DexValue value =
+        getSystemAnnotationValue(annotations, application.dexItemFactory.annotationThrows);
     if (value == null) {
       return null;
     }
-    DexValue[] values = value.getValues();
+    DexValue[] values = value.asDexValueArray().getValues();
     String[] res = new String[values.length];
     for (int i = 0; i < values.length; i++) {
-      res[i] = namingLens.lookupInternalName(((DexValueType) values[i]).value);
+      res[i] = namingLens.lookupInternalName(values[i].asDexValueType().value);
     }
     return res;
   }
@@ -282,10 +317,10 @@ public class CfApplicationWriter {
     int access = field.accessFlags.getAsCfAccessFlags();
     String name = namingLens.lookupName(field.field).toString();
     String desc = namingLens.lookupDescriptor(field.field.type).toString();
-    String signature = getSignature(field.annotations);
+    String signature = getSignature(field.annotations());
     Object value = getStaticValue(field);
     FieldVisitor visitor = writer.visitField(access, name, desc, signature, value);
-    writeAnnotations(visitor::visitAnnotation, field.annotations.annotations);
+    writeAnnotations(visitor::visitAnnotation, field.annotations().annotations);
     visitor.visitEnd();
   }
 
@@ -297,8 +332,8 @@ public class CfApplicationWriter {
     int access = method.accessFlags.getAsCfAccessFlags();
     String name = namingLens.lookupName(method.method).toString();
     String desc = method.descriptor(namingLens);
-    String signature = getSignature(method.annotations);
-    String[] exceptions = getExceptions(method.annotations);
+    String signature = getSignature(method.annotations());
+    String[] exceptions = getExceptions(method.annotations());
     MethodVisitor visitor = writer.visitMethod(access, name, desc, signature, exceptions);
     if (defaults.containsKey(method.method.name)) {
       AnnotationVisitor defaultVisitor = visitor.visitAnnotationDefault();
@@ -307,12 +342,33 @@ public class CfApplicationWriter {
         defaultVisitor.visitEnd();
       }
     }
-    writeAnnotations(visitor::visitAnnotation, method.annotations.annotations);
+    writeMethodParametersAnnotation(visitor, method.annotations().annotations);
+    writeAnnotations(visitor::visitAnnotation, method.annotations().annotations);
     writeParameterAnnotations(visitor, method.parameterAnnotationsList);
     if (!method.shouldNotHaveCode()) {
-      writeCode(method.getCode(), visitor, options, classFileVersion);
+      writeCode(method, visitor, classFileVersion);
     }
     visitor.visitEnd();
+  }
+
+  private void writeMethodParametersAnnotation(MethodVisitor visitor, DexAnnotation[] annotations) {
+    for (DexAnnotation annotation : annotations) {
+      if (annotation.annotation.type == appView.dexItemFactory().annotationMethodParameters) {
+        assert annotation.visibility == DexAnnotation.VISIBILITY_SYSTEM;
+        assert annotation.annotation.elements.length == 2;
+        assert annotation.annotation.elements[0].name.toString().equals("names");
+        assert annotation.annotation.elements[1].name.toString().equals("accessFlags");
+        DexValueArray names = annotation.annotation.elements[0].value.asDexValueArray();
+        DexValueArray accessFlags = annotation.annotation.elements[1].value.asDexValueArray();
+        assert names != null && accessFlags != null;
+        assert names.getValues().length == accessFlags.getValues().length;
+        for (int i = 0; i < names.getValues().length; i++) {
+          DexValueString name = names.getValues()[i].asDexValueString();
+          DexValueInt access = accessFlags.getValues()[i].asDexValueInt();
+          visitor.visitParameter(name.value.toString(), access.value);
+        }
+      }
+    }
   }
 
   private void writeParameterAnnotations(
@@ -363,58 +419,69 @@ public class CfApplicationWriter {
   }
 
   private void writeAnnotationElement(AnnotationVisitor visitor, String name, DexValue value) {
-    if (value instanceof DexValueAnnotation) {
-      DexValueAnnotation valueAnnotation = (DexValueAnnotation) value;
-      AnnotationVisitor innerVisitor =
-          visitor.visitAnnotation(
-              name, namingLens.lookupDescriptor(valueAnnotation.value.type).toString());
-      if (innerVisitor != null) {
-        writeAnnotation(innerVisitor, valueAnnotation.value);
-        innerVisitor.visitEnd();
-      }
-    } else if (value instanceof DexValueArray) {
-      DexValue[] values = ((DexValueArray) value).getValues();
-      AnnotationVisitor innerVisitor = visitor.visitArray(name);
-      if (innerVisitor != null) {
-        for (DexValue arrayValue : values) {
-          writeAnnotationElement(innerVisitor, null, arrayValue);
+    switch (value.getValueKind()) {
+      case ANNOTATION:
+        {
+          DexValueAnnotation valueAnnotation = value.asDexValueAnnotation();
+          AnnotationVisitor innerVisitor =
+              visitor.visitAnnotation(
+                  name, namingLens.lookupDescriptor(valueAnnotation.value.type).toString());
+          if (innerVisitor != null) {
+            writeAnnotation(innerVisitor, valueAnnotation.value);
+            innerVisitor.visitEnd();
+          }
         }
-        innerVisitor.visitEnd();
-      }
-    } else if (value instanceof DexValueEnum) {
-      DexValueEnum en = (DexValueEnum) value;
-      visitor.visitEnum(
-          name, namingLens.lookupDescriptor(en.value.type).toString(), en.value.name.toString());
-    } else if (value instanceof DexValueField) {
-      throw new Unreachable("writeAnnotationElement of DexValueField");
-    } else if (value instanceof DexValueMethod) {
-      throw new Unreachable("writeAnnotationElement of DexValueMethod");
-    } else if (value instanceof DexValueMethodHandle) {
-      throw new Unreachable("writeAnnotationElement of DexValueMethodHandle");
-    } else if (value instanceof DexValueMethodType) {
-      throw new Unreachable("writeAnnotationElement of DexValueMethodType");
-    } else if (value instanceof DexValueString) {
-      DexValueString str = (DexValueString) value;
-      visitor.visit(name, str.getValue().toString());
-    } else if (value instanceof DexValueType) {
-      DexValueType ty = (DexValueType) value;
-      visitor.visit(name, Type.getType(namingLens.lookupDescriptor(ty.value).toString()));
-    } else if (value instanceof UnknownDexValue) {
-      throw new Unreachable("writeAnnotationElement of UnknownDexValue");
-    } else {
-      visitor.visit(name, value.getBoxedValue());
+        break;
+
+      case ARRAY:
+        {
+          DexValue[] values = value.asDexValueArray().getValues();
+          AnnotationVisitor innerVisitor = visitor.visitArray(name);
+          if (innerVisitor != null) {
+            for (DexValue elementValue : values) {
+              writeAnnotationElement(innerVisitor, null, elementValue);
+            }
+            innerVisitor.visitEnd();
+          }
+        }
+        break;
+
+      case ENUM:
+        DexValueEnum en = value.asDexValueEnum();
+        visitor.visitEnum(
+            name, namingLens.lookupDescriptor(en.value.type).toString(), en.value.name.toString());
+        break;
+
+      case FIELD:
+        throw new Unreachable("writeAnnotationElement of DexValueField");
+
+      case METHOD:
+        throw new Unreachable("writeAnnotationElement of DexValueMethod");
+
+      case METHOD_HANDLE:
+        throw new Unreachable("writeAnnotationElement of DexValueMethodHandle");
+
+      case METHOD_TYPE:
+        throw new Unreachable("writeAnnotationElement of DexValueMethodType");
+
+      case STRING:
+        visitor.visit(name, value.asDexValueString().getValue().toString());
+        break;
+
+      case TYPE:
+        visitor.visit(
+            name,
+            Type.getType(namingLens.lookupDescriptor(value.asDexValueType().value).toString()));
+        break;
+
+      default:
+        visitor.visit(name, value.getBoxedValue());
+        break;
     }
   }
 
-  private void writeCode(
-      Code code, MethodVisitor visitor, InternalOptions options, int classFileVersion) {
-    if (code.isJarCode()) {
-      assert namingLens.isIdentityLens();
-      code.asJarCode().writeTo(visitor);
-    } else {
-      assert code.isCfCode();
-      code.asCfCode().write(visitor, namingLens, options, classFileVersion);
-    }
+  private void writeCode(DexEncodedMethod method, MethodVisitor visitor, int classFileVersion) {
+    method.getCode().asCfCode().write(method, visitor, namingLens, appView, classFileVersion);
   }
 
   public static String printCf(byte[] result) {

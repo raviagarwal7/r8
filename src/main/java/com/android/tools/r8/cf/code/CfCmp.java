@@ -5,6 +5,8 @@ package com.android.tools.r8.cf.code;
 
 import com.android.tools.r8.cf.CfPrinter;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.ir.code.Cmp;
 import com.android.tools.r8.ir.code.Cmp.Bias;
 import com.android.tools.r8.ir.code.NumericType;
@@ -12,6 +14,8 @@ import com.android.tools.r8.ir.code.ValueType;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
@@ -29,6 +33,14 @@ public class CfCmp extends CfInstruction {
     assert type == NumericType.LONG || bias != Cmp.Bias.NONE;
     this.bias = bias;
     this.type = type;
+  }
+
+  public Bias getBias() {
+    return bias;
+  }
+
+  public NumericType getType() {
+    return type;
   }
 
   public static CfCmp fromAsm(int opcode) {
@@ -67,7 +79,7 @@ public class CfCmp extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     visitor.visitInsn(getAsmOpcode());
   }
 
@@ -76,5 +88,11 @@ public class CfCmp extends CfInstruction {
     int right = state.pop().register;
     int left = state.pop().register;
     builder.addCmp(type, bias, state.push(ValueType.INT).register, left, right);
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return inliningConstraints.forBinop();
   }
 }

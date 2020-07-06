@@ -4,28 +4,36 @@
 
 package com.android.tools.r8.ir.optimize;
 
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult.SingleResolutionResult;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
-import com.android.tools.r8.ir.code.InvokeMethodWithReceiver;
-import com.android.tools.r8.ir.code.InvokePolymorphic;
-import com.android.tools.r8.ir.code.InvokeStatic;
+import com.android.tools.r8.ir.code.InvokeMethod;
 import com.android.tools.r8.ir.optimize.Inliner.InlineAction;
+import com.android.tools.r8.ir.optimize.Inliner.Reason;
+import com.android.tools.r8.ir.optimize.inliner.WhyAreYouNotInliningReporter;
 
 /**
  * The InliningOracle contains information needed for when inlining other methods into @method.
  */
 public interface InliningOracle {
 
-  void finish();
+  boolean isForcedInliningOracle();
 
-  InlineAction computeForInvokeWithReceiver(
-      InvokeMethodWithReceiver invoke, DexType invocationContext);
+  // TODO(b/142116551): This should be equivalent to invoke.lookupSingleTarget(appView, context)!
+  ProgramMethod lookupSingleTarget(InvokeMethod invoke, ProgramMethod context);
 
-  InlineAction computeForInvokeStatic(
-      InvokeStatic invoke,
-      DexType invocationContext,
-      ClassInitializationAnalysis classInitializationAnalysis);
+  boolean passesInliningConstraints(
+      InvokeMethod invoke,
+      SingleResolutionResult resolutionResult,
+      ProgramMethod candidate,
+      Reason reason,
+      WhyAreYouNotInliningReporter whyAreYouNotInliningReporter);
 
-  InlineAction computeForInvokePolymorphic(
-      InvokePolymorphic invoke, DexType invocationContext);
+  InlineAction computeInlining(
+      InvokeMethod invoke,
+      SingleResolutionResult resolutionResult,
+      ProgramMethod singleTarget,
+      ProgramMethod context,
+      ClassInitializationAnalysis classInitializationAnalysis,
+      WhyAreYouNotInliningReporter whyAreYouNotInliningReporter);
 }

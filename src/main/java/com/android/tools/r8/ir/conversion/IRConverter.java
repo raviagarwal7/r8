@@ -5,19 +5,16 @@ package com.android.tools.r8.ir.conversion;
 
 import static com.android.tools.r8.ir.desugar.InterfaceMethodRewriter.Flavor.ExcludeDexResources;
 import static com.android.tools.r8.ir.desugar.InterfaceMethodRewriter.Flavor.IncludeAllResources;
-import static com.android.tools.r8.ir.optimize.CodeRewriter.checksNullBeforeSideEffect;
 
+import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfo.ResolutionResult;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.CfCode;
 import com.android.tools.r8.graph.Code;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexApplication.Builder;
-import com.android.tools.r8.graph.DexCallSite;
-import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
@@ -26,10 +23,14 @@ import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexTypeList;
 import com.android.tools.r8.graph.GraphLense;
-import com.android.tools.r8.ir.analysis.InitializedClassesOnNormalExitAnalysis;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.TypeChecker;
 import com.android.tools.r8.ir.analysis.constant.SparseConditionalConstantPropagation;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.fieldaccess.FieldAccessAnalysis;
+import com.android.tools.r8.ir.analysis.fieldaccess.TrivialFieldAccessReprocessor;
+import com.android.tools.r8.ir.analysis.fieldvalueanalysis.InstanceFieldValueAnalysis;
+import com.android.tools.r8.ir.analysis.fieldvalueanalysis.StaticFieldValueAnalysis;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.AlwaysMaterializingDefinition;
 import com.android.tools.r8.ir.code.AlwaysMaterializingUser;
 import com.android.tools.r8.ir.code.BasicBlock;
@@ -39,55 +40,73 @@ import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.InvokeStatic;
 import com.android.tools.r8.ir.code.NumericType;
 import com.android.tools.r8.ir.code.Value;
+import com.android.tools.r8.ir.desugar.BackportedMethodRewriter;
 import com.android.tools.r8.ir.desugar.CovariantReturnTypeAnnotationTransformer;
+import com.android.tools.r8.ir.desugar.D8NestBasedAccessDesugaring;
+import com.android.tools.r8.ir.desugar.DesugaredLibraryAPIConverter;
+import com.android.tools.r8.ir.desugar.DesugaredLibraryAPIConverter.Mode;
+import com.android.tools.r8.ir.desugar.DesugaredLibraryRetargeter;
 import com.android.tools.r8.ir.desugar.InterfaceMethodRewriter;
-import com.android.tools.r8.ir.desugar.Java8MethodRewriter;
+import com.android.tools.r8.ir.desugar.InterfaceMethodRewriter.Flavor;
 import com.android.tools.r8.ir.desugar.LambdaRewriter;
 import com.android.tools.r8.ir.desugar.StringConcatRewriter;
 import com.android.tools.r8.ir.desugar.TwrCloseResourceRewriter;
+import com.android.tools.r8.ir.optimize.AssertionsRewriter;
+import com.android.tools.r8.ir.optimize.AssumeInserter;
 import com.android.tools.r8.ir.optimize.ClassInitializerDefaultsOptimization;
+import com.android.tools.r8.ir.optimize.ClassInitializerDefaultsOptimization.ClassInitializerDefaultsResult;
 import com.android.tools.r8.ir.optimize.CodeRewriter;
 import com.android.tools.r8.ir.optimize.ConstantCanonicalizer;
 import com.android.tools.r8.ir.optimize.DeadCodeRemover;
 import com.android.tools.r8.ir.optimize.Devirtualizer;
+import com.android.tools.r8.ir.optimize.DynamicTypeOptimization;
 import com.android.tools.r8.ir.optimize.IdempotentFunctionCallCanonicalizer;
 import com.android.tools.r8.ir.optimize.Inliner;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.MemberValuePropagation;
-import com.android.tools.r8.ir.optimize.NonNullTracker;
 import com.android.tools.r8.ir.optimize.Outliner;
 import com.android.tools.r8.ir.optimize.PeepholeOptimizer;
 import com.android.tools.r8.ir.optimize.RedundantFieldLoadElimination;
 import com.android.tools.r8.ir.optimize.ReflectionOptimizer;
 import com.android.tools.r8.ir.optimize.ServiceLoaderRewriter;
-import com.android.tools.r8.ir.optimize.UninstantiatedTypeOptimization;
 import com.android.tools.r8.ir.optimize.classinliner.ClassInliner;
+import com.android.tools.r8.ir.optimize.enums.EnumUnboxer;
+import com.android.tools.r8.ir.optimize.enums.EnumValueOptimizer;
+import com.android.tools.r8.ir.optimize.info.MethodOptimizationInfoCollector;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackDelayed;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackIgnore;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackSimple;
+import com.android.tools.r8.ir.optimize.info.field.InstanceFieldInitializationInfoCollection;
 import com.android.tools.r8.ir.optimize.lambda.LambdaMerger;
 import com.android.tools.r8.ir.optimize.staticizer.ClassStaticizer;
+import com.android.tools.r8.ir.optimize.string.StringBuilderOptimizer;
 import com.android.tools.r8.ir.optimize.string.StringOptimizer;
 import com.android.tools.r8.ir.regalloc.LinearScanRegisterAllocator;
 import com.android.tools.r8.ir.regalloc.RegisterAllocator;
-import com.android.tools.r8.kotlin.KotlinInfo;
 import com.android.tools.r8.logging.Log;
 import com.android.tools.r8.naming.IdentifierNameStringMarker;
+import com.android.tools.r8.position.MethodPosition;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.shaking.LibraryMethodOverrideAnalysis;
 import com.android.tools.r8.shaking.MainDexClasses;
 import com.android.tools.r8.utils.Action;
 import com.android.tools.r8.utils.CfgPrinter;
 import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.ExceptionUtils;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.InternalOptions.DesugarState;
 import com.android.tools.r8.utils.InternalOptions.OutlineOptions;
 import com.android.tools.r8.utils.StringDiagnostic;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
-import com.google.common.base.Predicates;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
+import com.android.tools.r8.utils.collections.SortedProgramMethodSet;
 import com.google.common.base.Suppliers;
 import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ListMultimap;
-import com.google.common.collect.Sets;
-import com.google.common.collect.Streams;
 import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -97,10 +116,9 @@ import java.util.TreeSet;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.function.BiConsumer;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -108,153 +126,254 @@ public class IRConverter {
 
   private static final int PEEPHOLE_OPTIMIZATION_PASSES = 2;
 
-  public final AppView<? extends AppInfo> appView;
+  public final AppView<?> appView;
   public final Set<DexType> mainDexClasses;
 
   private final Timing timing;
   private final Outliner outliner;
   private final ClassInitializerDefaultsOptimization classInitializerDefaultsOptimization;
+  private final FieldAccessAnalysis fieldAccessAnalysis;
+  private final LibraryMethodOverrideAnalysis libraryMethodOverrideAnalysis;
   private final StringConcatRewriter stringConcatRewriter;
+  private final StringOptimizer stringOptimizer;
+  private final StringBuilderOptimizer stringBuilderOptimizer;
+  private final IdempotentFunctionCallCanonicalizer idempotentFunctionCallCanonicalizer;
   private final LambdaRewriter lambdaRewriter;
+  private final D8NestBasedAccessDesugaring d8NestBasedAccessDesugaring;
   private final InterfaceMethodRewriter interfaceMethodRewriter;
   private final TwrCloseResourceRewriter twrCloseResourceRewriter;
-  private final Java8MethodRewriter java8MethodRewriter;
+  private final BackportedMethodRewriter backportedMethodRewriter;
+  private final DesugaredLibraryRetargeter desugaredLibraryRetargeter;
   private final LambdaMerger lambdaMerger;
   private final ClassInliner classInliner;
   private final ClassStaticizer classStaticizer;
   private final InternalOptions options;
   private final CfgPrinter printer;
   private final CodeRewriter codeRewriter;
+  private final ConstantCanonicalizer constantCanonicalizer;
   private final MemberValuePropagation memberValuePropagation;
   private final LensCodeRewriter lensCodeRewriter;
-  private final NonNullTracker nonNullTracker;
   private final Inliner inliner;
   private final IdentifierNameStringMarker identifierNameStringMarker;
   private final Devirtualizer devirtualizer;
   private final CovariantReturnTypeAnnotationTransformer covariantReturnTypeAnnotationTransformer;
-  private final StringOptimizer stringOptimizer;
-  private final UninstantiatedTypeOptimization uninstantiatedTypeOptimization;
+  private final StringSwitchRemover stringSwitchRemover;
   private final TypeChecker typeChecker;
-  private final IdempotentFunctionCallCanonicalizer idempotentFunctionCallCanonicalizer;
+  private final DesugaredLibraryAPIConverter desugaredLibraryAPIConverter;
   private final ServiceLoaderRewriter serviceLoaderRewriter;
+  private final EnumValueOptimizer enumValueOptimizer;
+  private final EnumUnboxer enumUnboxer;
 
+  public final AssumeInserter assumeInserter;
+  private final DynamicTypeOptimization dynamicTypeOptimization;
+
+  final AssertionsRewriter assertionsRewriter;
   final DeadCodeRemover deadCodeRemover;
+
+  private final MethodOptimizationInfoCollector methodOptimizationInfoCollector;
 
   private final OptimizationFeedbackDelayed delayedOptimizationFeedback =
       new OptimizationFeedbackDelayed();
-  private final OptimizationFeedback ignoreOptimizationFeedback = new OptimizationFeedbackIgnore();
-  private final OptimizationFeedback simpleOptimizationFeedback = new OptimizationFeedbackSimple();
+  private final OptimizationFeedback simpleOptimizationFeedback =
+      OptimizationFeedbackSimple.getInstance();
   private DexString highestSortingString;
 
   private List<Action> onWaveDoneActions = null;
+
+  private final List<DexString> neverMergePrefixes;
+  // Use AtomicBoolean to satisfy TSAN checking (see b/153714743).
+  AtomicBoolean seenNotNeverMergePrefix = new AtomicBoolean();
+  AtomicBoolean seenNeverMergePrefix = new AtomicBoolean();
 
   /**
    * The argument `appView` is used to determine if whole program optimizations are allowed or not
    * (i.e., whether we are running R8). See {@link AppView#enableWholeProgramOptimizations()}.
    */
   public IRConverter(
-      AppView<? extends AppInfo> appView,
-      Timing timing,
-      CfgPrinter printer,
-      MainDexClasses mainDexClasses) {
+      AppView<?> appView, Timing timing, CfgPrinter printer, MainDexClasses mainDexClasses) {
     assert appView.appInfo().hasLiveness() || appView.graphLense().isIdentityLense();
     assert appView.options() != null;
     assert appView.options().programConsumer != null;
-    this.timing = timing != null ? timing : new Timing("internal");
+    assert timing != null;
+    this.timing = timing;
     this.appView = appView;
     this.options = appView.options();
     this.printer = printer;
     this.mainDexClasses = mainDexClasses.getClasses();
     this.codeRewriter = new CodeRewriter(appView, this);
+    this.constantCanonicalizer = new ConstantCanonicalizer(codeRewriter);
     this.classInitializerDefaultsOptimization =
-        options.debug ? null : new ClassInitializerDefaultsOptimization(appView, this);
+        new ClassInitializerDefaultsOptimization(appView, this);
     this.stringConcatRewriter = new StringConcatRewriter(appView);
-    this.lambdaRewriter = options.enableDesugaring ? new LambdaRewriter(appView, this) : null;
-    this.interfaceMethodRewriter =
-        options.isInterfaceMethodDesugaringEnabled()
-            ? new InterfaceMethodRewriter(appView, this)
-            : null;
-    this.twrCloseResourceRewriter =
-        (options.enableDesugaring && enableTwrCloseResourceDesugaring())
-            ? new TwrCloseResourceRewriter(appView, this)
-            : null;
-    this.java8MethodRewriter =
-        (options.enableDesugaring && !options.canUseJava8Methods())
-            ? new Java8MethodRewriter(appView, this)
-            : null;
-    this.lambdaMerger = options.enableLambdaMerging ? new LambdaMerger(appView) : null;
-    this.covariantReturnTypeAnnotationTransformer =
-        options.processCovariantReturnTypeAnnotations
-            ? new CovariantReturnTypeAnnotationTransformer(this, appView.dexItemFactory())
-            : null;
     this.stringOptimizer = new StringOptimizer(appView);
-    this.nonNullTracker = options.enableNonNullTracking ? new NonNullTracker(appView) : null;
-    if (appView.enableWholeProgramOptimizations()) {
-      assert appView.appInfo().hasLiveness();
-      assert appView.rootSet() != null;
-      AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
-      AppInfoWithLiveness appInfoWithLiveness = appViewWithLiveness.appInfo();
-      this.classInliner =
-          options.enableClassInlining && options.enableInlining
-              ? new ClassInliner(appViewWithLiveness, lambdaRewriter)
+    this.stringBuilderOptimizer = new StringBuilderOptimizer(appView);
+    this.deadCodeRemover = new DeadCodeRemover(appView, codeRewriter);
+    this.assertionsRewriter = new AssertionsRewriter(appView);
+    this.idempotentFunctionCallCanonicalizer = new IdempotentFunctionCallCanonicalizer(appView);
+    this.neverMergePrefixes =
+        options.neverMergePrefixes.stream()
+            .map(prefix -> "L" + DescriptorUtils.getPackageBinaryNameFromJavaType(prefix))
+            .map(options.itemFactory::createString)
+            .collect(Collectors.toList());
+    if (options.isDesugaredLibraryCompilation()) {
+      // Specific L8 Settings.
+      // DesugaredLibraryRetargeter is needed for retarget core library members and backports.
+      // InterfaceMethodRewriter is needed for emulated interfaces.
+      // LambdaRewriter is needed because if it is missing there are invoke custom on
+      // default/static interface methods, and this is not supported by the compiler.
+      // DesugaredLibraryAPIConverter is here to duplicate APIs.
+      // The rest is nulled out. In addition the rewriting logic fails without lambda rewriting.
+      this.desugaredLibraryRetargeter =
+          options.desugaredLibraryConfiguration.getRetargetCoreLibMember().isEmpty()
+              ? null
+              : new DesugaredLibraryRetargeter(appView);
+      this.interfaceMethodRewriter =
+          options.desugaredLibraryConfiguration.getEmulateLibraryInterface().isEmpty()
+              ? null
+              : new InterfaceMethodRewriter(appView, this);
+      this.lambdaRewriter = new LambdaRewriter(appView);
+      this.desugaredLibraryAPIConverter =
+          new DesugaredLibraryAPIConverter(appView, Mode.GENERATE_CALLBACKS_AND_WRAPPERS);
+      this.backportedMethodRewriter =
+          options.testing.forceLibBackportsInL8CfToCf
+              ? new BackportedMethodRewriter(appView, this)
               : null;
-      this.classStaticizer =
-          options.enableClassStaticizer ? new ClassStaticizer(appViewWithLiveness, this) : null;
-      this.inliner = new Inliner(appViewWithLiveness, mainDexClasses);
-      this.outliner = new Outliner(appViewWithLiveness, this);
-      this.memberValuePropagation =
-          options.enableValuePropagation ? new MemberValuePropagation(appViewWithLiveness) : null;
-      this.lensCodeRewriter = new LensCodeRewriter(appViewWithLiveness);
-      if (!appInfoWithLiveness.identifierNameStrings.isEmpty() && options.isMinifying()) {
-        this.identifierNameStringMarker = new IdentifierNameStringMarker(appViewWithLiveness);
-      } else {
-        this.identifierNameStringMarker = null;
-      }
-      this.devirtualizer =
-          options.enableDevirtualization ? new Devirtualizer(appViewWithLiveness) : null;
-      this.uninstantiatedTypeOptimization =
-          options.enableUninstantiatedTypeOptimization
-              ? new UninstantiatedTypeOptimization(appViewWithLiveness)
-              : null;
-      this.typeChecker = new TypeChecker(appView.withLiveness());
-      this.serviceLoaderRewriter =
-          options.enableServiceLoaderRewriting ? new ServiceLoaderRewriter() : null;
-    } else {
+      this.twrCloseResourceRewriter = null;
+      this.lambdaMerger = null;
+      this.covariantReturnTypeAnnotationTransformer = null;
+      this.dynamicTypeOptimization = null;
       this.classInliner = null;
       this.classStaticizer = null;
+      this.fieldAccessAnalysis = null;
+      this.libraryMethodOverrideAnalysis = null;
       this.inliner = null;
       this.outliner = null;
       this.memberValuePropagation = null;
       this.lensCodeRewriter = null;
       this.identifierNameStringMarker = null;
       this.devirtualizer = null;
-      this.uninstantiatedTypeOptimization = null;
       this.typeChecker = null;
+      this.d8NestBasedAccessDesugaring = null;
+      this.stringSwitchRemover = null;
       this.serviceLoaderRewriter = null;
+      this.methodOptimizationInfoCollector = null;
+      this.enumValueOptimizer = null;
+      this.enumUnboxer = null;
+      this.assumeInserter = null;
+      return;
     }
-    this.deadCodeRemover = new DeadCodeRemover(appView, codeRewriter);
-    this.idempotentFunctionCallCanonicalizer =
-        new IdempotentFunctionCallCanonicalizer(appView.dexItemFactory());
-  }
-
-  public Set<DexCallSite> getDesugaredCallSites() {
-    if (lambdaRewriter != null) {
-      return lambdaRewriter.getDesugaredCallSites();
+    this.lambdaRewriter =
+        (options.desugarState == DesugarState.ON && !appView.enableWholeProgramOptimizations())
+            ? new LambdaRewriter(appView)
+            : null;
+    this.interfaceMethodRewriter =
+        options.isInterfaceMethodDesugaringEnabled()
+            ? new InterfaceMethodRewriter(appView, this)
+            : null;
+    this.twrCloseResourceRewriter =
+        ((options.desugarState == DesugarState.ON) && enableTwrCloseResourceDesugaring())
+            ? new TwrCloseResourceRewriter(appView, this)
+            : null;
+    this.backportedMethodRewriter = new BackportedMethodRewriter(appView, this);
+    this.desugaredLibraryRetargeter =
+        options.desugaredLibraryConfiguration.getRetargetCoreLibMember().isEmpty()
+            ? null
+            : new DesugaredLibraryRetargeter(appView);
+    this.covariantReturnTypeAnnotationTransformer =
+        options.processCovariantReturnTypeAnnotations
+            ? new CovariantReturnTypeAnnotationTransformer(this, appView.dexItemFactory())
+            : null;
+    if (appView.enableWholeProgramOptimizations()) {
+      assert appView.appInfo().hasLiveness();
+      assert appView.rootSet() != null;
+      AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
+      assumeInserter = new AssumeInserter(appViewWithLiveness);
+      this.classInliner =
+          options.enableClassInlining && options.enableInlining ? new ClassInliner() : null;
+      this.classStaticizer =
+          options.enableClassStaticizer ? new ClassStaticizer(appViewWithLiveness, this) : null;
+      this.dynamicTypeOptimization = new DynamicTypeOptimization(appViewWithLiveness);
+      this.fieldAccessAnalysis =
+          FieldAccessAnalysis.enable(options) ? new FieldAccessAnalysis(appViewWithLiveness) : null;
+      this.libraryMethodOverrideAnalysis =
+          options.enableTreeShakingOfLibraryMethodOverrides
+              ? new LibraryMethodOverrideAnalysis(appViewWithLiveness)
+              : null;
+      this.lambdaMerger =
+          options.enableLambdaMerging ? new LambdaMerger(appViewWithLiveness) : null;
+      this.enumUnboxer = options.enableEnumUnboxing ? new EnumUnboxer(appViewWithLiveness) : null;
+      this.lensCodeRewriter = new LensCodeRewriter(appViewWithLiveness, enumUnboxer);
+      this.inliner =
+          new Inliner(appViewWithLiveness, mainDexClasses, lambdaMerger, lensCodeRewriter);
+      this.outliner = new Outliner(appViewWithLiveness);
+      this.memberValuePropagation =
+          options.enableValuePropagation ? new MemberValuePropagation(appViewWithLiveness) : null;
+      this.methodOptimizationInfoCollector =
+          new MethodOptimizationInfoCollector(appViewWithLiveness);
+      if (options.isMinifying()) {
+        this.identifierNameStringMarker = new IdentifierNameStringMarker(appViewWithLiveness);
+      } else {
+        this.identifierNameStringMarker = null;
+      }
+      this.devirtualizer =
+          options.enableDevirtualization ? new Devirtualizer(appViewWithLiveness) : null;
+      this.typeChecker = new TypeChecker(appViewWithLiveness);
+      this.d8NestBasedAccessDesugaring = null;
+      this.serviceLoaderRewriter =
+          options.enableServiceLoaderRewriting
+              ? new ServiceLoaderRewriter(appViewWithLiveness)
+              : null;
+      this.desugaredLibraryAPIConverter =
+          appView.rewritePrefix.isRewriting()
+              ? new DesugaredLibraryAPIConverter(
+                  appView, Mode.ASSERT_CALLBACKS_AND_WRAPPERS_GENERATED)
+              : null;
+      this.enumValueOptimizer =
+          options.enableEnumValueOptimization ? new EnumValueOptimizer(appViewWithLiveness) : null;
     } else {
-      return Collections.emptySet();
+      this.assumeInserter = null;
+      this.classInliner = null;
+      this.classStaticizer = null;
+      this.dynamicTypeOptimization = null;
+      this.fieldAccessAnalysis = null;
+      this.libraryMethodOverrideAnalysis = null;
+      this.inliner = null;
+      this.lambdaMerger = null;
+      this.outliner = null;
+      this.memberValuePropagation = null;
+      this.lensCodeRewriter = null;
+      this.identifierNameStringMarker = null;
+      this.devirtualizer = null;
+      this.typeChecker = null;
+      this.d8NestBasedAccessDesugaring =
+          options.shouldDesugarNests() ? new D8NestBasedAccessDesugaring(appView) : null;
+      this.desugaredLibraryAPIConverter =
+          appView.rewritePrefix.isRewriting()
+              ? new DesugaredLibraryAPIConverter(appView, Mode.GENERATE_CALLBACKS_AND_WRAPPERS)
+              : null;
+      this.serviceLoaderRewriter = null;
+      this.methodOptimizationInfoCollector = null;
+      this.enumValueOptimizer = null;
+      this.enumUnboxer = null;
     }
+    this.stringSwitchRemover =
+        options.isStringSwitchConversionEnabled()
+            ? new StringSwitchRemover(appView, identifierNameStringMarker)
+            : null;
   }
 
   /** Create an IR converter for processing methods with full program optimization disabled. */
-  public IRConverter(AppView<? extends AppInfo> appView) {
-    this(appView, null, null, MainDexClasses.NONE);
+  public IRConverter(AppView<?> appView, Timing timing) {
+    this(appView, timing, null, MainDexClasses.NONE);
   }
 
-  /**
-   * Create an IR converter for processing methods with full program optimization disabled.
-   */
-  public IRConverter(AppInfo appInfo, InternalOptions options, Timing timing, CfgPrinter printer) {
-    this(AppView.createForD8(appInfo, options), timing, printer, MainDexClasses.NONE);
+  /** Create an IR converter for processing methods with full program optimization disabled. */
+  public IRConverter(AppView<?> appView, Timing timing, CfgPrinter printer) {
+    this(appView, timing, printer, MainDexClasses.NONE);
+  }
+
+  public IRConverter(AppInfo appInfo, Timing timing, CfgPrinter printer) {
+    this(AppView.createForD8(appInfo), timing, printer, MainDexClasses.NONE);
   }
 
   private boolean enableTwrCloseResourceDesugaring() {
@@ -271,18 +390,24 @@ public class IRConverter {
     throw new Unreachable();
   }
 
-  private boolean removeLambdaDeserializationMethods() {
+  private void removeLambdaDeserializationMethods() {
     if (lambdaRewriter != null) {
-      return lambdaRewriter.removeLambdaDeserializationMethods(appView.appInfo().classes());
+      lambdaRewriter.removeLambdaDeserializationMethods(appView.appInfo().classes());
     }
-    return false;
+  }
+
+  private void desugarNestBasedAccess(Builder<?> builder, ExecutorService executorService)
+      throws ExecutionException {
+    if (d8NestBasedAccessDesugaring != null) {
+      d8NestBasedAccessDesugaring.desugarNestBasedAccess(builder, executorService, this);
+    }
   }
 
   private void synthesizeLambdaClasses(Builder<?> builder, ExecutorService executorService)
       throws ExecutionException {
     if (lambdaRewriter != null) {
-      lambdaRewriter.adjustAccessibility();
-      lambdaRewriter.synthesizeLambdaClasses(builder, executorService);
+      assert !appView.enableWholeProgramOptimizations();
+      lambdaRewriter.finalizeLambdaDesugaringForD8(builder, this, executorService);
     }
   }
 
@@ -301,7 +426,7 @@ public class IRConverter {
 
   private void desugarInterfaceMethods(
       Builder<?> builder,
-      InterfaceMethodRewriter.Flavor includeAllResources,
+      Flavor includeAllResources,
       ExecutorService executorService)
       throws ExecutionException {
     if (interfaceMethodRewriter != null) {
@@ -320,8 +445,22 @@ public class IRConverter {
 
   private void synthesizeJava8UtilityClass(
       Builder<?> builder, ExecutorService executorService) throws ExecutionException {
-    if (java8MethodRewriter != null) {
-      java8MethodRewriter.synthesizeUtilityClass(builder, executorService, options);
+    if (backportedMethodRewriter != null) {
+      backportedMethodRewriter.synthesizeUtilityClasses(builder, executorService);
+    }
+  }
+
+  private void synthesizeRetargetClass(Builder<?> builder, ExecutorService executorService)
+      throws ExecutionException {
+    if (desugaredLibraryRetargeter != null) {
+      desugaredLibraryRetargeter.synthesizeRetargetClasses(builder, executorService, this);
+    }
+  }
+
+  private void synthesizeEnumUnboxingUtilityMethods(
+      Builder<?> builder, ExecutorService executorService) throws ExecutionException {
+    if (enumUnboxer != null) {
+      enumUnboxer.synthesizeUtilityMethods(builder, this, executorService);
     }
   }
 
@@ -331,22 +470,28 @@ public class IRConverter {
     }
   }
 
-  public DexApplication convertToDex(DexApplication application, ExecutorService executor)
+  public DexApplication convert(DexApplication application, ExecutorService executor)
       throws ExecutionException {
     removeLambdaDeserializationMethods();
+    workaroundAbstractMethodOnNonAbstractClassVerificationBug(
+        executor, OptimizationFeedbackIgnore.getInstance());
 
     timing.begin("IR conversion");
-    convertClassesToDex(application.classes(), executor);
+    ThreadUtils.processItems(application.classes(), this::convertMethods, executor);
 
     // Build a new application with jumbo string info,
     Builder<?> builder = application.builder();
     builder.setHighestSortingString(highestSortingString);
 
+    desugarNestBasedAccess(builder, executor);
     synthesizeLambdaClasses(builder, executor);
     desugarInterfaceMethods(builder, ExcludeDexResources, executor);
     synthesizeTwrCloseResourceUtilityClass(builder, executor);
     synthesizeJava8UtilityClass(builder, executor);
+    synthesizeRetargetClass(builder, executor);
+
     processCovariantReturnTypeAnnotations(builder);
+    generateDesugaredLibraryAPIWrappers(builder, executor);
 
     handleSynthesizedClassMapping(builder);
     timing.end();
@@ -386,9 +531,9 @@ public class IRConverter {
   }
 
   private void clearSynthesizedClassMapping(Builder<?> builder) {
-    for (DexProgramClass programClass : builder.getProgramClasses()) {
-      programClass.annotations =
-          programClass.annotations.getWithout(builder.dexItemFactory.annotationSynthesizedClassMap);
+    for (DexProgramClass clazz : builder.getProgramClasses()) {
+      clazz.setAnnotations(
+          clazz.annotations().getWithout(builder.dexItemFactory.annotationSynthesizedClassMap));
     }
   }
 
@@ -418,115 +563,215 @@ public class IRConverter {
       DexAnnotation updatedAnnotation =
           DexAnnotation.createAnnotationSynthesizedClassMap(synthesized, builder.dexItemFactory);
 
-      original.annotations = original.annotations.getWithAddedOrReplaced(updatedAnnotation);
+      original.setAnnotations(original.annotations().getWithAddedOrReplaced(updatedAnnotation));
     }
   }
 
-  private void convertClassesToDex(Iterable<DexProgramClass> classes,
-      ExecutorService executor) throws ExecutionException {
-    List<Future<?>> futures = new ArrayList<>();
-    for (DexProgramClass clazz : classes) {
-      futures.add(executor.submit(() -> convertMethodsToDex(clazz)));
-    }
-    ThreadUtils.awaitFutures(futures);
-  }
-
-  private void convertMethodsToDex(DexProgramClass clazz) {
+  private void convertMethods(DexProgramClass clazz) {
     boolean isReachabilitySensitive = clazz.hasReachabilitySensitiveAnnotation(options.itemFactory);
     // When converting all methods on a class always convert <clinit> first.
-    for (DexEncodedMethod method : clazz.directMethods()) {
-      if (method.isClassInitializer()) {
-        method.getMutableOptimizationInfo().setReachabilitySensitive(isReachabilitySensitive);
-        convertMethodToDex(method);
-        break;
-      }
+    DexEncodedMethod classInitializer = clazz.getClassInitializer();
+    if (classInitializer != null) {
+      classInitializer
+          .getMutableOptimizationInfo()
+          .setReachabilitySensitive(isReachabilitySensitive);
+      convertMethod(new ProgramMethod(clazz, classInitializer));
     }
-    clazz.forEachMethod(
+    clazz.forEachProgramMethodMatching(
+        definition -> !definition.isClassInitializer(),
         method -> {
-          if (!method.isClassInitializer()) {
-            method.getMutableOptimizationInfo().setReachabilitySensitive(isReachabilitySensitive);
-            convertMethodToDex(method);
-          }
+          DexEncodedMethod definition = method.getDefinition();
+          definition.getMutableOptimizationInfo().setReachabilitySensitive(isReachabilitySensitive);
+          convertMethod(method);
         });
   }
 
-  private void convertMethodToDex(DexEncodedMethod method) {
-    assert options.isGeneratingDex();
-    if (method.getCode() != null) {
-      boolean matchesMethodFilter = options.methodMatchesFilter(method);
+  private void convertMethod(ProgramMethod method) {
+    DexEncodedMethod definition = method.getDefinition();
+    if (definition.getCode() != null) {
+      boolean matchesMethodFilter = options.methodMatchesFilter(definition);
       if (matchesMethodFilter) {
-        if (!(options.passthroughDexCode && method.getCode().isDexCode())) {
-          // We do not process in call graph order, so anything could be a leaf.
-          rewriteCode(method, simpleOptimizationFeedback, x -> true, CallSiteInformation.empty(),
-              Outliner::noProcessing);
+        if (appView.options().enableNeverMergePrefixes) {
+          for (DexString neverMergePrefix : neverMergePrefixes) {
+            // Synthetic classes will always be merged.
+            if (method.getHolderType().isD8R8SynthesizedClassType()) {
+              continue;
+            }
+            if (method.getHolderType().descriptor.startsWith(neverMergePrefix)) {
+              seenNeverMergePrefix.getAndSet(true);
+            } else {
+              seenNotNeverMergePrefix.getAndSet(true);
+            }
+            // Don't mix.
+            if (seenNeverMergePrefix.get() && seenNotNeverMergePrefix.get()) {
+              StringBuilder message = new StringBuilder();
+              message
+                  .append("Merging dex file containing classes with prefix")
+                  .append(neverMergePrefixes.size() > 1 ? "es " : " ");
+              for (int i = 0; i < neverMergePrefixes.size(); i++) {
+                message
+                    .append("'")
+                    .append(neverMergePrefixes.get(0).toString().substring(1).replace('/', '.'))
+                    .append("'")
+                    .append(i < neverMergePrefixes.size() - 1 ? ", " : "");
+              }
+              message.append(" with classes with any other prefixes is not allowed.");
+              throw new CompilationError(message.toString());
+            }
+          }
         }
-        updateHighestSortingStrings(method);
+        if (options.isGeneratingClassFiles()
+            || !(options.passthroughDexCode && definition.getCode().isDexCode())) {
+          // We do not process in call graph order, so anything could be a leaf.
+          rewriteCode(
+              method,
+              simpleOptimizationFeedback,
+              OneTimeMethodProcessor.create(method, appView),
+              null);
+        } else {
+          assert definition.getCode().isDexCode();
+        }
+        if (!options.isGeneratingClassFiles()) {
+          updateHighestSortingStrings(definition);
+        }
       }
     }
   }
 
-  public DexApplication optimize(DexApplication application) throws ExecutionException {
+  private void workaroundAbstractMethodOnNonAbstractClassVerificationBug(
+      ExecutorService executorService, OptimizationFeedback feedback) throws ExecutionException {
+    if (!options.canHaveDalvikAbstractMethodOnNonAbstractClassVerificationBug()) {
+      return;
+    }
+    assert delayedOptimizationFeedback.noUpdatesLeft();
+    ThreadUtils.processItems(
+        appView.appInfo().classes(),
+        clazz -> {
+          if (!clazz.isAbstract()) {
+            clazz.forEachMethod(
+                method -> {
+                  if (method.isAbstract()) {
+                    method.accessFlags.unsetAbstract();
+                    finalizeEmptyThrowingCode(method, feedback);
+                  }
+                });
+          }
+        },
+        executorService);
+  }
+
+  public DexApplication optimize() throws ExecutionException {
     ExecutorService executor = Executors.newSingleThreadExecutor();
     try {
-      return optimize(application, executor);
+      return optimize(executor);
     } finally {
       executor.shutdown();
     }
   }
 
-  public DexApplication optimize(DexApplication application, ExecutorService executorService)
-      throws ExecutionException {
-    if (options.isShrinking()) {
-      assert !removeLambdaDeserializationMethods();
-    } else {
-      removeLambdaDeserializationMethods();
-    }
+  public DexApplication optimize(ExecutorService executorService) throws ExecutionException {
+    DexApplication application = appView.appInfo().app();
 
     computeReachabilitySensitivity(application);
     collectLambdaMergingCandidates(application);
     collectStaticizerCandidates(application);
+    workaroundAbstractMethodOnNonAbstractClassVerificationBug(
+        executorService, simpleOptimizationFeedback);
 
-    // The process is in two phases.
-    // 1) Subject all DexEncodedMethods to optimization (except outlining).
-    //    - a side effect is candidates for outlining are identified.
-    // 2) Perform outlining for the collected candidates.
-    // Ideally, we should outline eagerly when threshold for a template has been reached.
+    // The process is in two phases in general.
+    // 1) Subject all DexEncodedMethods to optimization, except some optimizations that require
+    //    reprocessing IR code of methods, e.g., outlining, double-inlining, class staticizer, etc.
+    //    - a side effect is candidates for those optimizations are identified.
+    // 2) Revisit DexEncodedMethods for the collected candidates.
 
     printPhase("Primary optimization pass");
+    if (fieldAccessAnalysis != null) {
+      fieldAccessAnalysis.fieldAssignmentTracker().initialize();
+    }
 
     // Process the application identifying outlining candidates.
     GraphLense graphLenseForIR = appView.graphLense();
     OptimizationFeedbackDelayed feedback = delayedOptimizationFeedback;
+    PostMethodProcessor.Builder postMethodProcessorBuilder =
+        new PostMethodProcessor.Builder(getOptimizationsForPostIRProcessing());
     {
-      timing.begin("Build call graph");
-      CallGraph callGraph = CallGraph.build(application, appView.withLiveness(), options, timing);
+      timing.begin("Build primary method processor");
+      PrimaryMethodProcessor primaryMethodProcessor =
+          PrimaryMethodProcessor.create(
+              appView.withLiveness(), postMethodProcessorBuilder, executorService, timing);
       timing.end();
       timing.begin("IR conversion phase 1");
-      BiConsumer<IRCode, DexEncodedMethod> outlineHandler =
-          outliner == null ? Outliner::noProcessing : outliner.identifyCandidateMethods();
-      callGraph.forEachMethod(
-          (method, isProcessedConcurrently) ->
-              processMethod(method, feedback, isProcessedConcurrently, callGraph, outlineHandler),
+      if (outliner != null) {
+        outliner.createOutlineMethodIdentifierGenerator();
+      }
+      primaryMethodProcessor.forEachMethod(
+          (method, methodProcessingId) ->
+              processMethod(method, feedback, primaryMethodProcessor, methodProcessingId),
           this::waveStart,
           this::waveDone,
+          timing,
           executorService);
       timing.end();
       assert graphLenseForIR == appView.graphLense();
     }
 
-    // Second inlining pass for dealing with double inline callers.
+    // Assure that no more optimization feedback left after primary processing.
+    assert feedback.noUpdatesLeft();
+    appView.setAllCodeProcessed();
+    // All the code has been processed so the rewriting required by the lenses is done everywhere,
+    // we clear lens code rewriting so that the lens rewriter can be re-executed in phase 2 if new
+    // lenses with code rewriting are added.
+    appView.clearCodeRewritings();
+
+    if (libraryMethodOverrideAnalysis != null) {
+      libraryMethodOverrideAnalysis.finish();
+    }
+
+    // Post processing:
+    //   1) Second pass for methods whose collected call site information become more precise.
+    //   2) Second inlining pass for dealing with double inline callers.
+    printPhase("Post optimization pass");
+    if (appView.callSiteOptimizationInfoPropagator() != null) {
+      postMethodProcessorBuilder.put(appView.callSiteOptimizationInfoPropagator());
+    }
     if (inliner != null) {
-      printPhase("Double caller inlining");
-      assert graphLenseForIR == appView.graphLense();
-      inliner.processDoubleInlineCallers(this, executorService, feedback);
+      postMethodProcessorBuilder.put(inliner);
+    }
+    if (enumUnboxer != null) {
+      enumUnboxer.finishAnalysis();
+      enumUnboxer.unboxEnums(postMethodProcessorBuilder, executorService, feedback);
+    }
+    if (!options.debug) {
+      new TrivialFieldAccessReprocessor(appView.withLiveness(), postMethodProcessorBuilder)
+          .run(executorService, feedback, timing);
+    }
+
+    timing.begin("IR conversion phase 2");
+    graphLenseForIR = appView.graphLense();
+    PostMethodProcessor postMethodProcessor =
+        postMethodProcessorBuilder.build(appView.withLiveness(), executorService, timing);
+    if (postMethodProcessor != null) {
+      assert !options.debug;
+      postMethodProcessor.forEachWave(feedback, executorService);
       feedback.updateVisibleOptimizationInfo();
       assert graphLenseForIR == appView.graphLense();
     }
+    timing.end();
+
+    // All the code that should be impacted by the lenses inserted between phase 1 and phase 2
+    // have now been processed and rewritten, we clear code lens rewriting so that the class
+    // staticizer and phase 3 does not perform again the rewriting.
+    appView.clearCodeRewritings();
 
     // TODO(b/112831361): Implement support for staticizeClasses in CF backend.
     if (!options.isGeneratingClassFiles()) {
       printPhase("Class staticizer post processing");
+      // TODO(b/127694949): Adapt to PostOptimization.
       staticizeClasses(feedback, executorService);
+      feedback.updateVisibleOptimizationInfo();
+      // The class staticizer lens shall not be applied through lens code rewriting or it breaks
+      // the lambda merger.
+      appView.clearCodeRewritings();
     }
 
     // Build a new application with jumbo string info.
@@ -538,35 +783,58 @@ public class IRConverter {
 
     printPhase("Interface method desugaring");
     desugarInterfaceMethods(builder, IncludeAllResources, executorService);
+    feedback.updateVisibleOptimizationInfo();
 
-    printPhase("Twr close resource utility class synthesis");
+    printPhase("Utility classes synthesis");
     synthesizeTwrCloseResourceUtilityClass(builder, executorService);
     synthesizeJava8UtilityClass(builder, executorService);
+    synthesizeRetargetClass(builder, executorService);
     handleSynthesizedClassMapping(builder);
+    synthesizeEnumUnboxingUtilityMethods(builder, executorService);
 
     printPhase("Lambda merging finalization");
+    // TODO(b/127694949): Adapt to PostOptimization.
     finalizeLambdaMerging(application, feedback, builder, executorService);
 
+    printPhase("Desugared library API Conversion finalization");
+    generateDesugaredLibraryAPIWrappers(builder, executorService);
+
+    if (serviceLoaderRewriter != null && serviceLoaderRewriter.getSynthesizedClass() != null) {
+      appView.appInfo().addSynthesizedClass(serviceLoaderRewriter.getSynthesizedClass());
+      processSynthesizedServiceLoaderMethods(
+          serviceLoaderRewriter.getSynthesizedClass(), executorService);
+      builder.addSynthesizedClass(serviceLoaderRewriter.getSynthesizedClass(), true);
+    }
+
+    // Update optimization info for all synthesized methods at once.
+    feedback.updateVisibleOptimizationInfo();
+
+    // TODO(b/127694949): Adapt to PostOptimization.
     if (outliner != null) {
       printPhase("Outlining");
-      timing.begin("IR conversion phase 2");
-      if (outliner.selectMethodsForOutlining()) {
+      timing.begin("IR conversion phase 3");
+      ProgramMethodSet methodsSelectedForOutlining = outliner.selectMethodsForOutlining();
+      if (!methodsSelectedForOutlining.isEmpty()) {
         forEachSelectedOutliningMethod(
-            executorService,
-            (code, method) -> {
+            methodsSelectedForOutlining,
+            code -> {
               printMethod(code, "IR before outlining (SSA)", null);
-              outliner.identifyOutlineSites(code, method);
-            });
+              outliner.identifyOutlineSites(code);
+            },
+            executorService);
         DexProgramClass outlineClass = outliner.buildOutlinerClass(computeOutlineClassType());
         appView.appInfo().addSynthesizedClass(outlineClass);
         optimizeSynthesizedClass(outlineClass, executorService);
         forEachSelectedOutliningMethod(
-            executorService,
-            (code, method) -> {
-              outliner.applyOutliningCandidate(code, method);
+            methodsSelectedForOutlining,
+            code -> {
+              outliner.applyOutliningCandidate(code);
               printMethod(code, "IR after outlining (SSA)", null);
-              finalizeIR(method, code, ignoreOptimizationFeedback);
-            });
+              removeDeadCodeAndFinalizeIR(
+                  code.context(), code, OptimizationFeedbackIgnore.getInstance(), Timing.empty());
+            },
+            executorService);
+        feedback.updateVisibleOptimizationInfo();
         assert outliner.checkAllOutlineSitesFoundAgain();
         builder.addSynthesizedClass(outlineClass, true);
         clearDexMethodCompilationState(outlineClass);
@@ -576,36 +844,54 @@ public class IRConverter {
     clearDexMethodCompilationState();
 
     if (identifierNameStringMarker != null) {
-      identifierNameStringMarker.decoupleIdentifierNameStringsInFields();
+      identifierNameStringMarker.decoupleIdentifierNameStringsInFields(executorService);
     }
 
-    if (Log.ENABLED && uninstantiatedTypeOptimization != null) {
-      uninstantiatedTypeOptimization.logResults();
+    if (Log.ENABLED) {
+      if (appView.callSiteOptimizationInfoPropagator() != null) {
+        appView.callSiteOptimizationInfoPropagator().logResults();
+      }
+      constantCanonicalizer.logResults();
+      if (idempotentFunctionCallCanonicalizer != null) {
+        idempotentFunctionCallCanonicalizer.logResults();
+      }
+      if (libraryMethodOverrideAnalysis != null) {
+        libraryMethodOverrideAnalysis.logResults();
+      }
+      if (stringOptimizer != null) {
+        stringOptimizer.logResult();
+      }
+      if (stringBuilderOptimizer != null) {
+        stringBuilderOptimizer.logResults();
+      }
     }
+
+    // Assure that no more optimization feedback left after post processing.
+    assert feedback.noUpdatesLeft();
 
     // Check if what we've added to the application builder as synthesized classes are same as
     // what we've added and used through AppInfo.
-    assert appView
-            .appInfo()
-            .getSynthesizedClassesForSanityCheck()
-            .containsAll(builder.getSynthesizedClasses())
-        && builder
-            .getSynthesizedClasses()
-            .containsAll(appView.appInfo().getSynthesizedClassesForSanityCheck());
+    assert appView.appInfo().synthesizedClasses().containsAll(builder.getSynthesizedClasses())
+        && builder.getSynthesizedClasses().containsAll(appView.appInfo().synthesizedClasses());
     return builder.build();
   }
 
-  private void waveStart() {
+  private void waveStart(ProgramMethodSet wave) {
     onWaveDoneActions = Collections.synchronizedList(new ArrayList<>());
   }
 
-  private void waveDone() {
+  private void waveDone(ProgramMethodSet wave) {
+    delayedOptimizationFeedback.refineAppInfoWithLiveness(appView.appInfo().withLiveness());
     delayedOptimizationFeedback.updateVisibleOptimizationInfo();
-    onWaveDoneActions.forEach(Action::execute);
+    if (options.enableFieldAssignmentTracker) {
+      fieldAccessAnalysis.fieldAssignmentTracker().waveDone(wave, delayedOptimizationFeedback);
+    }
+    assert delayedOptimizationFeedback.noUpdatesLeft();
+    onWaveDoneActions.forEach(com.android.tools.r8.utils.Action::execute);
     onWaveDoneActions = null;
   }
 
-  public void addWaveDoneAction(Action action) {
+  public void addWaveDoneAction(com.android.tools.r8.utils.Action action) {
     if (!appView.enableWholeProgramOptimizations()) {
       throw new Unreachable("addWaveDoneAction() should never be used in D8.");
     }
@@ -628,35 +914,48 @@ public class IRConverter {
   }
 
   private void forEachSelectedOutliningMethod(
-      ExecutorService executorService, BiConsumer<IRCode, DexEncodedMethod> consumer)
+      ProgramMethodSet methodsSelectedForOutlining,
+      Consumer<IRCode> consumer,
+      ExecutorService executorService)
       throws ExecutionException {
     assert !options.skipIR;
-    Set<DexEncodedMethod> methods = outliner.getMethodsSelectedForOutlining();
-    List<Future<?>> futures = new ArrayList<>();
-    for (DexEncodedMethod method : methods) {
-      futures.add(
-          executorService.submit(
-              () -> {
-                IRCode code =
-                    method.buildIR(appView, appView.appInfo().originFor(method.method.holder));
-                assert code != null;
-                assert !method.getCode().isOutlineCode();
-                // Instead of repeating all the optimizations of rewriteCode(), only run the
-                // optimizations needed for outlining: rewriteMoveResult() to remove out-values on
-                // StringBuilder/StringBuffer method invocations, and removeDeadCode() to remove
-                // unused out-values.
-                codeRewriter.rewriteMoveResult(code);
-                deadCodeRemover.run(code);
-                consumer.accept(code, method);
-                return null;
-              }));
-    }
-    ThreadUtils.awaitFutures(futures);
+    ThreadUtils.processItems(
+        methodsSelectedForOutlining,
+        method -> {
+          IRCode code = method.buildIR(appView);
+          assert code != null;
+          assert !method.getDefinition().getCode().isOutlineCode();
+          // Instead of repeating all the optimizations of rewriteCode(), only run the
+          // optimizations needed for outlining: rewriteMoveResult() to remove out-values on
+          // StringBuilder/StringBuffer method invocations, and removeDeadCode() to remove
+          // unused out-values.
+          codeRewriter.rewriteMoveResult(code);
+          deadCodeRemover.run(code, Timing.empty());
+          CodeRewriter.removeAssumeInstructions(appView, code);
+          consumer.accept(code);
+        },
+        executorService);
+  }
+
+  private void processSynthesizedServiceLoaderMethods(
+      DexProgramClass synthesizedClass, ExecutorService executorService) throws ExecutionException {
+    ThreadUtils.processItems(
+        synthesizedClass::forEachProgramMethod,
+        this::forEachSynthesizedServiceLoaderMethod,
+        executorService);
+  }
+
+  private void forEachSynthesizedServiceLoaderMethod(ProgramMethod method) {
+    IRCode code = method.buildIR(appView);
+    assert code != null;
+    codeRewriter.rewriteMoveResult(code);
+    removeDeadCodeAndFinalizeIR(
+        method, code, OptimizationFeedbackIgnore.getInstance(), Timing.empty());
   }
 
   private void collectLambdaMergingCandidates(DexApplication application) {
     if (lambdaMerger != null) {
-      lambdaMerger.collectGroupCandidates(application, appView.withLiveness());
+      lambdaMerger.collectGroupCandidates(application);
     }
   }
 
@@ -669,6 +968,14 @@ public class IRConverter {
     if (lambdaMerger != null) {
       lambdaMerger.applyLambdaClassMapping(
           application, this, feedback, builder, executorService);
+    }
+  }
+
+  private void generateDesugaredLibraryAPIWrappers(
+      DexApplication.Builder<?> builder, ExecutorService executorService)
+      throws ExecutionException {
+    if (desugaredLibraryAPIConverter != null) {
+      desugaredLibraryAPIConverter.finalizeWrappers(builder, this, executorService);
     }
   }
 
@@ -694,9 +1001,11 @@ public class IRConverter {
       Log.debug(getClass(), "Initial (SSA) flow graph for %s:\n%s", method.toSourceString(), code);
     }
     assert code.isConsistentSSA();
+    Timing timing = Timing.empty();
+    deadCodeRemover.run(code, timing);
     code.traceBlocks();
-    RegisterAllocator registerAllocator = performRegisterAllocation(code, method);
-    method.setCode(code, registerAllocator, options);
+    RegisterAllocator registerAllocator = performRegisterAllocation(code, method, timing);
+    method.setCode(code, registerAllocator, appView);
     if (Log.ENABLED) {
       Log.debug(getClass(), "Resulting dex code for %s:\n%s",
           method.toSourceString(), logCode(options, method));
@@ -708,86 +1017,89 @@ public class IRConverter {
   private DexType computeOutlineClassType() {
     DexType result;
     int count = 0;
+    String prefix = appView.options().synthesizedClassPrefix.replace('/', '.');
     do {
-      String name = OutlineOptions.CLASS_NAME + (count == 0 ? "" : Integer.toString(count));
+      String name =
+          prefix + OutlineOptions.CLASS_NAME + (count == 0 ? "" : Integer.toString(count));
       count++;
       result = appView.dexItemFactory().createType(DescriptorUtils.javaTypeToDescriptor(name));
-    } while (appView.definitionFor(result) != null);
-    // Register the newly generated type in the subtyping hierarchy, if we have one.
-    appView.appInfo().registerNewType(result, appView.dexItemFactory().objectType);
+
+    } while (appView.appInfo().definitionForWithoutExistenceAssert(result) != null);
     return result;
   }
 
   public void optimizeSynthesizedClass(
       DexProgramClass clazz, ExecutorService executorService)
       throws ExecutionException {
-    Set<DexEncodedMethod> methods = Sets.newIdentityHashSet();
-    clazz.forEachMethod(methods::add);
     // Process the generated class, but don't apply any outlining.
-    optimizeSynthesizedMethodsConcurrently(methods, executorService);
+    SortedProgramMethodSet methods = SortedProgramMethodSet.create(clazz::forEachProgramMethod);
+    processMethodsConcurrently(methods, executorService);
   }
 
   public void optimizeSynthesizedClasses(
       Collection<DexProgramClass> classes, ExecutorService executorService)
       throws ExecutionException {
-    Set<DexEncodedMethod> methods = Sets.newIdentityHashSet();
+    SortedProgramMethodSet methods = SortedProgramMethodSet.create();
     for (DexProgramClass clazz : classes) {
-      clazz.forEachMethod(methods::add);
+      clazz.forEachProgramMethod(methods::add);
     }
-    // Process the generated class, but don't apply any outlining.
-    optimizeSynthesizedMethodsConcurrently(methods, executorService);
+    processMethodsConcurrently(methods, executorService);
   }
 
-  public void optimizeSynthesizedMethod(DexEncodedMethod method) {
-    if (!method.isProcessed()) {
+  public void optimizeSynthesizedMethod(ProgramMethod synthesizedMethod) {
+    if (!synthesizedMethod.getDefinition().isProcessed()) {
       // Process the generated method, but don't apply any outlining.
-      processMethod(
-          method,
-          delayedOptimizationFeedback,
-          Predicates.alwaysFalse(),
-          CallSiteInformation.empty(),
-          Outliner::noProcessing);
+      OneTimeMethodProcessor methodProcessor =
+          OneTimeMethodProcessor.create(synthesizedMethod, appView);
+      methodProcessor.forEachWave(
+          (method, methodProcessingId) ->
+              processMethod(
+                  method, delayedOptimizationFeedback, methodProcessor, methodProcessingId));
     }
   }
 
-  public void optimizeSynthesizedMethodsConcurrently(
-      Collection<DexEncodedMethod> methods, ExecutorService executorService)
-      throws ExecutionException {
-    List<Future<?>> futures = new ArrayList<>();
-    for (DexEncodedMethod method : methods) {
-      futures.add(
-          executorService.submit(
-              () -> {
-                processMethod(
-                    method,
-                    delayedOptimizationFeedback,
-                    methods::contains,
-                    CallSiteInformation.empty(),
-                    Outliner::noProcessing);
-                return null; // we want a Callable not a Runnable to be able to throw
-              }));
+  public void processMethodsConcurrently(
+      SortedProgramMethodSet wave, ExecutorService executorService) throws ExecutionException {
+    if (!wave.isEmpty()) {
+      OneTimeMethodProcessor methodProcessor = OneTimeMethodProcessor.create(wave, appView);
+      methodProcessor.forEachWave(
+          (method, methodProcessingId) ->
+              processMethod(
+                  method, delayedOptimizationFeedback, methodProcessor, methodProcessingId),
+          executorService);
     }
-    ThreadUtils.awaitFutures(futures);
   }
 
   private String logCode(InternalOptions options, DexEncodedMethod method) {
     return options.useSmaliSyntax ? method.toSmaliString(null) : method.codeToString();
   }
 
-  public void processMethod(
-      DexEncodedMethod method,
+  List<CodeOptimization> getOptimizationsForPrimaryIRProcessing() {
+    // TODO(b/140766440): Remove unnecessary steps once all sub steps are converted.
+    return ImmutableList.of(this::optimize);
+  }
+
+  List<CodeOptimization> getOptimizationsForPostIRProcessing() {
+    // TODO(b/140766440): Remove unnecessary steps once all sub steps are converted.
+    return ImmutableList.of(this::optimize);
+  }
+
+  // TODO(b/140766440): Make this receive a list of CodeOptimizations to conduct.
+  public Timing processMethod(
+      ProgramMethod method,
       OptimizationFeedback feedback,
-      Predicate<DexEncodedMethod> isProcessedConcurrently,
-      CallSiteInformation callSiteInformation,
-      BiConsumer<IRCode, DexEncodedMethod> outlineHandler) {
-    Code code = method.getCode();
-    boolean matchesMethodFilter = options.methodMatchesFilter(method);
+      MethodProcessor methodProcessor,
+      MethodProcessingId methodProcessingId) {
+    DexEncodedMethod definition = method.getDefinition();
+    Code code = definition.getCode();
+    boolean matchesMethodFilter = options.methodMatchesFilter(definition);
     if (code != null && matchesMethodFilter) {
-      rewriteCode(method, feedback, isProcessedConcurrently, callSiteInformation, outlineHandler);
+      return rewriteCode(method, feedback, methodProcessor, methodProcessingId);
     } else {
       // Mark abstract methods as processed as well.
-      method.markProcessed(ConstraintWithTarget.NEVER);
+      definition.markProcessed(ConstraintWithTarget.NEVER);
     }
+    return Timing.empty();
   }
 
   private static void invertConditionalsForTesting(IRCode code) {
@@ -798,29 +1110,61 @@ public class IRConverter {
     }
   }
 
-  private void rewriteCode(
-      DexEncodedMethod method,
+  private Timing rewriteCode(
+      ProgramMethod method,
       OptimizationFeedback feedback,
-      Predicate<DexEncodedMethod> isProcessedConcurrently,
-      CallSiteInformation callSiteInformation,
-      BiConsumer<IRCode, DexEncodedMethod> outlineHandler) {
+      MethodProcessor methodProcessor,
+      MethodProcessingId methodProcessingId) {
+    return ExceptionUtils.withOriginAndPositionAttachmentHandler(
+        method.getOrigin(),
+        new MethodPosition(method.getReference().asMethodReference()),
+        () -> rewriteCodeInternal(method, feedback, methodProcessor, methodProcessingId));
+  }
+
+  private Timing rewriteCodeInternal(
+      ProgramMethod method,
+      OptimizationFeedback feedback,
+      MethodProcessor methodProcessor,
+      MethodProcessingId methodProcessingId) {
     if (options.verbose) {
       options.reporter.info(
           new StringDiagnostic("Processing: " + method.toSourceString()));
     }
     if (Log.ENABLED) {
-      Log.debug(getClass(), "Original code for %s:\n%s",
-          method.toSourceString(), logCode(options, method));
+      Log.debug(
+          getClass(),
+          "Original code for %s:\n%s",
+          method.toSourceString(),
+          logCode(options, method.getDefinition()));
+    }
+    if (options.testing.hookInIrConversion != null) {
+      options.testing.hookInIrConversion.run();
     }
     if (options.skipIR) {
-      feedback.markProcessed(method, ConstraintWithTarget.NEVER);
-      return;
+      feedback.markProcessed(method.getDefinition(), ConstraintWithTarget.NEVER);
+      return Timing.empty();
     }
-    IRCode code = method.buildIR(appView, appView.appInfo().originFor(method.method.holder));
+    IRCode code = method.buildIR(appView);
     if (code == null) {
-      feedback.markProcessed(method, ConstraintWithTarget.NEVER);
-      return;
+      feedback.markProcessed(method.getDefinition(), ConstraintWithTarget.NEVER);
+      return Timing.empty();
     }
+    return optimize(code, feedback, methodProcessor, methodProcessingId);
+  }
+
+  // TODO(b/140766440): Convert all sub steps an implementer of CodeOptimization
+  private Timing optimize(
+      IRCode code,
+      OptimizationFeedback feedback,
+      MethodProcessor methodProcessor,
+      MethodProcessingId methodProcessingId) {
+    ProgramMethod context = code.context();
+    DexEncodedMethod method = context.getDefinition();
+    DexProgramClass holder = context.getHolder();
+    assert holder != null;
+
+    Timing timing = Timing.create(method.qualifiedName(), options);
+
     if (Log.ENABLED) {
       Log.debug(getClass(), "Initial (SSA) flow graph for %s:\n%s", method.toSourceString(), code);
     }
@@ -833,7 +1177,9 @@ public class IRConverter {
     }
 
     if (options.canHaveArtStringNewInitBug()) {
+      timing.begin("Check for new-init issue");
       CodeRewriter.ensureDirectStringNewToInit(code, appView.dexItemFactory());
+      timing.end();
     }
 
     boolean isDebugMode = options.debug || method.getOptimizationInfo().isReachabilitySensitive();
@@ -842,12 +1188,30 @@ public class IRConverter {
       codeRewriter.simplifyDebugLocals(code);
     }
 
-    if (!method.isProcessed()) {
-      if (lensCodeRewriter != null) {
-        lensCodeRewriter.rewrite(code, method);
-      } else {
-        assert appView.graphLense().isIdentityLense();
-      }
+    if (appView.graphLense().hasCodeRewritings()) {
+      assert lensCodeRewriter != null;
+      timing.begin("Lens rewrite");
+      lensCodeRewriter.rewrite(code, context);
+      timing.end();
+    }
+
+    assert !method.isProcessed() || !isDebugMode;
+    assert !method.isProcessed()
+        || !appView.enableWholeProgramOptimizations()
+        || !appView.appInfo().withLiveness().neverReprocess.contains(method.method);
+
+    if (!method.isProcessed() && lambdaRewriter != null) {
+      timing.begin("Desugar lambdas");
+      lambdaRewriter.desugarLambdas(code);
+      timing.end();
+      assert code.isConsistentSSA();
+    }
+
+    if (lambdaMerger != null) {
+      timing.begin("Merge lambdas");
+      lambdaMerger.rewriteCode(code.context(), code, inliner, methodProcessor);
+      timing.end();
+      assert code.isConsistentSSA();
     }
 
     if (typeChecker != null && !typeChecker.check(code)) {
@@ -860,7 +1224,7 @@ public class IRConverter {
                   + "` does not type check and will be assumed to be unreachable.");
       options.reporter.warning(warning);
       finalizeEmptyThrowingCode(method, feedback);
-      return;
+      return timing;
     }
 
     // This is the first point in time where we can assert that the types are sound. If this
@@ -868,107 +1232,190 @@ public class IRConverter {
     // check. In the latter case, the type checker should be extended to detect the issue such that
     // we will return with finalizeEmptyThrowingCode() above.
     assert code.verifyTypes(appView);
+    assert code.isConsistentSSA();
+
+    if (appView.isCfByteCodePassThrough(method)) {
+      // If the code is pass trough, do not finalize by overwriting the existing code.
+      assert appView.enableWholeProgramOptimizations();
+      timing.begin("Collect optimization info");
+      collectOptimizationInfo(
+          method, code, ClassInitializerDefaultsResult.empty(), feedback, methodProcessor, timing);
+      timing.end();
+      return timing;
+    }
+
+    assertionsRewriter.run(method, code, timing);
 
     if (serviceLoaderRewriter != null) {
       assert appView.appInfo().hasLiveness();
-      serviceLoaderRewriter.rewrite(code, appView.withLiveness());
+      timing.begin("Rewrite service loaders");
+      serviceLoaderRewriter.rewrite(code, methodProcessingId);
+      timing.end();
     }
-
-    if (classStaticizer != null) {
-      classStaticizer.fixupMethodCode(method, code);
-      assert code.isConsistentSSA();
-    }
-
-    previous = printMethod(code, "IR after class staticizer (SSA)", previous);
 
     if (identifierNameStringMarker != null) {
-      identifierNameStringMarker.decoupleIdentifierNameStringsInMethod(method, code);
+      timing.begin("Decouple identifier-name strings");
+      identifierNameStringMarker.decoupleIdentifierNameStringsInMethod(code);
+      timing.end();
       assert code.isConsistentSSA();
     }
 
     if (memberValuePropagation != null) {
-      memberValuePropagation.rewriteWithConstantValues(
-          code, method.method.holder, isProcessedConcurrently);
+      timing.begin("Propagate member values");
+      memberValuePropagation.run(code);
+      timing.end();
     }
-    if (options.enableSwitchMapRemoval) {
+
+    if (enumValueOptimizer != null) {
       assert appView.enableWholeProgramOptimizations();
-      codeRewriter.removeSwitchMaps(code);
-    }
-    if (options.disableAssertions) {
-      codeRewriter.disableAssertions(appView, method, code, feedback);
+      timing.begin("Remove switch maps");
+      enumValueOptimizer.removeSwitchMaps(code);
+      timing.end();
     }
 
     previous = printMethod(code, "IR after disable assertions (SSA)", previous);
 
-    if (nonNullTracker != null) {
-      nonNullTracker.addNonNull(code);
-      assert code.isConsistentSSA();
+    if (assumeInserter != null) {
+      assumeInserter.insertAssumeInstructions(code, timing);
     }
 
-    previous = printMethod(code, "IR after null tracking (SSA)", previous);
+    previous = printMethod(code, "IR after inserting assume instructions (SSA)", previous);
+
+    timing.begin("Run proto shrinking tasks");
+    appView.withGeneratedExtensionRegistryShrinker(shrinker -> shrinker.rewriteCode(method, code));
+
+    previous = printMethod(code, "IR after generated extension registry shrinking (SSA)", previous);
+
+    appView.withGeneratedMessageLiteShrinker(shrinker -> shrinker.run(code));
+    timing.end();
+
+    previous = printMethod(code, "IR after generated message lite shrinking (SSA)", previous);
 
     if (!isDebugMode && options.enableInlining && inliner != null) {
-      inliner.performInlining(method, code, isProcessedConcurrently, callSiteInformation);
+      timing.begin("Inlining");
+      inliner.performInlining(code.context(), code, feedback, methodProcessor, timing);
+      timing.end();
+      assert code.verifyTypes(appView);
     }
 
     previous = printMethod(code, "IR after inlining (SSA)", previous);
 
     if (appView.appInfo().hasLiveness()) {
-      // Reflection optimization 1. getClass() -> const-class
-      ReflectionOptimizer.rewriteGetClass(appView.withLiveness(), code);
+      // Reflection optimization 1. getClass() / forName() -> const-class
+      timing.begin("Rewrite to const class");
+      ReflectionOptimizer.rewriteGetClassOrForNameToConstClass(appView.withLiveness(), code);
+      timing.end();
     }
 
     if (!isDebugMode) {
       // Reflection optimization 2. get*Name() with const-class -> const-string
       if (options.enableNameReflectionOptimization
           || options.testing.forceNameReflectionOptimization) {
+        timing.begin("Rewrite Class.getName");
         stringOptimizer.rewriteClassGetName(appView, code);
+        timing.end();
       }
       // Reflection/string optimization 3. trivial conversion/computation on const-string
+      timing.begin("Optimize const strings");
       stringOptimizer.computeTrivialOperationsOnConstString(code);
       stringOptimizer.removeTrivialConversions(code);
+      timing.end();
+      timing.begin("Optimize library methods");
+      appView
+          .libraryMethodOptimizer()
+          .optimize(code, feedback, methodProcessor, methodProcessingId);
+      timing.end();
       assert code.isConsistentSSA();
     }
 
+    assert code.verifyTypes(appView);
+
     if (devirtualizer != null) {
       assert code.verifyTypes(appView);
-      devirtualizer.devirtualizeInvokeInterface(code, method.method.holder);
-    }
-    if (uninstantiatedTypeOptimization != null) {
-      uninstantiatedTypeOptimization.rewrite(code);
+      timing.begin("Devirtualize invoke interface");
+      devirtualizer.devirtualizeInvokeInterface(code);
+      timing.end();
     }
 
     assert code.verifyTypes(appView);
-    codeRewriter.removeTrivialCheckCastAndInstanceOfInstructions(
-        code, appView.enableWholeProgramOptimizations());
 
-    codeRewriter.rewriteLongCompareAndRequireNonNull(code, options);
+    timing.begin("Remove trivial type checks/casts");
+    codeRewriter.removeTrivialCheckCastAndInstanceOfInstructions(code);
+    timing.end();
+
+    if (enumValueOptimizer != null) {
+      assert appView.enableWholeProgramOptimizations();
+      timing.begin("Rewrite constant enum methods");
+      enumValueOptimizer.rewriteConstantEnumMethodCalls(code);
+      timing.end();
+    }
+
+    timing.begin("Rewrite array length");
+    codeRewriter.rewriteKnownArrayLengthCalls(code);
+    timing.end();
+    timing.begin("Rewrite AssertionError");
+    codeRewriter.rewriteAssertionErrorTwoArgumentConstructor(code, options);
+    timing.end();
+    timing.begin("Run CSE");
     codeRewriter.commonSubexpressionElimination(code);
+    timing.end();
+    timing.begin("Simplify arrays");
     codeRewriter.simplifyArrayConstruction(code);
+    timing.end();
+    timing.begin("Rewrite move result");
     codeRewriter.rewriteMoveResult(code);
+    timing.end();
+    // TODO(b/114002137): for now, string concatenation depends on rewriteMoveResult.
+    if (options.enableStringConcatenationOptimization
+        && !isDebugMode
+        && options.isGeneratingDex()) {
+      timing.begin("Rewrite string concat");
+      stringBuilderOptimizer.computeTrivialStringConcatenation(code);
+      timing.end();
+    }
+
+    timing.begin("Split range invokes");
     codeRewriter.splitRangeInvokeConstants(code);
-    new SparseConditionalConstantPropagation(code).run();
-    codeRewriter.rewriteSwitch(code);
-    codeRewriter.processMethodsNeverReturningNormally(code);
-    codeRewriter.simplifyIf(code);
-    // TODO(b/123284765) This produces a runtime-crash in Q. Activate again when fixed.
-    // codeRewriter.redundantConstNumberRemoval(code);
-    new RedundantFieldLoadElimination(appView, code).run();
+    timing.end();
+    timing.begin("Propogate sparse conditionals");
+    new SparseConditionalConstantPropagation(appView, code).run();
+    timing.end();
+    timing.begin("Rewrite always throwing instructions");
+    codeRewriter.optimizeAlwaysThrowingInstructions(code);
+    timing.end();
+    timing.begin("Simplify control flow");
+    if (codeRewriter.simplifyControlFlow(code)) {
+      timing.begin("Remove trivial type checks/casts");
+      codeRewriter.removeTrivialCheckCastAndInstanceOfInstructions(code);
+      timing.end();
+    }
+    timing.end();
+    if (options.enableRedundantConstNumberOptimization) {
+      timing.begin("Remove const numbers");
+      codeRewriter.redundantConstNumberRemoval(code);
+      timing.end();
+    }
+    if (RedundantFieldLoadElimination.shouldRun(appView, code)) {
+      timing.begin("Remove field loads");
+      new RedundantFieldLoadElimination(appView, code).run();
+      timing.end();
+    }
 
     if (options.testing.invertConditionals) {
       invertConditionalsForTesting(code);
     }
 
-    if (nonNullTracker != null) {
-      // Computation of non-null parameters on normal exits rely on the existence of non-null IRs.
-      nonNullTracker.computeNonNullParamOnNormalExits(feedback, code);
-      nonNullTracker.cleanupNonNull(code);
-      assert code.isConsistentSSA();
+    if (!isDebugMode) {
+      timing.begin("Rewrite throw NPE");
+      codeRewriter.rewriteThrowNullPointerException(code);
+      timing.end();
     }
 
-    if (classInitializerDefaultsOptimization != null && !isDebugMode) {
-      classInitializerDefaultsOptimization.optimize(method, code);
-    }
+    timing.begin("Optimize class initializers");
+    ClassInitializerDefaultsResult classInitializerDefaultsResult =
+        classInitializerDefaultsOptimization.optimize(code, feedback);
+    timing.end();
+
     if (Log.ENABLED) {
       Log.debug(getClass(), "Intermediate (SSA) flow graph for %s:\n%s",
           method.toSourceString(), code);
@@ -976,22 +1423,32 @@ public class IRConverter {
     // Dead code removal. Performed after simplifications to remove code that becomes dead
     // as a result of those simplifications. The following optimizations could reveal more
     // dead code which is removed right before register allocation in performRegisterAllocation.
-    deadCodeRemover.run(code);
+    deadCodeRemover.run(code, timing);
     assert code.isConsistentSSA();
 
-    if (options.enableDesugaring && enableTryWithResourcesDesugaring()) {
+    if (options.desugarState == DesugarState.ON && enableTryWithResourcesDesugaring()) {
+      timing.begin("Rewrite Throwable suppresed methods");
       codeRewriter.rewriteThrowableAddAndGetSuppressed(code);
-    }
-    if (java8MethodRewriter != null) {
-      java8MethodRewriter.desugar(code);
+      timing.end();
     }
 
+    if (desugaredLibraryRetargeter != null) {
+      // The desugaredLibraryRetargeter should run before backportedMethodRewriter to be able to
+      // perform backport rewriting before the methods can be retargeted.
+      timing.begin("Retarget library methods");
+      desugaredLibraryRetargeter.desugar(code);
+      timing.end();
+    }
+
+    if (backportedMethodRewriter != null) {
+      timing.begin("Rewrite backport methods");
+      backportedMethodRewriter.desugar(code);
+      timing.end();
+    }
+
+    timing.begin("Desugar string concat");
     stringConcatRewriter.desugarStringConcats(method.method, code);
-
-    if (lambdaRewriter != null) {
-      lambdaRewriter.desugarLambdas(method, code);
-      assert code.isConsistentSSA();
-    }
+    timing.end();
 
     previous = printMethod(code, "IR after lambda desugaring (SSA)", previous);
 
@@ -1000,6 +1457,7 @@ public class IRConverter {
     previous = printMethod(code, "IR before class inlining (SSA)", previous);
 
     if (classInliner != null) {
+      timing.begin("Inline classes");
       // Class inliner should work before lambda merger, so if it inlines the
       // lambda, it does not get collected by merger.
       assert options.enableInlining && inliner != null;
@@ -1007,76 +1465,116 @@ public class IRConverter {
           appView.withLiveness(),
           codeRewriter,
           stringOptimizer,
-          method,
+          enumValueOptimizer,
+          code.context(),
           code,
-          isProcessedConcurrently,
+          feedback,
+          methodProcessor,
           inliner,
           Suppliers.memoize(
               () ->
                   inliner.createDefaultOracle(
-                      method,
-                      code,
-                      isProcessedConcurrently,
-                      callSiteInformation,
-                      Integer.MAX_VALUE / 2,
-                      Integer.MAX_VALUE / 2)));
+                      code.context(),
+                      methodProcessor,
+                      options.classInliningInstructionLimit,
+                      // Inlining instruction allowance is not needed for the class inliner since it
+                      // always uses a force inlining oracle for inlining.
+                      -1)));
+      timing.end();
       assert code.isConsistentSSA();
+      assert code.verifyTypes(appView);
     }
 
     previous = printMethod(code, "IR after class inlining (SSA)", previous);
 
+    if (d8NestBasedAccessDesugaring != null) {
+      timing.begin("Desugar nest access");
+      d8NestBasedAccessDesugaring.rewriteNestBasedAccesses(context, code, appView);
+      timing.end();
+      assert code.isConsistentSSA();
+    }
+
+    previous = printMethod(code, "IR after nest based access desugaring (SSA)", previous);
+
     if (interfaceMethodRewriter != null) {
+      timing.begin("Rewrite interface methods");
       interfaceMethodRewriter.rewriteMethodReferences(method, code);
+      timing.end();
       assert code.isConsistentSSA();
     }
 
     previous = printMethod(code, "IR after interface method rewriting (SSA)", previous);
 
-    if (twrCloseResourceRewriter != null) {
-      twrCloseResourceRewriter.rewriteMethodCode(code);
+    // This pass has to be after interfaceMethodRewriter and BackportedMethodRewriter.
+    if (desugaredLibraryAPIConverter != null
+        && (!appView.enableWholeProgramOptimizations() || methodProcessor.isPrimary())) {
+      timing.begin("Desugar library API");
+      desugaredLibraryAPIConverter.desugar(code);
+      timing.end();
+      assert code.isConsistentSSA();
     }
+
+    previous = printMethod(code, "IR after desugared library API Conversion (SSA)", previous);
+
+    if (twrCloseResourceRewriter != null) {
+      timing.begin("Rewrite TWR close");
+      twrCloseResourceRewriter.rewriteMethodCode(code);
+      timing.end();
+    }
+
+    assert code.verifyTypes(appView);
 
     previous = printMethod(code, "IR after twr close resource rewriter (SSA)", previous);
 
     if (lambdaMerger != null) {
-      lambdaMerger.processMethodCode(method, code);
+      timing.begin("Analyze lambda merging");
+      lambdaMerger.analyzeCode(code.context(), code);
+      timing.end();
       assert code.isConsistentSSA();
     }
 
     previous = printMethod(code, "IR after lambda merger (SSA)", previous);
 
-    if (options.outline.enabled) {
-      outlineHandler.accept(code, method);
+    // TODO(b/140766440): an ideal solution would be puttting CodeOptimization for this into
+    //  the list for primary processing only.
+    if (options.outline.enabled && outliner != null && methodProcessor.isPrimary()) {
+      timing.begin("Identify outlines");
+      outliner.getOutlineMethodIdentifierGenerator().accept(code);
+      timing.end();
       assert code.isConsistentSSA();
     }
 
+    assert code.verifyTypes(appView);
+
     previous = printMethod(code, "IR after outline handler (SSA)", previous);
+
+    if (stringSwitchRemover != null) {
+      // Remove string switches prior to canonicalization to ensure that the constants that are
+      // being introduced will be canonicalized if possible.
+      timing.begin("Remove string switch");
+      stringSwitchRemover.run(code);
+      timing.end();
+    }
 
     // TODO(mkroghj) Test if shorten live ranges is worth it.
     if (!options.isGeneratingClassFiles()) {
-      ConstantCanonicalizer.canonicalize(appView, code);
+      timing.begin("Canonicalize constants");
+      constantCanonicalizer.canonicalize(appView, code);
+      timing.end();
+      timing.begin("Create constants for literal instructions");
       codeRewriter.useDedicatedConstantForLitInstruction(code);
+      timing.end();
+      timing.begin("Shorten live ranges");
       codeRewriter.shortenLiveRanges(code);
+      timing.end();
     }
+
+    timing.begin("Canonicalize idempotent calls");
     idempotentFunctionCallCanonicalizer.canonicalize(code);
+    timing.end();
 
     previous =
         printMethod(code, "IR after idempotent function call canonicalization (SSA)", previous);
-
-    codeRewriter.identifyReturnsArgument(method, code, feedback);
-    if (options.enableInlining && inliner != null) {
-      codeRewriter.identifyInvokeSemanticsForInlining(method, code, appView, feedback);
-    }
-
-    // Track usage of parameters and compute their nullability and possibility of NPE.
-    if (appView.enableWholeProgramOptimizations()) {
-      if (method.getOptimizationInfo().getNonNullParamOrThrow() == null) {
-        computeNonNullParamHints(feedback, method, code);
-      }
-
-      computeInitializedClassesOnNormalExit(feedback, method, code);
-      computeMayHaveSideEffects(feedback, method, code);
-    }
 
     // Insert code to log arguments if requested.
     if (options.methodMatchesLogArgumentsFilter(method)) {
@@ -1086,197 +1584,190 @@ public class IRConverter {
 
     previous = printMethod(code, "IR after argument type logging (SSA)", previous);
 
-    // Analysis must be done after method is rewritten by logArgumentTypes()
-    codeRewriter.identifyClassInlinerEligibility(method, code, feedback);
-
-    previous = printMethod(code, "IR after class inliner eligibility (SSA)", previous);
-
-    if (method.isInstanceInitializer() || method.isClassInitializer()) {
-      codeRewriter.identifyTrivialInitializer(method, code, feedback);
-    }
-    codeRewriter.identifyParameterUsages(method, code, feedback);
     if (classStaticizer != null) {
-      classStaticizer.examineMethodCode(method, code);
+      timing.begin("Identify staticizing candidates");
+      classStaticizer.examineMethodCode(code);
+      timing.end();
     }
+
+    if (enumUnboxer != null && methodProcessor.isPrimary()) {
+      enumUnboxer.analyzeEnums(code);
+    }
+
+    assert code.verifyTypes(appView);
+
+    deadCodeRemover.run(code, timing);
+
+    if (appView.enableWholeProgramOptimizations()) {
+      timing.begin("Collect optimization info");
+      collectOptimizationInfo(
+          method, code, classInitializerDefaultsResult, feedback, methodProcessor, timing);
+      timing.end();
+    }
+
+    if (assumeInserter != null) {
+      timing.begin("Remove assume instructions");
+      CodeRewriter.removeAssumeInstructions(appView, code);
+      timing.end();
+      assert code.isConsistentSSA();
+    }
+
+    // Assert that we do not have unremoved non-sense code in the output, e.g., v <- non-null NULL.
+    assert code.verifyNoNullabilityBottomTypes();
+
+    assert code.verifyTypes(appView);
+
+    previous =
+        printMethod(code, "IR after computation of optimization info summary (SSA)", previous);
 
     if (options.canHaveNumberConversionRegisterAllocationBug()) {
+      timing.begin("Check number conversion issue");
       codeRewriter.workaroundNumberConversionRegisterAllocationBug(code);
-    }
-
-    // Either marked by IdentifierNameStringMarker or name reflection, or propagated from inlinee,
-    // Then, make it visible to IdentifierMinifier.
-    // Note that we place this at the end of IR processing because inlinee can be inlined by
-    // Inliner, ClassInliner, or future optimizations that use the inlining machinery.
-    if (method.getOptimizationInfo().useIdentifierNameString()) {
-      feedback.markUseIdentifierNameString(method);
-    } else {
-      assert Streams.stream(code.instructionIterator())
-          .noneMatch(Instruction::isDexItemBasedConstString);
+      timing.end();
     }
 
     printMethod(code, "Optimized IR (SSA)", previous);
-    finalizeIR(method, code, feedback);
+    timing.begin("Finalize IR");
+    finalizeIR(code, feedback, timing);
+    timing.end();
+    return timing;
   }
 
-  private void computeNonNullParamHints(
-    OptimizationFeedback feedback, DexEncodedMethod method, IRCode code) {
-    List<Value> arguments = code.collectArguments();
-    BitSet paramsCheckedForNull = new BitSet();
-    for (int index = 0; index < arguments.size(); index++) {
-      Value argument = arguments.get(index);
-      // This handles cases where the parameter is checked via Kotlin Intrinsics:
-      //
-      //   kotlin.jvm.internal.Intrinsics.checkParameterIsNotNull(param, message)
-      //
-      // or its inlined version:
-      //
-      //   if (param != null) return;
-      //   invoke-static throwParameterIsNullException(msg)
-      //
-      // or some other variants, e.g., throw null or NPE after the direct null check.
-      if (argument.isUsed() && checksNullBeforeSideEffect(code, argument, appView)) {
-        paramsCheckedForNull.set(index);
-      }
+  // Compute optimization info summary for the current method unless it is pinned
+  // (in that case we should not be making any assumptions about the behavior of the method).
+  public void collectOptimizationInfo(
+      DexEncodedMethod method,
+      IRCode code,
+      ClassInitializerDefaultsResult classInitializerDefaultsResult,
+      OptimizationFeedback feedback,
+      MethodProcessor methodProcessor,
+      Timing timing) {
+    if (libraryMethodOverrideAnalysis != null) {
+      timing.begin("Analyze library method overrides");
+      libraryMethodOverrideAnalysis.analyze(code);
+      timing.end();
     }
-    if (paramsCheckedForNull.length() > 0) {
-      // Check if collected information conforms to non-null parameter hints in Kotlin metadata.
-      // These hints are on the original holder. To find the original holder, we first find the
-      // original method signature (this could have changed as a result of, for example, class
-      // merging). Then, we find the type that now corresponds to the the original holder.
-      DexMethod originalSignature = appView.graphLense().getOriginalMethodSignature(method.method);
-      DexClass originalHolder =
-          appView.definitionFor(appView.graphLense().lookupType(originalSignature.holder));
-      if (originalHolder.hasKotlinInfo()) {
-        KotlinInfo kotlinInfo = originalHolder.getKotlinInfo();
-        if (kotlinInfo.hasNonNullParameterHints()) {
-          BitSet hintFromMetadata =
-              kotlinInfo.lookupNonNullParameterHint(
-                  originalSignature.name.toString(), originalSignature.proto.toDescriptorString());
-          if (hintFromMetadata != null && hintFromMetadata.length() > 0) {
-            if (!paramsCheckedForNull.equals(hintFromMetadata) && Log.ENABLED) {
-              Log.debug(getClass(), "Mismatching non-null param hints for %s: %s v.s. %s\n%s",
-                  paramsCheckedForNull.toString(),
-                  hintFromMetadata.toString(),
-                  method.toSourceString(),
-                  logCode(options, method));
-            }
-          }
-        }
-      }
-      feedback.setNonNullParamOrThrow(method, paramsCheckedForNull);
-    }
-  }
 
-  private void computeInitializedClassesOnNormalExit(
-      OptimizationFeedback feedback, DexEncodedMethod method, IRCode code) {
-    if (options.enableInitializedClassesAnalysis && appView.appInfo().hasLiveness()) {
-      AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
-      Set<DexType> initializedClasses =
-          InitializedClassesOnNormalExitAnalysis.computeInitializedClassesOnNormalExit(
-              appViewWithLiveness, code);
-      if (initializedClasses != null && !initializedClasses.isEmpty()) {
-        feedback.methodInitializesClassesOnNormalExit(method, initializedClasses);
+    if (fieldAccessAnalysis != null) {
+      timing.begin("Analyze field accesses");
+      fieldAccessAnalysis.recordFieldAccesses(code, feedback, methodProcessor);
+      if (classInitializerDefaultsResult != null) {
+        fieldAccessAnalysis.acceptClassInitializerDefaultsResult(classInitializerDefaultsResult);
       }
+      timing.end();
     }
-  }
 
-  private void computeMayHaveSideEffects(
-      OptimizationFeedback feedback, DexEncodedMethod method, IRCode code) {
-    if (options.enableSideEffectAnalysis
-        && !appView.appInfo().withLiveness().mayHaveSideEffects.containsKey(method.method)) {
-      boolean mayHaveSideEffects =
-          // If the method is synchronized then it acquires a lock.
-          method.accessFlags.isSynchronized()
-              || (appView.dexItemFactory().isConstructor(method.method)
-                  && hasNonTrivialFinalizeMethod(method.method.holder))
-              || Streams.stream(code.instructions())
-                  .anyMatch(
-                      instruction ->
-                          instruction.instructionMayHaveSideEffects(appView, method.method.holder));
-      if (!mayHaveSideEffects) {
-        feedback.methodMayNotHaveSideEffects(method);
-      }
+    // Arguments can be changed during the debug mode.
+    boolean isDebugMode = options.debug || method.getOptimizationInfo().isReachabilitySensitive();
+    if (!isDebugMode && appView.callSiteOptimizationInfoPropagator() != null) {
+      timing.begin("Collect call-site info");
+      appView.callSiteOptimizationInfoPropagator().collectCallSiteOptimizationInfo(code, timing);
+      timing.end();
     }
-  }
 
-  // Returns true if `method` is an initializer and the enclosing class overrides the method
-  // `void java.lang.Object.finalize()`.
-  private boolean hasNonTrivialFinalizeMethod(DexType type) {
-    DexClass clazz = appView.definitionFor(type);
-    if (clazz != null) {
-      if (clazz.isProgramClass()) {
-        ResolutionResult resolutionResult =
-            appView
-                .appInfo()
-                .resolveMethodOnClass(type, appView.dexItemFactory().objectMethods.finalize);
-        for (DexEncodedMethod target : resolutionResult.asListOfTargets()) {
-          if (target.method != appView.dexItemFactory().objectMethods.finalize) {
-            return true;
-          }
-        }
-        return false;
+    if (appView.appInfo().withLiveness().isPinned(code.method().method)) {
+      return;
+    }
+
+    InstanceFieldInitializationInfoCollection instanceFieldInitializationInfos = null;
+    if (method.isInitializer()) {
+      if (method.isClassInitializer()) {
+        StaticFieldValueAnalysis.run(
+            appView, code, classInitializerDefaultsResult, feedback, timing);
       } else {
-        // Conservatively report that the library class could implement finalize().
-        return true;
+        instanceFieldInitializationInfos =
+            InstanceFieldValueAnalysis.run(
+                appView, code, classInitializerDefaultsResult, feedback, timing);
       }
     }
-    return false;
+    methodOptimizationInfoCollector.collectMethodOptimizationInfo(
+        code.method(),
+        code,
+        feedback,
+        dynamicTypeOptimization,
+        instanceFieldInitializationInfos,
+        timing);
   }
 
-  private void finalizeIR(DexEncodedMethod method, IRCode code, OptimizationFeedback feedback) {
+  public void removeDeadCodeAndFinalizeIR(
+      ProgramMethod method, IRCode code, OptimizationFeedback feedback, Timing timing) {
+    if (stringSwitchRemover != null) {
+      stringSwitchRemover.run(code);
+    }
+    deadCodeRemover.run(code, timing);
+    finalizeIR(code, feedback, timing);
+  }
+
+  public void finalizeIR(IRCode code, OptimizationFeedback feedback, Timing timing) {
     code.traceBlocks();
     if (options.isGeneratingClassFiles()) {
-      finalizeToCf(method, code, feedback);
+      finalizeToCf(code, feedback);
     } else {
       assert options.isGeneratingDex();
-      finalizeToDex(method, code, feedback);
+      finalizeToDex(code, feedback, timing);
     }
   }
 
   private void finalizeEmptyThrowingCode(DexEncodedMethod method, OptimizationFeedback feedback) {
     assert options.isGeneratingClassFiles() || options.isGeneratingDex();
-    Code emptyThrowingCode =
-        options.isGeneratingClassFiles()
-            ? method.buildEmptyThrowingCfCode()
-            : method.buildEmptyThrowingDexCode();
-    method.setCode(emptyThrowingCode);
+    Code emptyThrowingCode = method.buildEmptyThrowingCode(options);
+    method.setCode(emptyThrowingCode, appView);
     feedback.markProcessed(method, ConstraintWithTarget.ALWAYS);
   }
 
-  private void finalizeToCf(DexEncodedMethod method, IRCode code, OptimizationFeedback feedback) {
+  private void finalizeToCf(IRCode code, OptimizationFeedback feedback) {
+    DexEncodedMethod method = code.method();
     assert !method.getCode().isDexCode();
     CfBuilder builder = new CfBuilder(appView, method, code);
-    CfCode result = builder.build(codeRewriter);
-    method.setCode(result);
-    markProcessed(method, code, feedback);
+    CfCode result = builder.build(deadCodeRemover);
+    method.setCode(result, appView);
+    markProcessed(code, feedback);
   }
 
-  private void finalizeToDex(DexEncodedMethod method, IRCode code, OptimizationFeedback feedback) {
+  private void finalizeToDex(IRCode code, OptimizationFeedback feedback, Timing timing) {
+    DexEncodedMethod method = code.method();
     // Workaround massive dex2oat memory use for self-recursive methods.
     CodeRewriter.disableDex2OatInliningForSelfRecursiveMethods(appView, code);
     // Perform register allocation.
-    RegisterAllocator registerAllocator = performRegisterAllocation(code, method);
-    method.setCode(code, registerAllocator, options);
+    RegisterAllocator registerAllocator = performRegisterAllocation(code, method, timing);
+    timing.begin("Build DEX code");
+    method.setCode(code, registerAllocator, appView);
+    timing.end();
     updateHighestSortingStrings(method);
     if (Log.ENABLED) {
       Log.debug(getClass(), "Resulting dex code for %s:\n%s",
           method.toSourceString(), logCode(options, method));
     }
     printMethod(code, "Final IR (non-SSA)", null);
-    markProcessed(method, code, feedback);
+    timing.begin("Marking processed");
+    markProcessed(code, feedback);
+    timing.end();
   }
 
-  private void markProcessed(DexEncodedMethod method, IRCode code, OptimizationFeedback feedback) {
+  private void markProcessed(IRCode code, OptimizationFeedback feedback) {
     // After all the optimizations have take place, we compute whether method should be inlined.
-    ConstraintWithTarget state;
-    if (!options.enableInlining
-        || inliner == null
-        || method.getOptimizationInfo().isReachabilitySensitive()) {
-      state = ConstraintWithTarget.NEVER;
-    } else {
-      state = inliner.computeInliningConstraint(code, method);
+    ProgramMethod method = code.context();
+    ConstraintWithTarget state =
+        shouldComputeInliningConstraint(method)
+            ? inliner.computeInliningConstraint(code)
+            : ConstraintWithTarget.NEVER;
+    feedback.markProcessed(method.getDefinition(), state);
+  }
+
+  private boolean shouldComputeInliningConstraint(ProgramMethod method) {
+    if (!options.enableInlining || inliner == null) {
+      return false;
     }
-    feedback.markProcessed(method, state);
+    DexEncodedMethod definition = method.getDefinition();
+    if (definition.isClassInitializer()
+        || definition.getOptimizationInfo().isReachabilitySensitive()) {
+      return false;
+    }
+    if (appView.appInfo().hasLiveness()
+        && appView.appInfo().withLiveness().isPinned(method.getReference())) {
+      return false;
+    }
+    return true;
   }
 
   private synchronized void updateHighestSortingStrings(DexEncodedMethod method) {
@@ -1289,24 +1780,31 @@ public class IRConverter {
     }
   }
 
-  private RegisterAllocator performRegisterAllocation(IRCode code, DexEncodedMethod method) {
+  private RegisterAllocator performRegisterAllocation(
+      IRCode code, DexEncodedMethod method, Timing timing) {
     // Always perform dead code elimination before register allocation. The register allocator
     // does not allow dead code (to make sure that we do not waste registers for unneeded values).
-    deadCodeRemover.run(code);
+    assert deadCodeRemover.verifyNoDeadCode(code);
     materializeInstructionBeforeLongOperationsWorkaround(code);
     workaroundForwardingInitializerBug(code);
+    timing.begin("Allocate registers");
     LinearScanRegisterAllocator registerAllocator = new LinearScanRegisterAllocator(appView, code);
     registerAllocator.allocateRegisters();
+    timing.end();
     if (options.canHaveExceptionTargetingLoopHeaderBug()) {
       codeRewriter.workaroundExceptionTargetingLoopHeaderBug(code);
     }
     printMethod(code, "After register allocation (non-SSA)", null);
+    timing.begin("Peephole optimize");
     for (int i = 0; i < PEEPHOLE_OPTIMIZATION_PASSES; i++) {
-      CodeRewriter.collapseTrivialGotos(method, code);
+      CodeRewriter.collapseTrivialGotos(code);
       PeepholeOptimizer.optimize(code, registerAllocator);
     }
+    timing.end();
+    timing.begin("Clean up");
     CodeRewriter.removeUnneededMovesOnExitingPaths(code, registerAllocator);
-    CodeRewriter.collapseTrivialGotos(method, code);
+    CodeRewriter.collapseTrivialGotos(code);
+    timing.end();
     if (Log.ENABLED) {
       Log.debug(getClass(), "Final (non-SSA) flow graph for %s:\n%s",
           method.toSourceString(), code);
@@ -1319,11 +1817,11 @@ public class IRConverter {
       return;
     }
     // Only constructors.
-    if (!code.method.isInstanceInitializer()) {
+    if (!code.method().isInstanceInitializer()) {
       return;
     }
     // Only constructors with certain signatures.
-    DexTypeList paramTypes = code.method.method.proto.parameters;
+    DexTypeList paramTypes = code.method().method.proto.parameters;
     if (paramTypes.size() != 3 ||
         paramTypes.values[0] != options.itemFactory.doubleType ||
         paramTypes.values[1] != options.itemFactory.doubleType ||
@@ -1333,12 +1831,15 @@ public class IRConverter {
     // Only if the constructor contains a super constructor call taking only parameters as
     // inputs.
     for (BasicBlock block : code.blocks) {
-      InstructionListIterator it = block.listIterator();
-      Instruction superConstructorCall = it.nextUntil((i) ->
-          i.isInvokeDirect() &&
-          i.asInvokeDirect().getInvokedMethod().name == options.itemFactory.constructorMethodName &&
-          i.asInvokeDirect().arguments().size() == 4 &&
-          i.asInvokeDirect().arguments().stream().allMatch(Value::isArgument));
+      InstructionListIterator it = block.listIterator(code);
+      Instruction superConstructorCall =
+          it.nextUntil(
+              (i) ->
+                  i.isInvokeDirect()
+                      && i.asInvokeDirect().getInvokedMethod().name
+                          == options.itemFactory.constructorMethodName
+                      && i.asInvokeDirect().arguments().size() == 4
+                      && i.asInvokeDirect().arguments().stream().allMatch(Value::isArgument));
       if (superConstructorCall != null) {
         // We force a materializing const instruction in front of the super call to make
         // sure that there is at least one temporary register in the method. That disables
@@ -1376,7 +1877,7 @@ public class IRConverter {
                     factory.intDescriptor,
                     new DexString[] {factory.longDescriptor}));
     for (BasicBlock block : code.blocks) {
-      InstructionListIterator it = block.listIterator();
+      InstructionListIterator it = block.listIterator(code);
       Instruction firstMaterializing = it.nextUntil(IRConverter::isNotPseudoInstruction);
       if (!isLongMul(firstMaterializing)) {
         continue;
@@ -1391,7 +1892,7 @@ public class IRConverter {
       Value outOfMul = firstMaterializing.outValue();
       for (Value inOfAddOrSub : secondMaterializing.inValues()) {
         if (isAliasOf(inOfAddOrSub, outOfMul)) {
-          it = block.listIterator();
+          it = block.listIterator(code);
           it.nextUntil(i -> i == firstMaterializing);
           Value longValue = firstMaterializing.inValues().get(0);
           InvokeStatic invokeLongSignum =
@@ -1453,7 +1954,7 @@ public class IRConverter {
       BasicBlock split = it.split(code);
       assert split.hasCatchHandlers();
       assert !block.hasCatchHandlers();
-      it = block.listIterator(block.getInstructions().size() - 1);
+      it = block.listIterator(code, block.getInstructions().size() - 1);
     }
     instruction.setPosition(addBefore.getPosition());
     it.add(instruction);
@@ -1465,7 +1966,7 @@ public class IRConverter {
     Instruction check = it.previous();
     assert addBefore == check;
     // Forced definition of const-zero
-    Value fixitValue = code.createValue(TypeLatticeElement.INT);
+    Value fixitValue = code.createValue(TypeElement.getInt());
     Instruction fixitDefinition = new AlwaysMaterializingDefinition(fixitValue);
     fixitDefinition.setBlock(addBefore.getBlock());
     fixitDefinition.setPosition(addBefore.getPosition());
@@ -1501,7 +2002,8 @@ public class IRConverter {
       code.print(printer);
       printer.end("cfg");
     }
-    if (options.extensiveLoggingFilter.contains(code.method.method.toSourceString())) {
+    if (options.extensiveLoggingFilter.size() > 0
+        && options.extensiveLoggingFilter.contains(code.method().method.toSourceString())) {
       String current = code.toString();
       System.out.println();
       System.out.println("-----------------------------------------------------------------------");

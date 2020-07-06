@@ -4,11 +4,12 @@
 package com.android.tools.r8.naming.applymapping.sourcelibrary;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 
 import com.android.tools.r8.NeverMerge;
+import com.android.tools.r8.NeverPropagateValue;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.TestParametersCollection;
@@ -29,7 +30,7 @@ import org.junit.runners.Parameterized;
 @NeverMerge
 abstract class AbstractChecker {
   // String tag -> p
-  private String tag = "PrivateInitialTag_AbstractChecker";
+  @NeverPropagateValue private String tag = "PrivateInitialTag_AbstractChecker";
 
   // check() -> x
   private void check() {
@@ -80,7 +81,7 @@ public class MemberResolutionTest extends TestBase {
 
   @Parameterized.Parameters(name = "{0}")
   public static TestParametersCollection data() {
-    return getTestParameters().withAllRuntimes().build();
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
   }
 
   public MemberResolutionTest(TestParameters parameters) {
@@ -121,10 +122,10 @@ public class MemberResolutionTest extends TestBase {
                 AbstractChecker.class, ConcreteChecker.class, MemberResolutionTestMain.class)
             .addKeepMainRule(MemberResolutionTestMain.class)
             .addKeepRules("-applymapping " + mapPath)
+            .enableMemberValuePropagationAnnotations()
             .enableMergeAnnotations()
-            .noMinification()
             .addOptionsModification(options -> options.enableInlining = false)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MemberResolutionTestMain.class)
             .assertSuccessWithOutput(expectedOutput)
             .inspector();
@@ -132,23 +133,19 @@ public class MemberResolutionTest extends TestBase {
     ClassSubject base = inspector.clazz(AbstractChecker.class);
     assertThat(base, isPresent());
     FieldSubject p = base.field("java.lang.String", "tag");
-    assertThat(p, isPresent());
-    assertThat(p, isRenamed());
+    assertThat(p, isPresentAndRenamed());
     assertEquals("p", p.getFinalName());
     MethodSubject x = base.method("void", "check", ImmutableList.of());
-    assertThat(x, isPresent());
-    assertThat(x, isRenamed());
+    assertThat(x, isPresentAndRenamed());
     assertEquals("x", x.getFinalName());
 
     ClassSubject sub = inspector.clazz(ConcreteChecker.class);
     assertThat(sub, isPresent());
     FieldSubject q = sub.field("java.lang.String", "tag");
-    assertThat(q, isPresent());
-    assertThat(q, isRenamed());
+    assertThat(q, isPresentAndRenamed());
     assertEquals("q", q.getFinalName());
     MethodSubject y = sub.method("void", "check", ImmutableList.of());
-    assertThat(y, isPresent());
-    assertThat(y, isRenamed());
+    assertThat(y, isPresentAndRenamed());
     assertEquals("y", y.getFinalName());
   }
 }

@@ -98,9 +98,7 @@ public class JasminBuilder {
     }
 
     private ClassBuilder(String name, String superName) {
-      this.name = name;
-      this.superName = superName;
-      this.interfaces = ImmutableList.of();
+      this(name , superName, new String[0]);
     }
 
     private ClassBuilder(String name, String superName, String... interfaces) {
@@ -519,7 +517,7 @@ public class JasminBuilder {
   }
 
   public DexApplication read(InternalOptions options) throws Exception {
-    Timing timing = new Timing("JasminTest");
+    Timing timing = Timing.empty();
     return new ApplicationReader(build(), options, timing).read();
   }
 }

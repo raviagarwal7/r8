@@ -4,6 +4,7 @@
 package com.android.tools.r8.ir.optimize.string;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assume.assumeTrue;
@@ -19,7 +20,6 @@ import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.InstructionSubject.JumboStringMode;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
-import com.google.common.collect.Streams;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -28,20 +28,48 @@ import org.junit.runners.Parameterized;
 public class StringConcatenationTest extends TestBase {
   private static final Class<?> MAIN = StringConcatenationTestClass.class;
   private static final String JAVA_OUTPUT = StringUtils.lines(
+      // trivialSequence
       "xyz",
+      // builderWithInitialValue
+      "Hello,R8",
+      // builderWithCapacity
       "42",
+      // nonStringArgs
+      "42",
+      // typeConversion
       "0.14 0 false null",
+      // typeConversion_withPhis
+      "3.14 3 0",
+      // nestedBuilders_appendBuilderItself
       "Hello,R8",
+      // nestedBuilders_appendBuilderResult
       "Hello,R8",
+      // nestedBuilders_conditional
+      "Hello,R8",
+      // concatenatedBuilders_init
+      "Hello,R8",
+      // concatenatedBuilders_append
+      "Hello,R8",
+      // concatenatedBuilders_conditional
+      "Hello,R8",
+      // simplePhi
       "Hello,",
       "Hello,D8",
+      // phiAtInit
+      "Hello,R8",
+      // phiWithDifferentInits
+      "Hello,R8",
+      // conditionalPhiWithoutAppend
+      "initial:suffix",
+      // loop
       "na;na;na;na;na;na;na;na;Batman!",
+      // loopWithBuilder
       "na;na;na;na;na;na;na;na;Batman!"
   );
 
   @Parameterized.Parameters(name = "{0}")
   public static TestParametersCollection data() {
-    return getTestParameters().withAllRuntimes().build();
+    return getTestParameters().withAllRuntimes().withAllApiLevels().build();
   }
 
   private final TestParameters parameters;
@@ -52,66 +80,126 @@ public class StringConcatenationTest extends TestBase {
 
   @Test
   public void testJVMOutput() throws Exception {
-    assumeTrue("Only run JVM reference once (for CF backend)", parameters.isCfRuntime());
+    assumeTrue("Only run JVM reference on CF runtimes", parameters.isCfRuntime());
     testForJvm()
         .addTestClasspath()
         .run(parameters.getRuntime(), MAIN)
         .assertSuccessWithOutput(JAVA_OUTPUT);
   }
 
-  private void test(
-      TestRunResult result, int expectedStringCount1, int expectedStringCount2)
-      throws Exception {
+  private void test(TestRunResult result, boolean isR8, boolean isReleaseMode) throws Exception {
+    // TODO(b/154899065): The lack of subtyping made the escape analysis to regard
+    //    StringBuilder#toString as an alias-introducing instruction.
+    //    For now, debug v.s. release mode of D8 have the same result.
+    //    Use library modeling to allow this optimization.
+
+    // Smaller is better in general. If the counter part is zero, that means non-string arguments
+    // are used, and in that case bigger is better.
+    // If the fixed count is used, that means StringBuilderOptimization should keep things as-is
+    // or there would be no observable differences (# of builders could be different).
+    int expectedCount;
+
     CodeInspector codeInspector = result.inspector();
     ClassSubject mainClass = codeInspector.clazz(MAIN);
 
-    MethodSubject method = mainClass.uniqueMethodWithName("trivialSequence");
+    MethodSubject method = mainClass.uniqueMethodWithName("unusedBuilder");
+    if (isR8) {
+      assertThat(method, not(isPresent()));
+    } else {
+      assertThat(method, isPresent());
+      assertEquals(0, countConstString(method));
+    }
+
+    method = mainClass.uniqueMethodWithName("trivialSequence");
     assertThat(method, isPresent());
-    long count = Streams.stream(method.iterateInstructions(
-        i -> i.isConstString(JumboStringMode.ALLOW))).count();
-    assertEquals(expectedStringCount1, count);
+    expectedCount = isR8 ? 1 : 3;
+    assertEquals(expectedCount, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("builderWithInitialValue");
+    assertThat(method, isPresent());
+    expectedCount = isR8 ? 1 : 3;
+    assertEquals(expectedCount, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("builderWithCapacity");
+    assertThat(method, isPresent());
+    expectedCount = isR8 ? 1 : 0;
+    assertEquals(expectedCount, countConstString(method));
 
     method = mainClass.uniqueMethodWithName("nonStringArgs");
     assertThat(method, isPresent());
-    count = Streams.stream(method.iterateInstructions(
-        i -> i.isConstString(JumboStringMode.ALLOW))).count();
-    assertEquals(0, count);
+    expectedCount = isR8 ? 1 : 0;
+    assertEquals(expectedCount, countConstString(method));
 
     method = mainClass.uniqueMethodWithName("typeConversion");
     assertThat(method, isPresent());
-    count = Streams.stream(method.iterateInstructions(
-        i -> i.isConstString(JumboStringMode.ALLOW))).count();
-    assertEquals(0, count);
+    expectedCount = isR8 ? 1 : 0;
+    assertEquals(expectedCount, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("typeConversion_withPhis");
+    assertThat(method, isPresent());
+    assertEquals(0, countConstString(method));
 
     method = mainClass.uniqueMethodWithName("nestedBuilders_appendBuilderItself");
     assertThat(method, isPresent());
-    count = Streams.stream(method.iterateInstructions(
-        i -> i.isConstString(JumboStringMode.ALLOW))).count();
-    assertEquals(expectedStringCount2, count);
+    // TODO(b/113859361): merge builders
+    expectedCount = 3;
+    assertEquals(expectedCount, countConstString(method));
 
     method = mainClass.uniqueMethodWithName("nestedBuilders_appendBuilderResult");
     assertThat(method, isPresent());
-    count = Streams.stream(method.iterateInstructions(
-        i -> i.isConstString(JumboStringMode.ALLOW))).count();
-    assertEquals(expectedStringCount2, count);
+    // TODO(b/113859361): merge builders
+    expectedCount = 3;
+    assertEquals(expectedCount, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("nestedBuilders_conditional");
+    assertThat(method, isPresent());
+    assertEquals(4, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("concatenatedBuilders_init");
+    assertThat(method, isPresent());
+    // TODO(b/113859361): merge builders
+    expectedCount = 2;
+    assertEquals(expectedCount, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("concatenatedBuilders_append");
+    assertThat(method, isPresent());
+    // TODO(b/113859361): merge builders
+    expectedCount = 2;
+    assertEquals(expectedCount, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("concatenatedBuilders_conditional");
+    assertThat(method, isPresent());
+    // TODO(b/113859361): merge builders
+    expectedCount = 4;
+    assertEquals(expectedCount, countConstString(method));
 
     method = mainClass.uniqueMethodWithName("simplePhi");
     assertThat(method, isPresent());
-    count = Streams.stream(method.iterateInstructions(
-        i -> i.isConstString(JumboStringMode.ALLOW))).count();
-    assertEquals(5, count);
+    assertEquals(4, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("phiAtInit");
+    assertThat(method, isPresent());
+    assertEquals(3, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("phiWithDifferentInits");
+    assertThat(method, isPresent());
+    assertEquals(3, countConstString(method));
+
+    method = mainClass.uniqueMethodWithName("conditionalPhiWithoutAppend");
+    assertThat(method, isPresent());
+    assertEquals(3, countConstString(method));
 
     method = mainClass.uniqueMethodWithName("loop");
     assertThat(method, isPresent());
-    count = Streams.stream(method.iterateInstructions(
-        i -> i.isConstString(JumboStringMode.ALLOW))).count();
-    assertEquals(3, count);
+    assertEquals(3, countConstString(method));
 
     method = mainClass.uniqueMethodWithName("loopWithBuilder");
     assertThat(method, isPresent());
-    count = Streams.stream(method.iterateInstructions(
-        i -> i.isConstString(JumboStringMode.ALLOW))).count();
-    assertEquals(2, count);
+    assertEquals(2, countConstString(method));
+  }
+
+  private long countConstString(MethodSubject method) {
+    return method.streamInstructions().filter(i -> i.isConstString(JumboStringMode.ALLOW)).count();
   }
 
   @Test
@@ -122,35 +210,34 @@ public class StringConcatenationTest extends TestBase {
         testForD8()
             .debug()
             .addProgramClasses(MAIN)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
-    test(result, 3, 4);
+    test(result, false, false);
 
     result =
         testForD8()
             .release()
             .addProgramClasses(MAIN)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
-    // TODO(b/114002137): could be 1 and 3.
-    test(result, 3, 4);
+    test(result, false, true);
   }
 
   @Test
   public void testR8() throws Exception {
+    assumeTrue("CF does not rewrite move results.", parameters.isDexRuntime());
+
     R8TestRunResult result =
         testForR8(parameters.getBackend())
             .addProgramClasses(MAIN)
             .enableInliningAnnotations()
             .addKeepMainRule(MAIN)
-            .setMinApi(parameters.getRuntime())
             .noMinification()
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
-    // TODO(b/114002137): could be 1 and 3.
-    test(result, 3, 4);
+    test(result, true, true);
   }
-
 }

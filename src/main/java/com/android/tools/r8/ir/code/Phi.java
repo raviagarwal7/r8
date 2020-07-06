@@ -6,29 +6,37 @@ package com.android.tools.r8.ir.code;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.errors.InvalidDebugInfoException;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DebugLocalInfo;
+import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.BasicBlock.EdgeType;
 import com.android.tools.r8.ir.conversion.IRBuilder;
 import com.android.tools.r8.ir.conversion.TypeConstraintResolver;
+import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.CfgPrinter;
+import com.android.tools.r8.utils.DequeUtils;
 import com.android.tools.r8.utils.ListUtils;
+import com.android.tools.r8.utils.Reporter;
+import com.android.tools.r8.utils.SetUtils;
 import com.android.tools.r8.utils.StringUtils;
+import com.google.common.collect.Sets;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.function.Predicate;
 
 public class Phi extends Value implements InstructionOrPhi {
 
   public enum RegisterReadType {
     NORMAL,
     DEBUG,
-    NORMAL_AND_DEBUG
   }
 
   private final BasicBlock block;
@@ -45,13 +53,18 @@ public class Phi extends Value implements InstructionOrPhi {
   public Phi(
       int number,
       BasicBlock block,
-      TypeLatticeElement typeLattice,
+      TypeElement type,
       DebugLocalInfo local,
       RegisterReadType readType) {
-    super(number, typeLattice, local);
+    super(number, type, local);
     this.block = block;
     this.readType = readType;
     block.addPhi(this);
+  }
+
+  @Override
+  public boolean isDefinedByInstructionSatisfying(Predicate<Instruction> predicate) {
+    return false;
   }
 
   @Override
@@ -64,8 +77,33 @@ public class Phi extends Value implements InstructionOrPhi {
     return this;
   }
 
+  @Override
   public BasicBlock getBlock() {
     return block;
+  }
+
+  @Override
+  public void constrainType(
+      ValueTypeConstraint constraint, DexMethod method, Origin origin, Reporter reporter) {
+    if (readType == RegisterReadType.DEBUG) {
+      abortOnInvalidDebugInfo(constraint);
+    }
+    super.constrainType(constraint, method, origin, reporter);
+  }
+
+  private void abortOnInvalidDebugInfo(ValueTypeConstraint constraint) {
+    if (constrainedType(constraint) == null) {
+      // If the phi has been requested from local info, throw out locals and retry compilation.
+      throw new InvalidDebugInfoException(
+          "Type information in locals-table is inconsistent."
+              + " Cannot constrain type: "
+              + type
+              + " for value: "
+              + this
+              + " by constraint "
+              + constraint
+              + ".");
+    }
   }
 
   public void addOperands(IRBuilder builder, int register) {
@@ -77,7 +115,7 @@ public class Phi extends Value implements InstructionOrPhi {
       throwUndefinedValueError();
     }
 
-    ValueTypeConstraint readConstraint = TypeConstraintResolver.constraintForType(typeLattice);
+    ValueTypeConstraint readConstraint = TypeConstraintResolver.constraintForType(type);
     List<Value> operands = new ArrayList<>(block.getPredecessors().size());
     for (BasicBlock pred : block.getPredecessors()) {
       EdgeType edgeType = pred.getEdgeType(block);
@@ -87,37 +125,9 @@ public class Phi extends Value implements InstructionOrPhi {
 
     if (readType != RegisterReadType.NORMAL) {
       for (Value operand : operands) {
-        ValueTypeConstraint constraint =
-            TypeConstraintResolver.constraintForType(operand.getTypeLattice());
-        if (constrainedType(constraint) == null) {
-          // If the phi has been requested from instructions and from local info, throw out locals
-          // and retry compilation.
-          if (readType == RegisterReadType.NORMAL_AND_DEBUG) {
-            throw new InvalidDebugInfoException(
-                "Type information in locals-table is inconsistent with instructions."
-                    + " Value of type "
-                    + operand.getTypeLattice()
-                    + " cannot be used as local of type "
-                    + typeLattice
-                    + ".");
-          }
-          // Otherwise only local info requested the phi and we replace with an uninitialized value.
-          assert readType == RegisterReadType.DEBUG;
-          BasicBlock block = getBlock();
-          InstructionListIterator it = block.listIterator();
-          Value value = new Value(builder.getValueNumberGenerator().next(), getTypeLattice(), null);
-          Position position = block.getPosition();
-          Instruction definition = new DebugLocalUninitialized(value);
-          definition.setBlock(block);
-          definition.setPosition(position);
-          it.add(definition);
-          // Update current definition and all users.
-          block.updateCurrentDefinition(register, value, EdgeType.NON_EDGE);
-          replaceUsers(value);
-          // Remove the phi from the block.
-          block.removePhi(this);
-          return;
-        }
+        TypeElement type = operand.getType();
+        ValueTypeConstraint constraint = TypeConstraintResolver.constraintForType(type);
+        abortOnInvalidDebugInfo(constraint);
       }
     }
 
@@ -125,7 +135,7 @@ public class Phi extends Value implements InstructionOrPhi {
       builder.constrainType(operand, readConstraint);
       appendOperand(operand);
     }
-    removeTrivialPhi(builder);
+    removeTrivialPhi(builder, null);
   }
 
   public void addOperands(List<Value> operands) {
@@ -150,19 +160,17 @@ public class Phi extends Value implements InstructionOrPhi {
 
   @Override
   public void markNonDebugLocalRead() {
-    if (readType == RegisterReadType.DEBUG) {
-      readType = RegisterReadType.NORMAL_AND_DEBUG;
-    }
+    readType = RegisterReadType.NORMAL;
   }
 
   private void throwUndefinedValueError() {
     throw new CompilationError(
         "Undefined value encountered during compilation. "
             + "This is typically caused by invalid dex input that uses a register "
-            + "that is not define on all control-flow paths leading to the use.");
+            + "that is not defined on all control-flow paths leading to the use.");
   }
 
-  private void appendOperand(Value operand) {
+  public void appendOperand(Value operand) {
     operands.add(operand);
     operand.addPhiUser(this);
   }
@@ -227,11 +235,11 @@ public class Phi extends Value implements InstructionOrPhi {
     return true;
   }
 
-  public void removeTrivialPhi() {
-    removeTrivialPhi(null);
+  public boolean removeTrivialPhi() {
+    return removeTrivialPhi(null, null);
   }
 
-  public void removeTrivialPhi(IRBuilder builder) {
+  public boolean removeTrivialPhi(IRBuilder builder, Set<Value> affectedValues) {
     Value same = null;
     for (Value op : operands) {
       if (op == same || op == this) {
@@ -241,7 +249,7 @@ public class Phi extends Value implements InstructionOrPhi {
       if (same != null) {
         // Merged at least two values and is therefore not trivial.
         assert !isTrivialPhi();
-        return;
+        return false;
       }
       same = op;
     }
@@ -250,11 +258,26 @@ public class Phi extends Value implements InstructionOrPhi {
       // When doing if-simplification we remove blocks and we can end up with cyclic phis
       // of the form v1 = phi(v1, v1) in dead blocks. If we encounter that case we just
       // leave the phi in there and check at the end that there are no trivial phis.
-      return;
+      return false;
+    }
+    if (getLocalInfo() != same.getLocalInfo()) {
+      if (getLocalInfo() == null) {
+        // The to-be replaced phi has no local info, so all is OK.
+      } else if (same.getLocalInfo() == null) {
+        // Move the local info to the replacement phi.
+        same.setLocalInfo(getLocalInfo());
+      } else {
+        // The phi's define distinct locals and are not trivially the same.
+        assert hasLocalInfo() && same.hasLocalInfo();
+        return false;
+      }
     }
     // Ensure that the value that replaces this phi is constrained to the type of this phi.
-    if (builder != null && typeLattice.isPreciseType() && !typeLattice.isBottom()) {
-      builder.constrainType(same, ValueTypeConstraint.fromTypeLattice(typeLattice));
+    if (builder != null && type.isPreciseType() && !type.isBottom()) {
+      builder.constrainType(same, ValueTypeConstraint.fromTypeLattice(type));
+    }
+    if (affectedValues != null) {
+      affectedValues.addAll(this.affectedValues());
     }
     // Removing this phi, so get rid of it as a phi user from all of the operands to avoid
     // recursively getting back here with the same phi. If the phi has itself as an operand
@@ -281,11 +304,23 @@ public class Phi extends Value implements InstructionOrPhi {
       replaceUsers(same);
       // Try to simplify phi users that might now have become trivial.
       for (Phi user : phiUsersToSimplify) {
-        user.removeTrivialPhi(builder);
+        user.removeTrivialPhi(builder, affectedValues);
       }
     }
     // Get rid of the phi itself.
     block.removePhi(this);
+    return true;
+  }
+
+  public void removeDeadPhi() {
+    // First, make sure it is indeed dead, i.e., no non-phi users.
+    assert !hasUsers();
+    // Then, manually clean up this from all of the operands.
+    for (Value operand : getOperands()) {
+      operand.removePhiUser(this);
+    }
+    // And remove it from the containing block.
+    getBlock().removePhi(this);
   }
 
   public String printPhi() {
@@ -297,7 +332,7 @@ public class Phi extends Value implements InstructionOrPhi {
     }
     builder.append(" <- phi");
     StringUtils.append(builder, ListUtils.map(operands, Value::toString));
-    builder.append(" : ").append(getTypeLattice());
+    builder.append(" : ").append(getType());
     return builder.toString();
   }
 
@@ -325,41 +360,6 @@ public class Phi extends Value implements InstructionOrPhi {
     definitionUsers = null;
   }
 
-  /**
-   * Determine if the only possible values for the phi are the integers 0 or 1.
-   */
-  @Override
-  public boolean knownToBeBoolean() {
-    return knownToBeBoolean(new HashSet<>());
-  }
-
-  private boolean knownToBeBoolean(HashSet<Phi> active) {
-    active.add(this);
-
-    for (Value operand : operands) {
-      if (!operand.isPhi()) {
-        if (operand.isConstNumber()) {
-          ConstNumber number = operand.getConstInstruction().asConstNumber();
-          if (!number.isIntegerOne() && !number.isIntegerZero()) {
-            return false;
-          }
-        } else {
-          return false;
-        }
-      }
-    }
-
-    for (Value operand : operands) {
-      if (operand.isPhi() && !active.contains(operand.asPhi())) {
-        if (!operand.asPhi().knownToBeBoolean(active)) {
-          return false;
-        }
-      }
-    }
-
-    return true;
-  }
-
   @Override
   public boolean isConstant() {
     return false;
@@ -367,7 +367,7 @@ public class Phi extends Value implements InstructionOrPhi {
 
   @Override
   public boolean isValueOnStack() {
-    assert verifyIsStackPhi(new HashSet<>());
+    assert verifyIsStackPhi(Sets.newIdentityHashSet());
     return isStackPhi;
   }
 
@@ -410,10 +410,40 @@ public class Phi extends Value implements InstructionOrPhi {
   }
 
   // Type of phi(v1, v2, ..., vn) is the least upper bound of all those n operands.
-  public TypeLatticeElement computePhiType(AppView<?> appView) {
-    TypeLatticeElement result = TypeLatticeElement.BOTTOM;
+  public TypeElement computePhiType(AppView<?> appView) {
+    TypeElement result = TypeElement.getBottom();
     for (Value operand : getOperands()) {
-      result = result.join(operand.getTypeLattice(), appView);
+      result = result.join(operand.getType(), appView);
+    }
+    return result;
+  }
+
+  @Override
+  public TypeElement getDynamicUpperBoundType(
+      AppView<? extends AppInfoWithClassHierarchy> appView) {
+    Set<Phi> reachablePhis = SetUtils.newIdentityHashSet(this);
+    Deque<Phi> worklist = DequeUtils.newArrayDeque(this);
+    while (!worklist.isEmpty()) {
+      Phi phi = worklist.removeFirst();
+      assert reachablePhis.contains(phi);
+      for (Value operand : phi.getOperands()) {
+        Phi candidate = operand.getAliasedValue().asPhi();
+        if (candidate != null && reachablePhis.add(candidate)) {
+          worklist.addLast(candidate);
+        }
+      }
+    }
+    Set<Value> visitedOperands = Sets.newIdentityHashSet();
+    TypeElement result = TypeElement.getBottom();
+    for (Phi phi : reachablePhis) {
+      for (Value operand : phi.getOperands()) {
+        if (!operand.getAliasedValue().isPhi() && visitedOperands.add(operand)) {
+          result = result.join(operand.getDynamicUpperBoundType(appView), appView);
+        }
+      }
+    }
+    if (getType().isReferenceType() && getType().isDefinitelyNotNull()) {
+      return result.asReferenceType().asMeetWithNotNull();
     }
     return result;
   }

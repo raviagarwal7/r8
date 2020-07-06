@@ -14,10 +14,11 @@ import com.android.tools.r8.code.SputShort;
 import com.android.tools.r8.code.SputWide;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
@@ -26,12 +27,19 @@ import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.ir.regalloc.RegisterAllocator;
-import org.objectweb.asm.Opcodes;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.shaking.ProguardMemberRule;
+import com.google.common.collect.Sets;
 
-public class StaticPut extends FieldInstruction {
+public class StaticPut extends FieldInstruction implements StaticFieldInstruction {
 
   public StaticPut(Value source, DexField field) {
     super(field, null, source);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.STATIC_PUT;
   }
 
   @Override
@@ -39,7 +47,8 @@ public class StaticPut extends FieldInstruction {
     return visitor.visit(this);
   }
 
-  public Value inValue() {
+  @Override
+  public Value value() {
     assert inValues.size() == 1;
     return inValues.get(0);
   }
@@ -47,7 +56,7 @@ public class StaticPut extends FieldInstruction {
   @Override
   public void buildDex(DexBuilder builder) {
     com.android.tools.r8.code.Instruction instruction;
-    int src = builder.allocatedRegister(inValue(), getNumber());
+    int src = builder.allocatedRegister(value(), getNumber());
     DexField field = getField();
     switch (getType()) {
       case INT:
@@ -73,9 +82,6 @@ public class StaticPut extends FieldInstruction {
       case SHORT:
         instruction = new SputShort(src, field);
         break;
-      case INT_OR_FLOAT:
-      case LONG_OR_DOUBLE:
-        throw new Unreachable("Unexpected imprecise type: " + getType());
       default:
         throw new Unreachable("Unexpected type: " + getType());
     }
@@ -85,6 +91,49 @@ public class StaticPut extends FieldInstruction {
   @Override
   public boolean instructionTypeCanThrow() {
     // This can cause <clinit> to run.
+    return true;
+  }
+
+  @Override
+  public boolean instructionMayHaveSideEffects(
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    if (appView.appInfo().hasLiveness()) {
+      AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
+      AppInfoWithLiveness appInfoWithLiveness = appViewWithLiveness.appInfo();
+      // MemberValuePropagation will replace the field read only if the target field has bound
+      // -assumevalues rule whose return value is *single*.
+      //
+      // Note that, in principle, class initializer of the field's holder may have side effects.
+      // However, with -assumevalues, we assume that the developer wants to remove field accesses.
+      ProguardMemberRule rule = appInfoWithLiveness.assumedValues.get(getField());
+      if (rule != null && rule.getReturnValue().isSingleValue()) {
+        return false;
+      }
+
+      if (instructionInstanceCanThrow(appView, context, assumption)) {
+        return true;
+      }
+
+      DexEncodedField encodedField =
+          appInfoWithLiveness.resolveField(getField()).getResolvedField();
+      assert encodedField != null : "NoSuchFieldError (resolution failure) should be caught.";
+
+      boolean isDeadProtoExtensionField =
+          appView.withGeneratedExtensionRegistryShrinker(
+              shrinker -> shrinker.isDeadProtoExtensionField(encodedField.field), false);
+      if (isDeadProtoExtensionField) {
+        return false;
+      }
+
+      if (encodedField.type().isAlwaysNull(appViewWithLiveness)) {
+        return false;
+      }
+
+      return appInfoWithLiveness.isFieldRead(encodedField)
+          || isStoringObjectWithFinalizer(appViewWithLiveness, encodedField);
+    }
+
+    // In D8, we always have to assume that the field can be read, and thus have side effects.
     return true;
   }
 
@@ -111,7 +160,7 @@ public class StaticPut extends FieldInstruction {
       // If the value being written by this instruction is an array, then make sure that the value
       // being written by the other instruction is the exact same value. Otherwise, the verifier
       // may incorrectly join the types of these arrays to Object[].
-      if (inValue().getTypeLattice().isArrayType() && inValue() != staticPut.inValue()) {
+      if (value().getType().isArrayType() && value() != staticPut.value()) {
         return false;
       }
     }
@@ -130,13 +179,18 @@ public class StaticPut extends FieldInstruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forStaticPut(getField(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forStaticPut(getField(), context.getHolder());
   }
 
   @Override
   public String toString() {
     return super.toString() + "; field: " + getField().toSourceString();
+  }
+
+  @Override
+  public boolean isStaticFieldInstruction() {
+    return true;
   }
 
   @Override
@@ -157,17 +211,36 @@ public class StaticPut extends FieldInstruction {
   @Override
   public void buildCf(CfBuilder builder) {
     builder.add(
-        new CfFieldInstruction(Opcodes.PUTSTATIC, getField(), builder.resolveField(getField())));
+        new CfFieldInstruction(
+            org.objectweb.asm.Opcodes.PUTSTATIC, getField(), builder.resolveField(getField())));
   }
 
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forStaticPut(
         this, clazz, appView, mode, assumption);
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    DexType holder = getField().holder;
+    if (appView.enableWholeProgramOptimizations()) {
+      // In R8, check if the class initialization of the holder or any of its ancestor types may
+      // have side effects.
+      return holder.classInitializationMayHaveSideEffects(
+          appView,
+          // Types that are a super type of `context` are guaranteed to be initialized already.
+          type -> appView.isSubtype(context.getHolderType(), type).isTrue(),
+          Sets.newIdentityHashSet());
+    } else {
+      // In D8, this instruction may trigger class initialization if the holder of the field is
+      // different from the current context.
+      return holder != context.getHolderType();
+    }
   }
 }

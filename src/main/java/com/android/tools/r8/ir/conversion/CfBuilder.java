@@ -18,18 +18,16 @@ import com.android.tools.r8.cf.code.CfLabel;
 import com.android.tools.r8.cf.code.CfPosition;
 import com.android.tools.r8.cf.code.CfTryCatch;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.CfCode;
 import com.android.tools.r8.graph.CfCode.LocalVariableInfo;
 import com.android.tools.r8.graph.DebugLocalInfo;
 import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.graph.DexDefinitionSupplier;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Argument;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.CatchHandlers;
@@ -37,7 +35,6 @@ import com.android.tools.r8.ir.code.ConstNumber;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Inc;
 import com.android.tools.r8.ir.code.Instruction;
-import com.android.tools.r8.ir.code.InstructionIterator;
 import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.InvokeDirect;
 import com.android.tools.r8.ir.code.JumpInstruction;
@@ -49,6 +46,7 @@ import com.android.tools.r8.ir.code.StackValues;
 import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.ir.code.Xor;
 import com.android.tools.r8.ir.optimize.CodeRewriter;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover;
 import com.android.tools.r8.ir.optimize.PeepholeOptimizer;
 import com.android.tools.r8.ir.optimize.PhiOptimizations;
 import com.android.tools.r8.ir.optimize.peepholes.BasicBlockMuncher;
@@ -74,7 +72,7 @@ public class CfBuilder {
   private static final int SUFFIX_SHARING_OVERHEAD = 30;
   private static final int IINC_PATTERN_SIZE = 4;
 
-  public final AppView<? extends AppInfo> appView;
+  public final AppView<?> appView;
   private final DexEncodedMethod method;
   private final IRCode code;
 
@@ -124,27 +122,27 @@ public class CfBuilder {
     }
   }
 
-  public CfBuilder(AppView<? extends AppInfo> appView, DexEncodedMethod method, IRCode code) {
+  public CfBuilder(AppView<?> appView, DexEncodedMethod method, IRCode code) {
     this.appView = appView;
     this.method = method;
     this.code = code;
   }
 
-  public CfCode build(CodeRewriter rewriter) {
+  public CfCode build(DeadCodeRemover deadCodeRemover) {
     computeInitializers();
     TypeVerificationHelper typeVerificationHelper = new TypeVerificationHelper(appView, code);
     typeVerificationHelper.computeVerificationTypes();
-    rewriter.converter.deadCodeRemover.run(code);
+    assert deadCodeRemover.verifyNoDeadCode(code);
     rewriteNots();
     LoadStoreHelper loadStoreHelper = new LoadStoreHelper(appView, code, typeVerificationHelper);
     loadStoreHelper.insertLoadsAndStores();
     // Run optimizations on phis and basic blocks in a fixpoint.
-    if (!appView.options().testing.disallowLoadStoreOptimization) {
+    if (appView.options().enableLoadStoreOptimization) {
       PhiOptimizations phiOptimizations = new PhiOptimizations();
       boolean reachedFixpoint = false;
       phiOptimizations.optimize(code);
       while (!reachedFixpoint) {
-        BasicBlockMuncher.optimize(code);
+        BasicBlockMuncher.optimize(code, appView.options());
         reachedFixpoint = !phiOptimizations.optimize(code);
       }
     }
@@ -154,26 +152,29 @@ public class CfBuilder {
     loadStoreHelper.insertPhiMoves(registerAllocator);
 
     for (int i = 0; i < PEEPHOLE_OPTIMIZATION_PASSES; i++) {
-      CodeRewriter.collapseTrivialGotos(method, code);
+      CodeRewriter.collapseTrivialGotos(code);
       PeepholeOptimizer.removeIdenticalPredecessorBlocks(code, registerAllocator);
       PeepholeOptimizer.shareIdenticalBlockSuffix(code, registerAllocator, SUFFIX_SHARING_OVERHEAD);
     }
 
     rewriteIincPatterns();
 
-    CodeRewriter.collapseTrivialGotos(method, code);
+    CodeRewriter.collapseTrivialGotos(code);
     DexBuilder.removeRedundantDebugPositions(code);
     CfCode code = buildCfCode();
     assert verifyInvokeInterface(code, appView);
     return code;
   }
 
-  private static boolean verifyInvokeInterface(CfCode code, DexDefinitionSupplier definitions) {
+  private static boolean verifyInvokeInterface(CfCode code, AppView<?> appView) {
+    if (appView.options().testing.allowInvokeErrors) {
+      return true;
+    }
     for (CfInstruction instruction : code.instructions) {
       if (instruction instanceof CfInvoke) {
         CfInvoke invoke = (CfInvoke) instruction;
         if (invoke.getMethod().holder.isClassType()) {
-          DexClass holder = definitions.definitionFor(invoke.getMethod().holder);
+          DexClass holder = appView.definitionFor(invoke.getMethod().holder);
           assert holder == null || holder.isInterface() == invoke.isInterface();
         }
       }
@@ -182,7 +183,8 @@ public class CfBuilder {
   }
 
   public DexField resolveField(DexField field) {
-    DexEncodedField resolvedField = appView.appInfo().resolveField(field);
+    DexEncodedField resolvedField =
+        appView.appInfoForDesugaring().resolveField(field).getResolvedField();
     return resolvedField == null ? field : resolvedField.field;
   }
 
@@ -222,7 +224,7 @@ public class CfBuilder {
 
   private void rewriteNots() {
     for (BasicBlock block : code.blocks) {
-      InstructionListIterator it = block.listIterator();
+      InstructionListIterator it = block.listIterator(code);
       while (it.hasNext()) {
         Instruction current = it.next();
         if (!current.isNot()) {
@@ -233,7 +235,7 @@ public class CfBuilder {
 
         // Insert ConstNumber(v, -1) before Not.
         it.previous();
-        Value constValue = code.createValue(inValue.getTypeLattice());
+        Value constValue = code.createValue(inValue.getType());
         Instruction newInstruction = new ConstNumber(constValue, -1);
         newInstruction.setBlock(block);
         newInstruction.setPosition(current.getPosition());
@@ -269,6 +271,7 @@ public class CfBuilder {
     CatchHandlers<BasicBlock> tryCatchHandlers = CatchHandlers.EMPTY_BASIC_BLOCK;
     boolean previousFallthrough = false;
 
+    boolean firstBlock = true;
     do {
       CatchHandlers<BasicBlock> handlers = block.getCatchHandlers();
       if (!tryCatchHandlers.equals(handlers)) {
@@ -310,6 +313,10 @@ public class CfBuilder {
 
       assert !block.exit().isReturn() || stackHeightTracker.isEmpty();
 
+      if (firstBlock) {
+        firstBlock = false;
+      }
+
       block = nextBlock;
       previousFallthrough = fallthrough;
     } while (block != null);
@@ -322,7 +329,7 @@ public class CfBuilder {
       }
     }
     return new CfCode(
-        method.method,
+        method.holder(),
         stackHeightTracker.maxHeight,
         registerAllocator.registersUsed(),
         instructions,
@@ -353,7 +360,7 @@ public class CfBuilder {
 
   private void rewriteIincPatterns() {
     for (BasicBlock block : code.blocks) {
-      ListIterator<Instruction> it = block.getInstructions().listIterator();
+      InstructionListIterator it = block.listIterator(code);
       // Test that we have enough instructions for iinc.
       while (IINC_PATTERN_SIZE <= block.getInstructions().size() - it.nextIndex()) {
         Instruction loadOrConst1 = it.next();
@@ -380,7 +387,7 @@ public class CfBuilder {
             || constNumber == null
             || add == null
             || store == null
-            || constNumber.outValue().getTypeLattice() != TypeLatticeElement.INT) {
+            || constNumber.getOutType() != TypeElement.getInt()) {
           it.next();
           continue;
         }
@@ -399,11 +406,11 @@ public class CfBuilder {
             || position != store.getPosition()) {
           continue;
         }
-        it.remove();
+        it.removeInstructionIgnoreOutValue();
         it.next();
-        it.remove();
+        it.removeInstructionIgnoreOutValue();
         it.next();
-        it.remove();
+        it.removeInstructionIgnoreOutValue();
         it.next();
         Inc inc = new Inc(store.outValue(), load.inValues().get(0), increment);
         inc.setPosition(position);
@@ -426,9 +433,7 @@ public class CfBuilder {
         pendingFrame = null;
       }
     }
-    InstructionIterator it = block.iterator();
-    while (it.hasNext()) {
-      Instruction instruction = it.next();
+    for (Instruction instruction : block.getInstructions()) {
       if (fallthrough && instruction.isGoto()) {
         assert block.exit() == instruction;
         return;

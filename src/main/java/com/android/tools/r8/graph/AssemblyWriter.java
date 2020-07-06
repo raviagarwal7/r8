@@ -3,26 +3,36 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.graph;
 
+import static com.android.tools.r8.utils.StringUtils.LINE_SEPARATOR;
+
 import com.android.tools.r8.ClassFileConsumer;
 import com.android.tools.r8.ir.conversion.IRConverter;
-import com.android.tools.r8.ir.conversion.OptimizationFeedback;
-import com.android.tools.r8.ir.conversion.OptimizationFeedbackIgnore;
+import com.android.tools.r8.ir.conversion.MethodProcessingId;
+import com.android.tools.r8.ir.conversion.OneTimeMethodProcessor;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackIgnore;
+import com.android.tools.r8.kotlin.Kotlin;
+import com.android.tools.r8.kotlin.KotlinMetadataWriter;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.naming.MemberNaming.FieldSignature;
 import com.android.tools.r8.utils.CfgPrinter;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.Timing;
+import java.io.BufferedReader;
 import java.io.PrintStream;
+import java.io.StringReader;
+import java.util.stream.Collectors;
 
 public class AssemblyWriter extends DexByteCodeWriter {
 
+  private final MethodProcessingId.Factory methodProcessingIdFactory =
+      new MethodProcessingId.Factory();
   private final boolean writeAllClassInfo;
   private final boolean writeFields;
   private final boolean writeAnnotations;
   private final boolean writeIR;
-  private final AppInfoWithSubtyping appInfo;
+  private final AppInfoWithClassHierarchy appInfo;
+  private final Kotlin kotlin;
   private final Timing timing = new Timing("AssemblyWriter");
-  private final OptimizationFeedback ignoreOptimizationFeedback = new OptimizationFeedbackIgnore();
 
   public AssemblyWriter(
       DexApplication application, InternalOptions options, boolean allInfo, boolean writeIR) {
@@ -32,7 +42,7 @@ public class AssemblyWriter extends DexByteCodeWriter {
     this.writeAnnotations = allInfo;
     this.writeIR = writeIR;
     if (writeIR) {
-      this.appInfo = new AppInfoWithSubtyping(application.toDirect());
+      this.appInfo = new AppInfoWithClassHierarchy(application.toDirect());
       if (options.programConsumer == null) {
         // Use class-file backend, since the CF frontend for testing does not support desugaring of
         // synchronized methods for the DEX backend (b/109789541).
@@ -42,6 +52,7 @@ public class AssemblyWriter extends DexByteCodeWriter {
     } else {
       this.appInfo = null;
     }
+    kotlin = new Kotlin(application.dexItemFactory);
   }
 
   @Override
@@ -60,7 +71,7 @@ public class AssemblyWriter extends DexByteCodeWriter {
     ps.println("# Bytecode for");
     ps.println("# Class: '" + clazzName + "'");
     if (writeAllClassInfo) {
-      writeAnnotations(clazz.annotations, ps);
+      writeAnnotations(clazz, clazz.annotations(), ps);
       ps.println("# Flags: '" + clazz.accessFlags + "'");
       if (clazz.superType != application.dexItemFactory.objectType) {
         ps.println("# Extends: '" + clazz.superType.toSourceString() + "'");
@@ -88,8 +99,13 @@ public class AssemblyWriter extends DexByteCodeWriter {
       FieldSignature fieldSignature = naming != null
           ? naming.originalSignatureOf(field.field)
           : FieldSignature.fromDexField(field.field);
-      writeAnnotations(field.annotations, ps);
-      ps.println(fieldSignature);
+      writeAnnotations(null, field.annotations(), ps);
+      ps.print(field.accessFlags + " ");
+      ps.print(fieldSignature);
+      if (field.isStatic() && field.hasExplicitStaticValue()) {
+        ps.print(" = " + field.getStaticValue());
+      }
+      ps.println();
     }
   }
 
@@ -99,40 +115,63 @@ public class AssemblyWriter extends DexByteCodeWriter {
   }
 
   @Override
-  void writeMethod(DexEncodedMethod method, PrintStream ps) {
+  void writeMethod(ProgramMethod method, PrintStream ps) {
+    DexEncodedMethod definition = method.getDefinition();
     ClassNameMapper naming = application.getProguardMap();
-    String methodName = naming != null
-        ? naming.originalSignatureOf(method.method).name
-        : method.method.name.toString();
+    String methodName =
+        naming != null
+            ? naming.originalSignatureOf(method.getReference()).name
+            : method.getReference().name.toString();
     ps.println("#");
     ps.println("# Method: '" + methodName + "':");
-    writeAnnotations(method.annotations, ps);
+    writeAnnotations(null, definition.annotations(), ps);
+    ps.println("# " + definition.accessFlags);
     ps.println("#");
     ps.println();
-    Code code = method.getCode();
+    Code code = definition.getCode();
     if (code != null) {
       if (writeIR) {
         writeIR(method, ps);
       } else {
-        ps.println(code.toString(method, naming));
+        ps.println(code.toString(definition, naming));
       }
     }
   }
 
-  private void writeIR(DexEncodedMethod method, PrintStream ps) {
+  private void writeIR(ProgramMethod method, PrintStream ps) {
     CfgPrinter printer = new CfgPrinter();
-    new IRConverter(appInfo, options, timing, printer)
-        .processMethod(method, ignoreOptimizationFeedback, null, null, null);
+    IRConverter converter = new IRConverter(appInfo, timing, printer);
+    OneTimeMethodProcessor methodProcessor =
+        OneTimeMethodProcessor.create(method, methodProcessingIdFactory);
+    methodProcessor.forEachWave(
+        (ignore, methodProcesingId) ->
+            converter.processMethod(
+                method,
+                OptimizationFeedbackIgnore.getInstance(),
+                methodProcessor,
+                methodProcesingId));
     ps.println(printer.toString());
   }
 
-  private void writeAnnotations(DexAnnotationSet annotations, PrintStream ps) {
+  private void writeAnnotations(
+      DexProgramClass clazz, DexAnnotationSet annotations, PrintStream ps) {
     if (writeAnnotations) {
       if (!annotations.isEmpty()) {
         ps.println("# Annotations:");
+        String prefix = "#  ";
         for (DexAnnotation annotation : annotations.annotations) {
-          ps.print("#   ");
-          ps.println(annotation);
+          if (annotation.annotation.type == kotlin.factory.kotlinMetadataType) {
+            assert clazz != null : "Kotlin metadata is a class annotation";
+            KotlinMetadataWriter.writeKotlinMetadataAnnotation(prefix, annotation, ps, kotlin);
+          } else {
+            String annotationString = annotation.toString();
+            ps.print(
+                new BufferedReader(new StringReader(annotationString))
+                    .lines()
+                    .collect(
+                        Collectors.joining(
+                            LINE_SEPARATOR + prefix + "  ", prefix, LINE_SEPARATOR)));
+          }
         }
       }
     }

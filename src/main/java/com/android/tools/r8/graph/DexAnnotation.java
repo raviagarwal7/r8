@@ -13,6 +13,8 @@ import com.android.tools.r8.graph.DexValue.DexValueMethod;
 import com.android.tools.r8.graph.DexValue.DexValueNull;
 import com.android.tools.r8.graph.DexValue.DexValueString;
 import com.android.tools.r8.graph.DexValue.DexValueType;
+import com.android.tools.r8.ir.desugar.CovariantReturnTypeAnnotationTransformer;
+import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.Pair;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -32,6 +34,10 @@ public class DexAnnotation extends DexItem {
   public DexAnnotation(int visibility, DexEncodedAnnotation annotation) {
     this.visibility = visibility;
     this.annotation = annotation;
+  }
+
+  public DexType getAnnotationType() {
+    return annotation.type;
   }
 
   @Override
@@ -67,6 +73,24 @@ public class DexAnnotation extends DexItem {
     mixedItems.add(this);
   }
 
+  public static boolean retainCompileTimeAnnotation(DexType annotation, InternalOptions options) {
+    if (options.readCompileTimeAnnotations) {
+      return true;
+    }
+    if (annotation == options.itemFactory.dalvikFastNativeAnnotation
+        || annotation == options.itemFactory.dalvikCriticalNativeAnnotation
+        || annotation == options.itemFactory.annotationSynthesizedClassMap) {
+      return true;
+    }
+    if (options.processCovariantReturnTypeAnnotations) {
+      // @CovariantReturnType annotations are processed by CovariantReturnTypeAnnotationTransformer,
+      // they thus need to be read here and will then be removed as part of the processing.
+      return CovariantReturnTypeAnnotationTransformer.isCovariantReturnTypeAnnotation(
+          annotation, options.itemFactory);
+    }
+    return false;
+  }
+
   public static DexAnnotation createEnclosingClassAnnotation(DexType enclosingClass,
       DexItemFactory factory) {
     return createSystemValueAnnotation(factory.annotationEnclosingClass, factory,
@@ -75,9 +99,11 @@ public class DexAnnotation extends DexItem {
 
   public static DexType getEnclosingClassFromAnnotation(
       DexAnnotation annotation, DexItemFactory factory) {
-    DexValueType typeValue =
-        (DexValueType) getSystemValueAnnotationValue(factory.annotationEnclosingClass, annotation);
-    return typeValue == null ? null : typeValue.value;
+    DexValue value = getSystemValueAnnotationValue(factory.annotationEnclosingClass, annotation);
+    if (value == null) {
+      return null;
+    }
+    return value.asDexValueType().value;
   }
 
   public static DexAnnotation createEnclosingMethodAnnotation(DexMethod enclosingMethod,
@@ -88,10 +114,11 @@ public class DexAnnotation extends DexItem {
 
   public static DexMethod getEnclosingMethodFromAnnotation(
       DexAnnotation annotation, DexItemFactory factory) {
-    DexValueMethod methodValue =
-        (DexValueMethod)
-            getSystemValueAnnotationValue(factory.annotationEnclosingMethod, annotation);
-    return methodValue == null ? null : methodValue.value;
+    DexValue value = getSystemValueAnnotationValue(factory.annotationEnclosingMethod, annotation);
+    if (value == null) {
+      return null;
+    }
+    return value.asDexValueMethod().value;
   }
 
   public static boolean isEnclosingClassAnnotation(DexAnnotation annotation,
@@ -135,12 +162,12 @@ public class DexAnnotation extends DexItem {
     Pair<DexString, Integer> result = new Pair<>();
     for (DexAnnotationElement element : elements) {
       if (element.name == factory.createString("name")) {
-        if (element.value instanceof DexValueString) {
-          result.setFirst(((DexValueString) element.value).getValue());
+        if (element.value.isDexValueString()) {
+          result.setFirst(element.value.asDexValueString().getValue());
         }
       } else {
         assert element.name == factory.createString("accessFlags");
-        result.setSecond(((DexValueInt) element.value).getValue());
+        result.setSecond(element.value.asDexValueInt().getValue());
       }
     }
     return result;
@@ -158,14 +185,14 @@ public class DexAnnotation extends DexItem {
 
   public static List<DexType> getMemberClassesFromAnnotation(
       DexAnnotation annotation, DexItemFactory factory) {
-    DexValueArray membersArray =
-        (DexValueArray) getSystemValueAnnotationValue(factory.annotationMemberClasses, annotation);
-    if (membersArray == null) {
+    DexValue value = getSystemValueAnnotationValue(factory.annotationMemberClasses, annotation);
+    if (value == null) {
       return null;
     }
+    DexValueArray membersArray = value.asDexValueArray();
     List<DexType> types = new ArrayList<>(membersArray.getValues().length);
-    for (DexValue value : membersArray.getValues()) {
-      types.add(((DexValueType) value).value);
+    for (DexValue elementValue : membersArray.getValues()) {
+      types.add(elementValue.asDexValueType().value);
     }
     return types;
   }
@@ -209,10 +236,10 @@ public class DexAnnotation extends DexItem {
   }
 
   public static String getSignature(DexAnnotation signatureAnnotation) {
-    DexValueArray elements = (DexValueArray) signatureAnnotation.annotation.elements[0].value;
+    DexValueArray elements = signatureAnnotation.annotation.elements[0].value.asDexValueArray();
     StringBuilder signature = new StringBuilder();
     for (DexValue element : elements.getValues()) {
-      signature.append(((DexValueString) element).value.toString());
+      signature.append(element.asDexValueString().value.toString());
     }
     return signature.toString();
   }
@@ -254,7 +281,6 @@ public class DexAnnotation extends DexItem {
       DexItemFactory factory) {
     return annotation.annotation.type == factory.annotationDefault;
   }
-
 
   public static boolean isSourceDebugExtension(DexAnnotation annotation,
       DexItemFactory factory) {
@@ -315,32 +341,27 @@ public class DexAnnotation extends DexItem {
   }
 
   public static Collection<DexType> readAnnotationSynthesizedClassMap(
-      DexProgramClass programClass,
-      DexItemFactory dexItemFactory) {
-    DexAnnotation foundAnnotation = programClass.annotations.getFirstMatching(
-        dexItemFactory.annotationSynthesizedClassMap);
+      DexProgramClass clazz, DexItemFactory dexItemFactory) {
+    DexAnnotation foundAnnotation =
+        clazz.annotations().getFirstMatching(dexItemFactory.annotationSynthesizedClassMap);
     if (foundAnnotation != null) {
       if (foundAnnotation.annotation.elements.length != 1) {
-        throw new CompilationError(
-            getInvalidSynthesizedClassMapMessage(programClass, foundAnnotation));
+        throw new CompilationError(getInvalidSynthesizedClassMapMessage(clazz, foundAnnotation));
       }
       DexAnnotationElement value = foundAnnotation.annotation.elements[0];
       if (!value.name.toSourceString().equals("value")) {
-        throw new CompilationError(
-            getInvalidSynthesizedClassMapMessage(programClass, foundAnnotation));
+        throw new CompilationError(getInvalidSynthesizedClassMapMessage(clazz, foundAnnotation));
       }
-      if (!(value.value instanceof DexValueArray)) {
-        throw new CompilationError(
-            getInvalidSynthesizedClassMapMessage(programClass, foundAnnotation));
+      DexValueArray existingList = value.value.asDexValueArray();
+      if (existingList == null) {
+        throw new CompilationError(getInvalidSynthesizedClassMapMessage(clazz, foundAnnotation));
       }
-      DexValueArray existingList = (DexValueArray) value.value;
       Collection<DexType> synthesized = new ArrayList<>(existingList.values.length);
       for (DexValue element : existingList.getValues()) {
-        if (!(element instanceof DexValueType)) {
-          throw new CompilationError(
-              getInvalidSynthesizedClassMapMessage(programClass, foundAnnotation));
+        if (!element.isDexValueType()) {
+          throw new CompilationError(getInvalidSynthesizedClassMapMessage(clazz, foundAnnotation));
         }
-        synthesized.add(((DexValueType) element).value);
+        synthesized.add(element.asDexValueType().value);
       }
       return synthesized;
     }

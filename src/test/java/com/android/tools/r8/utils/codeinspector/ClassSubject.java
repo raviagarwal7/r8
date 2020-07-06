@@ -4,9 +4,14 @@
 
 package com.android.tools.r8.utils.codeinspector;
 
-import com.android.tools.r8.graph.DexClass;
+import static com.android.tools.r8.ir.desugar.InterfaceMethodRewriter.COMPANION_CLASS_NAME_SUFFIX;
+
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
+import com.android.tools.r8.references.ClassReference;
 import com.android.tools.r8.references.MethodReference;
+import com.android.tools.r8.references.Reference;
 import com.android.tools.r8.references.TypeReference;
 import com.android.tools.r8.smali.SmaliBuilder;
 import com.android.tools.r8.utils.ListUtils;
@@ -14,11 +19,21 @@ import com.google.common.base.Predicates;
 import com.google.common.collect.ImmutableList;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import kotlinx.metadata.jvm.KotlinClassMetadata;
 
 public abstract class ClassSubject extends Subject {
+
+  protected final ClassReference reference;
+  protected final CodeInspector codeInspector;
+
+  public ClassSubject(CodeInspector codeInspector, ClassReference reference) {
+    this.codeInspector = codeInspector;
+    this.reference = reference;
+  }
 
   public abstract void forAllMethods(Consumer<FoundMethodSubject> inspection);
 
@@ -29,6 +44,23 @@ public abstract class ClassSubject extends Subject {
   public final List<FoundMethodSubject> allMethods(Predicate<FoundMethodSubject> predicate) {
     ImmutableList.Builder<FoundMethodSubject> builder = ImmutableList.builder();
     forAllMethods(
+        methodSubject -> {
+          if (predicate.test(methodSubject)) {
+            builder.add(methodSubject);
+          }
+        });
+    return builder.build();
+  }
+
+  public abstract void forAllVirtualMethods(Consumer<FoundMethodSubject> inspection);
+
+  public final List<FoundMethodSubject> virtualMethods() {
+    return virtualMethods(Predicates.alwaysTrue());
+  }
+
+  public final List<FoundMethodSubject> virtualMethods(Predicate<FoundMethodSubject> predicate) {
+    ImmutableList.Builder<FoundMethodSubject> builder = ImmutableList.builder();
+    forAllVirtualMethods(
         methodSubject -> {
           if (predicate.test(methodSubject)) {
             builder.add(methodSubject);
@@ -56,6 +88,10 @@ public abstract class ClassSubject extends Subject {
     return method(returnType, name, ImmutableList.of());
   }
 
+  public MethodSubject method(String returnType, String name, String... parameters) {
+    return method(returnType, name, Arrays.asList(parameters));
+  }
+
   public abstract MethodSubject method(String returnType, String name, List<String> parameters);
 
   public abstract MethodSubject uniqueMethodWithName(String name);
@@ -70,6 +106,10 @@ public abstract class ClassSubject extends Subject {
 
   public MethodSubject init(List<String> parameters) {
     return method("void", "<init>", parameters);
+  }
+
+  public MethodSubject init(String... parameters) {
+    return init(Arrays.asList(parameters));
   }
 
   public MethodSubject method(MethodSignature signature) {
@@ -89,9 +129,27 @@ public abstract class ClassSubject extends Subject {
     return builder.build();
   }
 
+  public abstract void forAllInstanceFields(Consumer<FoundFieldSubject> inspection);
+
+  public abstract void forAllStaticFields(Consumer<FoundFieldSubject> inspection);
+
+  public final List<FoundFieldSubject> allInstanceFields() {
+    ImmutableList.Builder<FoundFieldSubject> builder = ImmutableList.builder();
+    forAllInstanceFields(builder::add);
+    return builder.build();
+  }
+
+  public final List<FoundFieldSubject> allStaticFields() {
+    ImmutableList.Builder<FoundFieldSubject> builder = ImmutableList.builder();
+    forAllStaticFields(builder::add);
+    return builder.build();
+  }
+
   public abstract FieldSubject field(String type, String name);
 
   public abstract FieldSubject uniqueFieldWithName(String name);
+
+  public abstract FieldSubject uniqueFieldWithFinalName(String name);
 
   public FoundClassSubject asFoundClassSubject() {
     return null;
@@ -111,7 +169,7 @@ public abstract class ClassSubject extends Subject {
     return dump.toString();
   }
 
-  public abstract DexClass getDexClass();
+  public abstract DexProgramClass getDexProgramClass();
 
   public abstract AnnotationSubject annotation(String name);
 
@@ -119,9 +177,13 @@ public abstract class ClassSubject extends Subject {
 
   public abstract String getOriginalDescriptor();
 
+  public abstract String getOriginalBinaryName();
+
   public abstract String getFinalName();
 
   public abstract String getFinalDescriptor();
+
+  public abstract String getFinalBinaryName();
 
   public abstract boolean isMemberClass();
 
@@ -131,7 +193,22 @@ public abstract class ClassSubject extends Subject {
 
   public abstract boolean isSynthesizedJavaLambdaClass();
 
+  public abstract DexMethod getFinalEnclosingMethod();
+
   public abstract String getOriginalSignatureAttribute();
 
   public abstract String getFinalSignatureAttribute();
+
+  public abstract KmClassSubject getKmClass();
+
+  public abstract KmPackageSubject getKmPackage();
+
+  public abstract KotlinClassMetadata getKotlinClassMetadata();
+
+  public ClassSubject toCompanionClass() {
+    String descriptor = reference.getDescriptor();
+    return codeInspector.clazz(
+        Reference.classFromDescriptor(
+            descriptor.substring(0, descriptor.length() - 1) + COMPANION_CLASS_NAME_SUFFIX + ";"));
+  }
 }

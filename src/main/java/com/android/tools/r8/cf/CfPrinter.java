@@ -23,10 +23,12 @@ import com.android.tools.r8.cf.code.CfGoto;
 import com.android.tools.r8.cf.code.CfIf;
 import com.android.tools.r8.cf.code.CfIfCmp;
 import com.android.tools.r8.cf.code.CfIinc;
+import com.android.tools.r8.cf.code.CfInitClass;
 import com.android.tools.r8.cf.code.CfInstanceOf;
 import com.android.tools.r8.cf.code.CfInstruction;
 import com.android.tools.r8.cf.code.CfInvoke;
 import com.android.tools.r8.cf.code.CfInvokeDynamic;
+import com.android.tools.r8.cf.code.CfJsrRet;
 import com.android.tools.r8.cf.code.CfLabel;
 import com.android.tools.r8.cf.code.CfLoad;
 import com.android.tools.r8.cf.code.CfLogicalBinop;
@@ -50,9 +52,11 @@ import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.CfCode;
 import com.android.tools.r8.graph.CfCode.LocalVariableInfo;
 import com.android.tools.r8.graph.DebugLocalInfo;
+import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexMethodHandle;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.ir.code.If;
 import com.android.tools.r8.ir.code.MemberType;
@@ -115,7 +119,12 @@ public class CfPrinter {
   }
 
   /** Entry for printing a complete code object. */
-  public CfPrinter(CfCode code, ClassNameMapper mapper) {
+  public CfPrinter(CfCode code) {
+    this(code, null, null);
+  }
+
+  /** Entry for printing a complete method object. */
+  public CfPrinter(CfCode code, DexEncodedMethod method, ClassNameMapper mapper) {
     this.mapper = mapper;
     indent = "  ";
     instructionIndexSpace = ("" + code.getInstructions().size()).length();
@@ -127,9 +136,11 @@ public class CfPrinter {
         sortedLabels.add((CfLabel) instruction);
       }
     }
-    builder.append(".method ");
-    appendMethod(code.getMethod());
-    newline();
+    if (method != null) {
+      builder.append(".method ");
+      appendMethod(method.method);
+      newline();
+    }
     builder.append(".limit stack ").append(code.getMaxStack());
     newline();
     builder.append(".limit locals ").append(code.getMaxLocals());
@@ -175,8 +186,10 @@ public class CfPrinter {
       instruction.print(this);
     }
     newline();
-    builder.append(".end method");
-    newline();
+    if (method != null) {
+      builder.append(".end method");
+      newline();
+    }
   }
 
   private List<List<LocalVariableInfo>> computeLocalsAtLabels(
@@ -307,7 +320,13 @@ public class CfPrinter {
   public void print(CfConstClass constClass) {
     indent();
     builder.append("ldc ");
-    appendClass(constClass.getType());
+    appendType(constClass.getType());
+  }
+
+  public void print(CfInitClass initClass) {
+    indent();
+    builder.append("initclass ");
+    appendType(initClass.getClassValue());
   }
 
   public void print(CfReturnVoid ret) {
@@ -373,6 +392,9 @@ public class CfPrinter {
     builder.append(opcodeName(Opcodes.INVOKEDYNAMIC)).append(' ');
     builder.append(invoke.getCallSite().methodName);
     builder.append(invoke.getCallSite().methodProto.toDescriptorString());
+    DexMethodHandle bootstrapMethod = invoke.getCallSite().bootstrapMethod;
+    builder.append(", bsm:");
+    appendMethod(bootstrapMethod.asMethod());
   }
 
   public void print(CfFrame frame) {
@@ -483,7 +505,7 @@ public class CfPrinter {
     newline();
     instructionIndex();
     builder.append(getLabel(label)).append(':');
-    if (PRINT_INLINE_LOCALS) {
+    if (PRINT_INLINE_LOCALS && labelToIndex != null) {
       int labelNumber = labelToIndex.getInt(label);
       List<LocalVariableInfo> locals = localsAtLabel.get(labelNumber);
       appendComment(
@@ -595,8 +617,7 @@ public class CfPrinter {
     switch (type) {
       case OBJECT:
         return 'a';
-      case BOOLEAN:
-      case BYTE:
+      case BOOLEAN_OR_BYTE:
         return 'b';
       case CHAR:
         return 'c';
@@ -643,6 +664,11 @@ public class CfPrinter {
     indent();
     builder.append("ldc ");
     builder.append(type.getType().toString());
+  }
+
+  public void print(CfJsrRet ret) {
+    indent();
+    builder.append("ret ").append(ret.getLocal());
   }
 
   private String getLabel(CfLabel label) {

@@ -13,8 +13,8 @@ public class UnusedKeepRuleTest extends TestBase {
   public void test() throws Exception {
     testForR8(Backend.DEX)
         .addKeepRules("-keep class NotPresent")
+        .allowUnusedProguardConfigurationRules()
         .compile()
-        // TODO(b/128494963): Should print a warning that the keep rule does not match anything.
-        .assertNoMessages();
+        .assertInfosCount(1);
   }
 }

@@ -6,7 +6,6 @@ package com.android.tools.r8.ir.optimize.string;
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
 import com.android.tools.r8.ForceInline;
@@ -16,7 +15,7 @@ import com.android.tools.r8.TestBase;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.TestParametersCollection;
 import com.android.tools.r8.TestRunResult;
-import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.ir.optimize.string.StringValueOfTest.TestClass.Foo;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
@@ -24,105 +23,17 @@ import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.InstructionSubject;
 import com.android.tools.r8.utils.codeinspector.InstructionSubject.JumboStringMode;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
-import com.google.common.collect.Streams;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
-class StringValueOfTestMain {
-
-  static class Notification {
-    String id;
-    Notification(String id) {
-      this.id = id;
-    }
-
-    String getId() {
-      return id;
-    }
-  }
-
-  interface Itf {
-    String getter();
-  }
-
-  static class Uninitialized {
-  }
-
-  @NeverInline
-  @NeverPropagateValue
-  static String consumeUninitialized(Uninitialized arg) {
-    return String.valueOf(arg);
-  }
-
-  @NeverInline
-  static String hideNPE(String s) {
-    return String.valueOf(s);
-  }
-
-  static class Foo implements Itf {
-    @ForceInline
-    @Override
-    public String getter() {
-      return String.valueOf(getClass().getName());
-    }
-
-    @NeverInline
-    @Override
-    public String toString() {
-      return getter();
-    }
-  }
-
-  @NeverInline
-  static String eventuallyReturnsNull(String s) {
-    return System.currentTimeMillis() > 0 ? null : s;
-  }
-
-  public static void main(String[] args) {
-    Foo foo = new Foo();
-    System.out.println(foo.getter());
-    // Trivial, it's String.
-    String str = foo.toString();
-    System.out.println(String.valueOf(str));
-    if (str != null) {
-      // With an explicit check, it's non-null String.
-      System.out.println(String.valueOf(str));
-    }
-    // The instance itself is not of String type. Outputs are same, though.
-    System.out.println(String.valueOf(foo));
-
-    // Simply const-string "null"
-    System.out.println(String.valueOf((Object) null));
-    try {
-      System.out.println(hideNPE(null));
-    } catch (NullPointerException npe) {
-      fail("Not expected: " + npe);
-    }
-    try {
-      System.out.println(consumeUninitialized(null));
-    } catch (NullPointerException npe) {
-      fail("Not expected: " + npe);
-    }
-
-    // No matter what we pass, that function will return null.
-    // But, we're not sure about it, hence not optimizing String#valueOf.
-    System.out.println(String.valueOf(eventuallyReturnsNull(null)));
-    System.out.println(String.valueOf(eventuallyReturnsNull("non-null")));
-
-    // Eligible for class inlining. Make sure we're optimizing valueOf after class inlining.
-    Notification n = new Notification(null);
-    System.out.println(String.valueOf(n.getId()));
-  }
-}
-
 @RunWith(Parameterized.class)
 public class StringValueOfTest extends TestBase {
   private static final String JAVA_OUTPUT = StringUtils.lines(
-      "com.android.tools.r8.ir.optimize.string.StringValueOfTestMain$Foo",
-      "com.android.tools.r8.ir.optimize.string.StringValueOfTestMain$Foo",
-      "com.android.tools.r8.ir.optimize.string.StringValueOfTestMain$Foo",
-      "com.android.tools.r8.ir.optimize.string.StringValueOfTestMain$Foo",
+      Foo.class.getName(),
+      Foo.class.getName(),
+      Foo.class.getName(),
+      Foo.class.getName(),
       "null",
       "null",
       "null",
@@ -130,9 +41,7 @@ public class StringValueOfTest extends TestBase {
       "null",
       "null"
   );
-  private static final Class<?> MAIN = StringValueOfTestMain.class;
-
-  private static final String STRING_DESCRIPTOR = "Ljava/lang/String;";
+  private static final Class<?> MAIN = TestClass.class;
 
   @Parameterized.Parameters(name = "{0}")
   public static TestParametersCollection data() {
@@ -146,91 +55,54 @@ public class StringValueOfTest extends TestBase {
   }
 
   private void configure(InternalOptions options) {
+    // Disable the propagation of call site information to test String#valueOf optimization with
+    // nullable argument. Otherwise, e.g., we know that only `null` is used for `hideNPE`, and then
+    // simplify everything in that method.
+    options.callSiteOptimizationOptions().disableTypePropagationForTesting();
     options.testing.forceNameReflectionOptimization = true;
   }
 
   @Test
   public void testJVMOutput() throws Exception {
-    assumeTrue("Only run JVM reference once (for CF backend)", parameters.isCfRuntime());
+    assumeTrue("Only run JVM reference on CF runtimes", parameters.isCfRuntime());
     testForJvm()
         .addTestClasspath()
         .run(parameters.getRuntime(), MAIN)
         .assertSuccessWithOutput(JAVA_OUTPUT);
   }
 
-  private static boolean isStringValueOf(DexMethod method) {
-    return method.holder.toDescriptorString().equals(STRING_DESCRIPTOR)
-        && method.getArity() == 1
-        && method.proto.returnType.toDescriptorString().equals(STRING_DESCRIPTOR)
-        && method.name.toString().equals("valueOf");
-  }
-
-  private long countStringValueOf(MethodSubject method) {
-    return Streams.stream(method.iterateInstructions(instructionSubject -> {
-      if (instructionSubject.isInvoke()) {
-        return isStringValueOf(instructionSubject.getMethod());
-      }
-      return false;
-    })).count();
-  }
-
   private long countConstNullNumber(MethodSubject method) {
-    return Streams.stream(method.iterateInstructions(InstructionSubject::isConstNull)).count();
+    return method.streamInstructions().filter(InstructionSubject::isConstNull).count();
   }
 
   private long countNullStringNumber(MethodSubject method) {
-    return Streams.stream(method.iterateInstructions(instructionSubject ->
-        instructionSubject.isConstString("null", JumboStringMode.ALLOW))).count();
+    return method.streamInstructions().filter(instructionSubject ->
+        instructionSubject.isConstString("null", JumboStringMode.ALLOW)).count();
   }
 
-  private void test(
-      TestRunResult result,
-      int expectedStringValueOfCountInMain,
-      int expectedNullCount,
-      int expectedNullStringCountInMain,
-      int expectedStringValueOfCountInConsumer,
-      int expectedNullStringCountInConsumer)
-      throws Exception {
+  private void test(TestRunResult<?> result, boolean isR8, boolean isRelease) throws Exception {
     CodeInspector codeInspector = result.inspector();
     ClassSubject mainClass = codeInspector.clazz(MAIN);
     MethodSubject mainMethod = mainClass.mainMethod();
     assertThat(mainMethod, isPresent());
-    assertEquals(expectedStringValueOfCountInMain, countStringValueOf(mainMethod));
-    assertEquals(expectedNullCount, countConstNullNumber(mainMethod));
-    assertEquals(expectedNullStringCountInMain, countNullStringNumber(mainMethod));
+    int expectedCount = isR8 ? 4 : (isRelease ? 5 : 7);
+    assertEquals(expectedCount, countCall(mainMethod, "String", "valueOf"));
+    // Due to the different behavior regarding constant canonicalization.
+    expectedCount = isR8 ? (parameters.isCfRuntime() ? 3 : 1) : 1;
+    assertEquals(expectedCount, countConstNullNumber(mainMethod));
+    expectedCount = isR8 ? 1 : (isRelease ? 1 : 0);
+    assertEquals(expectedCount, countNullStringNumber(mainMethod));
 
     MethodSubject hideNPE = mainClass.uniqueMethodWithName("hideNPE");
-    assertThat(hideNPE, isPresent());
     // Due to the nullable argument, valueOf should remain.
-    assertEquals(1, countStringValueOf(hideNPE));
+    assertEquals(1, countCall(hideNPE, "String", "valueOf"));
 
     MethodSubject uninit = mainClass.uniqueMethodWithName("consumeUninitialized");
     assertThat(uninit, isPresent());
-    assertEquals(expectedStringValueOfCountInConsumer, countStringValueOf(uninit));
-    assertEquals(expectedNullStringCountInConsumer, countNullStringNumber(uninit));
-  }
-
-  @Test
-  public void testD8() throws Exception {
-    assumeTrue("Only run D8 for Dex backend", parameters.isDexRuntime());
-
-    TestRunResult result =
-        testForD8()
-            .debug()
-            .addProgramClassesAndInnerClasses(MAIN)
-            .setMinApi(parameters.getRuntime())
-            .run(parameters.getRuntime(), MAIN)
-            .assertSuccessWithOutput(JAVA_OUTPUT);
-    test(result, 7, 1, 0, 1, 0);
-
-    result =
-        testForD8()
-            .release()
-            .addProgramClassesAndInnerClasses(MAIN)
-            .setMinApi(parameters.getRuntime())
-            .run(parameters.getRuntime(), MAIN)
-            .assertSuccessWithOutput(JAVA_OUTPUT);
-    test(result, 5, 1, 1, 1, 0);
+    expectedCount = isR8 ? 0 : 1;
+    assertEquals(expectedCount, countCall(uninit, "String", "valueOf"));
+    expectedCount = isR8 ? 1 : 0;
+    assertEquals(expectedCount, countNullStringNumber(uninit));
   }
 
   @Test
@@ -246,9 +118,93 @@ public class StringValueOfTest extends TestBase {
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
-    // Due to the different behavior regarding constant canonicalization.
-    int expectedNullCount = parameters.isCfRuntime() ? 2 : 1;
-    int expectedNullStringCount = parameters.isCfRuntime() ? 2 : 1;
-    test(result, 3, expectedNullCount, expectedNullStringCount, 0, 1);
+    test(result, true, true);
+  }
+
+  static class TestClass {
+
+    static class Notification {
+      String id;
+      Notification(String id) {
+        this.id = id;
+      }
+
+      String getId() {
+        return id;
+      }
+    }
+
+    interface Itf {
+      String getter();
+    }
+
+    static class Uninitialized {
+    }
+
+    @NeverInline
+    @NeverPropagateValue
+    static String consumeUninitialized(Uninitialized arg) {
+      return String.valueOf(arg);
+    }
+
+    @NeverInline
+    static String hideNPE(String s) {
+      return String.valueOf(s);
+    }
+
+    static class Foo implements Itf {
+      @ForceInline
+      @Override
+      public String getter() {
+        return String.valueOf(getClass().getName());
+      }
+
+      @NeverInline
+      @Override
+      public String toString() {
+        return getter();
+      }
+    }
+
+    @NeverInline
+    static String eventuallyReturnsNull(String s) {
+      return System.currentTimeMillis() > 0 ? null : s;
+    }
+
+    public static void main(String[] args) {
+      Foo foo = new Foo();
+      System.out.println(foo.getter());
+      // Trivial, it's String.
+      String str = foo.toString();
+      System.out.println(String.valueOf(str));
+      if (str != null) {
+        // With an explicit check, it's non-null String.
+        System.out.println(String.valueOf(str));
+      }
+      // The instance itself is not of String type. Outputs are same, though.
+      System.out.println(String.valueOf(foo));
+
+      // Simply const-string "null"
+      System.out.println(String.valueOf((Object) null));
+      try {
+        System.out.println(hideNPE(null));
+      } catch (NullPointerException npe) {
+        throw new AssertionError("Not expected: " + npe);
+      }
+      try {
+        System.out.println(consumeUninitialized(null));
+      } catch (NullPointerException npe) {
+        throw new AssertionError("Not expected: " + npe);
+      }
+
+      // No matter what we pass, that function will return null.
+      // But, we're not sure about it, hence not optimizing String#valueOf.
+      System.out.println(String.valueOf(eventuallyReturnsNull(null)));
+      System.out.println(String.valueOf(eventuallyReturnsNull("non-null")));
+
+      // Eligible for class inlining. Make sure we're optimizing valueOf after class inlining.
+      Notification n = new Notification(null);
+      System.out.println(String.valueOf(n.getId()));
+    }
   }
 }

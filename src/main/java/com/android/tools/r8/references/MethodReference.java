@@ -7,7 +7,6 @@ import com.android.tools.r8.Keep;
 import com.android.tools.r8.utils.ListUtils;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.StringUtils.BraceType;
-import com.google.common.collect.ImmutableList;
 import java.util.List;
 import java.util.Objects;
 
@@ -18,24 +17,28 @@ import java.util.Objects;
  * full list of formal parameters.
  */
 @Keep
-public final class MethodReference {
+public class MethodReference {
   private final ClassReference holderClass;
   private final String methodName;
-  private final ImmutableList<TypeReference> formalTypes;
+  private final List<TypeReference> formalTypes;
   private final TypeReference returnType;
 
   MethodReference(
       ClassReference holderClass,
       String methodName,
-      ImmutableList<TypeReference> formalTypes,
+      List<TypeReference> formalTypes,
       TypeReference returnType) {
     assert holderClass != null;
     assert methodName != null;
-    assert formalTypes != null;
+    assert formalTypes != null || isUnknown();
     this.holderClass = holderClass;
     this.methodName = methodName;
     this.formalTypes = formalTypes;
     this.returnType = returnType;
+  }
+
+  public boolean isUnknown() {
+    return false;
   }
 
   public ClassReference getHolderClass() {
@@ -86,5 +89,17 @@ public final class MethodReference {
   @Override
   public String toString() {
     return getHolderClass().toString() + getMethodName() + getMethodDescriptor();
+  }
+
+  public static final class UnknownMethodReference extends MethodReference {
+
+    @Override
+    public boolean isUnknown() {
+      return true;
+    }
+
+    public UnknownMethodReference(ClassReference holderClass, String methodName) {
+      super(holderClass, methodName, null, null);
+    }
   }
 }

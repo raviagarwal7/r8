@@ -5,11 +5,15 @@ package com.android.tools.r8.cf.code;
 
 import com.android.tools.r8.cf.CfPrinter;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.ir.code.NumericType;
 import com.android.tools.r8.ir.code.ValueType;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
@@ -34,6 +38,14 @@ public class CfLogicalBinop extends CfInstruction {
     assert type != NumericType.FLOAT && type != NumericType.DOUBLE;
     this.opcode = opcode;
     this.type = type;
+  }
+
+  public NumericType getType() {
+    return type;
+  }
+
+  public Opcode getOpcode() {
+    return opcode;
   }
 
   public static CfLogicalBinop fromAsm(int opcode) {
@@ -92,7 +104,7 @@ public class CfLogicalBinop extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     visitor.visitInsn(getAsmOpcode());
   }
 
@@ -123,5 +135,11 @@ public class CfLogicalBinop extends CfInstruction {
       default:
         throw new Unreachable("CfLogicalBinop has unknown opcode " + opcode);
     }
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return inliningConstraints.forBinop();
   }
 }

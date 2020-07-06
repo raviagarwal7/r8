@@ -82,7 +82,11 @@ public abstract class Instruction {
   }
 
   protected void writeFirst(int aa, ShortBuffer dest) {
-    dest.put((short) (((aa & 0xff) << 8) | (getOpcode() & 0xff)));
+    writeFirst(aa, dest, getOpcode());
+  }
+
+  protected void writeFirst(int aa, ShortBuffer dest, int opcode) {
+    dest.put((short) (((aa & 0xff) << 8) | (opcode & 0xff)));
   }
 
   protected void writeFirst(int a, int b, ShortBuffer dest) {
@@ -123,7 +127,19 @@ public abstract class Instruction {
     this.offset = offset;
   }
 
+  public CheckCast asCheckCast() {
+    return null;
+  }
+
   public boolean isCheckCast() {
+    return false;
+  }
+
+  public InstanceOf asInstanceOf() {
+    return null;
+  }
+
+  public boolean isInstanceOf() {
     return false;
   }
 
@@ -132,6 +148,14 @@ public abstract class Instruction {
   }
 
   public boolean isConstString() {
+    return false;
+  }
+
+  public ConstClass asConstClass() {
+    return null;
+  }
+
+  public boolean isConstClass() {
     return false;
   }
 
@@ -151,6 +175,14 @@ public abstract class Instruction {
     return false;
   }
 
+  public boolean isInvokeVirtual() {
+    return false;
+  }
+
+  public InvokeVirtual asInvokeVirtual() {
+    return null;
+  }
+
   public boolean isSimpleNop() {
     return !isPayload() && this instanceof Nop;
   }
@@ -167,7 +199,11 @@ public abstract class Instruction {
     return false;
   }
 
-  public boolean isSwitch() {
+  public boolean isIntSwitch() {
+    return false;
+  }
+
+  public boolean isThrow() {
     return false;
   }
 

@@ -5,7 +5,8 @@
 package com.android.tools.r8.ir.optimize.inliner;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static org.junit.Assert.assertThat;
+import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 import com.android.tools.r8.NeverClassInline;
 import com.android.tools.r8.TestBase;
@@ -26,7 +27,7 @@ public class InlineNonReboundFieldTest extends TestBase {
             .addProgramClasses(
                 TestClass.class, Greeter.class, Greeting.class, Greeting.getGreetingBase())
             .addKeepMainRule(TestClass.class)
-            .enableClassInliningAnnotations()
+            .enableNeverClassInliningAnnotations()
             .enableMergeAnnotations()
             .run(TestClass.class)
             .assertSuccessWithOutput(expectedOutput)
@@ -39,9 +40,9 @@ public class InlineNonReboundFieldTest extends TestBase {
     // since main() does not have access to the GreetingBase.greeting field.
     assertThat(greeterSubject.uniqueMethodWithName("greet"), isPresent());
 
-    // TODO(b/128967328): The method greetInternal() should be inlined into greet() since it has a
-    //  single call site and nothing prevents it from being inlined.
-    assertThat(greeterSubject.uniqueMethodWithName("greetInternal"), isPresent());
+    // The method greetInternal() should be inlined into greet() since it has a single call site and
+    // nothing prevents it from being inlined.
+    assertThat(greeterSubject.uniqueMethodWithName("greetInternal"), not(isPresent()));
   }
 
   static class TestClass {

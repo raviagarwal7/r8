@@ -10,6 +10,7 @@ import com.google.common.collect.MapMaker;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentMap;
 
@@ -21,7 +22,7 @@ import java.util.concurrent.ConcurrentMap;
  * that allocation is reduced and equality is constant time. Internally, the objects are weakly
  * stored to avoid memory pressure.
  *
- * <p>All reference objects are immutable and can be compared for equality using physical identity.
+ * <p>No guarantees are made on identity and all references must be compared by {@code equals}.
  */
 @Keep
 public final class Reference {
@@ -64,6 +65,10 @@ public final class Reference {
     return instance;
   }
 
+  public static TypeReference returnTypeFromDescriptor(String descriptor) {
+    return descriptor.equals("V") ? null : typeFromDescriptor(descriptor);
+  }
+
   public static TypeReference typeFromDescriptor(String descriptor) {
     switch (descriptor.charAt(0)) {
       case 'L':
@@ -73,6 +78,10 @@ public final class Reference {
       default:
         return primitiveFromDescriptor(descriptor);
     }
+  }
+
+  public static TypeReference typeFromTypeName(String typeName) {
+    return typeFromDescriptor(DescriptorUtils.javaTypeToDescriptor(typeName));
   }
 
   // Internal helper to convert Class<?> for primitive/array types too.
@@ -115,6 +124,16 @@ public final class Reference {
   /** Get an array reference from a JVM descriptor. */
   public static ArrayReference arrayFromDescriptor(String descriptor) {
     return getInstance().arrays.computeIfAbsent(descriptor, ArrayReference::fromDescriptor);
+  }
+
+  /** Get an array reference from a base type and dimensions. */
+  public static ArrayReference array(TypeReference baseType, int dimensions) {
+    String arrayDescriptor =
+        DescriptorUtils.toArrayDescriptor(dimensions, baseType.getDescriptor());
+    return getInstance()
+        .arrays
+        .computeIfAbsent(
+            arrayDescriptor, descriptor -> ArrayReference.fromBaseType(baseType, dimensions));
   }
 
   /** Get a method reference from its full reference specification. */
@@ -162,6 +181,26 @@ public final class Reference {
     return method(classFromClass(holderClass), "<init>", builder.build(), null);
   }
 
+  /** Get a method reference from class name, method name and signature. */
+  public static MethodReference methodFromDescriptor(
+      String classDescriptor, String methodName, String methodDescriptor) {
+    ImmutableList.Builder<TypeReference> builder = ImmutableList.builder();
+    for (String parameterTypeDescriptor :
+        DescriptorUtils.getArgumentTypeDescriptors(methodDescriptor)) {
+      builder.add(typeFromDescriptor(parameterTypeDescriptor));
+    }
+    String returnTypeDescriptor = DescriptorUtils.getReturnTypeDescriptor(methodDescriptor);
+    return method(
+        classFromDescriptor(classDescriptor),
+        methodName,
+        builder.build(),
+        returnTypeDescriptor.equals("V") ? null : typeFromDescriptor(returnTypeDescriptor));
+  }
+
+  public static MethodReference classConstructor(ClassReference type) {
+    return method(type, "<clinit>", Collections.emptyList(), null);
+  }
+
   /** Get a field reference from its full reference specification. */
   public static FieldReference field(
       ClassReference holderClass, String fieldName, TypeReference fieldType) {
@@ -177,5 +216,16 @@ public final class Reference {
     String fieldName = field.getName();
     Class<?> fieldType = field.getType();
     return field(classFromClass(holderClass), fieldName, typeFromClass(fieldType));
+  }
+
+  /** Create a package reference from a string */
+  public static PackageReference packageFromString(String packageName) {
+    // Note, we rely on equality check for packages and do not canonicalize them.
+    return new PackageReference(packageName);
+  }
+
+  /** Create a package from a java.lang.Package */
+  public static PackageReference packageFromPackage(Package pkg) {
+    return new PackageReference(pkg.getName());
   }
 }

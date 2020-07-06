@@ -3,33 +3,23 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.graph;
 
-import com.android.tools.r8.ir.code.ConstInstruction;
-import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Invoke.Type;
-import com.android.tools.r8.ir.code.Position;
-import com.android.tools.r8.utils.IteratorUtils;
+import com.android.tools.r8.shaking.KeepInfoCollection;
+import com.android.tools.r8.utils.SetUtils;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Sets;
 import it.unimi.dsi.fastutil.objects.Object2BooleanArrayMap;
 import it.unimi.dsi.fastutil.objects.Object2BooleanMap;
-import java.util.ArrayDeque;
-import java.util.Collections;
-import java.util.Deque;
-import java.util.HashSet;
+import java.util.ArrayList;
 import java.util.IdentityHashMap;
-import java.util.LinkedList;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
-import java.util.SortedSet;
-import java.util.TreeSet;
-import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * A GraphLense implements a virtual view on top of the graph, used to delay global rewrites until
@@ -71,241 +61,6 @@ public abstract class GraphLense {
     }
   }
 
-  public static class RewrittenPrototypeDescription {
-
-    public static class RemovedArgumentInfo {
-
-      public static class Builder {
-
-        private int argumentIndex = -1;
-        private boolean isAlwaysNull = false;
-        private DexType type = null;
-
-        public Builder setArgumentIndex(int argumentIndex) {
-          this.argumentIndex = argumentIndex;
-          return this;
-        }
-
-        public Builder setIsAlwaysNull() {
-          this.isAlwaysNull = true;
-          return this;
-        }
-
-        public Builder setType(DexType type) {
-          this.type = type;
-          return this;
-        }
-
-        public RemovedArgumentInfo build() {
-          assert argumentIndex >= 0;
-          assert type != null;
-          return new RemovedArgumentInfo(argumentIndex, isAlwaysNull, type);
-        }
-      }
-
-      private final int argumentIndex;
-      private final boolean isAlwaysNull;
-      private final DexType type;
-
-      private RemovedArgumentInfo(int argumentIndex, boolean isAlwaysNull, DexType type) {
-        this.argumentIndex = argumentIndex;
-        this.isAlwaysNull = isAlwaysNull;
-        this.type = type;
-      }
-
-      public static Builder builder() {
-        return new Builder();
-      }
-
-      public int getArgumentIndex() {
-        return argumentIndex;
-      }
-
-      public DexType getType() {
-        return type;
-      }
-
-      public boolean isAlwaysNull() {
-        return isAlwaysNull;
-      }
-
-      public boolean isNeverUsed() {
-        return !isAlwaysNull;
-      }
-
-      public RemovedArgumentInfo withArgumentIndex(int argumentIndex) {
-        return this.argumentIndex != argumentIndex
-            ? new RemovedArgumentInfo(argumentIndex, isAlwaysNull, type)
-            : this;
-      }
-    }
-
-    public static class RemovedArgumentsInfo {
-
-      private static final RemovedArgumentsInfo empty = new RemovedArgumentsInfo(null);
-
-      private final List<RemovedArgumentInfo> removedArguments;
-
-      public RemovedArgumentsInfo(List<RemovedArgumentInfo> removedArguments) {
-        assert verifyRemovedArguments(removedArguments);
-        this.removedArguments = removedArguments;
-      }
-
-      private static boolean verifyRemovedArguments(List<RemovedArgumentInfo> removedArguments) {
-        if (removedArguments != null && !removedArguments.isEmpty()) {
-          // Check that list is sorted by argument indices.
-          int lastArgumentIndex = removedArguments.get(0).getArgumentIndex();
-          for (int i = 1; i < removedArguments.size(); ++i) {
-            int currentArgumentIndex = removedArguments.get(i).getArgumentIndex();
-            assert lastArgumentIndex < currentArgumentIndex;
-            lastArgumentIndex = currentArgumentIndex;
-          }
-        }
-        return true;
-      }
-
-      public static RemovedArgumentsInfo empty() {
-        return empty;
-      }
-
-      public ListIterator<RemovedArgumentInfo> iterator() {
-        return removedArguments == null
-            ? Collections.emptyListIterator()
-            : removedArguments.listIterator();
-      }
-
-      public boolean hasRemovedArguments() {
-        return removedArguments != null && !removedArguments.isEmpty();
-      }
-
-      public boolean isArgumentRemoved(int argumentIndex) {
-        if (removedArguments != null) {
-          for (RemovedArgumentInfo info : removedArguments) {
-            if (info.getArgumentIndex() == argumentIndex) {
-              return true;
-            }
-          }
-        }
-        return false;
-      }
-
-      public int numberOfRemovedArguments() {
-        return removedArguments != null ? removedArguments.size() : 0;
-      }
-
-      public RemovedArgumentsInfo combine(RemovedArgumentsInfo info) {
-        assert info != null;
-        if (hasRemovedArguments()) {
-          if (!info.hasRemovedArguments()) {
-            return this;
-          }
-        } else {
-          return info;
-        }
-
-        List<RemovedArgumentInfo> newRemovedArguments = new LinkedList<>(removedArguments);
-        ListIterator<RemovedArgumentInfo> iterator = newRemovedArguments.listIterator();
-        int offset = 0;
-        for (RemovedArgumentInfo pending : info.removedArguments) {
-          RemovedArgumentInfo next = IteratorUtils.peekNext(iterator);
-          while (next != null && next.getArgumentIndex() <= pending.getArgumentIndex() + offset) {
-            iterator.next();
-            next = IteratorUtils.peekNext(iterator);
-            offset++;
-          }
-          iterator.add(pending.withArgumentIndex(pending.getArgumentIndex() + offset));
-        }
-        return new RemovedArgumentsInfo(newRemovedArguments);
-      }
-    }
-
-    private static final RewrittenPrototypeDescription none = new RewrittenPrototypeDescription();
-
-    private final boolean hasBeenChangedToReturnVoid;
-    private final RemovedArgumentsInfo removedArgumentsInfo;
-
-    private RewrittenPrototypeDescription() {
-      this(false, RemovedArgumentsInfo.empty());
-    }
-
-    public RewrittenPrototypeDescription(
-        boolean hasBeenChangedToReturnVoid, RemovedArgumentsInfo removedArgumentsInfo) {
-      assert removedArgumentsInfo != null;
-      this.hasBeenChangedToReturnVoid = hasBeenChangedToReturnVoid;
-      this.removedArgumentsInfo = removedArgumentsInfo;
-    }
-
-    public static RewrittenPrototypeDescription none() {
-      return none;
-    }
-
-    public boolean isEmpty() {
-      return !hasBeenChangedToReturnVoid && !getRemovedArgumentsInfo().hasRemovedArguments();
-    }
-
-    public boolean hasBeenChangedToReturnVoid() {
-      return hasBeenChangedToReturnVoid;
-    }
-
-    public RemovedArgumentsInfo getRemovedArgumentsInfo() {
-      return removedArgumentsInfo;
-    }
-
-    /**
-     * Returns the {@link ConstInstruction} that should be used to materialize the result of
-     * invocations to the method represented by this {@link RewrittenPrototypeDescription}.
-     *
-     * <p>This method should only be used for methods that return a constant value and whose return
-     * type has been changed to void.
-     *
-     * <p>Note that the current implementation always returns null at this point.
-     */
-    public ConstInstruction getConstantReturn(IRCode code, Position position) {
-      assert hasBeenChangedToReturnVoid;
-      ConstInstruction instruction = code.createConstNull();
-      instruction.setPosition(position);
-      return instruction;
-    }
-
-    public DexType rewriteReturnType(DexType returnType, DexItemFactory dexItemFactory) {
-      return hasBeenChangedToReturnVoid ? dexItemFactory.voidType : returnType;
-    }
-
-    public DexType[] rewriteParameters(DexType[] params) {
-      RemovedArgumentsInfo removedArgumentsInfo = getRemovedArgumentsInfo();
-      if (removedArgumentsInfo.hasRemovedArguments()) {
-        DexType[] newParams =
-            new DexType[params.length - removedArgumentsInfo.numberOfRemovedArguments()];
-        int newParamIndex = 0;
-        for (int oldParamIndex = 0; oldParamIndex < params.length; ++oldParamIndex) {
-          if (!removedArgumentsInfo.isArgumentRemoved(oldParamIndex)) {
-            newParams[newParamIndex] = params[oldParamIndex];
-            ++newParamIndex;
-          }
-        }
-        return newParams;
-      }
-      return params;
-    }
-
-    public DexProto rewriteProto(DexProto proto, DexItemFactory dexItemFactory) {
-      DexType newReturnType = rewriteReturnType(proto.returnType, dexItemFactory);
-      DexType[] newParameters = rewriteParameters(proto.parameters.values);
-      return dexItemFactory.createProto(newReturnType, newParameters);
-    }
-
-    public RewrittenPrototypeDescription withConstantReturn() {
-      return !hasBeenChangedToReturnVoid
-          ? new RewrittenPrototypeDescription(true, removedArgumentsInfo)
-          : this;
-    }
-
-    public RewrittenPrototypeDescription withRemovedArguments(RemovedArgumentsInfo other) {
-      return new RewrittenPrototypeDescription(
-          hasBeenChangedToReturnVoid, removedArgumentsInfo.combine(other));
-    }
-  }
-
   public static class Builder {
 
     protected Builder() {}
@@ -314,8 +69,8 @@ public abstract class GraphLense {
     protected final Map<DexMethod, DexMethod> methodMap = new IdentityHashMap<>();
     protected final Map<DexField, DexField> fieldMap = new IdentityHashMap<>();
 
-    private final BiMap<DexField, DexField> originalFieldSignatures = HashBiMap.create();
-    private final BiMap<DexMethod, DexMethod> originalMethodSignatures = HashBiMap.create();
+    protected final BiMap<DexField, DexField> originalFieldSignatures = HashBiMap.create();
+    protected final BiMap<DexMethod, DexMethod> originalMethodSignatures = HashBiMap.create();
 
     public void map(DexType from, DexType to) {
       if (from == to) {
@@ -385,11 +140,23 @@ public abstract class GraphLense {
 
   public abstract DexField getRenamedFieldSignature(DexField originalField);
 
-  public abstract DexMethod getRenamedMethodSignature(DexMethod originalMethod);
+  public final DexMethod getRenamedMethodSignature(DexMethod originalMethod) {
+    return getRenamedMethodSignature(originalMethod, null);
+  }
+
+  public abstract DexMethod getRenamedMethodSignature(DexMethod originalMethod, GraphLense applied);
 
   public DexEncodedMethod mapDexEncodedMethod(
       DexEncodedMethod originalEncodedMethod, DexDefinitionSupplier definitions) {
-    DexMethod newMethod = getRenamedMethodSignature(originalEncodedMethod.method);
+    return mapDexEncodedMethod(originalEncodedMethod, definitions, null);
+  }
+
+  public DexEncodedMethod mapDexEncodedMethod(
+      DexEncodedMethod originalEncodedMethod,
+      DexDefinitionSupplier definitions,
+      GraphLense applied) {
+    assert originalEncodedMethod != DexEncodedMethod.SENTINEL;
+    DexMethod newMethod = getRenamedMethodSignature(originalEncodedMethod.method, applied);
     // Note that:
     // * Even if `newMethod` is the same as `originalEncodedMethod.method`, we still need to look it
     //   up, since `originalEncodedMethod` may be obsolete.
@@ -402,11 +169,18 @@ public abstract class GraphLense {
     return newEncodedMethod;
   }
 
+  public ProgramMethod mapProgramMethod(
+      ProgramMethod oldMethod, DexDefinitionSupplier definitions) {
+    DexMethod newMethod = getRenamedMethodSignature(oldMethod.getReference());
+    DexProgramClass holder = definitions.definitionForHolder(newMethod).asProgramClass();
+    return holder.lookupProgramMethod(newMethod);
+  }
+
   public abstract DexType lookupType(DexType type);
 
   // This overload can be used when the graph lense is known to be context insensitive.
   public DexMethod lookupMethod(DexMethod method) {
-    assert isContextFreeForMethod(method);
+    assert verifyIsContextFreeForMethod(method);
     return lookupMethod(method, null, null).getMethod();
   }
 
@@ -415,17 +189,15 @@ public abstract class GraphLense {
 
   public abstract RewrittenPrototypeDescription lookupPrototypeChanges(DexMethod method);
 
-  // Context sensitive graph lenses should override this method.
-  public Set<DexMethod> lookupMethodInAllContexts(DexMethod method) {
-    assert isContextFreeForMethod(method);
-    DexMethod result = lookupMethod(method);
-    if (result != null) {
-      return ImmutableSet.of(result);
-    }
-    return ImmutableSet.of();
+  public abstract DexField lookupField(DexField field);
+
+  public DexMethod lookupGetFieldForMethod(DexField field, DexMethod context) {
+    return null;
   }
 
-  public abstract DexField lookupField(DexField field);
+  public DexMethod lookupPutFieldForMethod(DexField field, DexMethod context) {
+    return null;
+  }
 
   public DexReference lookupReference(DexReference reference) {
     if (reference.isDexType()) {
@@ -450,7 +222,7 @@ public abstract class GraphLense {
   // an assertion error.
   public abstract boolean isContextFreeForMethods();
 
-  public boolean isContextFreeForMethod(DexMethod method) {
+  public boolean verifyIsContextFreeForMethod(DexMethod method) {
     return isContextFreeForMethods();
   }
 
@@ -458,8 +230,19 @@ public abstract class GraphLense {
     return IdentityGraphLense.getInstance();
   }
 
+  public boolean hasCodeRewritings() {
+    return true;
+  }
+
   public final boolean isIdentityLense() {
     return this == getIdentityLense();
+  }
+
+  public GraphLense withCodeRewritingsApplied() {
+    if (hasCodeRewritings()) {
+      return new ClearCodeRewritingGraphLens(this);
+    }
+    return this;
   }
 
   public <T extends DexDefinition> boolean assertDefinitionsNotModified(Iterable<T> definitions) {
@@ -471,6 +254,14 @@ public abstract class GraphLense {
       assert isBridge || lookupReference(reference) == reference;
     }
     return true;
+  }
+
+  public <T extends DexReference> boolean assertPinnedNotModified(KeepInfoCollection keepInfo) {
+    List<DexReference> pinnedItems = new ArrayList<>();
+    keepInfo.forEachPinnedType(pinnedItems::add);
+    keepInfo.forEachPinnedMethod(pinnedItems::add);
+    keepInfo.forEachPinnedField(pinnedItems::add);
+    return assertReferencesNotModified(pinnedItems);
   }
 
   public <T extends DexReference> boolean assertReferencesNotModified(Iterable<T> references) {
@@ -490,95 +281,40 @@ public abstract class GraphLense {
     return true;
   }
 
-  public ImmutableList<DexReference> rewriteReferencesConservatively(List<DexReference> original) {
-    ImmutableList.Builder<DexReference> builder = ImmutableList.builder();
-    for (DexReference item : original) {
-      if (item.isDexMethod()) {
-        DexMethod method = item.asDexMethod();
-        if (isContextFreeForMethod(method)) {
-          builder.add(lookupMethod(method));
-        } else {
-          builder.addAll(lookupMethodInAllContexts(method));
-        }
-      } else {
-        builder.add(lookupReference(item));
-      }
+  public DexReference rewriteReference(DexReference reference) {
+    if (reference.isDexField()) {
+      return getRenamedFieldSignature(reference.asDexField());
     }
-    return builder.build();
+    if (reference.isDexMethod()) {
+      return getRenamedMethodSignature(reference.asDexMethod());
+    }
+    assert reference.isDexType();
+    return lookupType(reference.asDexType());
   }
 
-  public ImmutableSet<DexReference> rewriteReferencesConservatively(Set<DexReference> original) {
-    ImmutableSet.Builder<DexReference> builder = ImmutableSet.builder();
-    for (DexReference item : original) {
-      if (item.isDexMethod()) {
-        DexMethod method = item.asDexMethod();
-        if (isContextFreeForMethod(method)) {
-          builder.add(lookupMethod(method));
-        } else {
-          builder.addAll(lookupMethodInAllContexts(method));
-        }
-      } else {
-        builder.add(lookupReference(item));
-      }
-    }
-    return builder.build();
-  }
-
-  public Set<DexReference> rewriteMutableReferencesConservatively(Set<DexReference> original) {
-    Set<DexReference> result = Sets.newIdentityHashSet();
-    for (DexReference item : original) {
-      if (item.isDexMethod()) {
-        DexMethod method = item.asDexMethod();
-        if (isContextFreeForMethod(method)) {
-          result.add(lookupMethod(method));
-        } else {
-          result.addAll(lookupMethodInAllContexts(method));
-        }
-      } else {
-        result.add(lookupReference(item));
-      }
+  public Set<DexReference> rewriteReferences(Set<DexReference> references) {
+    Set<DexReference> result = SetUtils.newIdentityHashSet(references.size());
+    for (DexReference reference : references) {
+      result.add(rewriteReference(reference));
     }
     return result;
   }
 
-  public Object2BooleanMap<DexReference> rewriteReferencesConservatively(
-      Object2BooleanMap<DexReference> original) {
+  public <T> ImmutableMap<DexReference, T> rewriteReferenceKeys(Map<DexReference, T> map) {
+    ImmutableMap.Builder<DexReference, T> builder = ImmutableMap.builder();
+    map.forEach((reference, value) -> builder.put(rewriteReference(reference), value));
+    return builder.build();
+  }
+
+  public Object2BooleanMap<DexReference> rewriteReferenceKeys(Object2BooleanMap<DexReference> map) {
     Object2BooleanMap<DexReference> result = new Object2BooleanArrayMap<>();
-    for (Object2BooleanMap.Entry<DexReference> entry : original.object2BooleanEntrySet()) {
-      DexReference item = entry.getKey();
-      if (item.isDexMethod()) {
-        DexMethod method = item.asDexMethod();
-        if (isContextFreeForMethod(method)) {
-          result.put(lookupMethod(method), entry.getBooleanValue());
-        } else {
-          for (DexMethod candidate: lookupMethodInAllContexts(method)) {
-            result.put(candidate, entry.getBooleanValue());
-          }
-        }
-      } else {
-        result.put(lookupReference(item), entry.getBooleanValue());
-      }
+    for (Object2BooleanMap.Entry<DexReference> entry : map.object2BooleanEntrySet()) {
+      result.put(rewriteReference(entry.getKey()), entry.getBooleanValue());
     }
     return result;
   }
 
-  public ImmutableSet<DexType> rewriteTypesConservatively(Set<DexType> original) {
-    ImmutableSet.Builder<DexType> builder = ImmutableSet.builder();
-    for (DexType item : original) {
-      builder.add(lookupType(item));
-    }
-    return builder.build();
-  }
-
-  public Set<DexType> rewriteMutableTypesConservatively(Set<DexType> original) {
-    Set<DexType> result = Sets.newIdentityHashSet();
-    for (DexType item : original) {
-      result.add(lookupType(item));
-    }
-    return result;
-  }
-
-  public ImmutableSortedSet<DexMethod> rewriteMethodsWithRenamedSignature(Set<DexMethod> methods) {
+  public ImmutableSortedSet<DexMethod> rewriteMethods(Set<DexMethod> methods) {
     ImmutableSortedSet.Builder<DexMethod> builder =
         new ImmutableSortedSet.Builder<>(PresortedComparable::slowCompare);
     for (DexMethod method : methods) {
@@ -587,65 +323,25 @@ public abstract class GraphLense {
     return builder.build();
   }
 
-  public ImmutableSortedSet<DexMethod> rewriteMethodsConservatively(Set<DexMethod> original) {
-    ImmutableSortedSet.Builder<DexMethod> builder =
+  public <T> ImmutableMap<DexField, T> rewriteFieldKeys(Map<DexField, T> map) {
+    ImmutableMap.Builder<DexField, T> builder = ImmutableMap.builder();
+    map.forEach((field, value) -> builder.put(getRenamedFieldSignature(field), value));
+    return builder.build();
+  }
+
+  public ImmutableSet<DexType> rewriteTypes(Set<DexType> types) {
+    ImmutableSortedSet.Builder<DexType> builder =
         new ImmutableSortedSet.Builder<>(PresortedComparable::slowCompare);
-    if (isContextFreeForMethods()) {
-      for (DexMethod item : original) {
-        builder.add(lookupMethod(item));
-      }
-    } else {
-      for (DexMethod item : original) {
-        // Avoid using lookupMethodInAllContexts when possible.
-        if (isContextFreeForMethod(item)) {
-          builder.add(lookupMethod(item));
-        } else {
-          // The lense is context sensitive, but we do not have the context here. Therefore, we
-          // conservatively look up the method in all contexts.
-          builder.addAll(lookupMethodInAllContexts(item));
-        }
-      }
+    for (DexType type : types) {
+      builder.add(lookupType(type));
     }
     return builder.build();
   }
 
-  public SortedSet<DexMethod> rewriteMutableMethodsConservatively(Set<DexMethod> original) {
-    SortedSet<DexMethod> result = new TreeSet<>(PresortedComparable::slowCompare);
-    if (isContextFreeForMethods()) {
-      for (DexMethod item : original) {
-        result.add(lookupMethod(item));
-      }
-    } else {
-      for (DexMethod item : original) {
-        // Avoid using lookupMethodInAllContexts when possible.
-        if (isContextFreeForMethod(item)) {
-          result.add(lookupMethod(item));
-        } else {
-          // The lense is context sensitive, but we do not have the context here. Therefore, we
-          // conservatively look up the method in all contexts.
-          result.addAll(lookupMethodInAllContexts(item));
-        }
-      }
-    }
-    return result;
-  }
-
-  public static <T extends DexReference, S> ImmutableMap<T, S> rewriteReferenceKeys(
-      Map<T, S> original, Function<T, T> rewrite) {
-    ImmutableMap.Builder<T, S> builder = new ImmutableMap.Builder<>();
-    for (T item : original.keySet()) {
-      builder.put(rewrite.apply(item), original.get(item));
-    }
+  public <T> ImmutableMap<DexType, T> rewriteTypeKeys(Map<DexType, T> map) {
+    ImmutableMap.Builder<DexType, T> builder = ImmutableMap.builder();
+    map.forEach((type, value) -> builder.put(lookupType(type), value));
     return builder.build();
-  }
-
-  public static <T extends DexReference, S> Map<T, S> rewriteMutableReferenceKeys(
-      Map<T, S> original, Function<T, T> rewrite) {
-    Map<T, S> result = new IdentityHashMap<>();
-    for (T item : original.keySet()) {
-      result.put(rewrite.apply(item), original.get(item));
-    }
-    return result;
   }
 
   public boolean verifyMappingToOriginalProgram(
@@ -671,61 +367,27 @@ public abstract class GraphLense {
         continue;
       }
       for (DexEncodedField field : clazz.fields()) {
+        // The field $r8$clinitField may be synthesized by R8 in order to trigger the initialization
+        // of the enclosing class. It is not present in the input, and therefore we do not require
+        // that it can be mapped back to the original program.
+        if (field.field.match(dexItemFactory.objectMembers.clinitField)) {
+          continue;
+        }
         DexField originalField = getOriginalFieldSignature(field.field);
         assert originalFields.contains(originalField)
             : "Unable to map field `" + field.field.toSourceString() + "` back to original program";
       }
       for (DexEncodedMethod method : clazz.methods()) {
-        if (method.accessFlags.isSynthetic()) {
-          // This could be a bridge that has been inserted, for example, as a result of member
-          // rebinding. Consider only skipping the check below for methods that have been
-          // synthesized by R8.
+        if (method.isD8R8Synthesized()) {
+          // Methods synthesized by D8/R8 may not be mapped.
           continue;
         }
         DexMethod originalMethod = getOriginalMethodSignature(method.method);
-        assert originalMethods.contains(originalMethod)
-                || verifyIsBridgeMethod(
-                    originalMethod, originalApplication, originalMethods, dexItemFactory)
-            : "Unable to map method `"
-                + originalMethod.toSourceString()
-                + "` back to original program";
+        assert originalMethods.contains(originalMethod);
       }
     }
 
     return true;
-  }
-
-  // Check if `method` is a bridge method for a method that is in the original application.
-  // This is needed because member rebinding synthesizes bridge methods for visibility.
-  private static boolean verifyIsBridgeMethod(
-      DexMethod method,
-      DexApplication originalApplication,
-      Set<DexMethod> originalMethods,
-      DexItemFactory dexItemFactory) {
-    Deque<DexType> worklist = new ArrayDeque<>();
-    Set<DexType> visited = Sets.newIdentityHashSet();
-    worklist.add(method.holder);
-    while (!worklist.isEmpty()) {
-      DexType holder = worklist.removeFirst();
-      if (!visited.add(holder)) {
-        // Already visited previously.
-        continue;
-      }
-      DexMethod targetMethod = dexItemFactory.createMethod(holder, method.proto, method.name);
-      if (originalMethods.contains(targetMethod)) {
-        return true;
-      }
-      // Stop traversing upwards if we reach the Object.
-      if (holder == dexItemFactory.objectType) {
-        continue;
-      }
-      DexClass clazz = originalApplication.definitionFor(holder);
-      if (clazz != null) {
-        worklist.add(clazz.superType);
-        Collections.addAll(worklist, clazz.interfaces.values);
-      }
-    }
-    return false;
   }
 
   private static class IdentityGraphLense extends GraphLense {
@@ -759,7 +421,7 @@ public abstract class GraphLense {
     }
 
     @Override
-    public DexMethod getRenamedMethodSignature(DexMethod originalMethod) {
+    public DexMethod getRenamedMethodSignature(DexMethod originalMethod, GraphLense applied) {
       return originalMethod;
     }
 
@@ -787,6 +449,54 @@ public abstract class GraphLense {
     public boolean isContextFreeForMethods() {
       return true;
     }
+
+    @Override
+    public boolean hasCodeRewritings() {
+      return false;
+    }
+  }
+
+  // This lens clears all code rewriting (lookup methods mimics identity lens behavior) but still
+  // relies on the previous lens for names (getRenamed/Original methods).
+  public static class ClearCodeRewritingGraphLens extends IdentityGraphLense {
+
+    private final GraphLense previous;
+
+    public ClearCodeRewritingGraphLens(GraphLense previous) {
+      this.previous = previous;
+    }
+
+    @Override
+    public DexType getOriginalType(DexType type) {
+      return previous.getOriginalType(type);
+    }
+
+    @Override
+    public DexField getOriginalFieldSignature(DexField field) {
+      return previous.getOriginalFieldSignature(field);
+    }
+
+    @Override
+    public DexMethod getOriginalMethodSignature(DexMethod method) {
+      return previous.getOriginalMethodSignature(method);
+    }
+
+    @Override
+    public DexField getRenamedFieldSignature(DexField originalField) {
+      return previous.getRenamedFieldSignature(originalField);
+    }
+
+    @Override
+    public DexMethod getRenamedMethodSignature(DexMethod originalMethod, GraphLense applied) {
+      return this != applied
+          ? previous.getRenamedMethodSignature(originalMethod, applied)
+          : originalMethod;
+    }
+
+    @Override
+    public DexType lookupType(DexType type) {
+      return previous.lookupType(type);
+    }
   }
 
   /**
@@ -801,7 +511,7 @@ public abstract class GraphLense {
    */
   public static class NestedGraphLense extends GraphLense {
 
-    protected final GraphLense previousLense;
+    protected GraphLense previousLense;
     protected final DexItemFactory dexItemFactory;
 
     protected final Map<DexType, DexType> typeMap;
@@ -839,6 +549,14 @@ public abstract class GraphLense {
       this.dexItemFactory = dexItemFactory;
     }
 
+    public <T> T withAlternativeParentLens(GraphLense lens, Supplier<T> action) {
+      GraphLense oldParent = previousLense;
+      previousLense = lens;
+      T result = action.get();
+      previousLense = oldParent;
+      return result;
+    }
+
     @Override
     public DexType getOriginalType(DexType type) {
       return previousLense.getOriginalType(type);
@@ -871,8 +589,11 @@ public abstract class GraphLense {
     }
 
     @Override
-    public DexMethod getRenamedMethodSignature(DexMethod originalMethod) {
-      DexMethod renamedMethod = previousLense.getRenamedMethodSignature(originalMethod);
+    public DexMethod getRenamedMethodSignature(DexMethod originalMethod, GraphLense applied) {
+      if (this == applied) {
+        return originalMethod;
+      }
+      DexMethod renamedMethod = previousLense.getRenamedMethodSignature(originalMethod, applied);
       return originalMethodSignatures != null
           ? originalMethodSignatures.inverse().getOrDefault(renamedMethod, renamedMethod)
           : renamedMethod;
@@ -923,6 +644,16 @@ public abstract class GraphLense {
       return previousLense.lookupPrototypeChanges(method);
     }
 
+    @Override
+    public DexMethod lookupGetFieldForMethod(DexField field, DexMethod context) {
+      return previousLense.lookupGetFieldForMethod(field, context);
+    }
+
+    @Override
+    public DexMethod lookupPutFieldForMethod(DexField field, DexMethod context) {
+      return previousLense.lookupPutFieldForMethod(field, context);
+    }
+
     /**
      * Default invocation type mapping.
      *
@@ -962,15 +693,6 @@ public abstract class GraphLense {
     }
 
     @Override
-    public Set<DexMethod> lookupMethodInAllContexts(DexMethod method) {
-      Set<DexMethod> result = new HashSet<>();
-      for (DexMethod previous : previousLense.lookupMethodInAllContexts(method)) {
-        result.add(methodMap.getOrDefault(previous, previous));
-      }
-      return result;
-    }
-
-    @Override
     public DexField lookupField(DexField field) {
       DexField previous = previousLense.lookupField(field);
       return fieldMap.getOrDefault(previous, previous);
@@ -982,8 +704,9 @@ public abstract class GraphLense {
     }
 
     @Override
-    public boolean isContextFreeForMethod(DexMethod method) {
-      return previousLense.isContextFreeForMethod(method);
+    public boolean verifyIsContextFreeForMethod(DexMethod method) {
+      assert previousLense.verifyIsContextFreeForMethod(method);
+      return true;
     }
 
     @Override

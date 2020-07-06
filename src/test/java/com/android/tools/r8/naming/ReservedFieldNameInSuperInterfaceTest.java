@@ -4,12 +4,13 @@
 package com.android.tools.r8.naming;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
-import static org.hamcrest.CoreMatchers.not;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndNotRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assume.assumeFalse;
 
+import com.android.tools.r8.NeverPropagateValue;
 import com.android.tools.r8.R8TestRunResult;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.utils.BooleanUtils;
@@ -50,6 +51,7 @@ public class ReservedFieldNameInSuperInterfaceTest extends TestBase {
                 reserveName
                     ? "-keepclassmembernames class " + I.class.getTypeName() + "{ <fields>; }"
                     : "")
+            .enableMemberValuePropagationAnnotations()
             .run(TestClass.class)
             .assertSuccessWithOutput(expectedOutput);
 
@@ -64,7 +66,7 @@ public class ReservedFieldNameInSuperInterfaceTest extends TestBase {
     // Interface fields are visited/renamed before fields on classes. Thus, the interface field I.a
     // will be visited first and assigned the name a. As it ends up receiving the same name as in
     // the input program, it has not technically been renamed.
-    assertThat(aFieldSubject, not(isRenamed()));
+    assertThat(aFieldSubject, isPresentAndNotRenamed());
 
     inspect(inspector);
   }
@@ -78,9 +80,8 @@ public class ReservedFieldNameInSuperInterfaceTest extends TestBase {
         .addProgramClasses(TestClass.class, A.class, J.class)
         .addLibraryClasses(I.class)
         .addLibraryFiles(runtimeJar(Backend.DEX))
-        .enableMemberValuePropagationAnnotations()
-        .enableMergeAnnotations()
         .addKeepMainRule(TestClass.class)
+        .enableMemberValuePropagationAnnotations()
         .compile()
         .addRunClasspathFiles(testForD8().addProgramClasses(I.class).compile().writeToZip())
         .run(TestClass.class)
@@ -94,7 +95,7 @@ public class ReservedFieldNameInSuperInterfaceTest extends TestBase {
 
     FieldSubject f1FieldSubject = jClassSubject.uniqueFieldWithName("f1");
     assertThat(f1FieldSubject, isPresent());
-    assertThat(f1FieldSubject, isRenamed());
+    assertThat(f1FieldSubject, isPresentAndRenamed());
     assertEquals("b", f1FieldSubject.getFinalName());
 
     ClassSubject aClassSubject = inspector.clazz(A.class);
@@ -102,7 +103,7 @@ public class ReservedFieldNameInSuperInterfaceTest extends TestBase {
 
     FieldSubject f2FieldSubject = aClassSubject.uniqueFieldWithName("f2");
     assertThat(f2FieldSubject, isPresent());
-    assertThat(f2FieldSubject, isRenamed());
+    assertThat(f2FieldSubject, isPresentAndRenamed());
     assertEquals("c", f2FieldSubject.getFinalName());
   }
 
@@ -118,7 +119,7 @@ public class ReservedFieldNameInSuperInterfaceTest extends TestBase {
 
   static class A implements I {
 
-    String f2 = "world!";
+    @NeverPropagateValue String f2 = "world!";
 
     @Override
     public String toString() {

@@ -6,39 +6,22 @@ package com.android.tools.r8.utils.codeinspector;
 
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AccessFlags;
+import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.naming.retrace.StackTrace;
+import com.android.tools.r8.naming.retrace.StackTrace.StackTraceLine;
+import com.android.tools.r8.references.MethodReference;
+import com.android.tools.r8.retrace.RetraceMethodResult;
+import com.android.tools.r8.retrace.RetraceMethodResult.Element;
+import com.android.tools.r8.utils.Box;
+import com.android.tools.r8.utils.Visibility;
 import com.google.common.collect.ImmutableList;
+import java.util.List;
+import java.util.stream.Collectors;
 import org.hamcrest.Description;
 import org.hamcrest.Matcher;
 import org.hamcrest.TypeSafeMatcher;
 
 public class Matchers {
-
-  private enum Visibility {
-    PUBLIC,
-    PROTECTED,
-    PRIVATE,
-    PACKAGE_PRIVATE;
-
-    @Override
-    public String toString() {
-      switch (this) {
-        case PUBLIC:
-          return "public";
-
-        case PROTECTED:
-          return "protected";
-
-        case PRIVATE:
-          return "private";
-
-        case PACKAGE_PRIVATE:
-          return "package-private";
-
-        default:
-          throw new Unreachable("Unexpected visibility");
-      }
-    }
-  }
 
   private static String type(Subject subject) {
     String type = "<unknown subject type>";
@@ -48,6 +31,20 @@ public class Matchers {
       type = "method";
     } else if (subject instanceof FieldSubject) {
       type = "field";
+    } else if (subject instanceof AnnotationSubject) {
+      type = "annotation";
+    } else if (subject instanceof KmClassSubject) {
+      type = "@Metadata.KmClass";
+    } else if (subject instanceof KmPackageSubject) {
+      type = "@Metadata.KmPackage";
+    } else if (subject instanceof KmFunctionSubject) {
+      type = "@Metadata.KmFunction";
+    } else if (subject instanceof KmPropertySubject) {
+      type = "@Metadata.KmProperty";
+    } else if (subject instanceof KmTypeParameterSubject) {
+      type = "@Metadata.KmTypeParameter";
+    } else if (subject instanceof KmClassifierSubject) {
+      type = "@Metadata.KmClassifier";
     }
     return type;
   }
@@ -60,6 +57,20 @@ public class Matchers {
       name = ((MethodSubject) subject).getOriginalName();
     } else if (subject instanceof FieldSubject) {
       name = ((FieldSubject) subject).getOriginalName();
+    } else if (subject instanceof AnnotationSubject) {
+      name = ((AnnotationSubject) subject).getAnnotation().type.toSourceString();
+    } else if (subject instanceof KmClassSubject) {
+      name = ((KmClassSubject) subject).getDexClass().toSourceString();
+    } else if (subject instanceof KmPackageSubject) {
+      name = ((KmPackageSubject) subject).getDexClass().toSourceString();
+    } else if (subject instanceof KmFunctionSubject) {
+      name = ((KmFunctionSubject) subject).toString();
+    } else if (subject instanceof KmPropertySubject) {
+      name = ((KmPropertySubject) subject).toString();
+    } else if (subject instanceof KmTypeParameterSubject) {
+      name = ((KmTypeParameterSubject) subject).getId() + "";
+    } else if (subject instanceof KmClassifierSubject) {
+      name = subject.toString();
     }
     return name;
   }
@@ -100,13 +111,19 @@ public class Matchers {
 
       @Override
       public void describeMismatchSafely(final Subject subject, Description description) {
-        description
-            .appendText(type(subject) + " ").appendValue(name(subject)).appendText(" was not");
+        if (subject instanceof ClassSubject || subject instanceof MemberSubject) {
+          description
+              .appendText(type(subject) + " ")
+              .appendValue(name(subject))
+              .appendText(" was not");
+        } else {
+          description.appendText(type(subject) + " ").appendText(" was not found");
+        }
       }
     };
   }
 
-  public static Matcher<Subject> isRenamed() {
+  public static Matcher<Subject> isPresentAndRenamed() {
     return new TypeSafeMatcher<Subject>() {
       @Override
       protected boolean matchesSafely(Subject subject) {
@@ -126,7 +143,7 @@ public class Matchers {
     };
   }
 
-  public static Matcher<Subject> isNotRenamed() {
+  public static Matcher<Subject> isPresentAndNotRenamed() {
     return new TypeSafeMatcher<Subject>() {
       @Override
       protected boolean matchesSafely(Subject subject) {
@@ -146,8 +163,8 @@ public class Matchers {
     };
   }
 
-  public static Matcher<Subject> isRenamed(boolean isRenamed) {
-    return isRenamed ? isRenamed() : isNotRenamed();
+  public static Matcher<Subject> isPresentAndRenamed(boolean isRenamed) {
+    return isRenamed ? isPresentAndRenamed() : isPresentAndNotRenamed();
   }
 
   public static Matcher<MemberSubject> isStatic() {
@@ -338,5 +355,270 @@ public class Matchers {
         }
       }
     };
+  }
+
+  public static Matcher<KmFunctionSubject> isExtensionFunction() {
+    return new TypeSafeMatcher<KmFunctionSubject>() {
+      @Override
+      protected boolean matchesSafely(KmFunctionSubject kmFunction) {
+        return kmFunction.isPresent() && kmFunction.isExtension();
+      }
+
+      @Override
+      public void describeTo(Description description) {
+        description.appendText("is extension function");
+      }
+
+      @Override
+      public void describeMismatchSafely(
+          final KmFunctionSubject kmFunction, Description description) {
+        description
+            .appendText("kmFunction ")
+            .appendValue(kmFunction)
+            .appendText(" was not");
+      }
+    };
+  }
+
+  public static Matcher<KmPropertySubject> isExtensionProperty() {
+    return new TypeSafeMatcher<KmPropertySubject>() {
+      @Override
+      protected boolean matchesSafely(KmPropertySubject kmProperty) {
+        return kmProperty.isPresent() && kmProperty.isExtension();
+      }
+
+      @Override
+      public void describeTo(Description description) {
+        description.appendText("is extension property");
+      }
+
+      @Override
+      public void describeMismatchSafely(
+          final KmPropertySubject kmProperty, Description description) {
+        description
+            .appendText("kmProperty ")
+            .appendValue(kmProperty)
+            .appendText(" was not");
+      }
+    };
+  }
+
+  public static Matcher<KmTypeSubject> isDexClass(DexClass clazz) {
+    return new TypeSafeMatcher<KmTypeSubject>() {
+      @Override
+      protected boolean matchesSafely(KmTypeSubject item) {
+        String descriptor = item.descriptor();
+        if (descriptor == null) {
+          return false;
+        }
+        return descriptor.equals(clazz.type.toDescriptorString());
+      }
+
+      @Override
+      public void describeTo(Description description) {
+        description.appendText("is class");
+      }
+
+      @Override
+      protected void describeMismatchSafely(KmTypeSubject item, Description mismatchDescription) {
+        mismatchDescription
+            .appendText(item.descriptor())
+            .appendText(" is not " + clazz.type.toDescriptorString());
+      }
+    };
+  }
+
+  public static Matcher<RetraceMethodResult> isInlineFrame() {
+    return new TypeSafeMatcher<RetraceMethodResult>() {
+      @Override
+      protected boolean matchesSafely(RetraceMethodResult item) {
+        return !item.isAmbiguous() && item.stream().count() > 1;
+      }
+
+      @Override
+      public void describeTo(Description description) {
+        description.appendText("is not an inline frame");
+      }
+    };
+  }
+
+  public static Matcher<RetraceMethodResult> isInlineStack(LinePosition startPosition) {
+    return new TypeSafeMatcher<RetraceMethodResult>() {
+      @Override
+      protected boolean matchesSafely(RetraceMethodResult item) {
+        Box<LinePosition> currentPosition = new Box<>(startPosition);
+        Box<Boolean> returnValue = new Box<>();
+        item.forEach(
+            element -> {
+              boolean sameMethod;
+              LinePosition currentInline = currentPosition.get();
+              if (currentInline == null) {
+                returnValue.set(false);
+                return;
+              }
+              sameMethod = element.getMethodReference().equals(currentInline.methodReference);
+              boolean samePosition =
+                  element.getOriginalLineNumber(currentInline.minifiedPosition)
+                      == currentInline.originalPosition;
+              if (!returnValue.isSet() || returnValue.get()) {
+                returnValue.set(sameMethod & samePosition);
+              }
+              currentPosition.set(currentInline.caller);
+            });
+        return returnValue.isSet() && returnValue.get();
+      }
+
+      @Override
+      public void describeTo(Description description) {
+        description.appendText("is not matching the inlining stack");
+      }
+    };
+  }
+
+  public static Matcher<RetraceMethodResult> isTopOfStackTrace(
+      StackTrace stackTrace, List<Integer> minifiedPositions) {
+    return new TypeSafeMatcher<RetraceMethodResult>() {
+      @Override
+      protected boolean matchesSafely(RetraceMethodResult item) {
+        List<Element> retraceElements = item.stream().collect(Collectors.toList());
+        if (retraceElements.size() > stackTrace.size()
+            || retraceElements.size() != minifiedPositions.size()) {
+          return false;
+        }
+        for (int i = 0; i < retraceElements.size(); i++) {
+          Element retraceElement = retraceElements.get(i);
+          StackTraceLine stackTraceLine = stackTrace.get(i);
+          MethodReference methodReference = retraceElement.getMethodReference();
+          if (!stackTraceLine.methodName.equals(methodReference.getMethodName())
+              || !stackTraceLine.className.equals(methodReference.getHolderClass().getTypeName())
+              || stackTraceLine.lineNumber
+                  != retraceElement.getOriginalLineNumber(minifiedPositions.get(i))) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      @Override
+      public void describeTo(Description description) {
+        description.appendText("is not matching the stack trace");
+      }
+    };
+  }
+
+  public static Matcher<StackTrace> containsLinePositions(LinePosition linePosition) {
+    return new TypeSafeMatcher<StackTrace>() {
+      @Override
+      protected boolean matchesSafely(StackTrace item) {
+        return containsLinePosition(item, 0, linePosition);
+      }
+
+      @Override
+      public void describeTo(Description description) {
+        description.appendText(linePosition + " cannot be found in stack trace");
+      }
+
+      private boolean containsLinePosition(
+          StackTrace stackTrace, int index, LinePosition linePosition) {
+        if (linePosition == null) {
+          return true;
+        }
+        Matcher<StackTraceLine> lineMatcher = Matchers.matchesLinePosition(linePosition);
+        for (int i = index; i < stackTrace.getStackTraceLines().size(); i++) {
+          StackTraceLine stackTraceLine = stackTrace.get(i);
+          if (lineMatcher.matches(stackTraceLine)) {
+            return containsLinePosition(stackTrace, index + 1, linePosition.caller);
+          }
+        }
+        return false;
+      }
+    };
+  }
+
+  public static Matcher<StackTraceLine> matchesLinePosition(LinePosition linePosition) {
+    return new TypeSafeMatcher<StackTraceLine>() {
+
+      @Override
+      protected boolean matchesSafely(StackTraceLine item) {
+        return containsLinePosition(item, linePosition);
+      }
+
+      @Override
+      public void describeTo(Description description) {
+        description.appendText(linePosition + " cannot be found in stack trace");
+      }
+
+      private boolean containsLinePosition(
+          StackTraceLine stackTraceLine, LinePosition currentPosition) {
+        return stackTraceLine.className.equals(currentPosition.getClassName())
+            && stackTraceLine.methodName.equals(currentPosition.getMethodName())
+            && stackTraceLine.lineNumber == currentPosition.originalPosition
+            && stackTraceLine.fileName.equals(currentPosition.filename);
+      }
+    };
+  }
+
+  public static class LinePosition {
+    private final MethodReference methodReference;
+    private final int minifiedPosition;
+    private final int originalPosition;
+    private final String filename;
+
+    private LinePosition caller;
+
+    private LinePosition(
+        MethodReference methodReference,
+        int minifiedPosition,
+        int originalPosition,
+        String filename) {
+      this.methodReference = methodReference;
+      this.minifiedPosition = minifiedPosition;
+      this.originalPosition = originalPosition;
+      this.filename = filename;
+    }
+
+    public static LinePosition create(
+        MethodReference methodReference,
+        int minifiedPosition,
+        int originalPosition,
+        String filename) {
+      return new LinePosition(methodReference, minifiedPosition, originalPosition, filename);
+    }
+
+    public static LinePosition create(
+        FoundMethodSubject methodSubject,
+        int minifiedPosition,
+        int originalPosition,
+        String filename) {
+      return create(
+          methodSubject.asMethodReference(), minifiedPosition, originalPosition, filename);
+    }
+
+    public static LinePosition stack(LinePosition... stack) {
+      setCaller(1, stack);
+      return stack[0];
+    }
+
+    private static void setCaller(int index, LinePosition... stack) {
+      assert index > 0;
+      if (index >= stack.length) {
+        return;
+      }
+      stack[index - 1].caller = stack[index];
+      setCaller(index + 1, stack);
+    }
+
+    String getMethodName() {
+      return methodReference.getMethodName();
+    }
+
+    String getClassName() {
+      return methodReference.getHolderClass().getTypeName();
+    }
+
+    @Override
+    public String toString() {
+      return getClassName() + "." + getMethodName() + "(" + filename + ":" + originalPosition + ")";
+    }
   }
 }

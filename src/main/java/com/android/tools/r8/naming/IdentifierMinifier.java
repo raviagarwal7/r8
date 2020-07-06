@@ -3,7 +3,6 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.naming;
 
-import static com.android.tools.r8.ir.optimize.ReflectionOptimizer.computeClassName;
 import static com.android.tools.r8.utils.DescriptorUtils.descriptorToJavaType;
 
 import com.android.tools.r8.cf.code.CfConstString;
@@ -16,8 +15,6 @@ import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.Code;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
-import com.android.tools.r8.graph.DexProgramClass;
-import com.android.tools.r8.graph.DexReference;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexValue;
@@ -25,8 +22,11 @@ import com.android.tools.r8.graph.DexValue.DexItemBasedValueString;
 import com.android.tools.r8.graph.DexValue.DexValueString;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.shaking.ProguardClassFilter;
+import com.android.tools.r8.utils.ThreadUtils;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 
 /**
  * Replaces all instances of DexItemBasedConstString by ConstString, and all instances of
@@ -44,29 +44,33 @@ class IdentifierMinifier {
     this.lens = lens;
   }
 
-  void run() {
+  void run(ExecutorService executorService) throws ExecutionException {
     if (!adaptClassStrings.isEmpty()) {
-      adaptClassStrings();
+      adaptClassStrings(executorService);
     }
-    replaceDexItemBasedConstString();
+    replaceDexItemBasedConstString(executorService);
   }
 
-  private void adaptClassStrings() {
-    for (DexProgramClass clazz : appView.appInfo().classes()) {
-      if (adaptClassStrings.matches(clazz.type)) {
-        for (DexEncodedField field : clazz.staticFields()) {
-          adaptClassStringsInStaticField(field);
-        }
-        clazz.forEachMethod(this::adaptClassStringsInMethod);
-      }
-    }
+  private void adaptClassStrings(ExecutorService executorService) throws ExecutionException {
+    ThreadUtils.processItems(
+        appView.appInfo().classes(),
+        clazz -> {
+          if (adaptClassStrings.matches(clazz.type)) {
+            for (DexEncodedField field : clazz.staticFields()) {
+              adaptClassStringsInStaticField(field);
+            }
+            clazz.forEachMethod(this::adaptClassStringsInMethod);
+          }
+        },
+        executorService
+    );
   }
 
   private void adaptClassStringsInStaticField(DexEncodedField encodedField) {
     assert encodedField.accessFlags.isStatic();
     DexValue staticValue = encodedField.getStaticValue();
-    if (staticValue instanceof DexValueString) {
-      DexString original = ((DexValueString) staticValue).getValue();
+    if (staticValue.isDexValueString()) {
+      DexString original = staticValue.asDexValueString().getValue();
       encodedField.setStaticValue(new DexValueString(getRenamedStringLiteral(original)));
     }
   }
@@ -116,60 +120,45 @@ class IdentifierMinifier {
     return originalLiteral;
   }
 
-  private void replaceDexItemBasedConstString() {
-    for (DexProgramClass clazz : appView.appInfo().classes()) {
-      // Some const strings could be moved to field's static value (from <clinit>).
-      for (DexEncodedField field : clazz.staticFields()) {
-        replaceDexItemBasedConstStringInStaticField(field);
-      }
-      clazz.forEachMethod(this::replaceDexItemBasedConstStringInMethod);
-    }
+  private void replaceDexItemBasedConstString(ExecutorService executorService)
+      throws ExecutionException {
+    ThreadUtils.processItems(
+        appView.appInfo().classes(),
+        clazz -> {
+          // Some const strings could be moved to field's static value (from <clinit>).
+          for (DexEncodedField field : clazz.staticFields()) {
+            replaceDexItemBasedConstStringInStaticField(field);
+          }
+          clazz
+              .methods(DexEncodedMethod::hasCode)
+              .forEach(this::replaceDexItemBasedConstStringInMethod);
+        },
+        executorService
+    );
   }
 
   private void replaceDexItemBasedConstStringInStaticField(DexEncodedField encodedField) {
     assert encodedField.accessFlags.isStatic();
     DexValue staticValue = encodedField.getStaticValue();
     if (staticValue instanceof DexItemBasedValueString) {
-      DexItemBasedValueString dexItemBasedValueString = (DexItemBasedValueString) staticValue;
-      DexReference original = dexItemBasedValueString.getValue();
+      DexItemBasedValueString cnst = (DexItemBasedValueString) staticValue;
       DexString replacement =
-          dexItemBasedValueString.getClassNameComputationInfo().needsToComputeClassName()
-              ? computeClassName(
-                  lens.lookupDescriptor(original.asDexType()),
-                  appView.definitionFor(original.asDexType()),
-                  dexItemBasedValueString.getClassNameComputationInfo(),
-                  appView.dexItemFactory())
-              : lens.lookupName(original, appView.dexItemFactory());
+          cnst.getNameComputationInfo().computeNameFor(cnst.getValue(), appView, lens);
       encodedField.setStaticValue(new DexValueString(replacement));
     }
   }
 
   private void replaceDexItemBasedConstStringInMethod(DexEncodedMethod encodedMethod) {
-    if (!encodedMethod.getOptimizationInfo().useIdentifierNameString()) {
-      return;
-    }
-    // Abstract methods do not have code_item.
-    if (encodedMethod.shouldNotHaveCode()) {
-      return;
-    }
     Code code = encodedMethod.getCode();
-    if (code == null) {
-      return;
-    }
+    assert code != null;
     if (code.isDexCode()) {
       Instruction[] instructions = code.asDexCode().instructions;
       for (int i = 0; i < instructions.length; ++i) {
         Instruction instruction = instructions[i];
-        if (instruction instanceof DexItemBasedConstString) {
+        if (instruction.isDexItemBasedConstString()) {
           DexItemBasedConstString cnst = instruction.asDexItemBasedConstString();
           DexString replacement =
-              cnst.getClassNameComputationInfo().needsToComputeClassName()
-                  ? computeClassName(
-                      lens.lookupDescriptor(cnst.getItem().asDexType()),
-                      appView.definitionFor(cnst.getItem().asDexType()),
-                      cnst.getClassNameComputationInfo(),
-                      appView.dexItemFactory())
-                  : lens.lookupName(cnst.getItem(), appView.dexItemFactory());
+              cnst.getNameComputationInfo().computeNameFor(cnst.getItem(), appView, lens);
           ConstString constString = new ConstString(cnst.AA, replacement);
           constString.setOffset(instruction.getOffset());
           instructions[i] = constString;
@@ -183,13 +172,7 @@ class IdentifierMinifier {
         if (instruction.isDexItemBasedConstString()) {
           CfDexItemBasedConstString cnst = instruction.asDexItemBasedConstString();
           DexString replacement =
-              cnst.getClassNameComputationInfo().needsToComputeClassName()
-                  ? computeClassName(
-                      lens.lookupDescriptor(cnst.getItem().asDexType()),
-                      appView.definitionFor(cnst.getItem().asDexType()),
-                      cnst.getClassNameComputationInfo(),
-                      appView.dexItemFactory())
-                  : lens.lookupName(cnst.getItem(), appView.dexItemFactory());
+              cnst.getNameComputationInfo().computeNameFor(cnst.getItem(), appView, lens);
           instructions.set(i, new CfConstString(replacement));
         }
       }

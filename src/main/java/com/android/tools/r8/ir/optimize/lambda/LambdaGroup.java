@@ -5,8 +5,7 @@
 package com.android.tools.r8.ir.optimize.lambda;
 
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedField;
@@ -14,6 +13,7 @@ import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback;
 import com.android.tools.r8.ir.optimize.lambda.CodeProcessor.Strategy;
 import com.android.tools.r8.kotlin.Kotlin;
 import com.android.tools.r8.utils.ThrowingConsumer;
@@ -90,7 +90,7 @@ public abstract class LambdaGroup {
     return false;
   }
 
-  final boolean shouldAddToMainDex(AppView<? extends AppInfo> appView) {
+  final boolean shouldAddToMainDex(AppView<?> appView) {
     // We add the group class to main index if any of the
     // lambda classes it replaces is added to main index.
     for (DexType type : lambdas.keySet()) {
@@ -156,23 +156,33 @@ public abstract class LambdaGroup {
   public abstract Strategy getCodeStrategy();
 
   public abstract ThrowingConsumer<DexClass, LambdaStructureError> lambdaClassValidator(
-      Kotlin kotlin, AppInfoWithSubtyping appInfo);
+      Kotlin kotlin, AppInfoWithClassHierarchy appInfo);
 
   // Package for a lambda group class to be created in.
   protected abstract String getTypePackage();
 
   protected abstract String getGroupSuffix();
 
-  final DexProgramClass synthesizeClass(DexItemFactory factory) {
+  final DexProgramClass synthesizeClass(
+      AppView<? extends AppInfoWithClassHierarchy> appView, OptimizationFeedback feedback) {
     assert classType == null;
     assert verifyLambdaIds(true);
     List<LambdaInfo> lambdas = Lists.newArrayList(this.lambdas.values());
-    classType = factory.createType(
-        "L" + getTypePackage() + "-$$LambdaGroup$" + getGroupSuffix() + createHash(lambdas) + ";");
-    return getBuilder(factory).synthesizeClass();
+    classType =
+        appView
+            .dexItemFactory()
+            .createType(
+                "L"
+                    + getTypePackage()
+                    + "-$$LambdaGroup$"
+                    + getGroupSuffix()
+                    + createHash(lambdas)
+                    + ";");
+    return getBuilder(appView.dexItemFactory()).synthesizeClass(appView, feedback);
   }
 
-  protected abstract LambdaGroupClassBuilder getBuilder(DexItemFactory factory);
+  protected abstract LambdaGroupClassBuilder<? extends LambdaGroup> getBuilder(
+      DexItemFactory factory);
 
   private String createHash(List<LambdaInfo> lambdas) {
     try {

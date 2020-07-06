@@ -9,7 +9,7 @@ package com.android.tools.r8.graph;
 import com.android.tools.r8.DataResourceProvider;
 import com.android.tools.r8.graph.LazyLoadedDexApplication.AllClasses;
 import com.android.tools.r8.naming.ClassNameMapper;
-import com.android.tools.r8.utils.ProgramClassCollection;
+import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.Timing;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -19,7 +19,11 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 
-public class DirectMappedDexApplication extends DexApplication {
+public class DirectMappedDexApplication extends DexApplication implements DexDefinitionSupplier {
+
+  // Mapping from code objects to their encoded-method owner. Used for asserting unique ownership
+  // and debugging purposes.
+  private final Map<Code, DexEncodedMethod> codeOwners = new IdentityHashMap<>();
 
   // Unmodifiable mapping of all types to their definitions.
   private final Map<DexType, DexClass> allClasses;
@@ -36,16 +40,14 @@ public class DirectMappedDexApplication extends DexApplication {
       ImmutableList<DexLibraryClass> libraryClasses,
       ImmutableList<DataResourceProvider> dataResourceProviders,
       ImmutableSet<DexType> mainDexList,
-      String deadCode,
-      DexItemFactory dexItemFactory,
+      InternalOptions options,
       DexString highestSortingString,
       Timing timing) {
     super(
         proguardMap,
         dataResourceProviders,
         mainDexList,
-        deadCode,
-        dexItemFactory,
+        options,
         highestSortingString,
         timing);
     this.allClasses = Collections.unmodifiableMap(allClasses);
@@ -67,10 +69,24 @@ public class DirectMappedDexApplication extends DexApplication {
     return libraryClasses;
   }
 
+  public Collection<DexClasspathClass> classpathClasses() {
+    return classpathClasses;
+  }
+
   @Override
   public DexClass definitionFor(DexType type) {
     assert type.isClassType() : "Cannot lookup definition for type: " + type;
     return allClasses.get(type);
+  }
+
+  @Override
+  public DexProgramClass definitionForProgramType(DexType type) {
+    return programDefinitionFor(type);
+  }
+
+  @Override
+  public DexItemFactory dexItemFactory() {
+    return dexItemFactory;
   }
 
   @Override
@@ -90,6 +106,11 @@ public class DirectMappedDexApplication extends DexApplication {
   }
 
   @Override
+  public boolean isDirect() {
+    return true;
+  }
+
+  @Override
   public DirectMappedDexApplication asDirect() {
     return this;
   }
@@ -99,11 +120,22 @@ public class DirectMappedDexApplication extends DexApplication {
     return "DexApplication (direct)";
   }
 
-  public DirectMappedDexApplication rewrittenWithLense(GraphLense graphLense) {
+  public DirectMappedDexApplication rewrittenWithLens(GraphLense lens) {
     // As a side effect, this will rebuild the program classes and library classes maps.
-    DirectMappedDexApplication rewrittenApplication = this.builder().build().asDirect();
-    assert rewrittenApplication.mappingIsValid(graphLense, allClasses.keySet());
+    DirectMappedDexApplication rewrittenApplication = builder().build().asDirect();
+    assert rewrittenApplication.mappingIsValid(lens, allClasses.keySet());
+    assert rewrittenApplication.verifyCodeObjectsOwners();
     return rewrittenApplication;
+  }
+
+  public boolean verifyNothingToRewrite(AppView<?> appView, GraphLense lens) {
+    assert allClasses.keySet().stream()
+        .allMatch(
+            type ->
+                lens.lookupType(type) == type
+                    || appView.verticallyMergedClasses().hasBeenMergedIntoSubtype(type));
+    assert verifyCodeObjectsOwners();
+    return true;
   }
 
   private boolean mappingIsValid(GraphLense graphLense, Iterable<DexType> types) {
@@ -122,18 +154,48 @@ public class DirectMappedDexApplication extends DexApplication {
     return true;
   }
 
+  // Debugging helper to compute the code-object owner map.
+  public Map<Code, DexEncodedMethod> computeCodeObjectOwnersForDebugging() {
+    // Call the verification method without assert to ensure owners are computed.
+    verifyCodeObjectsOwners();
+    return codeOwners;
+  }
+
+  // Debugging helper to find the method a code object belongs to.
+  public DexEncodedMethod getCodeOwnerForDebugging(Code code) {
+    return computeCodeObjectOwnersForDebugging().get(code);
+  }
+
+  public boolean verifyCodeObjectsOwners() {
+    codeOwners.clear();
+    for (DexProgramClass clazz : programClasses) {
+      for (DexEncodedMethod method :
+          clazz.methods(DexEncodedMethod::isNonAbstractNonNativeMethod)) {
+        Code code = method.getCode();
+        assert code != null;
+        // If code is (lazy) CF code, then use the CF code object rather than the lazy wrapper.
+        if (code.isCfCode()) {
+          code = code.asCfCode();
+        }
+        DexEncodedMethod otherMethod = codeOwners.put(code, method);
+        assert otherMethod == null;
+      }
+    }
+    return true;
+  }
+
   public static class Builder extends DexApplication.Builder<Builder> {
 
-    private final ImmutableList<DexLibraryClass> libraryClasses;
-    private final ImmutableList<DexClasspathClass> classpathClasses;
+    private ImmutableList<DexLibraryClass> libraryClasses;
+    private ImmutableList<DexClasspathClass> classpathClasses;
 
     Builder(LazyLoadedDexApplication application) {
       super(application);
       // As a side-effect, this will force-load all classes.
       AllClasses allClasses = application.loadAllClasses();
-      assert application.programClasses().equals(allClasses.getProgramClasses());
       libraryClasses = allClasses.getLibraryClasses();
       classpathClasses = allClasses.getClasspathClasses();
+      replaceProgramClasses(allClasses.getProgramClasses());
     }
 
     private Builder(DirectMappedDexApplication application) {
@@ -147,18 +209,32 @@ public class DirectMappedDexApplication extends DexApplication {
       return this;
     }
 
+    public Builder replaceLibraryClasses(Collection<DexLibraryClass> libraryClasses) {
+      this.libraryClasses = ImmutableList.copyOf(libraryClasses);
+      return self();
+    }
+
+    public Builder replaceClasspathClasses(Collection<DexClasspathClass> classpathClasses) {
+      this.classpathClasses = ImmutableList.copyOf(classpathClasses);
+      return self();
+    }
+
+    public Builder addClasspathClasses(Collection<DexClasspathClass> classes) {
+      classpathClasses =
+          ImmutableList.<DexClasspathClass>builder()
+              .addAll(classpathClasses)
+              .addAll(classes)
+              .build();
+      return self();
+    }
+
     @Override
-    public DexApplication build() {
+    public DirectMappedDexApplication build() {
       // Rebuild the map. This will fail if keys are not unique.
-      // TODO(zerny): It seems weird that we have conflict resolution here.
-      ImmutableList<DexProgramClass> newProgramClasses =
-          ImmutableList.copyOf(
-              ProgramClassCollection.create(
-                      programClasses, ProgramClassCollection::resolveClassConflictImpl)
-                  .getAllClasses());
       // TODO(zerny): Consider not rebuilding the map if no program classes are added.
-      Map<DexType, DexClass> allClasses = new IdentityHashMap<>(
-          newProgramClasses.size() + classpathClasses.size() + libraryClasses.size());
+      Map<DexType, DexClass> allClasses =
+          new IdentityHashMap<>(
+              programClasses.size() + classpathClasses.size() + libraryClasses.size());
       // Note: writing classes in reverse priority order, so a duplicate will be correctly ordered.
       // There should never be duplicates and that is asserted in the addAll subroutine.
       addAll(allClasses, libraryClasses);
@@ -167,13 +243,12 @@ public class DirectMappedDexApplication extends DexApplication {
       return new DirectMappedDexApplication(
           proguardMap,
           allClasses,
-          newProgramClasses,
+          ImmutableList.copyOf(programClasses),
           classpathClasses,
           libraryClasses,
           ImmutableList.copyOf(dataResourceProviders),
           ImmutableSet.copyOf(mainDexList),
-          deadCode,
-          dexItemFactory,
+          options,
           highestSortingString,
           timing);
     }
@@ -183,7 +258,7 @@ public class DirectMappedDexApplication extends DexApplication {
       Map<DexType, DexClass> allClasses, Iterable<T> toAdd) {
     for (DexClass clazz : toAdd) {
       DexClass old = allClasses.put(clazz.type, clazz);
-      assert old == null;
+      assert old == null : "Class " + old.type.toString() + " was already present.";
     }
   }
 }

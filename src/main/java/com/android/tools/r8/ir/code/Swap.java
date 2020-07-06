@@ -8,7 +8,8 @@ import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.code.CfStackInstruction;
 import com.android.tools.r8.cf.code.CfStackInstruction.Opcode;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -25,7 +26,12 @@ public class Swap extends Instruction {
     super(dest, ImmutableList.of(src1, src2));
     assert src1.isValueOnStack() && !(src1 instanceof StackValues);
     assert src2.isValueOnStack() && !(src2 instanceof StackValues);
-    assert !src1.getTypeLattice().isWide() && !src2.getTypeLattice().isWide();
+    assert !src1.getType().isWidePrimitive() && !src2.getType().isWidePrimitive();
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.SWAP;
   }
 
   @Override
@@ -83,7 +89,7 @@ public class Swap extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forSwap();
   }
 
@@ -105,5 +111,10 @@ public class Swap extends Instruction {
   @Override
   public Swap asSwap() {
     return this;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

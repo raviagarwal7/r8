@@ -22,22 +22,22 @@ public abstract class GetNameTestBase extends TestBase {
   static final String CLASS_DESCRIPTOR = "Ljava/lang/Class;";
   static final String STRING_DESCRIPTOR = "Ljava/lang/String;";
 
-  final TestParameters parameters;
-  final boolean enableMinification;
+  protected final TestParameters parameters;
+  protected final boolean enableMinification;
   Path mapping;
 
   @Parameterized.Parameters(name = "{0} minification: {1}")
   public static Collection<Object[]> data() {
     return buildParameters(
-        getTestParameters().withAllRuntimes().build(), BooleanUtils.values());
+        getTestParameters().withAllRuntimesAndApiLevels().build(), BooleanUtils.values());
   }
 
-  GetNameTestBase(TestParameters parameters, boolean enableMinification) {
+  public GetNameTestBase(TestParameters parameters, boolean enableMinification) {
     this.parameters = parameters;
     this.enableMinification = enableMinification;
   }
 
-  void configure(InternalOptions options) {
+  protected void configure(InternalOptions options) {
     options.testing.forceNameReflectionOptimization = true;
   }
 
@@ -54,7 +54,7 @@ public abstract class GetNameTestBase extends TestBase {
         && method.name.toString().endsWith("Name");
   }
 
-  static long countGetName(MethodSubject method) {
+  protected static long countGetName(MethodSubject method) {
     return Streams.stream(method.iterateInstructions(instructionSubject -> {
       if (instructionSubject.isInvoke()) {
         return isNameReflection(instructionSubject.getMethod());

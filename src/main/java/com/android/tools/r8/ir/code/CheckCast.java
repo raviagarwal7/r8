@@ -4,20 +4,25 @@
 
 package com.android.tools.r8.ir.code;
 
+import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
+
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.cf.code.CfCheckCast;
 import com.android.tools.r8.code.MoveObject;
 import com.android.tools.r8.code.MoveObjectFrom16;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AccessControl;
 import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 
 public class CheckCast extends Instruction {
 
@@ -30,6 +35,11 @@ public class CheckCast extends Instruction {
   public CheckCast(Value dest, Value value, DexType type) {
     super(dest, value);
     this.type = type;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.CHECK_CAST;
   }
 
   @Override
@@ -85,6 +95,44 @@ public class CheckCast extends Instruction {
   }
 
   @Override
+  public boolean instructionMayHaveSideEffects(
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    return instructionInstanceCanThrow(appView, context);
+  }
+
+  @Override
+  public boolean instructionInstanceCanThrow(AppView<?> appView, ProgramMethod context) {
+    if (appView.options().debug || !appView.appInfo().hasLiveness()) {
+      return true;
+    }
+    if (type.isPrimitiveType()) {
+      return true;
+    }
+    DexType baseType = type.toBaseType(appView.dexItemFactory());
+    if (baseType.isClassType()) {
+      DexClass definition = appView.definitionFor(baseType);
+      // Check that the class and its super types are present.
+      if (definition == null || !definition.isResolvable(appView)) {
+        return true;
+      }
+      // Check that the class is accessible.
+      if (AccessControl.isClassAccessible(definition, context, appView).isPossiblyFalse()) {
+        return true;
+      }
+    }
+    AppView<? extends AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
+    TypeElement castType = TypeElement.fromDexType(type, definitelyNotNull(), appView);
+    if (object()
+        .getDynamicUpperBoundType(appViewWithLiveness)
+        .lessThanOrEqualUpToNullability(castType, appView)) {
+      // This is a check-cast that has to be there for bytecode correctness, but R8 has proven
+      // that this cast will never throw.
+      return false;
+    }
+    return true;
+  }
+
+  @Override
   public boolean instructionTypeCanThrow() {
     return true;
   }
@@ -106,26 +154,25 @@ public class CheckCast extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forCheckCast(type, invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forCheckCast(type, context.getHolder());
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return object().getTypeLattice().checkCast(appView, type);
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.fromDexType(type, object().getType().nullability(), appView);
   }
 
   @Override
-  public boolean verifyTypes(AppView<? extends AppInfo> appView) {
+  public boolean verifyTypes(AppView<?> appView) {
     assert super.verifyTypes(appView);
 
-    TypeLatticeElement inType = object().getTypeLattice();
+    TypeElement inType = object().getType();
 
     assert inType.isPreciseType();
 
-    TypeLatticeElement outType = outValue().getTypeLattice();
-    TypeLatticeElement castType =
-        TypeLatticeElement.fromDexType(getType(), inType.nullability(), appView);
+    TypeElement outType = getOutType();
+    TypeElement castType = TypeElement.fromDexType(getType(), inType.nullability(), appView);
 
     if (inType.lessThanOrEqual(castType, appView)) {
       // Cast can be removed. Check that it is sound to replace all users of the out-value by the
@@ -168,13 +215,17 @@ public class CheckCast extends Instruction {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return type;
   }
 
   @Override
   public void buildCf(CfBuilder builder) {
     builder.add(new CfCheckCast(type));
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

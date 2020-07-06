@@ -11,15 +11,20 @@ import static org.junit.Assert.fail;
 
 import com.android.tools.r8.DeviceRunner.DeviceRunnerConfigurationException;
 import com.android.tools.r8.TestBase.Backend;
-import com.android.tools.r8.TestRuntime.CfVm;
+import com.android.tools.r8.TestRuntime.CfRuntime;
 import com.android.tools.r8.ToolHelper.DexVm.Kind;
 import com.android.tools.r8.dex.ApplicationReader;
+import com.android.tools.r8.errors.Unimplemented;
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AssemblyWriter;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.position.Position;
 import com.android.tools.r8.shaking.FilteredClassPath;
 import com.android.tools.r8.shaking.ProguardConfiguration;
 import com.android.tools.r8.shaking.ProguardConfigurationParser;
@@ -63,6 +68,7 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
@@ -71,13 +77,21 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import java.util.zip.CRC32;
+import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.rules.TemporaryFolder;
 
 public class ToolHelper {
 
+  static final Path[] EMPTY_PATH = {};
+
+  public static final String SOURCE_DIR = "src/main/java/";
   public static final String BUILD_DIR = "build/";
+  public static final String GENERATED_TEST_BUILD_DIR = BUILD_DIR + "generated/test/";
   public static final String LIBS_DIR = BUILD_DIR + "libs/";
+  public static final String THIRD_PARTY_DIR = "third_party/";
   public static final String TOOLS_DIR = "tools/";
   public static final String TESTS_DIR = "src/test/";
   public static final String EXAMPLES_DIR = TESTS_DIR + "examples/";
@@ -86,6 +100,7 @@ public class ToolHelper {
   public static final String EXAMPLES_ANDROID_P_DIR = TESTS_DIR + "examplesAndroidP/";
   public static final String EXAMPLES_KOTLIN_DIR = TESTS_DIR + "examplesKotlin/";
   public static final String TESTS_BUILD_DIR = BUILD_DIR + "test/";
+  public static final String JDK_TESTS_BUILD_DIR = TESTS_BUILD_DIR + "jdk11Tests/";
   public static final String EXAMPLES_BUILD_DIR = TESTS_BUILD_DIR + "examples/";
   public static final String EXAMPLES_CF_DIR = EXAMPLES_BUILD_DIR + "classes/";
   public static final String EXAMPLES_KOTLIN_BUILD_DIR = TESTS_BUILD_DIR + "examplesKotlin/";
@@ -95,9 +110,17 @@ public class ToolHelper {
   public static final String EXAMPLES_ANDROID_O_BUILD_DIR = TESTS_BUILD_DIR + "examplesAndroidO/";
   public static final String EXAMPLES_ANDROID_P_BUILD_DIR = TESTS_BUILD_DIR + "examplesAndroidP/";
   public static final String EXAMPLES_JAVA9_BUILD_DIR = TESTS_BUILD_DIR + "examplesJava9/";
-  public static final String EXAMPLES_JAVA11_BUILD_DIR = TESTS_BUILD_DIR + "examplesJava11/";
+  public static final String EXAMPLES_JAVA10_BUILD_DIR = TESTS_BUILD_DIR + "examplesJava10/";
+  public static final String EXAMPLES_JAVA11_JAR_DIR = TESTS_BUILD_DIR + "examplesJava11/";
+  public static final String EXAMPLES_JAVA11_BUILD_DIR = BUILD_DIR + "classes/java/examplesJava11/";
+  public static final String EXAMPLES_PROTO_BUILD_DIR = TESTS_BUILD_DIR + "examplesProto/";
+  public static final String GENERATED_PROTO_BUILD_DIR = GENERATED_TEST_BUILD_DIR + "proto/";
   public static final String SMALI_DIR = TESTS_DIR + "smali/";
   public static final String SMALI_BUILD_DIR = TESTS_BUILD_DIR + "smali/";
+  public static final String JAVA_CLASSES_DIR = BUILD_DIR + "classes/java/";
+  public static final String JDK_11_TESTS_CLASSES_DIR = JAVA_CLASSES_DIR + "jdk11Tests/";
+
+  public static final Path API_SAMPLE_JAR = Paths.get("tests", "r8_api_usage_sample.jar");
 
   public static final String LINE_SEPARATOR = StringUtils.LINE_SEPARATOR;
   public static final String CLASSPATH_SEPARATOR = File.pathSeparator;
@@ -106,28 +129,94 @@ public class ToolHelper {
   public static final String DEFAULT_PROGUARD_MAP_FILE = "proguard.map";
 
   public static final String JAVA_8_RUNTIME = "third_party/openjdk/openjdk-rt-1.8/rt.jar";
-  public static final String KT_STDLIB = "third_party/kotlin/kotlinc/lib/kotlin-stdlib.jar";
-  public static final String KT_REFLECT = "third_party/kotlin/kotlinc/lib/kotlin-reflect.jar";
+  public static final String DESUGAR_JDK_LIBS = "third_party/openjdk/desugar_jdk_libs/libjava.jar";
+  public static final String CORE_LAMBDA_STUBS =
+      "third_party/core-lambda-stubs/core-lambda-stubs.jar";
+  public static final String JSR223_RI_JAR = "third_party/jsr223-api-1.0/jsr223-api-1.0.jar";
+  public static final String RHINO_ANDROID_JAR =
+      "third_party/rhino-android-1.1.1/rhino-android-1.1.1.jar";
+  public static final String RHINO_JAR = "third_party/rhino-1.7.10/rhino-1.7.10.jar";
+  static final String KT_PRELOADER =
+      "third_party/kotlin/kotlin-compiler-1.3.72/kotlinc/lib/kotlin-preloader.jar";
+  public static final String KT_COMPILER =
+      "third_party/kotlin/kotlin-compiler-1.3.72/kotlinc/lib/kotlin-compiler.jar";
+  public static final String K2JVMCompiler = "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler";
+  public static final String KT_STDLIB =
+      "third_party/kotlin/kotlin-compiler-1.3.72/kotlinc/lib/kotlin-stdlib.jar";
+  public static final String KT_REFLECT =
+      "third_party/kotlin/kotlin-compiler-1.3.72/kotlinc/lib/kotlin-reflect.jar";
+  public static final String KT_SCRIPT_RT =
+      "third_party/kotlin/kotlin-compiler-1.3.72/kotlinc/lib/kotlin-script-runtime.jar";
   private static final String ANDROID_JAR_PATTERN = "third_party/android_jar/lib-v%d/android.jar";
   private static final AndroidApiLevel DEFAULT_MIN_SDK = AndroidApiLevel.I;
+
+  public static final String JDK_11_TESTS_DIR = "third_party/openjdk/jdk-11-test/";
 
   private static final String PROGUARD5_2_1 = "third_party/proguard/proguard5.2.1/bin/proguard";
   private static final String PROGUARD6_0_1 = "third_party/proguard/proguard6.0.1/bin/proguard";
   private static final String PROGUARD = PROGUARD5_2_1;
   public static final String JACOCO_AGENT = "third_party/jacoco/org.jacoco.agent-0.8.2-runtime.jar";
-  public static final String PROGUARD_SETTINGS_FOR_INTERNAL_APPS = "third_party/proguardsettings";
+  public static final String PROGUARD_SETTINGS_FOR_INTERNAL_APPS = "third_party/proguardsettings/";
 
   private static final String RETRACE6_0_1 = "third_party/proguard/proguard6.0.1/bin/retrace";
   private static final String RETRACE = RETRACE6_0_1;
+  public static final Path RETRACE_MAPS_DIR = Paths.get(THIRD_PARTY_DIR, "r8mappings");
 
   public static final long BOT_MAX_HEAP_SIZE = 7908360192L;
 
+  public static final Path D8_JAR = Paths.get(LIBS_DIR, "d8.jar");
   public static final Path R8_JAR = Paths.get(LIBS_DIR, "r8.jar");
+  public static final Path R8_WITH_DEPS_JAR = Paths.get(LIBS_DIR, "r8_with_deps.jar");
   public static final Path R8_WITH_RELOCATED_DEPS_JAR =
       Paths.get(LIBS_DIR, "r8_with_relocated_deps.jar");
+  public static final Path R8_WITH_DEPS_11_JAR = Paths.get(LIBS_DIR, "r8_with_deps_11.jar");
+  public static final Path R8_WITH_RELOCATED_DEPS_11_JAR =
+      Paths.get(LIBS_DIR, "r8_with_relocated_deps_11.jar");
   public static final Path R8LIB_JAR = Paths.get(LIBS_DIR, "r8lib.jar");
+  public static final Path R8LIB_MAP = Paths.get(LIBS_DIR, "r8lib.jar.map");
   public static final Path R8LIB_EXCLUDE_DEPS_JAR = Paths.get(LIBS_DIR, "r8lib-exclude-deps.jar");
-  public static final Path DEPS_NOT_RELOCATED = Paths.get(LIBS_DIR, "deps-not-relocated.jar");
+  public static final Path R8LIB_EXCLUDE_DEPS_MAP =
+      Paths.get(LIBS_DIR, "r8lib-exclude-deps.jar.map");
+  public static final Path DEPS = Paths.get(LIBS_DIR, "deps_all.jar");
+
+  public static final Path DESUGAR_LIB_CONVERSIONS =
+      Paths.get(LIBS_DIR, "library_desugar_conversions.zip");
+  public static final Path DESUGAR_LIB_JSON_FOR_TESTING =
+      Paths.get("src/library_desugar/desugar_jdk_libs.json");
+
+  public static boolean isLocalDevelopment() {
+    return System.getProperty("local_development", "0").equals("1");
+  }
+
+  public static boolean shouldRunSlowTests() {
+    return System.getProperty("slow_tests", "0").equals("1");
+  }
+
+  public static boolean verifyValidOutputMode(Backend backend, OutputMode outputMode) {
+    return (backend == Backend.CF && outputMode == OutputMode.ClassFile) || backend == Backend.DEX;
+  }
+
+  public static StringConsumer consumeString(Consumer<String> consumer) {
+    return new StringConsumer() {
+
+      private StringBuilder builder;
+
+      @Override
+      public void accept(String string, DiagnosticsHandler handler) {
+        if (builder == null) {
+          builder = new StringBuilder();
+        }
+        builder.append(string);
+      }
+
+      @Override
+      public void finished(DiagnosticsHandler handler) {
+        if (builder != null) {
+          consumer.accept(builder.toString());
+        }
+      }
+    };
+  }
 
   public enum DexVm {
     ART_4_0_4_TARGET(Version.V4_0_4, Kind.TARGET),
@@ -142,14 +231,15 @@ public class ToolHelper {
     ART_7_0_0_HOST(Version.V7_0_0, Kind.HOST),
     ART_8_1_0_TARGET(Version.V8_1_0, Kind.TARGET),
     ART_8_1_0_HOST(Version.V8_1_0, Kind.HOST),
+    ART_DEFAULT(Version.DEFAULT, Kind.HOST),
     ART_9_0_0_TARGET(Version.V9_0_0, Kind.TARGET),
     ART_9_0_0_HOST(Version.V9_0_0, Kind.HOST),
-    ART_DEFAULT(Version.DEFAULT, Kind.HOST);
+    ART_10_0_0_TARGET(Version.V10_0_0, Kind.TARGET),
+    ART_10_0_0_HOST(Version.V10_0_0, Kind.HOST);
 
     private static final ImmutableMap<String, DexVm> SHORT_NAME_MAP =
         Arrays.stream(DexVm.values()).collect(ImmutableMap.toImmutableMap(
             DexVm::toString, Function.identity()));
-
 
     public enum Version {
       V4_0_4("4.0.4"),
@@ -158,15 +248,20 @@ public class ToolHelper {
       V6_0_1("6.0.1"),
       V7_0_0("7.0.0"),
       V8_1_0("8.1.0"),
+      DEFAULT("default"),
       V9_0_0("9.0.0"),
-      DEFAULT("default");
+      V10_0_0("10.0.0");
 
       Version(String shortName) {
         this.shortName = shortName;
       }
 
+      public boolean isDalvik() {
+        return isOlderThanOrEqual(Version.V4_4_4);
+      }
+
       public boolean isLatest() {
-        return this == DEFAULT;
+        return this == V10_0_0;
       }
 
       public boolean isNewerThan(Version other) {
@@ -192,7 +287,7 @@ public class ToolHelper {
       }
 
       public static Version last() {
-        return DEFAULT;
+        return V10_0_0;
       }
 
       static {
@@ -263,6 +358,7 @@ public class ToolHelper {
     protected String mainClass;
     protected List<String> programArguments = new ArrayList<>();
     protected List<String> bootClassPaths = new ArrayList<>();
+    protected String executionDirectory;
 
     public CommandBuilder appendArtOption(String option) {
       options.add(option);
@@ -331,7 +427,11 @@ public class ToolHelper {
     }
 
     public ProcessBuilder asProcessBuilder() {
-      return new ProcessBuilder(command());
+      ProcessBuilder processBuilder = new ProcessBuilder(command());
+      if (executionDirectory != null) {
+        processBuilder.directory(new File(executionDirectory));
+      }
+      return processBuilder;
     }
 
     public String build() {
@@ -346,6 +446,7 @@ public class ToolHelper {
   public static class ArtCommandBuilder extends CommandBuilder {
 
     private DexVm version;
+    private boolean withArtFrameworks;
 
     public ArtCommandBuilder() {
       this.version = getDexVm();
@@ -365,6 +466,12 @@ public class ToolHelper {
 
     @Override
     protected String getExecutable() {
+      if (withArtFrameworks && version.isNewerThan(DexVm.ART_4_4_4_HOST)) {
+        // Run directly Art in its repository, which has been patched by gradle to match expected
+        // path for the frameworks.
+        executionDirectory = getArtDir(version);
+        return getRawArtBinary(version);
+      }
       return version != null ? getArtBinary(version) : getArtBinary();
     }
 
@@ -439,6 +546,7 @@ public class ToolHelper {
   private static final Map<DexVm, String> ART_DIRS =
       ImmutableMap.<DexVm, String>builder()
           .put(DexVm.ART_DEFAULT, "art")
+          .put(DexVm.ART_10_0_0_HOST, "art-10.0.0")
           .put(DexVm.ART_9_0_0_HOST, "art-9.0.0")
           .put(DexVm.ART_8_1_0_HOST, "art-8.1.0")
           .put(DexVm.ART_7_0_0_HOST, "art-7.0.0")
@@ -449,6 +557,7 @@ public class ToolHelper {
   private static final Map<DexVm, String> ART_BINARY_VERSIONS =
       ImmutableMap.<DexVm, String>builder()
           .put(DexVm.ART_DEFAULT, "bin/art")
+          .put(DexVm.ART_10_0_0_HOST, "bin/art")
           .put(DexVm.ART_9_0_0_HOST, "bin/art")
           .put(DexVm.ART_8_1_0_HOST, "bin/art")
           .put(DexVm.ART_7_0_0_HOST, "bin/art")
@@ -458,12 +567,13 @@ public class ToolHelper {
           .put(DexVm.ART_4_0_4_HOST, "bin/dalvik").build();
 
   private static final Map<DexVm, String> ART_BINARY_VERSIONS_X64 =
-      ImmutableMap.of(
-          DexVm.ART_DEFAULT, "bin/art",
-          DexVm.ART_9_0_0_HOST, "bin/art",
-          DexVm.ART_8_1_0_HOST, "bin/art",
-          DexVm.ART_7_0_0_HOST, "bin/art",
-          DexVm.ART_6_0_1_HOST, "bin/art");
+      ImmutableMap.<DexVm, String>builder()
+          .put(DexVm.ART_DEFAULT, "bin/art")
+          .put(DexVm.ART_10_0_0_HOST, "bin/art")
+          .put(DexVm.ART_9_0_0_HOST, "bin/art")
+          .put(DexVm.ART_8_1_0_HOST, "bin/art")
+          .put(DexVm.ART_7_0_0_HOST, "bin/art")
+          .put(DexVm.ART_6_0_1_HOST, "bin/art").build();
 
   private static final List<String> DALVIK_BOOT_LIBS =
       ImmutableList.of(
@@ -483,6 +593,7 @@ public class ToolHelper {
     ImmutableMap.Builder<DexVm, List<String>> builder = ImmutableMap.builder();
     builder
         .put(DexVm.ART_DEFAULT, ART_BOOT_LIBS)
+        .put(DexVm.ART_10_0_0_HOST, ART_BOOT_LIBS)
         .put(DexVm.ART_9_0_0_HOST, ART_BOOT_LIBS)
         .put(DexVm.ART_8_1_0_HOST, ART_BOOT_LIBS)
         .put(DexVm.ART_7_0_0_HOST, ART_BOOT_LIBS)
@@ -499,6 +610,7 @@ public class ToolHelper {
     ImmutableMap.Builder<DexVm, String> builder = ImmutableMap.builder();
     builder
         .put(DexVm.ART_DEFAULT, "angler")
+        .put(DexVm.ART_10_0_0_HOST, "coral")
         .put(DexVm.ART_9_0_0_HOST, "marlin")
         .put(DexVm.ART_8_1_0_HOST, "marlin")
         .put(DexVm.ART_7_0_0_HOST, "angler")
@@ -541,13 +653,19 @@ public class ToolHelper {
   }
 
   public static byte[] getClassAsBytes(Class clazz) throws IOException {
-    String s = clazz.getSimpleName() + ".class";
-    Class outer = clazz.getEnclosingClass();
-    while (outer != null) {
-      s = outer.getSimpleName() + '$' + s;
-      outer = outer.getEnclosingClass();
+    return Files.readAllBytes(getClassFileForTestClass(clazz));
+  }
+
+  public static long getClassByteCrc(Class clazz) {
+    byte[] bytes = null;
+    try {
+      bytes = getClassAsBytes(clazz);
+    } catch (IOException ioe) {
+      Assert.fail(ioe.toString());
     }
-    return ByteStreams.toByteArray(clazz.getResourceAsStream(s));
+    CRC32 crc = new CRC32();
+    crc.update(bytes, 0, bytes.length);
+    return crc.getValue();
   }
 
   public static String getArtDir(DexVm version) {
@@ -609,33 +727,82 @@ public class ToolHelper {
   }
 
   public static String getArtBinary(DexVm version) {
+    return getArtDir(version) + "/" + getRawArtBinary(version);
+  }
+
+  public static String getRawArtBinary(DexVm version) {
     String binary = ART_BINARY_VERSIONS.get(version);
     if (binary == null) {
       throw new IllegalStateException("Does not support running with dex vm: " + version);
     }
-    return getArtDir(version) + "/" + binary;
+    return binary;
   }
 
   public static Path getJava8RuntimeJar() {
     return Paths.get(JAVA_8_RUNTIME);
   }
 
+  public static Path getDesugarJDKLibs() {
+    return Paths.get(DESUGAR_JDK_LIBS);
+  }
+
+  public static Path getCoreLambdaStubs() {
+    return Paths.get(CORE_LAMBDA_STUBS);
+  }
+
+  @Deprecated
+  // Use getFirstSupportedAndroidJar(AndroidApiLevel) to specify a specific Android jar.
   public static Path getDefaultAndroidJar() {
     return getAndroidJar(AndroidApiLevel.getDefault());
+  }
+
+  public static Path getFirstSupportedAndroidJar(AndroidApiLevel apiLevel) {
+    // Fast path.
+    if (hasAndroidJar(apiLevel)) {
+      return getAndroidJar(apiLevel.getLevel());
+    }
+    // Search for an android jar.
+    for (AndroidApiLevel level : AndroidApiLevel.getAndroidApiLevelsSorted()) {
+      if (level.getLevel() >= apiLevel.getLevel() && hasAndroidJar(level)) {
+        return getAndroidJar(level.getLevel());
+      }
+    }
+    return getAndroidJar(AndroidApiLevel.LATEST);
   }
 
   public static Path getAndroidJar(int apiLevel) {
     return getAndroidJar(AndroidApiLevel.getAndroidApiLevel(apiLevel));
   }
 
-  public static Path getAndroidJar(AndroidApiLevel apiLevel) {
+  private static Path getAndroidJarPath(AndroidApiLevel apiLevel) {
     String jar = String.format(
         ANDROID_JAR_PATTERN,
         (apiLevel == AndroidApiLevel.getDefault() ? DEFAULT_MIN_SDK : apiLevel).getLevel());
-    Path path = Paths.get(jar);
+    return Paths.get(jar);
+  }
+
+  public static boolean hasAndroidJar(AndroidApiLevel apiLevel) {
+    Path path = getAndroidJarPath(apiLevel);
+    return Files.exists(path);
+  }
+
+  public static Path getAndroidJar(AndroidApiLevel apiLevel) {
+    Path path = getAndroidJarPath(apiLevel);
     assert Files.exists(path)
         : "Expected android jar to exist for API level " + apiLevel;
     return path;
+  }
+
+  public static Path getMostRecentAndroidJar() {
+    List<AndroidApiLevel> apiLevels = AndroidApiLevel.getAndroidApiLevelsSorted();
+    ListIterator<AndroidApiLevel> iterator = apiLevels.listIterator(apiLevels.size());
+    while (iterator.hasPrevious()) {
+      AndroidApiLevel apiLevel = iterator.previous();
+      if (hasAndroidJar(apiLevel)) {
+        return getAndroidJar(apiLevel);
+      }
+    }
+    throw new Unreachable("Unable to find a most recent android.jar");
   }
 
   public static Path getKotlinStdlibJar() {
@@ -730,6 +897,7 @@ public class ToolHelper {
     return dexVm == DexVm.ART_DEFAULT;
   }
 
+  @Deprecated
   public static DexVm getDexVm() {
     String artVersion = System.getProperty("dex_vm");
     if (artVersion == null) {
@@ -763,10 +931,12 @@ public class ToolHelper {
     switch (dexVm.version) {
       case DEFAULT:
         return AndroidApiLevel.O;
+      case V10_0_0:
+        return AndroidApiLevel.Q;
       case V9_0_0:
         return AndroidApiLevel.P;
       case V8_1_0:
-        return AndroidApiLevel.O;
+        return AndroidApiLevel.O_MR1;
       case V7_0_0:
         return AndroidApiLevel.N;
       case V6_0_1:
@@ -899,6 +1069,11 @@ public class ToolHelper {
     return paths;
   }
 
+  public static Collection<Path> getClassFilesForInnerClasses(Class<?>... classes)
+      throws IOException {
+    return getClassFilesForInnerClasses(Arrays.asList(classes));
+  }
+
   public static Path getFileNameForTestClass(Class clazz) {
     List<String> parts = getNamePartsForTestClass(clazz);
     return Paths.get("", parts.toArray(StringUtils.EMPTY_ARRAY));
@@ -909,22 +1084,19 @@ public class ToolHelper {
     return String.join("/", parts);
   }
 
-  public static DexApplication buildApplication(List<String> fileNames)
+  public static DirectMappedDexApplication buildApplication(List<String> fileNames)
       throws IOException, ExecutionException {
     return buildApplicationWithAndroidJar(fileNames, getDefaultAndroidJar());
   }
 
-  public static DexApplication buildApplicationWithAndroidJar(
-      List<String> fileNames, Path androidJar)
-      throws IOException, ExecutionException {
+  public static DirectMappedDexApplication buildApplicationWithAndroidJar(
+      List<String> fileNames, Path androidJar) throws IOException, ExecutionException {
     AndroidApp input =
         AndroidApp.builder()
             .addProgramFiles(ListUtils.map(fileNames, Paths::get))
             .addLibraryFiles(androidJar)
             .build();
-    return new ApplicationReader(
-        input, new InternalOptions(), new Timing("ToolHelper buildApplication"))
-        .read().toDirect();
+    return new ApplicationReader(input, new InternalOptions(), Timing.empty()).read().toDirect();
   }
 
   public static ProguardConfiguration loadProguardConfiguration(
@@ -1024,14 +1196,34 @@ public class ToolHelper {
     return compatSink.build();
   }
 
+  public static void runL8(L8Command command) throws CompilationFailedException {
+    runL8(command, options -> {});
+  }
+
+  public static void runL8(L8Command command, Consumer<InternalOptions> optionsModifier)
+      throws CompilationFailedException {
+    InternalOptions internalOptions = command.getInternalOptions();
+    optionsModifier.accept(internalOptions);
+    L8.runForTesting(
+        command.getInputApp(),
+        internalOptions,
+        command.isShrinking(),
+        command.getD8Command(),
+        command.getR8Command());
+  }
+
   public static void addFilteredAndroidJar(BaseCommand.Builder builder, AndroidApiLevel apiLevel) {
     addFilteredAndroidJar(getAppBuilder(builder), apiLevel);
   }
 
   public static void addFilteredAndroidJar(AndroidApp.Builder builder, AndroidApiLevel apiLevel) {
-    builder.addFilteredLibraryArchives(Collections.singletonList(
-        new FilteredClassPath(getAndroidJar(apiLevel),
-            ImmutableList.of("!junit/**", "!android/test/**"))));
+    builder.addFilteredLibraryArchives(
+        Collections.singletonList(
+            new FilteredClassPath(
+                getAndroidJar(apiLevel),
+                ImmutableList.of("!junit/**", "!android/test/**"),
+                Origin.unknown(),
+                Position.UNKNOWN)));
   }
 
   public static AndroidApp runD8(AndroidApp app) throws CompilationFailedException {
@@ -1082,6 +1274,15 @@ public class ToolHelper {
   }
 
   public static ProcessResult runDX(Path workingDirectory, String... args) throws IOException {
+    return runProcess(createProcessBuilderForRunningDx(workingDirectory, args));
+  }
+
+  public static ProcessBuilder createProcessBuilderForRunningDx(String... args) {
+    return createProcessBuilderForRunningDx(null, args);
+  }
+
+  public static ProcessBuilder createProcessBuilderForRunningDx(
+      Path workingDirectory, String... args) {
     Assume.assumeTrue(ToolHelper.artSupported());
     DXCommandBuilder builder = new DXCommandBuilder();
     for (String arg : args) {
@@ -1091,7 +1292,7 @@ public class ToolHelper {
     if (workingDirectory != null) {
       pb.directory(workingDirectory.toFile());
     }
-    return runProcess(pb);
+    return pb;
   }
 
   public static ProcessResult runJava(Class clazz) throws Exception {
@@ -1110,19 +1311,55 @@ public class ToolHelper {
 
   public static ProcessResult runJava(List<String> vmArgs, List<Path> classpath, String... args)
       throws IOException {
-    return runJava(null, vmArgs, classpath, args);
+    return runJava(TestRuntime.getSystemRuntime().asCf(), vmArgs, classpath, args);
   }
 
-  public static ProcessResult runJava(CfVm runtime, List<Path> classpath, String... args)
+  public static ProcessResult runJava(CfRuntime runtime, List<Path> classpath, String... args)
       throws IOException {
     return runJava(runtime, ImmutableList.of(), classpath, args);
   }
 
+  @Deprecated
+  public static ProcessResult runKotlinc(
+      List<Path> classPaths,
+      Path directoryToCompileInto,
+      List<String> extraOptions,
+      Path... filesToCompile)
+      throws IOException {
+    List<String> cmdline = new ArrayList<>(Arrays.asList(getJavaExecutable()));
+    cmdline.add("-jar");
+    cmdline.add(KT_PRELOADER);
+    cmdline.add("org.jetbrains.kotlin.preloading.Preloader");
+    cmdline.add("-cp");
+    cmdline.add(KT_COMPILER);
+    cmdline.add(K2JVMCompiler);
+    String[] strings = Arrays.stream(filesToCompile).map(Path::toString).toArray(String[]::new);
+    Collections.addAll(cmdline, strings);
+    cmdline.add("-d");
+    cmdline.add(directoryToCompileInto.toString());
+    List<String> cp = classPaths == null ? null
+        : classPaths.stream().map(Path::toString).collect(Collectors.toList());
+    if (cp != null) {
+      cmdline.add("-cp");
+      if (isWindows()) {
+        cmdline.add(String.join(";", cp));
+      } else {
+        cmdline.add(String.join(":", cp));
+      }
+    }
+    if (extraOptions != null) {
+      cmdline.addAll(extraOptions);
+    }
+    ProcessBuilder builder = new ProcessBuilder(cmdline);
+    return ToolHelper.runProcess(builder);
+  }
+
   public static ProcessResult runJava(
-      CfVm runtime, List<String> vmArgs, List<Path> classpath, String... args) throws IOException {
+      CfRuntime runtime, List<String> vmArgs, List<Path> classpath, String... args)
+      throws IOException {
     String cp =
         classpath.stream().map(Path::toString).collect(Collectors.joining(CLASSPATH_SEPARATOR));
-    List<String> cmdline = new ArrayList<String>(Arrays.asList(getJavaExecutable(runtime)));
+    List<String> cmdline = new ArrayList<>(Arrays.asList(runtime.getJavaExecutable().toString()));
     cmdline.addAll(vmArgs);
     cmdline.add("-cp");
     cmdline.add(cp);
@@ -1163,6 +1400,12 @@ public class ToolHelper {
     return forkJava(dir, R8.class, args);
   }
 
+  public static ProcessResult forkR8WithJavaOptions(
+      Path dir, List<String> javaOptions, String... args) throws IOException {
+    String r8Jar = R8_JAR.toAbsolutePath().toString();
+    return forkJavaWithJarAndJavaOptions(dir, r8Jar, Arrays.asList(args), javaOptions);
+  }
+
   public static ProcessResult forkR8Jar(Path dir, String... args)
       throws IOException, InterruptedException {
     String r8Jar = R8_JAR.toAbsolutePath().toString();
@@ -1189,13 +1432,22 @@ public class ToolHelper {
 
   private static ProcessResult forkJavaWithJar(Path dir, String jarPath, List<String> args)
       throws IOException {
-    List<String> command = new ImmutableList.Builder<String>()
-        .add(getJavaExecutable())
-        .add("-jar").add(jarPath)
-        .addAll(args)
-        .build();
+    return forkJavaWithJarAndJavaOptions(dir, jarPath, args, ImmutableList.of());
+  }
+
+  private static ProcessResult forkJavaWithJarAndJavaOptions(
+      Path dir, String jarPath, List<String> args, List<String> javaOptions) throws IOException {
+    List<String> command =
+        new ImmutableList.Builder<String>()
+            .add(getJavaExecutable())
+            .addAll(javaOptions)
+            .add("-jar")
+            .add(jarPath)
+            .addAll(args)
+            .build();
     return runProcess(new ProcessBuilder(command).directory(dir.toFile()));
   }
+
 
   private static ProcessResult forkJava(Path dir, Class clazz, List<String> args)
       throws IOException {
@@ -1209,23 +1461,13 @@ public class ToolHelper {
   }
 
   @Deprecated
-  // Use getJavaExecutable(CfVm) to specify a JDK version or getSystemJavaExecutable
+  // Use CfRuntime.getJavaExecutable() for a specific JDK or getSystemJavaExecutable
   public static String getJavaExecutable() {
     return getSystemJavaExecutable();
   }
 
   public static String getSystemJavaExecutable() {
-    return Paths.get(System.getProperty("java.home"), "bin", "java").toString();
-  }
-
-  public static String getJavaExecutable(CfVm runtime) {
-    if (TestRuntime.isCheckedInJDK(runtime)) {
-      return TestRuntime.getCheckInJDKPathFor(runtime).toString();
-    } else {
-      // TODO(b/127785410): Always assume a non-null runtime.
-      assert runtime == null || TestParametersBuilder.isSystemJdk(runtime);
-      return getSystemJavaExecutable();
-    }
+    return TestRuntime.getSystemRuntime().asCf().getJavaExecutable().toString();
   }
 
   public static ProcessResult runArtRaw(ArtCommandBuilder builder) throws IOException {
@@ -1245,7 +1487,7 @@ public class ToolHelper {
   public static ProcessResult runArtRaw(List<String> files, String mainClass,
       Consumer<ArtCommandBuilder> extras)
       throws IOException {
-    return runArtRaw(files, mainClass, extras, null);
+    return runArtRaw(files, mainClass, extras, null, false);
   }
 
   // Index used to name directory aimed at storing dex files and process result
@@ -1258,10 +1500,12 @@ public class ToolHelper {
       String mainClass,
       Consumer<ArtCommandBuilder> extras,
       DexVm version,
+      boolean withArtFrameworks,
       String... args)
       throws IOException {
     ArtCommandBuilder builder =
         version != null ? new ArtCommandBuilder(version) : new ArtCommandBuilder();
+    builder.withArtFrameworks = withArtFrameworks;
     files.forEach(builder::appendClasspath);
     builder.setMainClass(mainClass);
     if (extras != null) {
@@ -1333,8 +1577,11 @@ public class ToolHelper {
     assert headSha1 != null;
 
     return Files.createDirectories(
-         Paths.get(destDir.getAbsolutePath(), headSha1, testClassName, testName + "-" + String
-             .format("%03d", testOutputPathIndex)));
+        Paths.get(
+            destDir.getAbsolutePath(),
+            headSha1,
+            testClassName,
+            testName + "-" + String.format("%03d", testOutputPathIndex)));
   }
 
   private static List<File> unzipDexFilesArchive(File zipFile) throws IOException {
@@ -1462,7 +1709,7 @@ public class ToolHelper {
       Consumer<ArtCommandBuilder> extras,
       DexVm version)
       throws IOException {
-    ProcessResult result = runArtRaw(files, mainClass, extras, version);
+    ProcessResult result = runArtRaw(files, mainClass, extras, version, false);
     failOnProcessFailure(result);
     failOnVerificationErrors(result);
     return result;
@@ -1580,6 +1827,7 @@ public class ToolHelper {
   public static ProcessResult runDex2OatRaw(Path file, Path outFile, DexVm vm) throws IOException {
     // TODO(jmhenaff): find a way to run this on windows (push dex and run on device/emulator?)
     Assume.assumeTrue(ToolHelper.isDex2OatSupported());
+    Assume.assumeFalse("b/144975341", vm.version == DexVm.Version.V10_0_0);
     if (vm.isOlderThanOrEqual(DexVm.ART_4_4_4_HOST)) {
       // Run default dex2oat for tests on dalvik runtimes.
       vm = DexVm.ART_DEFAULT;
@@ -1712,7 +1960,7 @@ public class ToolHelper {
     public final String stderr;
     public final String command;
 
-    ProcessResult(int exitCode, String stdout, String stderr, String command) {
+    public ProcessResult(int exitCode, String stdout, String stderr, String command) {
       this.exitCode = exitCode;
       this.stdout = stdout;
       this.stderr = stderr;
@@ -1759,27 +2007,35 @@ public class ToolHelper {
   }
 
   public static ProcessResult runProcess(ProcessBuilder builder) throws IOException {
+    return runProcess(builder, System.out);
+  }
+
+  public static ProcessResult runProcess(ProcessBuilder builder, PrintStream out)
+      throws IOException {
     String command = String.join(" ", builder.command());
-    System.out.println(command);
-    Process p = builder.start();
+    out.println(command);
+    return drainProcessOutputStreams(builder.start(), command);
+  }
+
+  public static ProcessResult drainProcessOutputStreams(Process process, String command) {
     // Drain stdout and stderr so that the process does not block. Read stdout and stderr
     // in parallel to make sure that neither buffer can get filled up which will cause the
     // C program to block in a call to write.
-    StreamReader stdoutReader = new StreamReader(p.getInputStream());
-    StreamReader stderrReader = new StreamReader(p.getErrorStream());
+    StreamReader stdoutReader = new StreamReader(process.getInputStream());
+    StreamReader stderrReader = new StreamReader(process.getErrorStream());
     Thread stdoutThread = new Thread(stdoutReader);
     Thread stderrThread = new Thread(stderrReader);
     stdoutThread.start();
     stderrThread.start();
     try {
-      p.waitFor();
+      process.waitFor();
       stdoutThread.join();
       stderrThread.join();
     } catch (InterruptedException e) {
       throw new RuntimeException("Execution interrupted", e);
     }
     return new ProcessResult(
-        p.exitValue(), stdoutReader.getResult(), stderrReader.getResult(), command);
+        process.exitValue(), stdoutReader.getResult(), stderrReader.getResult(), command);
   }
 
   public static R8Command.Builder addProguardConfigurationConsumer(
@@ -1800,8 +2056,7 @@ public class ToolHelper {
     return builder;
   }
 
-  public static R8Command.Builder allowTestProguardOptions(
-      R8Command.Builder builder) {
+  public static R8Command.Builder allowTestProguardOptions(R8Command.Builder builder) {
     builder.allowTestProguardOptions();
     return builder;
   }
@@ -1837,10 +2092,9 @@ public class ToolHelper {
         Executors.newSingleThreadExecutor(),
         application,
         null,
-        null,
         GraphLense.getIdentityLense(),
+        InitClassLens.getDefault(),
         NamingLens.getIdentityLens(),
-        null,
         options,
         null);
   }
@@ -1858,12 +2112,39 @@ public class ToolHelper {
     public String getFolderName() {
       return folderName;
     }
+
+    public String getJvmTargetString() {
+      switch (this) {
+        case JAVA_6:
+          return "1.6";
+        case JAVA_8:
+          return "1.8";
+        default:
+          throw new Unimplemented("JvmTarget not specified for " + this);
+      }
+    }
   }
 
   public static void disassemble(AndroidApp app, PrintStream ps)
       throws IOException, ExecutionException {
     DexApplication application =
-        new ApplicationReader(app, new InternalOptions(), new Timing()).read().toDirect();
+        new ApplicationReader(app, new InternalOptions(), Timing.empty()).read().toDirect();
     new AssemblyWriter(application, new InternalOptions(), true, false).write(ps);
+  }
+
+  public static Path getTestFolderForClass(Class<?> clazz) {
+    return Paths.get(ToolHelper.TESTS_DIR)
+        .resolve("java")
+        .resolve(ToolHelper.getFileNameForTestClass(clazz))
+        .getParent();
+  }
+
+  public static Collection<Path> getFilesInTestFolderRelativeToClass(
+      Class<?> clazz, String folderName, String endsWith) throws IOException {
+    Path subFolder = getTestFolderForClass(clazz).resolve(folderName);
+    assert Files.isDirectory(subFolder);
+    try (Stream<Path> walker = Files.walk(subFolder)) {
+      return walker.filter(path -> path.toString().endsWith(endsWith)).collect(Collectors.toList());
+    }
   }
 }

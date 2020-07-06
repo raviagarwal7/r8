@@ -223,11 +223,12 @@ public class GenerateMainDexListCommand extends BaseCommand {
   @Override
   InternalOptions getInternalOptions() {
     InternalOptions internal = new InternalOptions(factory, reporter);
+    internal.programConsumer = ClassFileConsumer.emptyConsumer();
     internal.mainDexKeepRules = mainDexKeepRules;
     internal.mainDexListConsumer = mainDexListConsumer;
     internal.mainDexKeptGraphConsumer = mainDexKeptGraphConsumer;
     internal.minimalMainDex = internal.debug;
-    internal.enableSwitchMapRemoval = false;
+    internal.enableEnumValueOptimization = false;
     internal.enableInlining = false;
     return internal;
   }

@@ -10,16 +10,13 @@ import static com.android.tools.r8.utils.DescriptorUtils.getClassBinaryNameFromD
 import static com.android.tools.r8.utils.DescriptorUtils.getPackageBinaryNameFromJavaType;
 
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexProto;
-import com.android.tools.r8.graph.DexReference;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.InnerClassAttribute;
-import com.android.tools.r8.naming.signature.GenericSignatureRewriter;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.shaking.ProguardPackageNameList;
 import com.android.tools.r8.utils.DescriptorUtils;
@@ -31,11 +28,12 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.function.Predicate;
 
 class ClassNameMinifier {
 
@@ -47,15 +45,14 @@ class ClassNameMinifier {
   private final boolean isAccessModificationAllowed;
   private final Set<String> noObfuscationPrefixes = Sets.newHashSet();
   private final Set<String> usedPackagePrefixes = Sets.newHashSet();
-  private final Set<DexString> usedTypeNames = Sets.newIdentityHashSet();
-
+  private final Set<String> usedTypeNames = Sets.newHashSet();
   private final Map<DexType, DexString> renaming = Maps.newIdentityHashMap();
   private final Map<String, Namespace> states = new HashMap<>();
-  private final List<String> packageDictionary;
-  private final List<String> classDictionary;
   private final boolean keepInnerClassStructure;
 
   private final Namespace topLevelState;
+  private final boolean allowMixedCaseNaming;
+  private final Predicate<String> isUsed;
 
   ClassNameMinifier(
       AppView<AppInfoWithLiveness> appView,
@@ -70,22 +67,30 @@ class ClassNameMinifier {
     this.packageObfuscationMode = options.getProguardConfiguration().getPackageObfuscationMode();
     this.isAccessModificationAllowed =
         options.getProguardConfiguration().isAccessModificationAllowed();
-    this.packageDictionary = options.getProguardConfiguration().getPackageObfuscationDictionary();
-    this.classDictionary = options.getProguardConfiguration().getClassObfuscationDictionary();
-    this.keepInnerClassStructure =
-        options.getProguardConfiguration().getKeepAttributes().signature
-            || options.getProguardConfiguration().getKeepAttributes().innerClasses;
+    this.keepInnerClassStructure = options.keepInnerClassStructure();
 
     // Initialize top-level naming state.
     topLevelState = new Namespace(
         getPackageBinaryNameFromJavaType(options.getProguardConfiguration().getPackagePrefix()));
 
     states.put("", topLevelState);
+
+    if (options.getProguardConfiguration().hasDontUseMixedCaseClassnames()) {
+      allowMixedCaseNaming = false;
+      isUsed = candidate -> usedTypeNames.contains(candidate.toLowerCase());
+    } else {
+      allowMixedCaseNaming = true;
+      isUsed = usedTypeNames::contains;
+    }
+  }
+
+  private void setUsedTypeName(String typeName) {
+    usedTypeNames.add(allowMixedCaseNaming ? typeName : typeName.toLowerCase());
   }
 
   static class ClassRenaming {
-    protected final Map<String, String> packageRenaming;
-    protected final Map<DexType, DexString> classRenaming;
+    final Map<String, String> packageRenaming;
+    final Map<DexType, DexString> classRenaming;
 
     private ClassRenaming(
         Map<DexType, DexString> classRenaming, Map<String, String> packageRenaming) {
@@ -94,34 +99,31 @@ class ClassNameMinifier {
     }
   }
 
-  ClassRenaming computeRenaming(Timing timing) {
-    return computeRenaming(timing, Collections.emptyMap());
+  ClassRenaming computeRenaming(Timing timing, ExecutorService executorService)
+      throws ExecutionException {
+    return computeRenaming(timing, executorService, Collections.emptyMap());
   }
 
-  ClassRenaming computeRenaming(Timing timing, Map<DexType, DexString> syntheticClasses) {
+  ClassRenaming computeRenaming(
+      Timing timing, ExecutorService executorService, Map<DexType, DexString> syntheticClasses)
+      throws ExecutionException {
     // Externally defined synthetic classes populate an initial renaming.
     renaming.putAll(syntheticClasses);
 
     // Collect names we have to keep.
     timing.begin("reserve");
     for (DexClass clazz : classes) {
-      if (classNamingStrategy.noObfuscation().contains(clazz.type)) {
+      DexString descriptor = classNamingStrategy.reservedDescriptor(clazz.type);
+      if (descriptor != null) {
         assert !renaming.containsKey(clazz.type);
-        registerClassAsUsed(clazz.type);
+        registerClassAsUsed(clazz.type, descriptor);
       }
     }
     timing.end();
 
     timing.begin("rename-classes");
     for (DexClass clazz : classes) {
-      // Let anonymous classes be as-is.
-      if (clazz.isAnonymousClass()) {
-        continue;
-      }
       if (!renaming.containsKey(clazz.type)) {
-        // TreePruner already removed inner-class / enclosing-method attributes for local classes.
-        assert !clazz.isLocalClass();
-        clazz.annotations = clazz.annotations.keepIf(this::isNotKotlinMetadata);
         DexString renamed = computeName(clazz.type);
         renaming.put(clazz.type, renamed);
         // If the class is a member class and it has used $ separator, its renamed name should have
@@ -129,7 +131,9 @@ class ClassNameMinifier {
         assert !keepInnerClassStructure
             || !clazz.isMemberClass()
             || !clazz.type.getInternalName().contains(String.valueOf(INNER_CLASS_SEPARATOR))
-            || renamed.toString().contains(String.valueOf(INNER_CLASS_SEPARATOR));
+            || renamed.toString().contains(String.valueOf(INNER_CLASS_SEPARATOR))
+            || classNamingStrategy.isRenamedByApplyMapping(clazz.type)
+                : clazz.toSourceString() + " -> " + renamed;
       }
     }
     timing.end();
@@ -138,10 +142,6 @@ class ClassNameMinifier {
     for (DexClass clazz : classes) {
       renameDanglingTypes(clazz);
     }
-    timing.end();
-
-    timing.begin("rename-generic");
-    new GenericSignatureRewriter(appView, renaming).run();
     timing.end();
 
     timing.begin("rename-arrays");
@@ -181,30 +181,29 @@ class ClassNameMinifier {
   }
 
   private void renameDanglingType(DexType type) {
-    if (appView.appInfo().wasPruned(type)
-        && !renaming.containsKey(type)
-        && !classNamingStrategy.noObfuscation().contains(type)) {
+    if (appView.appInfo().wasPruned(type) && !renaming.containsKey(type)) {
       // We have a type that is defined in the program source but is only used in a proto or
       // return type. As we don't need the class, we can rename it to anything as long as it is
       // unique.
       assert appView.definitionFor(type) == null;
-      renaming.put(type, topLevelState.nextTypeName(type));
+      DexString descriptor = classNamingStrategy.reservedDescriptor(type);
+      renaming.put(type, descriptor != null ? descriptor : topLevelState.nextTypeName(type));
     }
   }
 
-  private void registerClassAsUsed(DexType type) {
-    renaming.put(type, type.descriptor);
+  private void registerClassAsUsed(DexType type, DexString descriptor) {
+    renaming.put(type, descriptor);
     registerPackagePrefixesAsUsed(
-        getParentPackagePrefix(getClassBinaryNameFromDescriptor(type.descriptor.toSourceString())));
-    usedTypeNames.add(type.descriptor);
+        getParentPackagePrefix(getClassBinaryNameFromDescriptor(descriptor.toSourceString())));
+    setUsedTypeName(descriptor.toString());
     if (keepInnerClassStructure) {
       DexType outerClass = getOutClassForType(type);
       if (outerClass != null) {
         if (!renaming.containsKey(outerClass)
-            && !classNamingStrategy.noObfuscation().contains(outerClass)) {
+            && classNamingStrategy.reservedDescriptor(outerClass) == null) {
           // The outer class was not previously kept and will not be kept.
           // We have to force keep the outer class now.
-          registerClassAsUsed(outerClass);
+          registerClassAsUsed(outerClass, outerClass.descriptor);
         }
       }
     }
@@ -231,13 +230,6 @@ class ClassNameMinifier {
     if (clazz == null) {
       return null;
     }
-    // We do not need to preserve the names for local or anonymous classes, as they do not result
-    // in a member type declaration and hence cannot be referenced as nested classes in
-    // method signatures.
-    // See https://docs.oracle.com/javase/specs/jls/se7/html/jls-8.html#jls-8.5.
-    if (clazz.getEnclosingMethod() != null) {
-      return null;
-    }
     // For DEX inputs this could result in returning the outer class of a local class since we
     // can't distinguish it from a member class based on just the enclosing-class annotation.
     // We could filter out the local classes by looking for a corresponding entry in the
@@ -247,31 +239,29 @@ class ClassNameMinifier {
     if (attribute == null) {
       return null;
     }
-    return attribute.getOuter();
-  }
-
-  private String getInnerNameForType(DexType type) {
-    // This util is used only after the corresponding outer-class is recognized.
-    // Therefore, the definition for the type and its inner-class attribute should be found.
-    DexClass clazz = appView.definitionFor(type);
-    assert clazz != null;
-    InnerClassAttribute attribute = clazz.getInnerClassAttributeForThisClass();
-    assert attribute != null;
-    return attribute.getInnerName().toString();
+    return attribute.getLiveContext(appView.appInfo());
   }
 
   private DexString computeName(DexType type) {
     Namespace state = null;
     if (keepInnerClassStructure) {
-      // When keeping the nesting structure of inner classes, we have to insert the name
-      // of the outer class for the $ prefix.
+      // When keeping the nesting structure of inner classes, bind this type to the live context.
+      // Note that such live context might not be always the enclosing class. E.g., a local class
+      // does not have a direct enclosing class, but we use the holder of the enclosing method here.
       DexType outerClass = getOutClassForType(type);
       if (outerClass != null) {
-        String innerClassSeparator =
-            computeInnerClassSeparator(
-                outerClass, type, getInnerNameForType(type), appView.options());
-        assert innerClassSeparator != null;
-        state = getStateForOuterClass(outerClass, innerClassSeparator);
+        DexClass clazz = appView.definitionFor(type);
+        assert clazz != null;
+        InnerClassAttribute attribute = clazz.getInnerClassAttributeForThisClass();
+        assert attribute != null;
+        // Note that, to be consistent with the way inner-class attribute is written via minifier
+        // lense, we are using attribute's outer-class, not the live context.
+        String separator =
+            computeInnerClassSeparator(attribute.getOuter(), type, attribute.getInnerName());
+        if (separator == null) {
+          separator = String.valueOf(INNER_CLASS_SEPARATOR);
+        }
+        state = getStateForOuterClass(outerClass, separator);
       }
     }
     if (state == null) {
@@ -372,12 +362,12 @@ class ClassNameMinifier {
     }
   }
 
-  protected class Namespace {
+  protected class Namespace implements InternalNamingState {
 
     private final String packageName;
     private final char[] packagePrefix;
-    private final Iterator<String> packageDictionaryIterator;
-    private final Iterator<String> classDictionaryIterator;
+    private int dictionaryIndex = 0;
+    private int nameIndex = 1;
 
     Namespace(String packageName) {
       this(packageName, String.valueOf(DESCRIPTOR_PACKAGE_SEPARATOR));
@@ -389,76 +379,63 @@ class ClassNameMinifier {
           // L or La/b/ (or La/b/C$)
           + (packageName.isEmpty() ? "" : separator))
           .toCharArray();
-      this.packageDictionaryIterator = packageDictionary.iterator();
-      this.classDictionaryIterator = classDictionary.iterator();
-
-      // R.class in Android, which contains constant IDs to assets, can be bundled at any time.
-      // Insert `R` immediately so that the class name minifier can skip that name by default.
-      StringBuilder rBuilder = new StringBuilder().append(packagePrefix).append("R;");
-      usedTypeNames.add(appView.dexItemFactory().createString(rBuilder.toString()));
     }
 
     public String getPackageName() {
       return packageName;
     }
 
-    private DexString nextSuggestedNameForClass(DexType type) {
-      StringBuilder nextName = new StringBuilder();
-      if (!classNamingStrategy.bypassDictionary() && classDictionaryIterator.hasNext()) {
-        nextName.append(packagePrefix).append(classDictionaryIterator.next()).append(';');
-        return appView.dexItemFactory().createString(nextName.toString());
-      } else {
-        return classNamingStrategy.next(this, type, packagePrefix);
-      }
-    }
-
     DexString nextTypeName(DexType type) {
-      DexString candidate;
-      do {
-        candidate = nextSuggestedNameForClass(type);
-      } while (usedTypeNames.contains(candidate));
-      usedTypeNames.add(candidate);
+      DexString candidate = classNamingStrategy.next(type, packagePrefix, this, isUsed);
+      assert !usedTypeNames.contains(candidate.toString());
+      setUsedTypeName(candidate.toString());
       return candidate;
-    }
-
-    private String nextSuggestedNameForSubpackage() {
-      // Note that the differences between this method and the other variant for class renaming are
-      // 1) this one uses the different dictionary and counter,
-      // 2) this one does not append ';' at the end, and
-      // 3) this one removes 'L' at the beginning to make the return value a binary form.
-      if (!packageNamingStrategy.bypassDictionary() && packageDictionaryIterator.hasNext()) {
-        StringBuilder nextName = new StringBuilder();
-        nextName.append(packagePrefix).append(packageDictionaryIterator.next());
-        return nextName.toString().substring(1);
-      } else {
-        return packageNamingStrategy.next(this, packagePrefix);
-      }
     }
 
     String nextPackagePrefix() {
-      String candidate;
-      do {
-        candidate = nextSuggestedNameForSubpackage();
-      } while (usedPackagePrefixes.contains(candidate));
-      usedPackagePrefixes.add(candidate);
-      return candidate;
+      String next = packageNamingStrategy.next(packagePrefix, this, usedPackagePrefixes::contains);
+      assert !usedPackagePrefixes.contains(next);
+      usedPackagePrefixes.add(next);
+      return next;
+    }
+
+    @Override
+    public int getDictionaryIndex() {
+      return dictionaryIndex;
+    }
+
+    @Override
+    public int incrementDictionaryIndex() {
+      return dictionaryIndex++;
+    }
+
+    @Override
+    public int incrementNameIndex(boolean isDirectMethodCall) {
+      assert !isDirectMethodCall;
+      return nameIndex++;
     }
   }
 
   protected interface ClassNamingStrategy {
+    DexString next(
+        DexType type, char[] packagePrefix, InternalNamingState state, Predicate<String> isUsed);
 
-    DexString next(Namespace namespace, DexType type, char[] packagePrefix);
+    /**
+     * Returns the reserved descriptor for a type. If the type is not allowed to be obfuscated
+     * (minified) it will return the original type descriptor. If applymapping is used, it will try
+     * to return the applied name such that it can be reserved. Otherwise, if there are no
+     * reservations, it will return null.
+     *
+     * @param type The type to find a reserved descriptor for
+     * @return The reserved descriptor
+     */
+    DexString reservedDescriptor(DexType type);
 
-    boolean bypassDictionary();
-
-    Set<DexReference> noObfuscation();
+    boolean isRenamedByApplyMapping(DexType type);
   }
 
   protected interface PackageNamingStrategy {
-
-    String next(Namespace namespace, char[] packagePrefix);
-
-    boolean bypassDictionary();
+    String next(char[] packagePrefix, InternalNamingState state, Predicate<String> isUsed);
   }
 
   /**
@@ -473,10 +450,5 @@ class ClassNameMinifier {
       return "";
     }
     return packagePrefix.substring(0, i);
-  }
-
-  private boolean isNotKotlinMetadata(DexAnnotation annotation) {
-    return annotation.annotation.type
-        != appView.dexItemFactory().kotlin.metadata.kotlinMetadataType;
   }
 }

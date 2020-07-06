@@ -41,12 +41,12 @@ public class R8GMSCoreDeterministicTest extends GMSCoreCompilationTestBase {
               // For this test just do random shuffle.
               options.testing.irOrdering = NondeterministicIROrdering.getInstance();
               // Only use one thread to process to process in the order decided by the callback.
-              options.numberOfThreads = 1;
+              options.threadCount = 1;
               // Ignore the missing classes.
               options.ignoreMissingClasses = true;
               // Store the generated Proguard map.
               options.proguardMapConsumer =
-                  (proguardMap, handler) -> result.proguardMap = proguardMap;
+                  ToolHelper.consumeString(proguardMap -> result.proguardMap = proguardMap);
             });
     return result;
   }

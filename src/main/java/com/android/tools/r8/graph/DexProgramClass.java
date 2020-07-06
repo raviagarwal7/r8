@@ -3,36 +3,53 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.graph;
 
+import static com.android.tools.r8.kotlin.KotlinMetadataUtils.NO_KOTLIN_INFO;
+import static com.google.common.base.Predicates.alwaysTrue;
+
 import com.android.tools.r8.ProgramResource;
 import com.android.tools.r8.ProgramResource.Kind;
 import com.android.tools.r8.dex.IndexedItemCollection;
 import com.android.tools.r8.dex.MixedSectionCollection;
-import com.android.tools.r8.kotlin.KotlinInfo;
+import com.android.tools.r8.errors.CompilationError;
+import com.android.tools.r8.kotlin.KotlinClassLevelInfo;
+import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.utils.TraversalContinuation;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 public class DexProgramClass extends DexClass implements Supplier<DexProgramClass> {
+
+  @FunctionalInterface
+  public interface ChecksumSupplier {
+    long getChecksum(DexProgramClass programClass);
+  }
+
   public static final DexProgramClass[] EMPTY_ARRAY = {};
 
   private static final DexEncodedArray SENTINEL_NOT_YET_COMPUTED =
       new DexEncodedArray(DexValue.EMPTY_ARRAY);
 
   private final ProgramResource.Kind originKind;
-  private DexEncodedArray staticValues = SENTINEL_NOT_YET_COMPUTED;
   private final Collection<DexProgramClass> synthesizedFrom;
   private int initialClassFileVersion = -1;
-  private KotlinInfo kotlinInfo = null;
+  private KotlinClassLevelInfo kotlinInfo = NO_KOTLIN_INFO;
+
+  private final ChecksumSupplier checksumSupplier;
 
   public DexProgramClass(
       DexType type,
-      ProgramResource.Kind originKind,
+      Kind originKind,
       Origin origin,
       ClassAccessFlags accessFlags,
       DexType superType,
@@ -47,7 +64,8 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
       DexEncodedField[] instanceFields,
       DexEncodedMethod[] directMethods,
       DexEncodedMethod[] virtualMethods,
-      boolean skipNameValidationForTesting) {
+      boolean skipNameValidationForTesting,
+      ChecksumSupplier checksumSupplier) {
     this(
         type,
         originKind,
@@ -66,12 +84,13 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
         directMethods,
         virtualMethods,
         skipNameValidationForTesting,
+        checksumSupplier,
         Collections.emptyList());
   }
 
   public DexProgramClass(
       DexType type,
-      ProgramResource.Kind originKind,
+      Kind originKind,
       Origin origin,
       ClassAccessFlags accessFlags,
       DexType superType,
@@ -87,6 +106,7 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
       DexEncodedMethod[] directMethods,
       DexEncodedMethod[] virtualMethods,
       boolean skipNameValidationForTesting,
+      ChecksumSupplier checksumSupplier,
       Collection<DexProgramClass> synthesizedDirectlyFrom) {
     super(
         sourceFile,
@@ -105,10 +125,100 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
         classAnnotations,
         origin,
         skipNameValidationForTesting);
+    assert checksumSupplier != null;
     assert classAnnotations != null;
     this.originKind = originKind;
+    this.checksumSupplier = checksumSupplier;
     this.synthesizedFrom = new HashSet<>();
     synthesizedDirectlyFrom.forEach(this::addSynthesizedFrom);
+  }
+
+  public void forEachProgramField(Consumer<ProgramField> consumer) {
+    forEachField(field -> consumer.accept(new ProgramField(this, field)));
+  }
+
+  public void forEachProgramMethod(Consumer<ProgramMethod> consumer) {
+    forEachProgramMethodMatching(alwaysTrue(), consumer);
+  }
+
+  public void forEachProgramMethodMatching(
+      Predicate<DexEncodedMethod> predicate, Consumer<ProgramMethod> consumer) {
+    methodCollection.forEachMethodMatching(
+        predicate, method -> consumer.accept(new ProgramMethod(this, method)));
+  }
+
+  public void forEachProgramDirectMethod(Consumer<ProgramMethod> consumer) {
+    forEachProgramDirectMethodMatching(alwaysTrue(), consumer);
+  }
+
+  public void forEachProgramDirectMethodMatching(
+      Predicate<DexEncodedMethod> predicate, Consumer<ProgramMethod> consumer) {
+    methodCollection.forEachDirectMethodMatching(
+        predicate, method -> consumer.accept(new ProgramMethod(this, method)));
+  }
+
+  public void forEachProgramVirtualMethod(Consumer<ProgramMethod> consumer) {
+    forEachProgramVirtualMethodMatching(alwaysTrue(), consumer);
+  }
+
+  public void forEachProgramVirtualMethodMatching(
+      Predicate<DexEncodedMethod> predicate, Consumer<ProgramMethod> consumer) {
+    methodCollection.forEachVirtualMethodMatching(
+        predicate, method -> consumer.accept(new ProgramMethod(this, method)));
+  }
+
+  public ProgramMethod getProgramClassInitializer() {
+    return toProgramMethodOrNull(getClassInitializer());
+  }
+
+  public ProgramMethod getProgramDefaultInitializer() {
+    return getProgramInitializer(DexType.EMPTY_ARRAY);
+  }
+
+  public ProgramMethod getProgramInitializer(DexType[] types) {
+    return toProgramMethodOrNull(getInitializer(types));
+  }
+
+  public ProgramField lookupProgramField(DexField reference) {
+    return toProgramFieldOrNull(lookupField(reference));
+  }
+
+  public ProgramMethod lookupProgramMethod(DexMethod reference) {
+    return toProgramMethodOrNull(getMethodCollection().getMethod(reference));
+  }
+
+  private ProgramField toProgramFieldOrNull(DexEncodedField field) {
+    if (field != null) {
+      return new ProgramField(this, field);
+    }
+    return null;
+  }
+
+  private ProgramMethod toProgramMethodOrNull(DexEncodedMethod method) {
+    if (method != null) {
+      return new ProgramMethod(this, method);
+    }
+    return null;
+  }
+
+  public TraversalContinuation traverseProgramMethods(
+      Function<ProgramMethod, TraversalContinuation> fn) {
+    return getMethodCollection().traverse(method -> fn.apply(new ProgramMethod(this, method)));
+  }
+
+  public TraversalContinuation traverseProgramInstanceInitializers(
+      Function<ProgramMethod, TraversalContinuation> fn) {
+    return traverseProgramMethods(fn, DexEncodedMethod::isInstanceInitializer);
+  }
+
+  public TraversalContinuation traverseProgramMethods(
+      Function<ProgramMethod, TraversalContinuation> fn, Predicate<DexEncodedMethod> predicate) {
+    return getMethodCollection()
+        .traverse(
+            method ->
+                predicate.test(method)
+                    ? fn.apply(new ProgramMethod(this, method))
+                    : TraversalContinuation.CONTINUE);
   }
 
   public boolean originatesFromDexResource() {
@@ -132,22 +242,21 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
       if (sourceFile != null) {
         sourceFile.collectIndexedItems(indexedItems, method, instructionOffset);
       }
-      if (annotations != null) {
-        annotations.collectIndexedItems(indexedItems, method, instructionOffset);
-      }
+      annotations().collectIndexedItems(indexedItems, method, instructionOffset);
       if (interfaces != null) {
         interfaces.collectIndexedItems(indexedItems, method, instructionOffset);
       }
-      if (getEnclosingMethod() != null) {
-        getEnclosingMethod().collectIndexedItems(indexedItems);
+      if (getEnclosingMethodAttribute() != null) {
+        getEnclosingMethodAttribute().collectIndexedItems(indexedItems);
       }
       for (InnerClassAttribute attribute : getInnerClasses()) {
         attribute.collectIndexedItems(indexedItems);
       }
       synchronizedCollectAll(indexedItems, staticFields);
       synchronizedCollectAll(indexedItems, instanceFields);
-      synchronizedCollectAll(indexedItems, directMethods);
-      synchronizedCollectAll(indexedItems, virtualMethods);
+      synchronized (methodCollection) {
+        methodCollection.forEachMethod(m -> m.collectIndexedItems(indexedItems));
+      }
     }
   }
 
@@ -164,7 +273,7 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
 
   @Override
   void collectMixedSectionItems(MixedSectionCollection mixedItems) {
-    assert getEnclosingMethod() == null;
+    assert getEnclosingMethodAttribute() == null;
     assert getInnerClasses().isEmpty();
     if (hasAnnotations()) {
       mixedItems.setAnnotationsDirectoryForClass(this, new DexAnnotationDirectory(this));
@@ -173,33 +282,18 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
 
   @Override
   public void addDependencies(MixedSectionCollection collector) {
-    assert getEnclosingMethod() == null;
+    assert getEnclosingMethodAttribute() == null;
     assert getInnerClasses().isEmpty();
     // We only have a class data item if there are methods or fields.
     if (hasMethodsOrFields()) {
       collector.add(this);
-
-      // The ordering of methods and fields may not be deterministic due to concurrency
-      // (see b/116027780).
-      sortMembers();
-      synchronizedCollectAll(collector, directMethods);
-      synchronizedCollectAll(collector, virtualMethods);
-      synchronizedCollectAll(collector, staticFields);
-      synchronizedCollectAll(collector, instanceFields);
+      methodCollection.forEachMethod(m -> m.collectMixedSectionItems(collector));
+      collectAll(collector, staticFields);
+      collectAll(collector, instanceFields);
     }
-    if (annotations != null) {
-      annotations.collectMixedSectionItems(collector);
-    }
+    annotations().collectMixedSectionItems(collector);
     if (interfaces != null) {
       interfaces.collectMixedSectionItems(collector);
-    }
-    annotations.collectMixedSectionItems(collector);
-  }
-
-  private static <T extends DexItem> void synchronizedCollectAll(MixedSectionCollection collection,
-      T[] items) {
-    synchronized (items) {
-      collectAll(collection, items);
     }
   }
 
@@ -213,6 +307,26 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
     return type.toSourceString();
   }
 
+  /**
+   * Returns true if this class is final, or it is a non-pinned program class with no instantiated
+   * subtypes.
+   */
+  @Override
+  public boolean isEffectivelyFinal(AppView<?> appView) {
+    if (isFinal()) {
+      return true;
+    }
+    if (appView.enableWholeProgramOptimizations()) {
+      assert appView.appInfo().hasLiveness();
+      AppInfoWithLiveness appInfo = appView.appInfo().withLiveness();
+      if (appInfo.isPinned(type)) {
+        return false;
+      }
+      return !appInfo.isInstantiatedIndirectly(this);
+    }
+    return false;
+  }
+
   @Override
   public boolean isProgramClass() {
     return true;
@@ -223,38 +337,47 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
     return this;
   }
 
+  public static DexProgramClass asProgramClassOrNull(DexClass clazz) {
+    return clazz != null ? clazz.asProgramClass() : null;
+  }
+
   @Override
   public boolean isNotProgramClass() {
     return false;
   }
 
   @Override
-  public KotlinInfo getKotlinInfo() {
+  public KotlinClassLevelInfo getKotlinInfo() {
     return kotlinInfo;
   }
 
-  public void setKotlinInfo(KotlinInfo kotlinInfo) {
-    assert this.kotlinInfo == null || kotlinInfo == null;
+  public void setKotlinInfo(KotlinClassLevelInfo kotlinInfo) {
+    assert kotlinInfo != null;
+    assert this.kotlinInfo == NO_KOTLIN_INFO || kotlinInfo == NO_KOTLIN_INFO;
     this.kotlinInfo = kotlinInfo;
   }
 
+  public boolean hasFields() {
+    return instanceFields.length + staticFields.length > 0;
+  }
+
+  public boolean hasMethods() {
+    return methodCollection.size() > 0;
+  }
+
   public boolean hasMethodsOrFields() {
-    int numberOfFields = staticFields().size() + instanceFields().size();
-    int numberOfMethods = directMethods().size() + virtualMethods().size();
-    return numberOfFields + numberOfMethods > 0;
+    return hasMethods() || hasFields();
   }
 
   public boolean hasAnnotations() {
-    return !annotations.isEmpty()
-        || hasAnnotations(virtualMethods)
-        || hasAnnotations(directMethods)
+    return !annotations().isEmpty()
+        || hasAnnotations(methodCollection)
         || hasAnnotations(staticFields)
         || hasAnnotations(instanceFields);
   }
 
   boolean hasOnlyInternalizableAnnotations() {
-    return !hasAnnotations(virtualMethods)
-        && !hasAnnotations(directMethods)
+    return !hasAnnotations(methodCollection)
         && !hasAnnotations(staticFields)
         && !hasAnnotations(instanceFields);
   }
@@ -265,9 +388,9 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
     }
   }
 
-  private boolean hasAnnotations(DexEncodedMethod[] methods) {
+  private boolean hasAnnotations(MethodCollection methods) {
     synchronized (methods) {
-      return Arrays.stream(methods).anyMatch(DexEncodedMethod::hasAnnotation);
+      return methods.hasAnnotations();
     }
   }
 
@@ -279,101 +402,49 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
     }
   }
 
-  public void computeStaticValues() {
-    // It does not actually hurt to compute this multiple times. So racing on staticValues is OK.
-    if (staticValues == SENTINEL_NOT_YET_COMPUTED) {
-      synchronized (staticFields) {
-        assert PresortedComparable.isSorted(Arrays.asList(staticFields));
-        DexEncodedField[] fields = staticFields;
-        int length = 0;
-        List<DexValue> values = new ArrayList<>(fields.length);
-        for (int i = 0; i < fields.length; i++) {
-          DexEncodedField field = fields[i];
-          DexValue staticValue = field.getStaticValue();
-          assert staticValue != null;
-          values.add(staticValue);
-          if (!staticValue.isDefault(field.field.type)) {
-            length = i + 1;
-          }
-        }
-        staticValues =
-            length > 0
-                ? new DexEncodedArray(values.subList(0, length).toArray(DexValue.EMPTY_ARRAY))
-                : null;
-      }
-    }
-  }
-
-  public boolean isSorted() {
-    return isSorted(virtualMethods)
-        && isSorted(directMethods)
-        && isSorted(staticFields)
-        && isSorted(instanceFields);
-  }
-
-  private static <T extends KeyedDexItem<S>, S extends PresortedComparable<S>> boolean isSorted(
-      T[] items) {
-    synchronized (items) {
-      T[] sorted = items.clone();
-      Arrays.sort(sorted, Comparator.comparing(KeyedDexItem::getKey));
-      return Arrays.equals(items, sorted);
-    }
-  }
-  public DexEncodedArray getStaticValues() {
-    // The sentinel value is left over for classes that actually have no fields.
-    if (staticValues == SENTINEL_NOT_YET_COMPUTED) {
-      assert !hasMethodsOrFields();
+  public DexEncodedArray computeStaticValuesArray(NamingLens namingLens) {
+    // Fast path to avoid sorting and collection allocation when no non-default values exist.
+    if (!hasNonDefaultStaticFieldValues()) {
       return null;
     }
-    return staticValues;
+    DexEncodedField[] fields = staticFields;
+    Arrays.sort(fields, (a, b) -> a.field.slowCompareTo(b.field, namingLens));
+    int length = 0;
+    List<DexValue> values = new ArrayList<>(fields.length);
+    for (int i = 0; i < fields.length; i++) {
+      DexEncodedField field = fields[i];
+      DexValue staticValue = field.getStaticValue();
+      assert staticValue != null;
+      values.add(staticValue);
+      if (!staticValue.isDefault(field.field.type)) {
+        length = i + 1;
+      }
+    }
+    return length > 0
+        ? new DexEncodedArray(values.subList(0, length).toArray(DexValue.EMPTY_ARRAY))
+        : null;
+  }
+
+  private boolean hasNonDefaultStaticFieldValues() {
+    for (DexEncodedField field : staticFields) {
+      DexValue value = field.getStaticValue();
+      if (value != null && !value.isDefault(field.field.type)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public void addMethod(DexEncodedMethod method) {
-    if (method.accessFlags.isStatic()
-        || method.accessFlags.isPrivate()
-        || method.accessFlags.isConstructor()) {
-      addDirectMethod(method);
-    } else {
-      addVirtualMethod(method);
-    }
+    methodCollection.addMethod(method);
   }
 
   public void addVirtualMethod(DexEncodedMethod virtualMethod) {
-    assert !virtualMethod.accessFlags.isStatic();
-    assert !virtualMethod.accessFlags.isPrivate();
-    assert !virtualMethod.accessFlags.isConstructor();
-    synchronized (virtualMethods) {
-      virtualMethods = Arrays.copyOf(virtualMethods, virtualMethods.length + 1);
-      virtualMethods[virtualMethods.length - 1] = virtualMethod;
-    }
+    methodCollection.addVirtualMethod(virtualMethod);
   }
 
-  public void addDirectMethod(DexEncodedMethod staticMethod) {
-    assert staticMethod.accessFlags.isStatic() || staticMethod.accessFlags.isPrivate()
-        || staticMethod.accessFlags.isConstructor();
-    synchronized (directMethods) {
-      directMethods = Arrays.copyOf(directMethods, directMethods.length + 1);
-      directMethods[directMethods.length - 1] = staticMethod;
-    }
-  }
-
-  public void sortMembers() {
-    sortEncodedFields(staticFields);
-    sortEncodedFields(instanceFields);
-    sortEncodedMethods(directMethods);
-    sortEncodedMethods(virtualMethods);
-  }
-
-  private void sortEncodedFields(DexEncodedField[] fields) {
-    synchronized (fields) {
-      Arrays.sort(fields, Comparator.comparing(a -> a.field));
-    }
-  }
-
-  private void sortEncodedMethods(DexEncodedMethod[] methods) {
-    synchronized (methods) {
-      Arrays.sort(methods, Comparator.comparing(a -> a.method));
-    }
+  public void addDirectMethod(DexEncodedMethod directMethod) {
+    methodCollection.addDirectMethod(directMethod);
   }
 
   @Override
@@ -404,34 +475,60 @@ public class DexProgramClass extends DexClass implements Supplier<DexProgramClas
    * entire scope.
    */
   public boolean hasReachabilitySensitiveAnnotation(DexItemFactory factory) {
-    for (DexEncodedMethod directMethod : directMethods) {
-      for (DexAnnotation annotation : directMethod.annotations.annotations) {
-        if (annotation.annotation.type == factory.annotationReachabilitySensitive) {
-          return true;
-        }
-      }
-    }
-    for (DexEncodedMethod virtualMethod : virtualMethods) {
-      for (DexAnnotation annotation : virtualMethod.annotations.annotations) {
-        if (annotation.annotation.type == factory.annotationReachabilitySensitive) {
-          return true;
-        }
-      }
-    }
-    for (DexEncodedField staticField : staticFields) {
-      for (DexAnnotation annotation : staticField.annotations.annotations) {
-        if (annotation.annotation.type == factory.annotationReachabilitySensitive) {
-          return true;
-        }
-      }
-    }
-    for (DexEncodedField instanceField : instanceFields) {
-      for (DexAnnotation annotation : instanceField.annotations.annotations) {
+    for (DexEncodedMember<?, ?> member : members()) {
+      for (DexAnnotation annotation : member.annotations().annotations) {
         if (annotation.annotation.type == factory.annotationReachabilitySensitive) {
           return true;
         }
       }
     }
     return false;
+  }
+
+  public static Iterable<DexProgramClass> asProgramClasses(
+      Iterable<DexType> types, DexDefinitionSupplier definitions) {
+    return () ->
+        new Iterator<DexProgramClass>() {
+
+          private final Iterator<DexType> iterator = types.iterator();
+
+          private DexProgramClass next = findNext();
+
+          @Override
+          public boolean hasNext() {
+            return next != null;
+          }
+
+          @Override
+          public DexProgramClass next() {
+            DexProgramClass current = next;
+            next = findNext();
+            return current;
+          }
+
+          private DexProgramClass findNext() {
+            while (iterator.hasNext()) {
+              DexType next = iterator.next();
+              DexClass clazz = definitions.definitionFor(next);
+              if (clazz != null && clazz.isProgramClass()) {
+                return clazz.asProgramClass();
+              }
+            }
+            return null;
+          }
+        };
+  }
+
+  public static long invalidChecksumRequest(DexProgramClass clazz) {
+    throw new CompilationError(
+        clazz + " has no checksum information while checksum encoding is requested", clazz.origin);
+  }
+
+  public static long checksumFromType(DexProgramClass clazz) {
+    return clazz.type.hashCode();
+  }
+
+  public long getChecksum() {
+    return checksumSupplier.getChecksum(this);
   }
 }

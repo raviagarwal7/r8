@@ -31,7 +31,6 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.BeforeParam;
 
 @RunWith(Parameterized.class)
 public class ApplyMappingAfterVerticalMergingMethodTest extends TestBase {
@@ -100,11 +99,6 @@ public class ApplyMappingAfterVerticalMergingMethodTest extends TestBase {
   @ClassRule
   public static TemporaryFolder staticTemp = ToolHelper.getTemporaryFolderForTest();
 
-  @BeforeParam
-  public static void forceCompilation(TestParameters parameters) {
-    compilationResults.apply(parameters.getBackend());
-  }
-
   public static CompilationResult compile(Backend backend)
       throws ExecutionException, CompilationFailedException, IOException {
     R8TestCompileResult library = compileLibrary(backend);
@@ -122,17 +116,19 @@ public class ApplyMappingAfterVerticalMergingMethodTest extends TestBase {
         .addKeepClassAndDefaultConstructor(LibrarySubclass.class)
         .setMinApi(AndroidApiLevel.B)
         .compile()
-        .inspect(inspector -> {
-          assertThat(inspector.clazz(LibraryBase.class), not(isPresent()));
-          assertThat(inspector.clazz(LibrarySubclass.class), isPresent());
-          List<FoundMethodSubject> methods = inspector.clazz(LibrarySubclass.class).allMethods();
-          // TODO(b/129365817): This should have just the three methods: <init>, main and one foo.
-          assertEquals(4, methods.size());
-          assertEquals(1, methods.stream().filter(m -> m.isInstanceInitializer()).count());
-          assertEquals(1, methods.stream().filter(m -> m.getFinalName().contains("main")).count());
-          assertEquals(
-              2, methods.stream().filter(m -> m.getOriginalName().contains("foo")).count());
-        });
+        .inspect(
+            inspector -> {
+              assertThat(inspector.clazz(LibraryBase.class), not(isPresent()));
+              assertThat(inspector.clazz(LibrarySubclass.class), isPresent());
+              List<FoundMethodSubject> methods =
+                  inspector.clazz(LibrarySubclass.class).allMethods();
+              assertEquals(3, methods.size());
+              assertEquals(1, methods.stream().filter(m -> m.isInstanceInitializer()).count());
+              assertEquals(
+                  1, methods.stream().filter(m -> m.getFinalName().contains("main")).count());
+              assertEquals(
+                  1, methods.stream().filter(m -> m.getOriginalName().contains("foo")).count());
+            });
   }
 
   private static R8TestCompileResult compileProgram(Backend backend, String proguardMap)

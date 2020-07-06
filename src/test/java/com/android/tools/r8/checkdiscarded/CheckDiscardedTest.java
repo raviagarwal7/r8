@@ -3,33 +3,69 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.checkdiscarded;
 
+import static com.android.tools.r8.DiagnosticsMatcher.diagnosticMessage;
+import static org.hamcrest.CoreMatchers.allOf;
+import static org.hamcrest.core.StringContains.containsString;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
+
 import com.android.tools.r8.CompilationFailedException;
+import com.android.tools.r8.R8FullTestBuilder;
+import com.android.tools.r8.R8TestCompileResult;
 import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestDiagnosticMessages;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestRuntime.NoneRuntime;
 import com.android.tools.r8.checkdiscarded.testclasses.Main;
 import com.android.tools.r8.checkdiscarded.testclasses.UnusedClass;
 import com.android.tools.r8.checkdiscarded.testclasses.UsedClass;
 import com.android.tools.r8.checkdiscarded.testclasses.WillBeGone;
 import com.android.tools.r8.checkdiscarded.testclasses.WillStay;
+import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.InternalOptions;
 import com.google.common.collect.ImmutableList;
 import java.util.List;
-import org.junit.Assert;
+import java.util.function.Consumer;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
+@RunWith(Parameterized.class)
 public class CheckDiscardedTest extends TestBase {
 
-  private void run(boolean obfuscate, Class annotation, boolean checkMembers, boolean shouldFail)
-      throws Exception {
-    List<Class<?>> classes = ImmutableList.of(UnusedClass.class, UsedClass.class, Main.class);
-    String proguardConfig = keepMainProguardConfiguration(Main.class, true, obfuscate)
-        + checkDiscardRule(checkMembers, annotation);
+  @Parameters(name = "{0}, minify:{1}")
+  public static List<Object[]> data() {
+    return buildParameters(getTestParameters().withNoneRuntime().build(), BooleanUtils.values());
+  }
+
+  public final boolean minify;
+
+  public CheckDiscardedTest(TestParameters parameters, boolean minify) {
+    assertEquals(NoneRuntime.getInstance(), parameters.getRuntime());
+    this.minify = minify;
+  }
+
+  private void compile(
+      Class annotation,
+      boolean checkMembers,
+      Consumer<TestDiagnosticMessages> onCompilationFailure) {
+    R8FullTestBuilder builder = testForR8(Backend.DEX);
+    TestDiagnosticMessages diagnostics = builder.getState().getDiagnosticsMessages();
     try {
-      compileWithR8(classes, proguardConfig, this::noInlining);
+      R8TestCompileResult result =
+          builder
+              .addProgramClasses(UnusedClass.class, UsedClass.class, Main.class)
+              .addKeepMainRule(Main.class)
+              .addKeepRules(checkDiscardRule(checkMembers, annotation))
+              .minification(minify)
+              .addOptionsModification(this::noInlining)
+              .compile();
+      assertNull(onCompilationFailure);
+      result.assertNoMessages();
     } catch (CompilationFailedException e) {
-      Assert.assertTrue(shouldFail);
-      return;
+      onCompilationFailure.accept(diagnostics);
     }
-    Assert.assertFalse(shouldFail);
   }
 
   private void noInlining(InternalOptions options) {
@@ -38,34 +74,52 @@ public class CheckDiscardedTest extends TestBase {
 
   private String checkDiscardRule(boolean member, Class annotation) {
     if (member) {
-      return "-checkdiscard class * { @" + annotation.getCanonicalName() + " *; }";
+      return "-checkdiscard class * { @" + annotation.getName() + " *; }";
     } else {
-      return "-checkdiscard @" + annotation.getCanonicalName() + " class *";
+      return "-checkdiscard @" + annotation.getName() + " class *";
     }
   }
 
   @Test
-  public void classesAreGone() throws Exception {
-    run(false, WillBeGone.class, false, false);
-    run(true, WillBeGone.class, false, false);
+  public void classesAreGone() {
+    compile(WillBeGone.class, false, null);
   }
 
   @Test
-  public void classesAreNotGone() throws Exception {
-    run(false, WillStay.class, false, true);
-    run(true, WillStay.class, false, true);
+  public void classesAreNotGone() {
+    Consumer<TestDiagnosticMessages> check =
+        diagnostics ->
+            diagnostics
+                .assertNoWarnings()
+                .assertErrorsMatch(diagnosticMessage(containsString("Discard checks failed")))
+                .assertInfosMatch(
+                    ImmutableList.of(
+                        allOf(
+                            diagnosticMessage(containsString("UsedClass was not discarded")),
+                            diagnosticMessage(containsString("is instantiated in"))),
+                        allOf(
+                            diagnosticMessage(containsString("Main was not discarded")),
+                            diagnosticMessage(containsString("is referenced in keep rule")))));
+    compile(WillStay.class, false, check);
   }
 
   @Test
-  public void membersAreGone() throws Exception {
-    run(false, WillBeGone.class, true, false);
-    run(true, WillBeGone.class, true, false);
+  public void membersAreGone() {
+    compile(WillBeGone.class, true, null);
   }
 
   @Test
-  public void membersAreNotGone() throws Exception {
-    run(false, WillStay.class, true, true);
-    run(true, WillStay.class, true, true);
+  public void membersAreNotGone() {
+    Consumer<TestDiagnosticMessages> check =
+        diagnostics ->
+            diagnostics
+                .assertNoWarnings()
+                .assertErrorsMatch(diagnosticMessage(containsString("Discard checks failed")))
+                .assertInfosMatch(
+                    allOf(
+                        diagnosticMessage(containsString("was not discarded")),
+                        diagnosticMessage(containsString("is invoked from"))));
+    compile(WillStay.class, true, check);
   }
 
 }

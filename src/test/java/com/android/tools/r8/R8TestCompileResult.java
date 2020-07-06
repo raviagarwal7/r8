@@ -3,51 +3,47 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
-import com.android.tools.r8.TestBase.Backend;
 import com.android.tools.r8.ToolHelper.ProcessResult;
 import com.android.tools.r8.shaking.CollectingGraphConsumer;
 import com.android.tools.r8.shaking.ProguardConfiguration;
 import com.android.tools.r8.shaking.ProguardConfigurationRule;
 import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.FileUtils;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.graphinspector.GraphInspector;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 
 public class R8TestCompileResult extends TestCompileResult<R8TestCompileResult, R8TestRunResult> {
 
-  private final Backend backend;
   private final ProguardConfiguration proguardConfiguration;
   private final List<ProguardConfigurationRule> syntheticProguardRules;
   private final String proguardMap;
   private final CollectingGraphConsumer graphConsumer;
+  private final int minApiLevel;
 
   R8TestCompileResult(
       TestState state,
-      Backend backend,
+      OutputMode outputMode,
       AndroidApp app,
       ProguardConfiguration proguardConfiguration,
       List<ProguardConfigurationRule> syntheticProguardRules,
       String proguardMap,
-      CollectingGraphConsumer graphConsumer) {
-    super(state, app);
-    this.backend = backend;
+      CollectingGraphConsumer graphConsumer,
+      int minApiLevel) {
+    super(state, app, outputMode);
     this.proguardConfiguration = proguardConfiguration;
     this.syntheticProguardRules = syntheticProguardRules;
     this.proguardMap = proguardMap;
     this.graphConsumer = graphConsumer;
+    this.minApiLevel = minApiLevel;
   }
 
   @Override
   public R8TestCompileResult self() {
     return this;
-  }
-
-  @Override
-  public Backend getBackend() {
-    return backend;
   }
 
   @Override
@@ -61,11 +57,21 @@ public class R8TestCompileResult extends TestCompileResult<R8TestCompileResult, 
   }
 
   @Override
-  public CodeInspector inspector() throws IOException, ExecutionException {
+  public String getStdout() {
+    return state.getStdout();
+  }
+
+  @Override
+  public String getStderr() {
+    return state.getStderr();
+  }
+
+  @Override
+  public CodeInspector inspector() throws IOException {
     return new CodeInspector(app, proguardMap);
   }
 
-  public GraphInspector graphInspector() throws IOException, ExecutionException {
+  public GraphInspector graphInspector() throws IOException {
     assert graphConsumer != null;
     return new GraphInspector(graphConsumer, inspector());
   }
@@ -91,11 +97,16 @@ public class R8TestCompileResult extends TestCompileResult<R8TestCompileResult, 
   }
 
   @Override
-  public R8TestRunResult createRunResult(ProcessResult result) {
-    return new R8TestRunResult(app, result, proguardMap, this::graphInspector);
+  public R8TestRunResult createRunResult(TestRuntime runtime, ProcessResult result) {
+    return new R8TestRunResult(app, runtime, result, proguardMap, this::graphInspector);
   }
 
   public String getProguardMap() {
     return proguardMap;
+  }
+
+  public R8TestCompileResult writeProguardMap(Path path) throws IOException {
+    FileUtils.writeTextFile(path, getProguardMap());
+    return self();
   }
 }

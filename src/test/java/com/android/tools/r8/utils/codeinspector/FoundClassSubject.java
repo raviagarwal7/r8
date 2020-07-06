@@ -4,34 +4,44 @@
 
 package com.android.tools.r8.utils.codeinspector;
 
+import static com.android.tools.r8.KotlinTestBase.METADATA_TYPE;
+import static org.junit.Assert.assertTrue;
+
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.kotlin.KotlinClassMetadataReader;
 import com.android.tools.r8.naming.ClassNamingForNameMapper;
 import com.android.tools.r8.naming.MemberNaming;
 import com.android.tools.r8.naming.MemberNaming.FieldSignature;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.naming.MemberNaming.Signature;
 import com.android.tools.r8.naming.signature.GenericSignatureParser;
+import com.android.tools.r8.references.ClassReference;
 import com.android.tools.r8.utils.DescriptorUtils;
 import com.android.tools.r8.utils.StringUtils;
-import java.util.Arrays;
 import java.util.List;
 import java.util.function.Consumer;
+import kotlinx.metadata.jvm.KotlinClassMetadata;
 
 public class FoundClassSubject extends ClassSubject {
 
-  private final CodeInspector codeInspector;
   private final DexClass dexClass;
   final ClassNamingForNameMapper naming;
 
-  FoundClassSubject(CodeInspector codeInspector, DexClass dexClass, ClassNamingForNameMapper naming) {
-    this.codeInspector = codeInspector;
+  FoundClassSubject(
+      CodeInspector codeInspector,
+      DexClass dexClass,
+      ClassNamingForNameMapper naming,
+      ClassReference reference) {
+    super(codeInspector, reference);
     this.dexClass = dexClass;
     this.naming = naming;
   }
@@ -53,6 +63,11 @@ public class FoundClassSubject extends ClassSubject {
         (encoded, clazz) -> new FoundMethodSubject(codeInspector, encoded, clazz),
         this,
         inspection);
+    forAllVirtualMethods(inspection);
+  }
+
+  @Override
+  public void forAllVirtualMethods(Consumer<FoundMethodSubject> inspection) {
     CodeInspector.forAll(
         dexClass.virtualMethods(),
         (encoded, clazz) -> new FoundMethodSubject(codeInspector, encoded, clazz),
@@ -90,7 +105,7 @@ public class FoundClassSubject extends ClassSubject {
         : new FoundMethodSubject(codeInspector, encoded, this);
   }
 
-  private DexEncodedMethod findMethod(List<DexEncodedMethod> methods, DexMethod dexMethod) {
+  private DexEncodedMethod findMethod(Iterable<DexEncodedMethod> methods, DexMethod dexMethod) {
     for (DexEncodedMethod method : methods) {
       if (method.method.equals(dexMethod)) {
         return method;
@@ -113,13 +128,23 @@ public class FoundClassSubject extends ClassSubject {
 
   @Override
   public void forAllFields(Consumer<FoundFieldSubject> inspection) {
+    forAllInstanceFields(inspection);
+    forAllStaticFields(inspection);
+  }
+
+  @Override
+  public void forAllInstanceFields(Consumer<FoundFieldSubject> inspection) {
     CodeInspector.forAll(
-        dexClass.staticFields(),
+        dexClass.instanceFields(),
         (dexField, clazz) -> new FoundFieldSubject(codeInspector, dexField, clazz),
         this,
         inspection);
+  }
+
+  @Override
+  public void forAllStaticFields(Consumer<FoundFieldSubject> inspection) {
     CodeInspector.forAll(
-        dexClass.instanceFields(),
+        dexClass.staticFields(),
         (dexField, clazz) -> new FoundFieldSubject(codeInspector, dexField, clazz),
         this,
         inspection);
@@ -161,6 +186,18 @@ public class FoundClassSubject extends ClassSubject {
   }
 
   @Override
+  public FieldSubject uniqueFieldWithFinalName(String name) {
+    FieldSubject fieldSubject = null;
+    for (FoundFieldSubject candidate : allFields()) {
+      if (candidate.getFinalName().equals(name)) {
+        assert fieldSubject == null;
+        fieldSubject = candidate;
+      }
+    }
+    return fieldSubject != null ? fieldSubject : new AbsentFieldSubject();
+  }
+
+  @Override
   public FoundClassSubject asFoundClassSubject() {
     return this;
   }
@@ -190,8 +227,13 @@ public class FoundClassSubject extends ClassSubject {
   }
 
   @Override
-  public DexClass getDexClass() {
-    return dexClass;
+  public DexProgramClass getDexProgramClass() {
+    assert dexClass.isProgramClass();
+    return dexClass.asProgramClass();
+  }
+
+  public ClassSubject getSuperClass() {
+    return codeInspector.clazz(dexClass.superType.toSourceString());
   }
 
   @Override
@@ -200,7 +242,7 @@ public class FoundClassSubject extends ClassSubject {
     assert !name.endsWith("EnclosingClass")
         && !name.endsWith("EnclosingMethod")
         && !name.endsWith("InnerClass");
-    DexAnnotation annotation = codeInspector.findAnnotation(name, dexClass.annotations);
+    DexAnnotation annotation = codeInspector.findAnnotation(name, dexClass.annotations());
     return annotation == null
         ? new AbsentAnnotationSubject()
         : new FoundAnnotationSubject(annotation);
@@ -225,6 +267,15 @@ public class FoundClassSubject extends ClassSubject {
   }
 
   @Override
+  public String getOriginalBinaryName() {
+    return DescriptorUtils.getBinaryNameFromDescriptor(getOriginalDescriptor());
+  }
+
+  public DexType getOriginalDexType(DexItemFactory dexItemFactory) {
+    return dexItemFactory.createType(getOriginalDescriptor());
+  }
+
+  @Override
   public String getFinalName() {
     return DescriptorUtils.descriptorToJavaType(getFinalDescriptor());
   }
@@ -232,6 +283,11 @@ public class FoundClassSubject extends ClassSubject {
   @Override
   public String getFinalDescriptor() {
     return dexClass.type.descriptor.toString();
+  }
+
+  @Override
+  public String getFinalBinaryName() {
+    return DescriptorUtils.getBinaryNameFromDescriptor(getFinalDescriptor());
   }
 
   @Override
@@ -260,14 +316,19 @@ public class FoundClassSubject extends ClassSubject {
   }
 
   @Override
+  public DexMethod getFinalEnclosingMethod() {
+    return dexClass.getEnclosingMethodAttribute().getEnclosingMethod();
+  }
+
+  @Override
   public String getOriginalSignatureAttribute() {
     return codeInspector.getOriginalSignatureAttribute(
-        dexClass.annotations, GenericSignatureParser::parseClassSignature);
+        dexClass.annotations(), GenericSignatureParser::parseClassSignature);
   }
 
   @Override
   public String getFinalSignatureAttribute() {
-    return codeInspector.getFinalSignatureAttribute(dexClass.annotations);
+    return codeInspector.getFinalSignatureAttribute(dexClass.annotations());
   }
 
   @Override
@@ -292,5 +353,54 @@ public class FoundClassSubject extends ClassSubject {
   @Override
   public String toString() {
     return dexClass.toSourceString();
+  }
+
+  public TypeSubject asTypeSubject() {
+    return new TypeSubject(codeInspector, getDexProgramClass().type);
+  }
+
+  @Override
+  public KmClassSubject getKmClass() {
+    AnnotationSubject annotationSubject = annotation(METADATA_TYPE);
+    if (!annotationSubject.isPresent()) {
+      return new AbsentKmClassSubject();
+    }
+    KotlinClassMetadata metadata =
+        KotlinClassMetadataReader.toKotlinClassMetadata(
+            codeInspector.getFactory().kotlin, annotationSubject.getAnnotation());
+    assertTrue(metadata instanceof KotlinClassMetadata.Class);
+    KotlinClassMetadata.Class kClass = (KotlinClassMetadata.Class) metadata;
+    return new FoundKmClassSubject(codeInspector, getDexProgramClass(), kClass.toKmClass());
+  }
+
+  @Override
+  public KmPackageSubject getKmPackage() {
+    AnnotationSubject annotationSubject = annotation(METADATA_TYPE);
+    if (!annotationSubject.isPresent()) {
+      return new AbsentKmPackageSubject();
+    }
+    KotlinClassMetadata metadata =
+        KotlinClassMetadataReader.toKotlinClassMetadata(
+            codeInspector.getFactory().kotlin, annotationSubject.getAnnotation());
+    assertTrue(metadata instanceof KotlinClassMetadata.FileFacade
+        || metadata instanceof KotlinClassMetadata.MultiFileClassPart);
+    if (metadata instanceof KotlinClassMetadata.FileFacade) {
+      KotlinClassMetadata.FileFacade kFile = (KotlinClassMetadata.FileFacade) metadata;
+      return new FoundKmPackageSubject(codeInspector, getDexProgramClass(), kFile.toKmPackage());
+    } else {
+      KotlinClassMetadata.MultiFileClassPart kPart =
+          (KotlinClassMetadata.MultiFileClassPart) metadata;
+      return new FoundKmPackageSubject(codeInspector, getDexProgramClass(), kPart.toKmPackage());
+    }
+  }
+
+  @Override
+  public KotlinClassMetadata getKotlinClassMetadata() {
+    AnnotationSubject annotationSubject = annotation(METADATA_TYPE);
+    if (!annotationSubject.isPresent()) {
+      return null;
+    }
+    return KotlinClassMetadataReader.toKotlinClassMetadata(
+        codeInspector.getFactory().kotlin, annotationSubject.getAnnotation());
   }
 }

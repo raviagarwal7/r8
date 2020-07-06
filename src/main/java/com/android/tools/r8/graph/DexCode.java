@@ -16,6 +16,7 @@ import com.android.tools.r8.ir.code.Position;
 import com.android.tools.r8.ir.code.ValueNumberGenerator;
 import com.android.tools.r8.ir.conversion.DexSourceCode;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.conversion.MethodProcessor;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.StringUtils;
@@ -32,8 +33,8 @@ import java.util.Set;
 // DexCode corresponds to code item in dalvik/dex-format.html
 public class DexCode extends Code {
 
-  private static final String FAKE_THIS_PREFIX = "_";
-  private static final String FAKE_THIS_SUFFIX = "this";
+  static final String FAKE_THIS_PREFIX = "_";
+  static final String FAKE_THIS_SUFFIX = "this";
 
   public final int registerSize;
   public final int incomingRegisterSize;
@@ -132,7 +133,7 @@ public class DexCode extends Code {
     return new DexDebugInfo(debugInfo.startLine, newParameters, debugInfo.events);
   }
 
-  private static int getLargestPrefix(DexItemFactory factory, DexString name) {
+  public static int getLargestPrefix(DexItemFactory factory, DexString name) {
     if (name != null && name.endsWith(factory.thisName)) {
       String string = name.toString();
       for (int i = 0; i < string.length(); i++) {
@@ -213,41 +214,47 @@ public class DexCode extends Code {
   }
 
   @Override
-  public IRCode buildIR(
-      DexEncodedMethod encodedMethod, AppView<? extends AppInfo> appView, Origin origin) {
-    assert getOwner() == encodedMethod;
+  public IRCode buildIR(ProgramMethod method, AppView<?> appView, Origin origin) {
     DexSourceCode source =
         new DexSourceCode(
             this,
-            encodedMethod,
-            appView.graphLense().getOriginalMethodSignature(encodedMethod.method),
+            method,
+            appView.graphLense().getOriginalMethodSignature(method.getReference()),
             null);
-    IRBuilder builder =
-        new IRBuilder(encodedMethod, appView, source, origin, new ValueNumberGenerator());
-    return builder.build(encodedMethod);
+    return IRBuilder.create(method, appView, source, origin).build(method);
   }
 
   @Override
   public IRCode buildInliningIR(
-      DexEncodedMethod context,
-      DexEncodedMethod encodedMethod,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      ProgramMethod method,
+      AppView<?> appView,
       ValueNumberGenerator valueNumberGenerator,
       Position callerPosition,
-      Origin origin) {
-    assert getOwner() == encodedMethod;
+      Origin origin,
+      MethodProcessor methodProcessor) {
     DexSourceCode source =
         new DexSourceCode(
             this,
-            encodedMethod,
-            appView.graphLense().getOriginalMethodSignature(encodedMethod.method),
+            method,
+            appView.graphLense().getOriginalMethodSignature(method.getReference()),
             callerPosition);
-    IRBuilder builder = new IRBuilder(encodedMethod, appView, source, origin, valueNumberGenerator);
-    return builder.build(context);
+    return IRBuilder.createForInlining(
+            method, appView, source, origin, methodProcessor, valueNumberGenerator)
+        .build(context);
   }
 
   @Override
-  public void registerCodeReferences(UseRegistry registry) {
+  public void registerCodeReferences(ProgramMethod method, UseRegistry registry) {
+    internalRegisterCodeReferences(method, registry);
+  }
+
+  @Override
+  public void registerCodeReferencesForDesugaring(ClasspathMethod method, UseRegistry registry) {
+    internalRegisterCodeReferences(method, registry);
+  }
+
+  private void internalRegisterCodeReferences(DexClassAndMethod method, UseRegistry registry) {
     for (Instruction insn : instructions) {
       insn.registerUse(registry);
     }
@@ -293,9 +300,13 @@ public class DexCode extends Code {
       debugInfo = debugInfoIterator.hasNext() ? debugInfoIterator.next() : null;
     }
     int instructionNumber = 0;
+    Map<Integer, DebugLocalInfo> locals = Collections.emptyMap();
     for (Instruction insn : instructions) {
       while (debugInfo != null && debugInfo.address == insn.getOffset()) {
-        builder.append("         ").append(debugInfo.toString(false)).append("\n");
+        if (debugInfo.lineEntry || !locals.equals(debugInfo.locals)) {
+          builder.append("         ").append(debugInfo.toString(false)).append("\n");
+        }
+        locals = debugInfo.locals;
         debugInfo = debugInfoIterator.hasNext() ? debugInfoIterator.next() : null;
       }
       StringUtils.appendLeftPadded(builder, Integer.toString(instructionNumber++), 5);

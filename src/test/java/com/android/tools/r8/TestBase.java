@@ -4,64 +4,103 @@
 
 package com.android.tools.r8;
 
+import static com.android.tools.r8.utils.InternalOptions.ASM_VERSION;
 import static com.google.common.collect.Lists.cartesianProduct;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
-import static com.android.tools.r8.utils.InternalOptions.ASM_VERSION;
 
+import com.android.tools.r8.ClassFileConsumer.ArchiveConsumer;
 import com.android.tools.r8.DataResourceProvider.Visitor;
+import com.android.tools.r8.KotlinCompilerTool.KotlinCompiler;
+import com.android.tools.r8.TestRuntime.CfRuntime;
 import com.android.tools.r8.ToolHelper.ArtCommandBuilder;
 import com.android.tools.r8.ToolHelper.DexVm;
+import com.android.tools.r8.ToolHelper.KotlinTargetVersion;
 import com.android.tools.r8.ToolHelper.ProcessResult;
 import com.android.tools.r8.code.Instruction;
 import com.android.tools.r8.dex.ApplicationReader;
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppServices;
+import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexCode;
 import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProto;
+import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.graph.SmaliWriter;
+import com.android.tools.r8.graph.SubtypingInfo;
 import com.android.tools.r8.jasmin.JasminBuilder;
 import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.references.ClassReference;
+import com.android.tools.r8.references.FieldReference;
+import com.android.tools.r8.references.MethodReference;
+import com.android.tools.r8.references.Reference;
+import com.android.tools.r8.references.TypeReference;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.shaking.EnqueuerFactory;
+import com.android.tools.r8.shaking.ProguardClassFilter;
+import com.android.tools.r8.shaking.ProguardClassNameList;
+import com.android.tools.r8.shaking.ProguardConfiguration;
+import com.android.tools.r8.shaking.ProguardConfigurationRule;
+import com.android.tools.r8.shaking.ProguardKeepRule;
+import com.android.tools.r8.shaking.ProguardKeepRule.Builder;
+import com.android.tools.r8.shaking.ProguardKeepRuleType;
+import com.android.tools.r8.shaking.ProguardMemberRule;
+import com.android.tools.r8.shaking.ProguardMemberType;
+import com.android.tools.r8.shaking.ProguardTypeMatcher;
+import com.android.tools.r8.shaking.RootSetBuilder;
+import com.android.tools.r8.shaking.RootSetBuilder.RootSet;
+import com.android.tools.r8.shaking.serviceloader.ServiceLoaderMultipleTest.Greeter;
+import com.android.tools.r8.transformers.ClassFileTransformer;
 import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.AndroidAppConsumers;
 import com.android.tools.r8.utils.DescriptorUtils;
 import com.android.tools.r8.utils.FileUtils;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.ListUtils;
 import com.android.tools.r8.utils.PreloadedClassFileProvider;
+import com.android.tools.r8.utils.Reporter;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.TestDescriptionWatcher;
 import com.android.tools.r8.utils.Timing;
-import com.android.tools.r8.utils.ZipUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Streams;
+import com.google.common.collect.Sets;
 import com.google.common.io.ByteStreams;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.lang.reflect.Modifier;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.jar.JarOutputStream;
@@ -69,6 +108,8 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
 import org.objectweb.asm.ClassReader;
@@ -90,12 +131,17 @@ public class TestBase {
     return R8CompatTestBuilder.create(new TestState(temp), backend, forceProguardCompatibility);
   }
 
-  public static ExternalR8TestBuilder testForExternalR8(TemporaryFolder temp, Backend backend) {
-    return ExternalR8TestBuilder.create(new TestState(temp), backend);
+  public static ExternalR8TestBuilder testForExternalR8(
+      TemporaryFolder temp, Backend backend, TestRuntime runtime) {
+    return ExternalR8TestBuilder.create(new TestState(temp), backend, runtime);
+  }
+
+  public static D8TestBuilder testForD8(TemporaryFolder temp, Backend backend) {
+    return D8TestBuilder.create(new TestState(temp), backend);
   }
 
   public static D8TestBuilder testForD8(TemporaryFolder temp) {
-    return D8TestBuilder.create(new TestState(temp));
+    return D8TestBuilder.create(new TestState(temp), Backend.DEX);
   }
 
   public static DXTestBuilder testForDX(TemporaryFolder temp) {
@@ -126,12 +172,16 @@ public class TestBase {
     return testForR8Compat(temp, backend, forceProguardCompatibility);
   }
 
-  public ExternalR8TestBuilder testForExternalR8(Backend backend) {
-    return testForExternalR8(temp, backend);
+  public ExternalR8TestBuilder testForExternalR8(Backend backend, TestRuntime runtime) {
+    return testForExternalR8(temp, backend, runtime);
   }
 
   public D8TestBuilder testForD8() {
-    return testForD8(temp);
+    return testForD8(temp, Backend.DEX);
+  }
+
+  public D8TestBuilder testForD8(Backend backend) {
+    return testForD8(temp, backend);
   }
 
   public DXTestBuilder testForDX() {
@@ -142,12 +192,67 @@ public class TestBase {
     return testForJvm(temp);
   }
 
+  public TestBuilder<? extends TestRunResult<?>, ?> testForRuntime(
+      TestRuntime runtime, Consumer<D8TestBuilder> d8TestBuilderConsumer) {
+    if (runtime.isCf()) {
+      return testForJvm();
+    } else {
+      assert runtime.isDex();
+      D8TestBuilder d8TestBuilder = testForD8();
+      d8TestBuilderConsumer.accept(d8TestBuilder);
+      return d8TestBuilder;
+    }
+  }
+
+  public TestBuilder<? extends TestRunResult<?>, ?> testForRuntime(
+      TestRuntime runtime, AndroidApiLevel apiLevel) {
+    return testForRuntime(runtime, d8TestBuilder -> d8TestBuilder.setMinApi(apiLevel));
+  }
+
+  public TestBuilder<? extends TestRunResult<?>, ?> testForRuntime(TestParameters parameters) {
+    return testForRuntime(parameters.getRuntime(), parameters.getApiLevel());
+  }
+
   public ProguardTestBuilder testForProguard() {
     return testForProguard(temp);
   }
 
   public GenerateMainDexListTestBuilder testForMainDexListGenerator() {
     return testForMainDexListGenerator(temp);
+  }
+
+  public JavaCompilerTool javac(CfRuntime jdk) {
+    return JavaCompilerTool.create(jdk, temp);
+  }
+
+  public static JavaCompilerTool javac(CfRuntime jdk, TemporaryFolder temp) {
+    return JavaCompilerTool.create(jdk, temp);
+  }
+
+  public static KotlinCompilerTool kotlinc(
+      CfRuntime jdk,
+      TemporaryFolder temp,
+      KotlinCompiler kotlinCompiler,
+      KotlinTargetVersion kotlinTargetVersion) {
+    return KotlinCompilerTool.create(jdk, temp, kotlinCompiler, kotlinTargetVersion);
+  }
+
+  public static KotlinCompilerTool kotlinc(
+      KotlinCompiler kotlinCompiler, KotlinTargetVersion kotlinTargetVersion) {
+    return kotlinc(TestRuntime.getCheckedInJdk9(), staticTemp, kotlinCompiler, kotlinTargetVersion);
+  }
+
+  public KotlinCompilerTool kotlinc(
+      CfRuntime jdk, KotlinCompiler kotlinCompiler, KotlinTargetVersion kotlinTargetVersion) {
+    return KotlinCompilerTool.create(jdk, temp, kotlinCompiler, kotlinTargetVersion);
+  }
+
+  public static ClassFileTransformer transformer(Class<?> clazz) throws IOException {
+    return ClassFileTransformer.create(clazz);
+  }
+
+  public static ClassFileTransformer transformer(byte[] bytes, ClassReference classReference) {
+    return ClassFileTransformer.create(bytes, classReference);
   }
 
   // Actually running Proguard should only be during development.
@@ -161,11 +266,32 @@ public class TestBase {
   @Rule
   public TestDescriptionWatcher watcher = new TestDescriptionWatcher();
 
+  private static TemporaryFolder staticTemp = null;
+
+  @BeforeClass
+  public static void testBaseBeforeClassSetup() throws IOException {
+    assert staticTemp == null;
+    staticTemp = ToolHelper.getTemporaryFolderForTest();
+    staticTemp.create();
+  }
+
+  @AfterClass
+  public static void testBaseBeforeClassTearDown() {
+    assert staticTemp != null;
+    staticTemp.delete();
+    staticTemp = null;
+  }
+
+  public static TemporaryFolder getStaticTemp() {
+    return staticTemp;
+  }
+
   public static TestParametersBuilder getTestParameters() {
     return TestParametersBuilder.builder();
   }
 
-  protected static <S, T> Function<S, T> memoizeFunction(ThrowableFunction<S, T> fn) {
+  protected static <S, T, E extends Throwable> Function<S, T> memoizeFunction(
+      ThrowingFunction<S, T, E> fn) {
     return CacheBuilder.newBuilder()
         .build(
             CacheLoader.from(
@@ -176,6 +302,35 @@ public class TestBase {
                     throw new RuntimeException(e);
                   }
                 }));
+  }
+
+  protected static <S, T, U, E extends Throwable> BiFunction<S, T, U> memoizeBiFunction(
+      ThrowingBiFunction<S, T, U, E> fn) {
+    class Pair {
+      final S first;
+      final T second;
+
+      public Pair(S first, T second) {
+        this.first = first;
+        this.second = second;
+      }
+
+      @Override
+      public boolean equals(Object obj) {
+        if (!(obj instanceof Pair)) {
+          return false;
+        }
+        Pair other = (Pair) obj;
+        return Objects.equals(first, other.first) && Objects.equals(second, other.second);
+      }
+
+      @Override
+      public int hashCode() {
+        return Objects.hash(first, second);
+      }
+    }
+    final Function<Pair, U> memoizedFn = memoizeFunction(pair -> fn.apply(pair.first, pair.second));
+    return (a, b) -> memoizedFn.apply(new Pair(a, b));
   }
 
   /**
@@ -201,6 +356,10 @@ public class TestBase {
     return writeTextToTempFile(System.lineSeparator(), Arrays.asList(lines));
   }
 
+  protected void writeTextToTempFile(Path file, String... lines) throws IOException {
+    writeTextToTempFile(file, System.lineSeparator(), Arrays.asList(lines));
+  }
+
   /**
    * Write lines of text to a temporary file, along with the specified line separator.
    *
@@ -209,6 +368,11 @@ public class TestBase {
   protected Path writeTextToTempFile(String lineSeparator, List<String> lines)
       throws IOException {
     return writeTextToTempFile(lineSeparator, lines, true);
+  }
+
+  protected void writeTextToTempFile(Path file, String lineSeparator, List<String> lines)
+      throws IOException {
+    writeTextToTempFile(file, lineSeparator, lines, true);
   }
 
   /**
@@ -221,12 +385,21 @@ public class TestBase {
       String lineSeparator, List<String> lines, boolean includeTerminatingLineSeparator)
       throws IOException {
     Path file = temp.newFile().toPath();
+    writeTextToTempFile(file, lineSeparator, lines, includeTerminatingLineSeparator);
+    return file;
+  }
+
+  protected void writeTextToTempFile(
+      Path file,
+      String lineSeparator,
+      List<String> lines,
+      boolean includeTerminatingLineSeparator)
+      throws IOException {
     String contents = String.join(lineSeparator, lines);
     if (includeTerminatingLineSeparator) {
       contents += lineSeparator;
     }
     Files.write(file, contents.getBytes(StandardCharsets.UTF_8));
-    return file;
   }
 
   /** Build an AndroidApp with the specified test classes as byte array. */
@@ -268,26 +441,40 @@ public class TestBase {
   /** Build an AndroidApp with the specified test classes. */
   protected static AndroidApp readClasses(
       List<Class<?>> programClasses, List<Class<?>> libraryClasses) throws IOException {
+    return buildClasses(programClasses, libraryClasses).build();
+  }
+
+  protected static AndroidApp.Builder buildClasses(Class<?>... programClasses) throws IOException {
+    return buildClasses(Arrays.asList(programClasses), Collections.emptyList());
+  }
+
+  protected static AndroidApp.Builder buildClasses(Collection<Class<?>> programClasses)
+      throws IOException {
+    return buildClasses(programClasses, Collections.emptyList());
+  }
+
+  protected static AndroidApp.Builder buildClasses(
+      Collection<Class<?>> programClasses, Collection<Class<?>> libraryClasses) throws IOException {
     AndroidApp.Builder builder = AndroidApp.builder();
-    for (Class clazz : programClasses) {
+    for (Class<?> clazz : programClasses) {
       builder.addProgramFiles(ToolHelper.getClassFileForTestClass(clazz));
     }
     if (!libraryClasses.isEmpty()) {
       PreloadedClassFileProvider.Builder libraryBuilder = PreloadedClassFileProvider.builder();
-      for (Class clazz : libraryClasses) {
+      for (Class<?> clazz : libraryClasses) {
         Path file = ToolHelper.getClassFileForTestClass(clazz);
-        libraryBuilder.addResource(DescriptorUtils.javaTypeToDescriptor(clazz.getCanonicalName()),
+        libraryBuilder.addResource(DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName()),
             Files.readAllBytes(file));
       }
       builder.addLibraryResourceProvider(libraryBuilder.build());
     }
-    return builder.build();
+    return builder;
   }
 
   protected static AndroidApp readClassesAndRuntimeJar(
       List<Class<?>> programClasses, Backend backend) throws IOException {
     AndroidApp.Builder builder = AndroidApp.builder();
-    for (Class clazz : programClasses) {
+    for (Class<?> clazz : programClasses) {
       builder.addProgramFiles(ToolHelper.getClassFileForTestClass(clazz));
     }
     if (backend == Backend.DEX) {
@@ -309,7 +496,7 @@ public class TestBase {
    * Copy test classes to the specified directory.
    */
   protected void copyTestClasses(Path dest, Class... classes) throws IOException {
-    for (Class clazz : classes) {
+    for (Class<?> clazz : classes) {
       Path path = dest.resolve(clazz.getCanonicalName().replace('.', '/') + ".class");
       Files.createDirectories(path.getParent());
       Files.copy(ToolHelper.getClassFileForTestClass(clazz), path);
@@ -319,6 +506,11 @@ public class TestBase {
   /** Create a temporary JAR file containing the specified test classes. */
   protected Path jarTestClasses(Class<?>... classes) throws IOException {
     return jarTestClasses(Arrays.asList(classes), null);
+  }
+
+  /** Create a temporary JAR file containing the specified test classes. */
+  protected Path jarTestClasses(Iterable<Class<?>> classes) throws IOException {
+    return jarTestClasses(classes, null);
   }
 
   /** Create a temporary JAR file containing the specified test classes and data resources. */
@@ -337,7 +529,7 @@ public class TestBase {
   /** Create a temporary JAR file containing the specified test classes. */
   protected void addTestClassesToJar(JarOutputStream out, Iterable<Class<?>> classes)
       throws IOException {
-    for (Class clazz : classes) {
+    for (Class<?> clazz : classes) {
       try (FileInputStream in =
           new FileInputStream(ToolHelper.getClassFileForTestClass(clazz).toFile())) {
         out.putNextEntry(new ZipEntry(ToolHelper.getJarEntryForTestClass(clazz)));
@@ -389,16 +581,162 @@ public class TestBase {
     return newJar;
   }
 
-  protected AppInfo getAppInfo(AndroidApp application) {
-    try {
-      DexApplication dexApplication =
-          new ApplicationReader(
-                  application, new InternalOptions(), new Timing("TestBase.getAppInfo"))
-              .read();
-      return new AppInfo(dexApplication);
-    } catch (IOException | ExecutionException e) {
-      throw new RuntimeException(e);
-    }
+  private static DexApplication readApplicationForDexOutput(AndroidApp app, InternalOptions options)
+      throws Exception {
+    assert options.programConsumer == null;
+    options.programConsumer = DexIndexedConsumer.emptyConsumer();
+    return new ApplicationReader(app, options, Timing.empty()).read();
+  }
+
+  protected static AppView<AppInfo> computeAppView(AndroidApp app) throws Exception {
+    AppInfo appInfo = new AppInfo(readApplicationForDexOutput(app, new InternalOptions()));
+    return AppView.createForD8(appInfo);
+  }
+
+  protected static AppInfoWithClassHierarchy computeAppInfoWithClassHierarchy(AndroidApp app)
+      throws Exception {
+    return new AppInfoWithClassHierarchy(readApplicationForDexOutput(app, new InternalOptions()));
+  }
+
+  protected static AppView<AppInfoWithClassHierarchy> computeAppViewWithSubtyping(AndroidApp app)
+      throws Exception {
+    return computeAppViewWithSubtyping(
+        app,
+        factory ->
+            buildConfigForRules(
+                factory,
+                Collections.singletonList(ProguardKeepRule.defaultKeepAllRule(unused -> {}))));
+  }
+
+  private static AppView<AppInfoWithClassHierarchy> computeAppViewWithSubtyping(
+      AndroidApp app, Function<DexItemFactory, ProguardConfiguration> keepConfig) throws Exception {
+    DexItemFactory dexItemFactory = new DexItemFactory();
+    InternalOptions options = new InternalOptions(keepConfig.apply(dexItemFactory), new Reporter());
+    DexApplication dexApplication = readApplicationForDexOutput(app, options);
+    AppView<AppInfoWithClassHierarchy> appView =
+        AppView.createForR8(new AppInfoWithClassHierarchy(dexApplication.toDirect()));
+    appView.setAppServices(AppServices.builder(appView).build());
+    return appView;
+  }
+
+  protected static AppView<AppInfoWithLiveness> computeAppViewWithLiveness(AndroidApp app)
+      throws Exception {
+    return computeAppViewWithLiveness(
+        app,
+        factory ->
+            buildConfigForRules(
+                factory, ImmutableList.of(ProguardKeepRule.defaultKeepAllRule(unused -> {}))));
+  }
+
+  protected static AppView<AppInfoWithLiveness> computeAppViewWithLiveness(
+      AndroidApp app, Class<?> mainClass) throws Exception {
+    return computeAppViewWithLiveness(
+        app,
+        factory ->
+            buildConfigForRules(factory, buildKeepRuleForClassAndMethods(mainClass, factory)));
+  }
+
+  protected static AppView<AppInfoWithLiveness> computeAppViewWithLiveness(
+      AndroidApp app, Function<DexItemFactory, ProguardConfiguration> keepConfig) throws Exception {
+    AppView<AppInfoWithClassHierarchy> appView = computeAppViewWithSubtyping(app, keepConfig);
+    // Run the tree shaker to compute an instance of AppInfoWithLiveness.
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    DirectMappedDexApplication application = appView.appInfo().app().asDirect();
+    SubtypingInfo subtypingInfo = new SubtypingInfo(application.allClasses(), application);
+    RootSet rootSet =
+        new RootSetBuilder(
+                appView, subtypingInfo, application.options.getProguardConfiguration().getRules())
+            .run(executor);
+    appView.setRootSet(rootSet);
+    AppInfoWithLiveness appInfoWithLiveness =
+        EnqueuerFactory.createForInitialTreeShaking(appView, subtypingInfo)
+            .traceApplication(rootSet, ProguardClassFilter.empty(), executor, application.timing);
+    // We do not run the tree pruner to ensure that the hierarchy is as designed and not modified
+    // due to liveness.
+    return appView.setAppInfo(appInfoWithLiveness);
+  }
+
+  protected static DexType buildType(Class<?> clazz, DexItemFactory factory) {
+    return buildType(Reference.classFromClass(clazz), factory);
+  }
+
+  protected static DexType buildType(TypeReference type, DexItemFactory factory) {
+    return factory.createType(type.getDescriptor());
+  }
+
+  protected static DexField buildField(Field field, DexItemFactory factory) {
+    return buildField(Reference.fieldFromField(field), factory);
+  }
+
+  protected static DexField buildField(FieldReference field, DexItemFactory factory) {
+    return factory.createField(
+        buildType(field.getHolderClass(), factory),
+        buildType(field.getFieldType(), factory),
+        field.getFieldName());
+  }
+
+  protected static DexMethod buildMethod(Method method, DexItemFactory factory) {
+    return buildMethod(Reference.methodFromMethod(method), factory);
+  }
+
+  protected static DexMethod buildMethod(MethodReference method, DexItemFactory factory) {
+    return factory.createMethod(
+        buildType(method.getHolderClass(), factory),
+        buildProto(method.getReturnType(), method.getFormalTypes(), factory),
+        method.getMethodName());
+  }
+
+  protected static DexMethod buildNullaryVoidMethod(
+      Class<?> clazz, String name, DexItemFactory factory) {
+    return buildMethod(
+        Reference.method(Reference.classFromClass(clazz), name, Collections.emptyList(), null),
+        factory);
+  }
+
+  protected static DexProto buildProto(
+      TypeReference returnType, List<TypeReference> formalTypes, DexItemFactory factory) {
+    return factory.createProto(
+        returnType == null ? factory.voidType : buildType(returnType, factory),
+        ListUtils.map(formalTypes, type -> buildType(type, factory)));
+  }
+
+  protected static List<ProguardConfigurationRule> buildKeepRuleForClass(
+      Class<?> clazz, DexItemFactory factory) {
+    Builder keepRuleBuilder = ProguardKeepRule.builder();
+    keepRuleBuilder.setSource("buildKeepRuleForClass " + clazz.getTypeName());
+    keepRuleBuilder.setType(ProguardKeepRuleType.KEEP);
+    keepRuleBuilder.setClassNames(
+        ProguardClassNameList.singletonList(
+            ProguardTypeMatcher.create(
+                factory.createType(DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName())))));
+    return Collections.singletonList(keepRuleBuilder.build());
+  }
+
+  protected static List<ProguardConfigurationRule> buildKeepRuleForClassAndMethods(
+      Class<?> clazz, DexItemFactory factory) {
+    Builder keepRuleBuilder = ProguardKeepRule.builder();
+    keepRuleBuilder.setSource("buildKeepRuleForClassAndMethods " + clazz.getTypeName());
+    keepRuleBuilder.setType(ProguardKeepRuleType.KEEP);
+    keepRuleBuilder.setClassNames(
+        ProguardClassNameList.singletonList(
+            ProguardTypeMatcher.create(
+                factory.createType(DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName())))));
+    keepRuleBuilder.setMemberRules(
+        Lists.newArrayList(
+            ProguardMemberRule.builder().setRuleType(ProguardMemberType.ALL_METHODS).build()));
+    return Collections.singletonList(keepRuleBuilder.build());
+  }
+
+  protected static ProguardConfiguration buildConfigForRules(
+      DexItemFactory factory, Collection<ProguardConfigurationRule> rules) {
+    return buildConfigForRules(factory, new Reporter(), rules);
+  }
+
+  protected static ProguardConfiguration buildConfigForRules(
+      DexItemFactory factory, Reporter reporter, Collection<ProguardConfigurationRule> rules) {
+    ProguardConfiguration.Builder builder = ProguardConfiguration.builder(factory, reporter);
+    rules.forEach(builder::addRule);
+    return builder.build();
   }
 
   /** Returns a list containing all the data resources in the given app. */
@@ -428,6 +766,10 @@ public class TestBase {
     return dataResources;
   }
 
+  protected static Path getFileInTest(String folder, String fileName) {
+    return Paths.get(ToolHelper.TESTS_DIR, "java", folder, fileName);
+  }
+
   /**
    * Create a temporary JAR file containing all test classes in a package.
    */
@@ -449,20 +791,6 @@ public class TestBase {
   /** Create a temporary JAR file containing the specified test classes. */
   protected Path jarTestClasses(List<Class<?>> classes) throws IOException {
     return jarTestClasses(classes.toArray(new Class<?>[]{}));
-  }
-
-  /**
-   * Get the class name generated by javac.
-   */
-  protected static String getJavacGeneratedClassName(Class clazz) {
-    List<String> parts = Lists.newArrayList(clazz.getCanonicalName().split("\\."));
-    Class enclosing = clazz;
-    while (enclosing.getEnclosingClass() != null) {
-      parts.set(parts.size() - 2, parts.get(parts.size() - 2) + "$" + parts.get(parts.size() - 1));
-      parts.remove(parts.size() - 1);
-      enclosing = clazz.getEnclosingClass();
-    }
-    return String.join(".", parts);
   }
 
   protected static List<Object[]> buildParameters(Object... arraysOrIterables) {
@@ -613,23 +941,16 @@ public class TestBase {
    * Generate a Proguard configuration for keeping the "static void main(String[])" method of the
    * specified class.
    */
-  public static String keepMainProguardConfiguration(Class clazz) {
-    return keepMainProguardConfiguration(clazz, ImmutableList.of());
+  public static String keepMainProguardConfiguration(Class<?> clazz) {
+    return keepMainProguardConfiguration(clazz.getTypeName());
   }
 
   /**
    * Generate a Proguard configuration for keeping the "static void main(String[])" method of the
    * specified class.
    */
-  public static String keepMainProguardConfiguration(Class clazz, List<String> additionalLines) {
-    String modifier = (clazz.getModifiers() & Modifier.PUBLIC) == Modifier.PUBLIC ? "public " : "";
-    return String.join(System.lineSeparator(),
-        Iterables.concat(ImmutableList.of(
-            "-keep " + modifier + "class " + getJavacGeneratedClassName(clazz) + " {",
-            "  public static void main(java.lang.String[]);",
-            "}",
-            "-printmapping"),
-            additionalLines));
+  public static String keepMainProguardConfiguration(Class<?> clazz, List<String> additionalLines) {
+    return keepMainProguardConfiguration(clazz.getTypeName()) + StringUtils.lines(additionalLines);
   }
 
   /**
@@ -639,15 +960,12 @@ public class TestBase {
    * The class is assumed to be public.
    */
   public static String keepMainProguardConfiguration(String clazz) {
-    return "-keep public class " + clazz + " {\n"
-        + "  public static void main(java.lang.String[]);\n"
-        + "}\n"
-        + "-printmapping\n";
+    return StringUtils.lines(
+        "-keep class " + clazz + " {", "  public static void main(java.lang.String[]);", "}");
   }
 
   public static String noShrinkingNoMinificationProguardConfiguration() {
-    return "-dontshrink\n"
-        + "-dontobfuscate\n";
+    return StringUtils.lines("-dontshrink", "-dontobfuscate");
   }
 
   /**
@@ -655,7 +973,7 @@ public class TestBase {
    * specified class and specify if -allowaccessmodification and -dontobfuscate are added as well.
    */
   public static String keepMainProguardConfiguration(
-      Class clazz, boolean allowaccessmodification, boolean obfuscate) {
+      Class<?> clazz, boolean allowaccessmodification, boolean obfuscate) {
     return keepMainProguardConfiguration(clazz)
         + (allowaccessmodification ? "-allowaccessmodification\n" : "")
         + (obfuscate ? "-printmapping\n" : "-dontobfuscate\n");
@@ -672,15 +990,7 @@ public class TestBase {
    * Generate a Proguard configuration for keeping the "static void main(String[])" method of the
    * specified class and add rules to inline methods with the inlining annotation.
    */
-  public static String keepMainProguardConfigurationWithInliningAnnotation(Class clazz) {
-    return "-forceinline class * { @com.android.tools.r8.ForceInline *; }"
-        + System.lineSeparator()
-        + "-neverinline class * { @com.android.tools.r8.NeverInline *; }"
-        + System.lineSeparator()
-        + keepMainProguardConfiguration(clazz);
-  }
-
-  public static String keepMainProguardConfigurationWithInliningAnnotation(String clazz) {
+  public static String keepMainProguardConfigurationWithInliningAnnotation(Class<?> clazz) {
     return "-forceinline class * { @com.android.tools.r8.ForceInline *; }"
         + System.lineSeparator()
         + "-neverinline class * { @com.android.tools.r8.NeverInline *; }"
@@ -699,7 +1009,8 @@ public class TestBase {
       Consumer<ArtCommandBuilder> cmdBuilder, DexVm version) throws IOException {
     Path out = File.createTempFile("junit", ".zip", temp.getRoot()).toPath();
     app.writeToZip(out, OutputMode.DexIndexed);
-    return ToolHelper.runArtRaw(ImmutableList.of(out.toString()), mainClass, cmdBuilder, version);
+    return ToolHelper.runArtRaw(
+        ImmutableList.of(out.toString()), mainClass, cmdBuilder, version, false);
   }
 
   /**
@@ -920,31 +1231,43 @@ public class TestBase {
     return extractor.getClassInternalType();
   }
 
-  protected static void writeToJar(Path output, List<byte[]> classes) throws IOException {
-    try (ZipOutputStream out =
-        new ZipOutputStream(
-            Files.newOutputStream(
-                output, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING))) {
-      for (byte[] clazz : classes) {
-        String name = extractClassName(clazz);
-        ZipUtils.writeToZipStream(
-            out, DescriptorUtils.getPathFromJavaType(name), clazz, ZipEntry.STORED);
-      }
+  protected static void writeClassesToJar(Path output, Collection<Class<?>> classes)
+      throws IOException {
+    ClassFileConsumer consumer = new ArchiveConsumer(output);
+    for (Class<?> clazz : classes) {
+      consumer.accept(
+          ByteDataView.of(Files.readAllBytes(ToolHelper.getClassFileForTestClass(clazz))),
+          DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName()),
+          null);
     }
+    consumer.finished(null);
   }
 
-  protected static void writeToJar(Path output, Collection<Path> classes) throws IOException {
+  protected static void writeClassesToJar(Path output, Class<?>... classes) throws IOException {
+    writeClassesToJar(output, Arrays.asList(classes));
+  }
+
+  protected static void writeClassFileDataToJar(Path output, Collection<byte[]> classes) {
+    ClassFileConsumer consumer = new ArchiveConsumer(output);
+    for (byte[] clazz : classes) {
+      consumer.accept(ByteDataView.of(clazz), extractClassDescriptor(clazz), null);
+    }
+    consumer.finished(null);
+  }
+
+  protected static void writeClassFilesToJar(Path output, Collection<Path> classes)
+      throws IOException {
     List<byte[]> bytes = new LinkedList<>();
     for (Path classPath : classes) {
       byte[] classBytes = Files.readAllBytes(Paths.get(classPath.toString()));
       bytes.add(classBytes);
     }
-    writeToJar(output, bytes);
+    writeClassFileDataToJar(output, bytes);
   }
 
   protected Path writeToJar(List<byte[]> classes) throws IOException {
     Path result = File.createTempFile("junit", ".jar", temp.getRoot()).toPath();
-    writeToJar(result, classes);
+    writeClassFileDataToJar(result, classes);
     return result;
   }
 
@@ -996,13 +1319,14 @@ public class TestBase {
     return getMethodSubject(application, className, returnType, methodName, parameters).getMethod();
   }
 
-  protected DexEncodedMethod getMethod(
+  protected ProgramMethod getMethod(
       CodeInspector inspector,
       String className,
       String returnType,
       String methodName,
       List<String> parameters) {
-    return getMethodSubject(inspector, className, returnType, methodName, parameters).getMethod();
+    return getMethodSubject(inspector, className, returnType, methodName, parameters)
+        .getProgramMethod();
   }
 
   protected static void checkInstructions(
@@ -1022,14 +1346,24 @@ public class TestBase {
   }
 
   protected long countCall(MethodSubject method, String className, String methodName) {
-    return Streams.stream(method.iterateInstructions(instructionSubject -> {
+    return method.streamInstructions().filter(instructionSubject -> {
       if (instructionSubject.isInvoke()) {
         DexMethod invokedMethod = instructionSubject.getMethod();
         return invokedMethod.holder.toString().contains(className)
             && invokedMethod.name.toString().contains(methodName);
       }
       return false;
-    })).count();
+    }).count();
+  }
+
+  protected long countCall(MethodSubject method, String methodName) {
+    return method.streamInstructions().filter(instructionSubject -> {
+      if (instructionSubject.isInvoke()) {
+        DexMethod invokedMethod = instructionSubject.getMethod();
+        return invokedMethod.name.toString().contains(methodName);
+      }
+      return false;
+    }).count();
   }
 
   public enum MinifyMode {
@@ -1064,6 +1398,7 @@ public class TestBase {
     }
   }
 
+  @Deprecated
   public static Path runtimeJar(TestParameters parameters) {
     if (parameters.isDexRuntime()) {
       return ToolHelper.getAndroidJar(parameters.getRuntime().asDex().getMinApiLevel());
@@ -1073,6 +1408,7 @@ public class TestBase {
     }
   }
 
+  @Deprecated
   public static Path runtimeJar(Backend backend) {
     if (backend == Backend.DEX) {
       return ToolHelper.getDefaultAndroidJar();
@@ -1080,5 +1416,137 @@ public class TestBase {
       assert backend == Backend.CF;
       return ToolHelper.getJava8RuntimeJar();
     }
+  }
+
+  public static class JarBuilder {
+    final Path jar;
+    final ZipOutputStream stream;
+    final Set<Class<?>> servicesAdded = Sets.newIdentityHashSet();
+
+    private JarBuilder(TemporaryFolder temp) throws IOException {
+      jar = temp.newFolder().toPath().resolve("a.jar");
+      stream = new ZipOutputStream(Files.newOutputStream(jar));
+    }
+
+    public static JarBuilder builder(TemporaryFolder temp) throws IOException {
+      return new JarBuilder(temp);
+    }
+
+    public JarBuilder addClass(Class<?> clazz) throws IOException {
+      stream.putNextEntry(new ZipEntry(DescriptorUtils.getPathFromJavaType(clazz)));
+      stream.write(Files.readAllBytes(ToolHelper.getClassFileForTestClass(clazz)));
+      stream.closeEntry();
+      return this;
+    }
+
+    public JarBuilder addResource(String path, String content) throws IOException {
+      stream.putNextEntry(new ZipEntry(path));
+      stream.write(content.getBytes(StandardCharsets.UTF_8));
+      stream.closeEntry();
+      return this;
+    }
+
+    public JarBuilder addServiceWithImplementations(
+        Class<?> service, List<Class<?>> implementations) throws IOException {
+      boolean added = servicesAdded.add(service);
+      assert added : "Currently each service can only be added once";
+      addResource(
+          "META-INF/services/" + Greeter.class.getTypeName(),
+          StringUtils.lines(
+              implementations.stream().map(Class::getTypeName).collect(Collectors.toList())));
+      return this;
+    }
+
+    public Path build() throws IOException {
+      stream.close();
+      return jar;
+    }
+  }
+
+  public JarBuilder jarBuilder() throws IOException {
+    return JarBuilder.builder(temp);
+  }
+
+  public List<Path> buildOnDexRuntime(TestParameters parameters, List<Path> paths)
+      throws CompilationFailedException, IOException {
+    if (parameters.isCfRuntime()) {
+      return paths;
+    }
+    return Collections.singletonList(
+        testForD8()
+            .addProgramFiles(paths)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .writeToZip());
+  }
+
+  public List<Path> buildOnDexRuntime(TestParameters parameters, Path... paths)
+      throws IOException, CompilationFailedException {
+    return buildOnDexRuntime(parameters, Arrays.asList(paths));
+  }
+
+  public Path buildOnDexRuntime(TestParameters parameters, Class<?>... classes)
+      throws IOException, CompilationFailedException {
+    if (parameters.isDexRuntime()) {
+      return testForD8()
+          .addProgramClasses(classes)
+          .setMinApi(parameters.getApiLevel())
+          .compile()
+          .writeToZip();
+    }
+    Path path = temp.newFolder().toPath().resolve("classes.jar");
+    ArchiveConsumer consumer = new ArchiveConsumer(path);
+    for (Class clazz : classes) {
+      consumer.accept(
+          ByteDataView.of(ToolHelper.getClassAsBytes(clazz)),
+          DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName()),
+          null);
+    }
+    consumer.finished(null);
+    return path;
+  }
+
+  public static String binaryName(Class<?> clazz) {
+    return DescriptorUtils.getBinaryNameFromJavaType(typeName(clazz));
+  }
+
+  public static String descriptor(Class<?> clazz) {
+    return DescriptorUtils.javaTypeToDescriptor(typeName(clazz));
+  }
+
+  public static String typeName(Class<?> clazz) {
+    return clazz.getTypeName();
+  }
+
+  public static AndroidApiLevel apiLevelWithDefaultInterfaceMethodsSupport() {
+    return AndroidApiLevel.N;
+  }
+
+  public static AndroidApiLevel apiLevelWithInvokeCustomSupport() {
+    return AndroidApiLevel.O;
+  }
+
+  public Path compileToZip(
+      TestParameters parameters, Collection<Class<?>> classPath, Class<?>... compilationUnit)
+      throws Exception {
+    return compileToZip(parameters, classPath, Arrays.asList(compilationUnit));
+  }
+
+  public Path compileToZip(
+      TestParameters parameters,
+      Collection<Class<?>> classpath,
+      Collection<Class<?>> compilationUnit)
+      throws Exception {
+    if (parameters.isCfRuntime()) {
+      Path out = temp.newFolder().toPath().resolve("out.jar");
+      writeClassesToJar(out, compilationUnit);
+      return out;
+    }
+    return testForD8()
+        .setMinApi(parameters.getApiLevel())
+        .addProgramClasses(compilationUnit)
+        .addClasspathClasses(classpath)
+        .compile()
+        .writeToZip();
   }
 }

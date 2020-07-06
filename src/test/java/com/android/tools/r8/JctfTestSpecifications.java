@@ -5,6 +5,7 @@
 package com.android.tools.r8;
 
 import static com.android.tools.r8.TestCondition.JAVA_RUNTIME;
+import static com.android.tools.r8.TestCondition.R8DEX_COMPILER;
 import static com.android.tools.r8.TestCondition.R8_COMPILER;
 import static com.android.tools.r8.TestCondition.and;
 import static com.android.tools.r8.TestCondition.any;
@@ -999,7 +1000,9 @@ public class JctfTestSpecifications {
               "lang.SecurityManager.checkMulticastLjava_net_InetAddress.SecurityManager_checkMulticast_A01",
               anyDexVm())
           .put("lang.SecurityManager.Constructor.SecurityManager_Constructor_A01", anyDexVm())
-          .put("lang.SecurityManager.getClassContext.SecurityManager_getClassContext_A01", any())
+          .put(
+              "lang.SecurityManager.getClassContext.SecurityManager_getClassContext_A01",
+              anyDexVm())
           .put(
               "lang.SecurityManager.checkMemberAccessLjava_lang_ClassI.SecurityManager_checkMemberAccess_A03",
               anyDexVm())
@@ -1116,13 +1119,15 @@ public class JctfTestSpecifications {
           .put(
               "lang.SecurityManager.checkLinkLjava_lang_String.SecurityManager_checkLink_A02",
               anyDexVm())
-          .put("lang.SecurityManager.classLoaderDepth.SecurityManager_classLoaderDepth_A01", any())
+          .put(
+              "lang.SecurityManager.classLoaderDepth.SecurityManager_classLoaderDepth_A01",
+              anyDexVm())
           .put(
               "lang.SecurityManager.checkPermissionLjava_security_Permission.SecurityManager_checkPermission_A02",
               anyDexVm())
           .put(
               "lang.SecurityManager.currentLoadedClass.SecurityManager_currentLoadedClass_A01",
-              any())
+              anyDexVm())
           .put(
               "lang.SecurityManager.checkSecurityAccessLjava_lang_String.SecurityManager_checkSecurityAccess_A03",
               anyDexVm())
@@ -1151,7 +1156,7 @@ public class JctfTestSpecifications {
           .put(
               "lang.SecurityManager.checkLinkLjava_lang_String.SecurityManager_checkLink_A01",
               anyDexVm())
-          .put("lang.Throwable.getStackTrace.Throwable_getStackTrace_A01", any())
+          .put("lang.Throwable.getStackTrace.Throwable_getStackTrace_A01", anyDexVm())
           .put(
               "lang.SecurityManager.checkSystemClipboardAccess.SecurityManager_checkSystemClipboardAccess_A01",
               anyDexVm())
@@ -1711,7 +1716,6 @@ public class JctfTestSpecifications {
           .put(
               "lang.ClassLoader.definePackageLjava_lang_String6Ljava_net_URL.ClassLoader_definePackage_A03",
               cf())
-          .put("lang.ClassLoader.getPackages.ClassLoader_getPackages_A01", cf())
           .put("lang.Package.getImplementationVersion.Package_getImplementationVersion_A01", cf())
           .put(
               "lang.SecurityManager.checkAwtEventQueueAccess.SecurityManager_checkAwtEventQueueAccess_A01",
@@ -1740,6 +1744,28 @@ public class JctfTestSpecifications {
           .put("lang.reflect.Field.toGenericString.Field_toGenericString_A01", cf())
           .build(); // end of failuresToTriage
 
+  public static final Multimap<String, TestCondition> bugs =
+      new ImmutableListMultimap.Builder<String, TestCondition>()
+          // The following StringBuffer/StringBuilder tests fails because we remove, e.g.,
+          // new StringBuffer(-5) if it is dead code (but it should trow), see b/133745205
+          .put(
+              "lang.StringBuffer.ConstructorLjava_lang_String.StringBuffer_Constructor_A02",
+              match(R8DEX_COMPILER))
+          .put(
+              "lang.StringBuffer.ConstructorLjava_lang_CharSequence.StringBuffer_Constructor_A02",
+              match(R8DEX_COMPILER))
+          .put("lang.StringBuffer.ConstructorI.StringBuffer_Constructor_A02", match(R8DEX_COMPILER))
+          .put(
+              "lang.StringBuilder.ConstructorI.StringBuilder_Constructor_A02",
+              match(R8DEX_COMPILER))
+          .put(
+              "lang.StringBuilder.ConstructorLjava_lang_CharSequence.StringBuilder_Constructor_A02",
+              match(R8DEX_COMPILER))
+          .put(
+              "lang.StringBuilder.ConstructorLjava_lang_String.StringBuilder_Constructor_A02",
+              match(R8DEX_COMPILER))
+          .build();
+
   public static final Multimap<String, TestCondition> flakyWhenRun =
       new ImmutableListMultimap.Builder<String, TestCondition>()
           .put("lang.Object.notifyAll.Object_notifyAll_A03", anyDexVm())
@@ -1753,6 +1779,7 @@ public class JctfTestSpecifications {
               "util.concurrent.SynchronousQueue.ConstructorZ.SynchronousQueue_Constructor_A01",
               anyDexVm())
           .put("lang.Thread.getState.Thread_getState_A01", anyDexVm())
+          .put("lang.Thread.join.Thread_join_A01", anyDexVm())
           .put(
               "util.concurrent.ScheduledThreadPoolExecutor.getTaskCount.ScheduledThreadPoolExecutor_getTaskCount_A01",
               any())
@@ -1770,8 +1797,9 @@ public class JctfTestSpecifications {
               match(
                   and(
                       runtimes(Runtime.ART_V9_0_0, Runtime.ART_V8_1_0),
-                      artRuntimesUpTo(Runtime.ART_V4_4_4))))
-          .put("lang.ref.WeakReference.isEnqueued.WeakReference_isEnqueued_A01", anyDexVm())
+                      artRuntimesUpTo(Runtime.ART_V4_4_4),
+                      JAVA_RUNTIME)))
+          .put("lang.ref.WeakReference.isEnqueued.WeakReference_isEnqueued_A01", any())
           .put(
               "lang.ref.WeakReference.enqueue.WeakReference_enqueue_A01",
               match(artRuntimesUpTo(Runtime.ART_V4_4_4)))
@@ -1780,10 +1808,11 @@ public class JctfTestSpecifications {
               match(
                   and(
                       runtimes(Runtime.ART_V9_0_0, Runtime.ART_V8_1_0),
-                      artRuntimesUpTo(Runtime.ART_V4_4_4))))
+                      artRuntimesUpTo(Runtime.ART_V4_4_4),
+                      JAVA_RUNTIME)))
           .put(
               "lang.ref.SoftReference.enqueue.SoftReference_enqueue_A01",
-              match(artRuntimesUpTo(Runtime.ART_V4_4_4)))
+              match(and(artRuntimesUpTo(Runtime.ART_V4_4_4), JAVA_RUNTIME)))
           .put(
               "lang.ref.ReferenceQueue.poll.ReferenceQueue_poll_A01",
               match(artRuntimesUpTo(Runtime.ART_V4_4_4)))
@@ -1792,6 +1821,14 @@ public class JctfTestSpecifications {
           .put(
               "util.concurrent.AbstractExecutorService.invokeAllLjava_util_CollectionJLjava_util_concurrent_TimeUnit.AbstractExecutorService_invokeAll_A06",
               match(runtimes(Runtime.ART_V4_0_4)))
+          .put(
+              "util.concurrent.Executors.newCachedThreadPoolLjava_util_concurrent_ThreadFactory.Executors_newCachedThreadPool_A01",
+              anyDexVm())
+          .put(
+              "util.concurrent.Executors.newCachedThreadPool.Executors_newCachedThreadPool_A01",
+              match(runtimes(Runtime.ART_V5_1_1)))
+          .put("lang.ref.SoftReference.get.SoftReference_get_A01", cf())
+          .put("lang.ref.WeakReference.get.WeakReference_get_A01", cf())
           .build(); // end of flakyWhenRun
 
   public static final Multimap<String, TestCondition> timeoutsWhenRun =
@@ -1839,6 +1876,7 @@ public class JctfTestSpecifications {
               "lang.Runtime.execLjava_lang_String_Ljava_lang_StringLjava_io_File.Runtime_exec_A04",
               anyDexVm())
           .put("lang.Thread.getContextClassLoader.Thread_getContextClassLoader_A02", anyDexVm())
+          .put("lang.ThreadGroup.suspend.ThreadGroup_suspend_A01", cf())
           .put("lang.ThreadGroup.suspend.ThreadGroup_suspend_A02", anyDexVm())
           .put("lang.Thread.setDaemonZ.Thread_setDaemon_A03", anyDexVm())
           .put("lang.ProcessBuilder.environment.ProcessBuilder_environment_A07", anyDexVm())
@@ -1943,6 +1981,9 @@ public class JctfTestSpecifications {
     Outcome outcome = null;
 
     if (testMatch(failuresToTriage, name, compilerUnderTest, runtime, compilationMode)) {
+      outcome = Outcome.FAILS_WHEN_RUN;
+    }
+    if (testMatch(bugs, name, compilerUnderTest, runtime, compilationMode)) {
       outcome = Outcome.FAILS_WHEN_RUN;
     }
     if (testMatch(timeoutsWhenRun, name, compilerUnderTest, runtime, compilationMode)) {

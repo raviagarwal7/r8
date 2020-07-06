@@ -13,7 +13,6 @@ import com.android.tools.r8.graph.JarClassFileReader;
 import com.android.tools.r8.origin.PathOrigin;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.StreamUtils;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -90,7 +89,6 @@ public class JarDiff {
     this.before = before;
     this.after = after;
     InternalOptions options = new InternalOptions();
-    options.enableCfFrontend = true;
     applicationReader = new JarApplicationReader(options);
   }
 
@@ -157,7 +155,7 @@ public class JarDiff {
 
     Collector collector = new Collector();
     JarClassFileReader reader = new JarClassFileReader(applicationReader, collector);
-    reader.read(new PathOrigin(path), ClassKind.PROGRAM, new ByteArrayInputStream(bytes));
+    reader.read(new PathOrigin(path), ClassKind.PROGRAM, bytes);
     return collector.get().asProgramClass();
   }
 
@@ -165,9 +163,7 @@ public class JarDiff {
     class1.forEachMethod(
         method1 -> {
           DexEncodedMethod method2 = class2.lookupMethod(method1.method);
-          if (method2 == null) {
-            compareMethods(method1, method2);
-          }
+          compareMethods(method1, method2);
         });
     class2.forEachMethod(
         method2 -> {

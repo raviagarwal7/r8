@@ -10,6 +10,7 @@ import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.google.common.collect.Maps;
@@ -43,7 +44,7 @@ import java.util.concurrent.Future;
 public class InheritanceClassInDexDistributor {
 
   private static final Comparator<DexProgramClass> DEX_PROGRAM_CLASS_COMPARATOR =
-      Comparator.comparing(clazz -> clazz.type.descriptor);
+      (a, b) -> a.type.descriptor.slowCompareTo(b.type.descriptor);
 
   private static final int DEX_FULL_ENOUGH_THRESHOLD = VirtualFile.MAX_ENTRIES - 100;
   private final ExecutorService executorService;
@@ -69,7 +70,7 @@ public class InheritanceClassInDexDistributor {
 
     public void updateNumbersOfIds() {
       // Use a temporary VirtualFile to evaluate the number of ids in the group.
-      VirtualFile virtualFile = new VirtualFile(0, namingLens);
+      VirtualFile virtualFile = new VirtualFile(0, initClassLens, namingLens);
       // Note: sort not needed.
       for (DexProgramClass clazz : members) {
         virtualFile.addClass(clazz);
@@ -283,6 +284,7 @@ public class InheritanceClassInDexDistributor {
   private final Set<DexProgramClass> classes;
   private final DexApplication app;
   private int dexIndexOffset;
+  private final InitClassLens initClassLens;
   private final NamingLens namingLens;
   private final DirectSubClassesInfo directSubClasses;
 
@@ -290,8 +292,8 @@ public class InheritanceClassInDexDistributor {
       VirtualFile mainDex,
       List<VirtualFile> dexes,
       Set<DexProgramClass> classes,
-      Map<DexProgramClass, String> originalNames,
       int dexIndexOffset,
+      InitClassLens initClassLens,
       NamingLens namingLens,
       DexApplication app,
       ExecutorService executorService) {
@@ -299,6 +301,7 @@ public class InheritanceClassInDexDistributor {
     this.dexes = dexes;
     this.classes = classes;
     this.dexIndexOffset = dexIndexOffset;
+    this.initClassLens = initClassLens;
     this.namingLens = namingLens;
     this.app = app;
     this.executorService = executorService;
@@ -370,7 +373,8 @@ public class InheritanceClassInDexDistributor {
   }
 
   private Collection<VirtualFile> assignGroup(ClassGroup group, List<VirtualFile> dexBlackList) {
-    VirtualFileCycler cycler = new VirtualFileCycler(dexes, namingLens, dexIndexOffset);
+    VirtualFileCycler cycler =
+        new VirtualFileCycler(dexes, initClassLens, namingLens, dexIndexOffset);
     if (group.members.isEmpty()) {
       return Collections.emptyList();
     } else if (group.canFitInOneDex()) {
@@ -418,10 +422,11 @@ public class InheritanceClassInDexDistributor {
     Collections.sort(layers);
 
     Collection<VirtualFile> usedDex = new ArrayList<>();
-    VirtualFileCycler cycler = new VirtualFileCycler(dexes, namingLens, dexIndexOffset);
+    VirtualFileCycler cycler =
+        new VirtualFileCycler(dexes, initClassLens, namingLens, dexIndexOffset);
     // Don't modify input dexBlackList. Think about modifying the input collection considering this
     // is private API.
-    HashSet<VirtualFile> currentBlackList = new HashSet<>(dexBlackList);
+    Set<VirtualFile> currentBlackList = new HashSet<>(dexBlackList);
     // Don't put class expected to fail linking in the main dex, save main dex space for classes
     // that may benefit to be in the main dex.
     currentBlackList.add(mainDex);
@@ -620,7 +625,7 @@ public class InheritanceClassInDexDistributor {
     int assignedClasses = 0;
     int dexInitialSize = dex.classes().size();
     boolean isLayerFullyAssigned = true;
-    HashSet<DexProgramClass> remaining = new HashSet<>(classes);
+    Set<DexProgramClass> remaining = new HashSet<>(classes);
     while (isLayerFullyAssigned && !remaining.isEmpty()) {
       Set<DexProgramClass> toProcess = remaining;
       remaining = new HashSet<>();

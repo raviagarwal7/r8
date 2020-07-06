@@ -3,41 +3,47 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.logging;
 
+import com.google.common.collect.ImmutableSet;
+import java.util.Set;
+
 public class Log {
 
-  static public final boolean ENABLED = false;
+  public static final boolean ENABLED =
+      System.getProperty("com.android.tools.r8.logging.Log.ENABLED") != null;
 
-  static private final boolean VERBOSE_ENABLED = false;
-  static private final boolean INFO_ENABLED = true;
-  static private final boolean DEBUG_ENABLED = true;
-  static private final boolean WARN_ENABLED = true;
+  private static final boolean VERBOSE_ENABLED = false;
+  private static final boolean INFO_ENABLED = true;
+  private static final boolean DEBUG_ENABLED = true;
+  private static final boolean WARN_ENABLED = true;
+
+  public static final Set<Class<?>> CLASS_FILTER = getClassFilter();
 
   public static void verbose(Class<?> from, String message, Object... arguments) {
-    if (ENABLED && VERBOSE_ENABLED && isClassEnabled(from)) {
+    if (isLoggingEnabledFor(from) && VERBOSE_ENABLED) {
       log("VERB", from, message, arguments);
     }
   }
 
   public static void info(Class<?> from, String message, Object... arguments) {
-    if (ENABLED && INFO_ENABLED && isClassEnabled(from)) {
+    if (isLoggingEnabledFor(from) && INFO_ENABLED) {
       log("INFO", from, message, arguments);
     }
   }
 
   public static void debug(Class<?> from, String message, Object... arguments) {
-    if (ENABLED && DEBUG_ENABLED && isClassEnabled(from)) {
+    if (isLoggingEnabledFor(from) && DEBUG_ENABLED) {
       log("DBG", from, message, arguments);
     }
   }
 
   public static void warn(Class<?> from, String message, Object... arguments) {
-    if (ENABLED && WARN_ENABLED && isClassEnabled(from)) {
+    if (isLoggingEnabledFor(from) && WARN_ENABLED) {
       log("WARN", from, message, arguments);
     }
   }
 
-  private static boolean isClassEnabled(Class<?> clazz) {
-    return true;
+  public static boolean isLoggingEnabledFor(Class<?> clazz) {
+    return ENABLED && (CLASS_FILTER == null || CLASS_FILTER.contains(clazz));
   }
 
   synchronized private static void log(String kind, Class<?> from, String message, Object... args) {
@@ -45,5 +51,21 @@ public class Log {
       message = String.format(message, args);
     }
     System.out.println("[" + kind + "] {" + from.getSimpleName() + "}: " + message);
+  }
+
+  private static Set<Class<?>> getClassFilter() {
+    String property = System.getProperty("com.android.tools.r8.logging.Log.CLASS_FILTER");
+    if (property != null) {
+      try {
+        ImmutableSet.Builder<Class<?>> builder = ImmutableSet.builder();
+        for (String className : property.split(";")) {
+          builder.add(Class.forName(className));
+        }
+        return builder.build();
+      } catch (ClassNotFoundException e) {
+        throw new RuntimeException(e);
+      }
+    }
+    return null;
   }
 }

@@ -5,7 +5,7 @@
 package com.android.tools.r8.utils.codeinspector;
 
 import com.android.tools.r8.graph.DexEncodedMethod;
-import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.google.common.collect.Streams;
@@ -15,11 +15,11 @@ import java.util.stream.Stream;
 
 public abstract class MethodSubject extends MemberSubject {
 
-  public final IRCode buildIR() {
-    return buildIR(new DexItemFactory());
-  }
+  public abstract IRCode buildIR();
 
-  public abstract IRCode buildIR(DexItemFactory dexItemFactory);
+  public final boolean isAbsent() {
+    return !isPresent();
+  }
 
   public abstract boolean isAbstract();
 
@@ -31,6 +31,10 @@ public abstract class MethodSubject extends MemberSubject {
 
   public abstract boolean isVirtual();
 
+  public FoundMethodSubject asFoundMethodSubject() {
+    return null;
+  }
+
   @Override
   public abstract MethodSignature getOriginalSignature();
 
@@ -39,6 +43,8 @@ public abstract class MethodSubject extends MemberSubject {
   public abstract String getFinalSignatureAttribute();
 
   public abstract DexEncodedMethod getMethod();
+
+  public abstract ProgramMethod getProgramMethod();
 
   public Iterator<InstructionSubject> iterateInstructions() {
     return null;
@@ -64,10 +70,21 @@ public abstract class MethodSubject extends MemberSubject {
 
   public abstract LineNumberTable getLineNumberTable();
 
+  public abstract LocalVariableTable getLocalVariableTable();
+
   public abstract boolean hasLocalVariableTable();
 
   public Stream<InstructionSubject> streamInstructions() {
     return Streams.stream(iterateInstructions());
+  }
+
+  public Stream<TryCatchSubject> streamTryCatches() {
+    return Streams.stream(iterateTryCatches());
+  }
+
+  public void getLineNumberForInstruction(InstructionSubject subject) {
+    assert hasLineNumberTable();
+    getLineNumberTable().getLineForInstruction(subject);
   }
 
   @Override
@@ -83,4 +100,8 @@ public abstract class MethodSubject extends MemberSubject {
   public boolean hasCode() {
     return getMethod().getCode() != null;
   }
+
+  public abstract String getJvmMethodSignatureAsString();
+
+  public abstract MethodSubject toMethodOnCompanionClass();
 }

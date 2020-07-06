@@ -6,39 +6,61 @@ package com.android.tools.r8.ir.optimize.lambda;
 
 import com.android.tools.r8.DiagnosticsHandler;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexApplication.Builder;
 import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexClassAndMethod;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult;
+import com.android.tools.r8.graph.classmerging.HorizontallyMergedLambdaClasses;
+import com.android.tools.r8.ir.analysis.type.DestructivePhiTypeUpdater;
 import com.android.tools.r8.ir.code.IRCode;
+import com.android.tools.r8.ir.code.InitClass;
 import com.android.tools.r8.ir.code.InstanceGet;
 import com.android.tools.r8.ir.code.InstancePut;
+import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.InvokeMethod;
+import com.android.tools.r8.ir.code.InvokeVirtual;
 import com.android.tools.r8.ir.code.NewInstance;
+import com.android.tools.r8.ir.code.Phi;
 import com.android.tools.r8.ir.code.StaticGet;
 import com.android.tools.r8.ir.code.StaticPut;
-import com.android.tools.r8.ir.conversion.CallSiteInformation;
+import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.ir.conversion.IRConverter;
-import com.android.tools.r8.ir.conversion.OptimizationFeedback;
+import com.android.tools.r8.ir.conversion.MethodProcessor;
+import com.android.tools.r8.ir.optimize.Inliner;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
-import com.android.tools.r8.ir.optimize.Outliner;
+import com.android.tools.r8.ir.optimize.Inliner.InliningInfo;
+import com.android.tools.r8.ir.optimize.info.FieldOptimizationInfo;
+import com.android.tools.r8.ir.optimize.info.MethodOptimizationInfo;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback.OptimizationInfoFixer;
+import com.android.tools.r8.ir.optimize.inliner.InliningIRProvider;
 import com.android.tools.r8.ir.optimize.lambda.CodeProcessor.Strategy;
 import com.android.tools.r8.ir.optimize.lambda.LambdaGroup.LambdaStructureError;
 import com.android.tools.r8.ir.optimize.lambda.kotlin.KotlinLambdaGroupIdFactory;
 import com.android.tools.r8.kotlin.Kotlin;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.utils.SetUtils;
 import com.android.tools.r8.utils.StringDiagnostic;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.ThrowingConsumer;
+import com.android.tools.r8.utils.Timing;
+import com.android.tools.r8.utils.collections.LongLivedProgramMethodSetBuilder;
+import com.android.tools.r8.utils.collections.SortedProgramMethodSet;
+import com.google.common.collect.BiMap;
+import com.google.common.collect.HashBiMap;
 import com.google.common.collect.Sets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -49,8 +71,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
-import java.util.function.BiFunction;
-import java.util.stream.Collectors;
+import java.util.function.Function;
 
 // Merging lambda classes into single lambda group classes. There are three flavors
 // of lambdas we are dealing with:
@@ -76,6 +97,82 @@ import java.util.stream.Collectors;
 //   5. synthesize group lambda classes.
 //
 public final class LambdaMerger {
+
+  private abstract static class Mode {
+
+    void rewriteCode(
+        ProgramMethod method,
+        IRCode code,
+        Inliner inliner,
+        ProgramMethod context,
+        InliningIRProvider provider) {}
+
+    void analyzeCode(ProgramMethod method, IRCode code) {}
+  }
+
+  private class AnalyzeMode extends Mode {
+
+    @Override
+    void analyzeCode(ProgramMethod method, IRCode code) {
+      new AnalysisStrategy(method, code).processCode();
+    }
+  }
+
+  private class ApplyMode extends Mode {
+
+    private final Map<DexProgramClass, LambdaGroup> lambdaGroups;
+    private final LambdaMergerOptimizationInfoFixer optimizationInfoFixer;
+
+    ApplyMode(
+        Map<DexProgramClass, LambdaGroup> lambdaGroups,
+        LambdaMergerOptimizationInfoFixer optimizationInfoFixer) {
+      this.lambdaGroups = lambdaGroups;
+      this.optimizationInfoFixer = optimizationInfoFixer;
+    }
+
+    @Override
+    void rewriteCode(
+        ProgramMethod method,
+        IRCode code,
+        Inliner inliner,
+        ProgramMethod context,
+        InliningIRProvider provider) {
+      LambdaGroup lambdaGroup = lambdaGroups.get(method.getHolder());
+      if (lambdaGroup == null) {
+        // Only rewrite the methods that have not been synthesized for the lambda group classes.
+        new ApplyStrategy(method, code, context, optimizationInfoFixer).processCode();
+        return;
+      }
+
+      if (method.getDefinition().isInitializer()) {
+        // Should not require rewriting.
+        return;
+      }
+
+      assert method.getDefinition().isNonPrivateVirtualMethod();
+      assert context == null;
+
+      Map<InvokeVirtual, InliningInfo> invokesToInline = new IdentityHashMap<>();
+      for (InvokeVirtual invoke : code.<InvokeVirtual>instructions(Instruction::isInvokeVirtual)) {
+        DexMethod invokedMethod = invoke.getInvokedMethod();
+        DexType holder = invokedMethod.holder;
+        if (lambdaGroup.containsLambda(holder)) {
+          // TODO(b/150685763): Check if we can use simpler lookup.
+          ResolutionResult resolution = appView.appInfo().resolveMethodOnClass(invokedMethod);
+          assert resolution.isSingleResolution();
+          ProgramMethod singleTarget =
+              resolution.asSingleResolution().getResolutionPair().asProgramMethod();
+          assert singleTarget != null;
+          invokesToInline.put(invoke, new InliningInfo(singleTarget, singleTarget.getHolderType()));
+        }
+      }
+
+      assert invokesToInline.size() > 1;
+
+      inliner.performForcedInlining(method, code, invokesToInline, provider, Timing.empty());
+    }
+  }
+
   // Maps lambda into a group, only contains lambdas we decided to merge.
   // NOTE: needs synchronization.
   private final Map<DexType, LambdaGroup> lambdas = new IdentityHashMap<>();
@@ -98,32 +195,35 @@ public final class LambdaMerger {
   // we mark a method for further processing, and then invalidate the only lambda referenced
   // from it. In this case we will reprocess method that does not need patching, but it
   // should not be happening very frequently and we ignore possible overhead.
-  private final Set<DexEncodedMethod> methodsToReprocess = Sets.newIdentityHashSet();
+  private final LongLivedProgramMethodSetBuilder<SortedProgramMethodSet> methodsToReprocess =
+      LongLivedProgramMethodSetBuilder.createSorted();
 
-  private final AppView<? extends AppInfo> appView;
-  private final DexItemFactory factory;
+  private final AppView<AppInfoWithLiveness> appView;
   private final Kotlin kotlin;
   private final DiagnosticsHandler reporter;
 
-  private BiFunction<DexEncodedMethod, IRCode, CodeProcessor> strategyFactory = null;
+  private Mode mode;
 
   // Lambda visitor invalidating lambdas it sees.
   private final LambdaTypeVisitor lambdaInvalidator;
   // Lambda visitor throwing Unreachable on each lambdas it sees.
   private final LambdaTypeVisitor lambdaChecker;
 
-  public LambdaMerger(AppView<? extends AppInfo> appView) {
+  public LambdaMerger(AppView<AppInfoWithLiveness> appView) {
+    DexItemFactory factory = appView.dexItemFactory();
     this.appView = appView;
-    this.factory = appView.dexItemFactory();
     this.kotlin = factory.kotlin;
     this.reporter = appView.options().reporter;
 
-    this.lambdaInvalidator = new LambdaTypeVisitor(factory, this::isMergeableLambda,
-        this::invalidateLambda);
-    this.lambdaChecker = new LambdaTypeVisitor(factory, this::isMergeableLambda,
-        type -> {
-          throw new Unreachable("Unexpected lambda " + type.toSourceString());
-        });
+    this.lambdaInvalidator =
+        new LambdaTypeVisitor(factory, this::isMergeableLambda, this::invalidateLambda);
+    this.lambdaChecker =
+        new LambdaTypeVisitor(
+            factory,
+            this::isMergeableLambda,
+            type -> {
+              throw new Unreachable("Unexpected lambda " + type.toSourceString());
+            });
   }
 
   private void invalidateLambda(DexType lambda) {
@@ -138,30 +238,29 @@ public final class LambdaMerger {
     return lambdas.get(lambda);
   }
 
-  private synchronized void queueForProcessing(DexEncodedMethod method) {
+  private synchronized void queueForProcessing(ProgramMethod method) {
     methodsToReprocess.add(method);
   }
 
   // Collect all group candidates and assign unique lambda ids inside each group.
   // We do this before methods are being processed to guarantee stable order of
   // lambdas inside each group.
-  public final void collectGroupCandidates(
-      DexApplication app, AppView<AppInfoWithLiveness> appView) {
+  public final void collectGroupCandidates(DexApplication app) {
     // Collect lambda groups.
     app.classes().stream()
         .filter(cls -> !appView.appInfo().isPinned(cls.type))
         .filter(
             cls ->
-                cls.hasKotlinInfo()
-                    && cls.getKotlinInfo().isSyntheticClass()
+                cls.getKotlinInfo().isSyntheticClass()
                     && cls.getKotlinInfo().asSyntheticClass().isLambda()
-                    && KotlinLambdaGroupIdFactory.hasValidAnnotations(kotlin, cls))
+                    && KotlinLambdaGroupIdFactory.hasValidAnnotations(kotlin, cls)
+                    && (appView.options().featureSplitConfiguration == null
+                        || !appView.options().featureSplitConfiguration.isInFeature(cls)))
         .sorted((a, b) -> a.type.slowCompareTo(b.type)) // Ensure stable ordering.
         .forEachOrdered(
             lambda -> {
               try {
-                LambdaGroupId id =
-                    KotlinLambdaGroupIdFactory.create(kotlin, lambda, appView.options());
+                LambdaGroupId id = KotlinLambdaGroupIdFactory.create(appView, kotlin, lambda);
                 LambdaGroup group = groups.computeIfAbsent(id, LambdaGroupId::createGroup);
                 group.add(lambda);
                 lambdas.put(lambda.type, group);
@@ -180,20 +279,57 @@ public final class LambdaMerger {
     // Remove trivial groups.
     removeTrivialLambdaGroups();
 
-    assert strategyFactory == null;
-    strategyFactory = AnalysisStrategy::new;
+    assert mode == null;
+    mode = new AnalyzeMode();
   }
 
-  // Is called by IRConverter::rewriteCode, performs different actions
-  // depending on phase:
-  //   - in ANALYZE phase just analyzes invalid usages of lambda classes
-  //     inside the method code, invalidated such lambda classes,
-  //     collects methods that need to be patched.
-  //   - in APPLY phase patches the code to use lambda group classes, also
-  //     asserts that there are no more invalid lambda class references.
-  public final void processMethodCode(DexEncodedMethod method, IRCode code) {
-    if (strategyFactory != null) {
-      strategyFactory.apply(method, code).processCode();
+  /**
+   * Is called by IRConverter::rewriteCode. Performs different actions depending on the current
+   * mode.
+   *
+   * <ol>
+   *   <li>in ANALYZE mode analyzes invalid usages of lambda classes inside the method code,
+   *       invalidated such lambda classes, collects methods that need to be patched.
+   *   <li>in APPLY mode does nothing.
+   * </ol>
+   */
+  public final void analyzeCode(ProgramMethod method, IRCode code) {
+    if (mode != null) {
+      mode.analyzeCode(method, code);
+    }
+  }
+
+  /**
+   * Is called by IRConverter::rewriteCode. Performs different actions depending on the current
+   * mode.
+   *
+   * <ol>
+   *   <li>in ANALYZE mode does nothing.
+   *   <li>in APPLY mode patches the code to use lambda group classes, also asserts that there are
+   *       no more invalid lambda class references.
+   * </ol>
+   */
+  public final void rewriteCode(
+      ProgramMethod method, IRCode code, Inliner inliner, MethodProcessor methodProcessor) {
+    if (mode != null) {
+      mode.rewriteCode(
+          code.context(),
+          code,
+          inliner,
+          null,
+          new InliningIRProvider(appView, method, code, methodProcessor));
+    }
+  }
+
+  /**
+   * Similar to {@link #rewriteCode(ProgramMethod, IRCode, Inliner, MethodProcessor)}, but for
+   * rewriting code for inlining. The {@param context} is the caller that {@param method} is being
+   * inlined into.
+   */
+  public final void rewriteCodeForInlining(
+      ProgramMethod method, IRCode code, ProgramMethod context, InliningIRProvider provider) {
+    if (mode != null) {
+      mode.rewriteCode(method, code, null, context, provider);
     }
   }
 
@@ -210,23 +346,25 @@ public final class LambdaMerger {
 
     // Analyse references from program classes. We assume that this optimization
     // is only used for full program analysis and there are no classpath classes.
-    analyzeReferencesInProgramClasses(app, executorService);
+    ThreadUtils.processItems(app.classes(), this::analyzeClass, executorService);
 
     // Analyse more complex aspects of lambda classes including method code.
-    assert appView.appInfo().hasSubtyping();
-    AppInfoWithSubtyping appInfoWithSubtyping = appView.appInfo().withSubtyping();
-    analyzeLambdaClassesStructure(appInfoWithSubtyping, executorService);
+    analyzeLambdaClassesStructure(executorService);
 
     // Remove invalidated lambdas, compact groups to ensure
     // sequential lambda ids, create group lambda classes.
-    Map<LambdaGroup, DexProgramClass> lambdaGroupsClasses =
-        finalizeLambdaGroups(appInfoWithSubtyping);
+    BiMap<LambdaGroup, DexProgramClass> lambdaGroupsClasses = finalizeLambdaGroups(feedback);
+
+    // Fixup optimization info to ensure that the optimization info does not refer to any merged
+    // lambdas.
+    LambdaMergerOptimizationInfoFixer optimizationInfoFixer =
+        new LambdaMergerOptimizationInfoFixer(lambdaGroupsClasses);
+    feedback.fixupOptimizationInfos(appView, executorService, optimizationInfoFixer);
 
     // Switch to APPLY strategy.
-    this.strategyFactory = ApplyStrategy::new;
+    this.mode = new ApplyMode(lambdaGroupsClasses.inverse(), optimizationInfoFixer);
 
     // Add synthesized lambda group classes to the builder.
-
     for (Entry<LambdaGroup, DexProgramClass> entry : lambdaGroupsClasses.entrySet()) {
       DexProgramClass synthesizedClass = entry.getValue();
       appView.appInfo().addSynthesizedClass(synthesizedClass);
@@ -242,29 +380,23 @@ public final class LambdaMerger {
       synthesizedClass.forEachMethod(
           encodedMethod -> encodedMethod.markProcessed(ConstraintWithTarget.NEVER));
     }
+
     converter.optimizeSynthesizedClasses(lambdaGroupsClasses.values(), executorService);
 
     // Rewrite lambda class references into lambda group class
     // references inside methods from the processing queue.
-    rewriteLambdaReferences(converter, executorService, feedback);
-    this.strategyFactory = null;
+    rewriteLambdaReferences(converter, executorService);
+    this.mode = null;
+
+    appView.setHorizontallyMergedLambdaClasses(
+        new HorizontallyMergedLambdaClasses(lambdas.keySet()));
   }
 
-  private void analyzeReferencesInProgramClasses(
-      DexApplication app, ExecutorService service) throws ExecutionException {
-    List<Future<?>> futures = new ArrayList<>();
-    for (DexProgramClass clazz : app.classes()) {
-      futures.add(service.submit(() -> analyzeClass(clazz)));
-    }
-    ThreadUtils.awaitFutures(futures);
-  }
-
-  private void analyzeLambdaClassesStructure(
-      AppInfoWithSubtyping appInfo, ExecutorService service) throws ExecutionException {
+  private void analyzeLambdaClassesStructure(ExecutorService service) throws ExecutionException {
     List<Future<?>> futures = new ArrayList<>();
     for (LambdaGroup group : groups.values()) {
       ThrowingConsumer<DexClass, LambdaStructureError> validator =
-          group.lambdaClassValidator(kotlin, appInfo);
+          group.lambdaClassValidator(kotlin, appView.appInfo());
       group.forEachLambda(info ->
           futures.add(service.submit(() -> {
             try {
@@ -283,7 +415,7 @@ public final class LambdaMerger {
     ThreadUtils.awaitFutures(futures);
   }
 
-  private Map<LambdaGroup, DexProgramClass> finalizeLambdaGroups(AppInfoWithSubtyping appInfo) {
+  private BiMap<LambdaGroup, DexProgramClass> finalizeLambdaGroups(OptimizationFeedback feedback) {
     for (DexType lambda : invalidatedLambdas) {
       LambdaGroup group = lambdas.get(lambda);
       assert group != null;
@@ -296,15 +428,12 @@ public final class LambdaMerger {
     removeTrivialLambdaGroups();
 
     // Compact lambda groups, synthesize lambda group classes.
-    Map<LambdaGroup, DexProgramClass> result = new LinkedHashMap<>();
+    BiMap<LambdaGroup, DexProgramClass> result = HashBiMap.create();
     for (LambdaGroup group : groups.values()) {
       assert !group.isTrivial() : "No trivial group is expected here.";
       group.compact();
-      DexProgramClass lambdaGroupClass = group.synthesizeClass(factory);
+      DexProgramClass lambdaGroupClass = group.synthesizeClass(appView, feedback);
       result.put(group, lambdaGroupClass);
-
-      // We have to register this new class as a subtype of object.
-      appInfo.registerNewType(lambdaGroupClass.type, lambdaGroupClass.superType);
     }
     return result;
   }
@@ -321,58 +450,37 @@ public final class LambdaMerger {
     }
   }
 
-  private void rewriteLambdaReferences(
-      IRConverter converter, ExecutorService executorService, OptimizationFeedback feedback)
+  private void rewriteLambdaReferences(IRConverter converter, ExecutorService executorService)
       throws ExecutionException {
     if (methodsToReprocess.isEmpty()) {
       return;
     }
-    Set<DexEncodedMethod> methods =
-        methodsToReprocess.stream()
-            .map(method -> appView.graphLense().mapDexEncodedMethod(method, appView))
-            .collect(Collectors.toSet());
-    List<Future<?>> futures = new ArrayList<>();
-    for (DexEncodedMethod method : methods) {
-      futures.add(
-          executorService.submit(
-              () -> {
-                converter.processMethod(
-                    method,
-                    feedback,
-                    methods::contains,
-                    CallSiteInformation.empty(),
-                    Outliner::noProcessing);
-                assert method.isProcessed();
-                return null;
-              }));
-    }
-    ThreadUtils.awaitFutures(futures);
+    SortedProgramMethodSet methods = methodsToReprocess.build(appView);
+    converter.processMethodsConcurrently(methods, executorService);
+    assert methods.stream()
+        .map(DexClassAndMethod::getDefinition)
+        .allMatch(DexEncodedMethod::isProcessed);
   }
 
   private void analyzeClass(DexProgramClass clazz) {
     lambdaInvalidator.accept(clazz.superType);
     lambdaInvalidator.accept(clazz.interfaces);
-    lambdaInvalidator.accept(clazz.annotations);
+    lambdaInvalidator.accept(clazz.annotations());
 
     for (DexEncodedField field : clazz.staticFields()) {
-      lambdaInvalidator.accept(field.annotations);
+      lambdaInvalidator.accept(field.annotations());
       if (field.field.type != clazz.type) {
         // Ignore static fields of the same type.
         lambdaInvalidator.accept(field.field, clazz.type);
       }
     }
     for (DexEncodedField field : clazz.instanceFields()) {
-      lambdaInvalidator.accept(field.annotations);
+      lambdaInvalidator.accept(field.annotations());
       lambdaInvalidator.accept(field.field, clazz.type);
     }
 
-    for (DexEncodedMethod method : clazz.directMethods()) {
-      lambdaInvalidator.accept(method.annotations);
-      lambdaInvalidator.accept(method.parameterAnnotationsList);
-      lambdaInvalidator.accept(method.method, clazz.type);
-    }
-    for (DexEncodedMethod method : clazz.virtualMethods()) {
-      lambdaInvalidator.accept(method.annotations);
+    for (DexEncodedMethod method : clazz.methods()) {
+      lambdaInvalidator.accept(method.annotations());
       lambdaInvalidator.accept(method.parameterAnnotationsList);
       lambdaInvalidator.accept(method.method, clazz.type);
     }
@@ -384,7 +492,7 @@ public final class LambdaMerger {
   }
 
   private final class AnalysisStrategy extends CodeProcessor {
-    private AnalysisStrategy(DexEncodedMethod method, IRCode code) {
+    private AnalysisStrategy(ProgramMethod method, IRCode code) {
       super(
           LambdaMerger.this.appView,
           LambdaMerger.this::strategyProvider,
@@ -422,16 +530,90 @@ public final class LambdaMerger {
     void process(Strategy strategy, StaticGet staticGet) {
       queueForProcessing(method);
     }
+
+    @Override
+    void process(Strategy strategy, InitClass initClass) {
+      queueForProcessing(method);
+    }
   }
 
-  private final class ApplyStrategy extends CodeProcessor {
-    private ApplyStrategy(DexEncodedMethod method, IRCode code) {
+  public final class ApplyStrategy extends CodeProcessor {
+
+    private final LambdaMergerOptimizationInfoFixer optimizationInfoFixer;
+
+    private final Set<Value> typeAffectedValues = Sets.newIdentityHashSet();
+
+    private ApplyStrategy(
+        ProgramMethod method,
+        IRCode code,
+        ProgramMethod context,
+        LambdaMergerOptimizationInfoFixer optimizationInfoFixer) {
       super(
           LambdaMerger.this.appView,
           LambdaMerger.this::strategyProvider,
           lambdaChecker,
           method,
-          code);
+          code,
+          context);
+      this.optimizationInfoFixer = optimizationInfoFixer;
+    }
+
+    public void recordTypeHasChanged(Value value) {
+      for (Value affectedValue : value.affectedValues()) {
+        if (typeMayHaveChanged(affectedValue)) {
+          typeAffectedValues.add(affectedValue);
+        }
+      }
+    }
+
+    @Override
+    void processCode() {
+      super.processCode();
+
+      if (typeAffectedValues.isEmpty()) {
+        return;
+      }
+
+      // Find all the transitively type affected values.
+      Set<Value> transitivelyTypeAffectedValues = SetUtils.newIdentityHashSet(typeAffectedValues);
+      Deque<Value> worklist = new ArrayDeque<>(typeAffectedValues);
+      while (!worklist.isEmpty()) {
+        Value value = worklist.pop();
+        assert typeMayHaveChanged(value);
+        assert transitivelyTypeAffectedValues.contains(value);
+
+        for (Value affectedValue : value.affectedValues()) {
+          if (typeMayHaveChanged(affectedValue)
+              && transitivelyTypeAffectedValues.add(affectedValue)) {
+            worklist.add(affectedValue);
+          }
+        }
+      }
+
+      // Update the types of these values if they refer to obsolete types. This is needed to be
+      // able to propagate the type information correctly, since lambda merging is neither a
+      // narrowing nor a widening.
+      for (Value value : transitivelyTypeAffectedValues) {
+        value.setType(value.getType().fixupClassTypeReferences(optimizationInfoFixer, appView));
+      }
+
+      // Filter out the type affected phis and destructively update the type of the phis. This is
+      // needed because narrowing does not work in presence of cyclic phis.
+      Set<Phi> typeAffectedPhis = Sets.newIdentityHashSet();
+      for (Value typeAffectedValue : transitivelyTypeAffectedValues) {
+        if (typeAffectedValue.isPhi()) {
+          typeAffectedPhis.add(typeAffectedValue.asPhi());
+        }
+      }
+      if (!typeAffectedPhis.isEmpty()) {
+        new DestructivePhiTypeUpdater(appView, optimizationInfoFixer)
+            .recomputeAndPropagateTypes(code, typeAffectedPhis);
+      }
+      assert code.verifyTypes(appView);
+    }
+
+    private boolean typeMayHaveChanged(Value value) {
+      return value.isPhi() || !value.definition.hasInvariantOutType();
     }
 
     @Override
@@ -446,7 +628,9 @@ public final class LambdaMerger {
 
     @Override
     void process(Strategy strategy, InstancePut instancePut) {
-      strategy.patch(this, instancePut);
+      // Instance put should only appear in lambda class instance constructor,
+      // we should never get here since we never rewrite them.
+      throw new Unreachable();
     }
 
     @Override
@@ -456,12 +640,63 @@ public final class LambdaMerger {
 
     @Override
     void process(Strategy strategy, StaticPut staticPut) {
-      strategy.patch(this, staticPut);
+      // Static put should only appear in lambda class static initializer,
+      // we should never get here since we never rewrite them.
+      throw new Unreachable();
     }
 
     @Override
     void process(Strategy strategy, StaticGet staticGet) {
       strategy.patch(this, staticGet);
+    }
+
+    @Override
+    void process(Strategy strategy, InitClass initClass) {
+      strategy.patch(this, initClass);
+    }
+  }
+
+  private final class LambdaMergerOptimizationInfoFixer
+      implements Function<DexType, DexType>, OptimizationInfoFixer {
+
+    private final Map<LambdaGroup, DexProgramClass> lambdaGroupsClasses;
+
+    LambdaMergerOptimizationInfoFixer(Map<LambdaGroup, DexProgramClass> lambdaGroupsClasses) {
+      this.lambdaGroupsClasses = lambdaGroupsClasses;
+    }
+
+    @Override
+    public DexType apply(DexType type) {
+      LambdaGroup group = lambdas.get(type);
+      if (group != null) {
+        DexProgramClass clazz = lambdaGroupsClasses.get(group);
+        if (clazz != null) {
+          return clazz.type;
+        }
+      }
+      return type;
+    }
+
+    @Override
+    public void fixup(DexEncodedField field) {
+      FieldOptimizationInfo optimizationInfo = field.getOptimizationInfo();
+      if (optimizationInfo.isMutableFieldOptimizationInfo()) {
+        optimizationInfo.asMutableFieldOptimizationInfo().fixupClassTypeReferences(this, appView);
+      } else {
+        assert optimizationInfo.isDefaultFieldOptimizationInfo();
+      }
+    }
+
+    @Override
+    public void fixup(DexEncodedMethod method) {
+      MethodOptimizationInfo optimizationInfo = method.getOptimizationInfo();
+      if (optimizationInfo.isUpdatableMethodOptimizationInfo()) {
+        optimizationInfo
+            .asUpdatableMethodOptimizationInfo()
+            .fixupClassTypeReferences(this, appView);
+      } else {
+        assert optimizationInfo.isDefaultMethodOptimizationInfo();
+      }
     }
   }
 }

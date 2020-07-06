@@ -4,17 +4,17 @@
 
 package com.android.tools.r8.ir.analysis;
 
-import com.android.tools.r8.OptionalBool;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfo.ResolutionResult;
+import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexDefinition;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
-import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.CatchHandlers.CatchHandler;
 import com.android.tools.r8.ir.code.DominatorTree;
@@ -22,9 +22,11 @@ import com.android.tools.r8.ir.code.DominatorTree.Assumption;
 import com.android.tools.r8.ir.code.DominatorTree.Inclusive;
 import com.android.tools.r8.ir.code.FieldInstruction;
 import com.android.tools.r8.ir.code.IRCode;
+import com.android.tools.r8.ir.code.InitClass;
 import com.android.tools.r8.ir.code.InstanceGet;
 import com.android.tools.r8.ir.code.InstancePut;
 import com.android.tools.r8.ir.code.Instruction;
+import com.android.tools.r8.ir.code.InstructionIterator;
 import com.android.tools.r8.ir.code.InvokeDirect;
 import com.android.tools.r8.ir.code.InvokeInterface;
 import com.android.tools.r8.ir.code.InvokeStatic;
@@ -35,11 +37,13 @@ import com.android.tools.r8.ir.code.StaticGet;
 import com.android.tools.r8.ir.code.StaticPut;
 import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Streams;
 import java.util.ArrayDeque;
+import java.util.BitSet;
 import java.util.Deque;
-import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -70,7 +74,6 @@ public class ClassInitializationAnalysis {
 
   private final AppView<AppInfoWithLiveness> appView;
   private final IRCode code;
-  private final DexItemFactory dexItemFactory;
 
   private DominatorTree dominatorTree = null;
   private int markingColor = -1;
@@ -78,13 +81,11 @@ public class ClassInitializationAnalysis {
   private ClassInitializationAnalysis() {
     this.appView = null;
     this.code = null;
-    this.dexItemFactory = null;
   }
 
   public ClassInitializationAnalysis(AppView<AppInfoWithLiveness> appView, IRCode code) {
     this.appView = appView;
     this.code = code;
-    this.dexItemFactory = appView.dexItemFactory();
   }
 
   // Returns a trivial, conservative analysis that always returns false.
@@ -93,7 +94,7 @@ public class ClassInitializationAnalysis {
   }
 
   public boolean isClassDefinitelyLoadedBeforeInstruction(DexType type, Instruction instruction) {
-    DexType context = code.method.method.holder;
+    ProgramMethod context = code.context();
     BasicBlock block = instruction.getBlock();
 
     // Visit the instructions in `block` prior to `instruction`.
@@ -120,7 +121,7 @@ public class ClassInitializationAnalysis {
     // Visit all the instructions in all the blocks that dominate `block`.
     for (BasicBlock dominator : dominatorTree.dominatorBlocks(block, Inclusive.NO)) {
       AnalysisAssumption assumption = getAssumptionForDominator(dominator, block);
-      Iterator<Instruction> instructionIterator = dominator.iterator();
+      InstructionIterator instructionIterator = dominator.iterator();
       while (instructionIterator.hasNext()) {
         Instruction previous = instructionIterator.next();
         if (previous.definitelyTriggersClassInitialization(
@@ -193,33 +194,10 @@ public class ClassInitializationAnalysis {
     }
 
     for (CatchHandler<BasicBlock> catchHandler : dominator.getCatchHandlers()) {
-      if (!catchHandler.target.isMarked(markingColor)) {
-        // There is no path from this catch handler to the instruction of interest, so we can
-        // ignore it.
-        continue;
-      }
-
-      DexType guard = catchHandler.guard;
-      if (exceptionalExit.isInstanceGet()
-          || exceptionalExit.isInstancePut()
-          || exceptionalExit.isInvokeMethodWithReceiver()) {
-        // If an instance-get, instance-put, or instance-invoke instruction does not fail with a
-        // NullPointerException, then the receiver class must have been initialized.
-        OptionalBool isCatchingNPE = appView.isSubtype(dexItemFactory.npeType, guard);
-        if (isCatchingNPE.isPossiblyTrue()) {
-          return AnalysisAssumption.NONE;
-        }
-      }
-      if (exceptionalExit.isStaticGet()
-          || exceptionalExit.isStaticPut()
-          || exceptionalExit.isInvokeStatic()) {
-        // If a static-get, static-put, or invoke-static does not fail with an ExceptionIn-
-        // InitializerError, then the holder class must have been initialized.
-        OptionalBool isCatchingInitError =
-            appView.isSubtype(dexItemFactory.exceptionInInitializerErrorType, guard);
-        if (isCatchingInitError.isPossiblyTrue()) {
-          return AnalysisAssumption.NONE;
-        }
+      if (catchHandler.target.isMarked(markingColor)) {
+        // There is a path from this catch handler to the instruction of interest, so we can't make
+        // any assumptions.
+        return AnalysisAssumption.NONE;
       }
     }
 
@@ -253,10 +231,24 @@ public class ClassInitializationAnalysis {
 
   public static class InstructionUtils {
 
+    public static boolean forInitClass(
+        InitClass instruction,
+        DexType type,
+        AppView<AppInfoWithLiveness> appView,
+        Query mode,
+        AnalysisAssumption assumption) {
+      if (assumption == AnalysisAssumption.NONE) {
+        // Class initialization may fail with ExceptionInInitializerError.
+        return false;
+      }
+      DexClass clazz = appView.definitionFor(instruction.getClassValue());
+      return clazz != null && isTypeInitializedBy(instruction, type, clazz, appView, mode);
+    }
+
     public static boolean forInstanceGet(
         InstanceGet instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       return forInstanceGetOrPut(instruction, type, appView, mode, assumption);
@@ -265,7 +257,7 @@ public class ClassInitializationAnalysis {
     public static boolean forInstancePut(
         InstancePut instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       return forInstanceGetOrPut(instruction, type, appView, mode, assumption);
@@ -274,7 +266,7 @@ public class ClassInitializationAnalysis {
     private static boolean forInstanceGetOrPut(
         FieldInstruction instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       assert instruction.isInstanceGet() || instruction.isInstancePut();
@@ -283,40 +275,43 @@ public class ClassInitializationAnalysis {
             instruction.isInstanceGet()
                 ? instruction.asInstanceGet().object()
                 : instruction.asInstancePut().object();
-        if (object.getTypeLattice().isNullable()) {
+        if (object.getType().isNullable()) {
           // If the receiver is null we cannot be sure that the holder has been initialized.
           return false;
         }
       }
-      DexEncodedField field = appView.appInfo().resolveField(instruction.getField());
-      return field != null && isTypeInitializedBy(type, field, appView, mode);
+      DexEncodedField field =
+          appView.appInfo().resolveField(instruction.getField()).getResolvedField();
+      return field != null && isTypeInitializedBy(instruction, type, field, appView, mode);
     }
 
     public static boolean forInvokeDirect(
         InvokeDirect instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       if (assumption == AnalysisAssumption.NONE) {
-        if (instruction.getReceiver().getTypeLattice().isNullable()) {
+        if (instruction.getReceiver().getType().isNullable()) {
           // If the receiver is null we cannot be sure that the holder has been initialized.
           return false;
         }
       }
-      DexEncodedMethod method = appView.definitionFor(instruction.getInvokedMethod());
-      return method != null && isTypeInitializedBy(type, method, appView, mode);
+      DexMethod invokedMethod = instruction.getInvokedMethod();
+      DexClass holder = appView.definitionForHolder(invokedMethod);
+      DexEncodedMethod method = invokedMethod.lookupOnClass(holder);
+      return method != null && isTypeInitializedBy(instruction, type, method, appView, mode);
     }
 
     public static boolean forInvokeInterface(
         InvokeInterface instruction,
         DexType type,
-        DexType context,
-        AppView<? extends AppInfo> appView,
+        ProgramMethod context,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       if (assumption == AnalysisAssumption.NONE) {
-        if (instruction.getReceiver().getTypeLattice().isNullable()) {
+        if (instruction.getReceiver().getType().isNullable()) {
           // If the receiver is null we cannot be sure that the holder has been initialized.
           return false;
         }
@@ -328,45 +323,46 @@ public class ClassInitializationAnalysis {
         return false;
       }
       if (appView.appInfo().hasLiveness()) {
-        AppInfoWithLiveness appInfoWithLiveness = appView.appInfo().withLiveness();
         DexEncodedMethod singleTarget =
-            instruction.lookupSingleTarget(appInfoWithLiveness, context);
+            instruction.lookupSingleTarget(appView.withLiveness(), context);
         if (singleTarget != null) {
-          return isTypeInitializedBy(type, singleTarget, appView, mode);
+          return isTypeInitializedBy(instruction, type, singleTarget, appView, mode);
         }
       }
       DexMethod method = instruction.getInvokedMethod();
-      ResolutionResult resolutionResult = appView.appInfo().resolveMethod(method.holder, method);
-      if (!resolutionResult.hasSingleTarget()) {
+      ResolutionResult resolutionResult =
+          appView.appInfo().resolveMethodOnInterface(method.holder, method);
+      if (!resolutionResult.isSingleResolution()) {
         return false;
       }
-      DexType holder = resolutionResult.asSingleTarget().method.holder;
+      DexType holder = resolutionResult.getSingleTarget().holder();
       return appView.isSubtype(holder, type).isTrue();
     }
 
     public static boolean forInvokeStatic(
         InvokeStatic instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        ProgramMethod context,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       if (assumption == AnalysisAssumption.NONE) {
         // Class initialization may fail with ExceptionInInitializerError.
         return false;
       }
-      DexEncodedMethod method = appView.definitionFor(instruction.getInvokedMethod());
-      return method != null && isTypeInitializedBy(type, method, appView, mode);
+      DexEncodedMethod method = instruction.lookupSingleTarget(appView, context);
+      return method != null && isTypeInitializedBy(instruction, type, method, appView, mode);
     }
 
     public static boolean forInvokeSuper(
         InvokeSuper instruction,
         DexType type,
-        DexType context,
-        AppView<? extends AppInfo> appView,
+        ProgramMethod context,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       if (assumption == AnalysisAssumption.NONE) {
-        if (instruction.getReceiver().getTypeLattice().isNullable()) {
+        if (instruction.getReceiver().getType().isNullable()) {
           // If the receiver is null we cannot be sure that the holder has been initialized.
           return false;
         }
@@ -378,11 +374,10 @@ public class ClassInitializationAnalysis {
         return false;
       }
       if (appView.appInfo().hasLiveness()) {
-        AppInfoWithLiveness appInfoWithLiveness = appView.appInfo().withLiveness();
         DexEncodedMethod singleTarget =
-            instruction.lookupSingleTarget(appInfoWithLiveness, context);
+            instruction.lookupSingleTarget(appView.withLiveness(), context);
         if (singleTarget != null) {
-          return isTypeInitializedBy(type, singleTarget, appView, mode);
+          return isTypeInitializedBy(instruction, type, singleTarget, appView, mode);
         }
       }
       DexMethod method = instruction.getInvokedMethod();
@@ -394,23 +389,24 @@ public class ClassInitializationAnalysis {
       if (superType == null) {
         return false;
       }
-      ResolutionResult resolutionResult = appView.appInfo().resolveMethod(superType, method);
-      if (!resolutionResult.hasSingleTarget()) {
+      ResolutionResult resolutionResult =
+          appView.appInfo().resolveMethodOn(superType, method, instruction.isInterface);
+      if (!resolutionResult.isSingleResolution()) {
         return false;
       }
-      DexType holder = resolutionResult.asSingleTarget().method.holder;
+      DexType holder = resolutionResult.getSingleTarget().holder();
       return appView.isSubtype(holder, type).isTrue();
     }
 
     public static boolean forInvokeVirtual(
         InvokeVirtual instruction,
         DexType type,
-        DexType context,
-        AppView<? extends AppInfo> appView,
+        ProgramMethod context,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       if (assumption == AnalysisAssumption.NONE) {
-        if (instruction.getReceiver().getTypeLattice().isNullable()) {
+        if (instruction.getReceiver().getType().isNullable()) {
           // If the receiver is null we cannot be sure that the holder has been initialized.
           return false;
         }
@@ -422,26 +418,26 @@ public class ClassInitializationAnalysis {
         return false;
       }
       if (appView.appInfo().hasLiveness()) {
-        AppInfoWithLiveness appInfoWithLiveness = appView.appInfo().withLiveness();
         DexEncodedMethod singleTarget =
-            instruction.lookupSingleTarget(appInfoWithLiveness, context);
+            instruction.lookupSingleTarget(appView.withLiveness(), context);
         if (singleTarget != null) {
-          return isTypeInitializedBy(type, singleTarget, appView, mode);
+          return isTypeInitializedBy(instruction, type, singleTarget, appView, mode);
         }
       }
       DexMethod method = instruction.getInvokedMethod();
-      ResolutionResult resolutionResult = appView.appInfo().resolveMethod(method.holder, method);
-      if (!resolutionResult.hasSingleTarget()) {
+      ResolutionResult resolutionResult =
+          appView.appInfo().resolveMethodOnClass(method, method.holder);
+      if (!resolutionResult.isSingleResolution()) {
         return false;
       }
-      DexType holder = resolutionResult.asSingleTarget().method.holder;
+      DexType holder = resolutionResult.getSingleTarget().holder();
       return appView.isSubtype(holder, type).isTrue();
     }
 
     public static boolean forNewInstance(
         NewInstance instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       if (assumption == AnalysisAssumption.NONE) {
@@ -449,13 +445,13 @@ public class ClassInitializationAnalysis {
         return false;
       }
       DexClass clazz = appView.definitionFor(instruction.clazz);
-      return clazz != null && isTypeInitializedBy(type, clazz, appView, mode);
+      return clazz != null && isTypeInitializedBy(instruction, type, clazz, appView, mode);
     }
 
     public static boolean forStaticGet(
         StaticGet instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       return forStaticGetOrPut(instruction, type, appView, mode, assumption);
@@ -464,7 +460,7 @@ public class ClassInitializationAnalysis {
     public static boolean forStaticPut(
         StaticPut instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       return forStaticGetOrPut(instruction, type, appView, mode, assumption);
@@ -473,7 +469,7 @@ public class ClassInitializationAnalysis {
     private static boolean forStaticGetOrPut(
         FieldInstruction instruction,
         DexType type,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode,
         AnalysisAssumption assumption) {
       assert instruction.isStaticGet() || instruction.isStaticPut();
@@ -481,27 +477,25 @@ public class ClassInitializationAnalysis {
         // Class initialization may fail with ExceptionInInitializerError.
         return false;
       }
-      DexEncodedField field = appView.appInfo().resolveField(instruction.getField());
-      return field != null && isTypeInitializedBy(type, field, appView, mode);
+      DexEncodedField field =
+          appView.appInfo().resolveField(instruction.getField()).getResolvedField();
+      return field != null && isTypeInitializedBy(instruction, type, field, appView, mode);
     }
 
     private static boolean isTypeInitializedBy(
+        Instruction instruction,
         DexType typeToBeInitialized,
         DexDefinition definition,
-        AppView<? extends AppInfo> appView,
+        AppView<AppInfoWithLiveness> appView,
         Query mode) {
       if (mode == Query.DIRECTLY) {
         if (definition.isDexClass()) {
           return definition.asDexClass().type == typeToBeInitialized;
         }
-        if (definition.isDexEncodedField()) {
-          return definition.asDexEncodedField().field.holder == typeToBeInitialized;
+        if (definition.isDexEncodedMember()) {
+          return definition.asDexEncodedMember().toReference().holder == typeToBeInitialized;
         }
-        if (definition.isDexEncodedMethod()) {
-          return definition.asDexEncodedMethod().method.holder == typeToBeInitialized;
-        }
-        assert false;
-        return false;
+        throw new Unreachable();
       }
 
       Set<DexType> visited = Sets.newIdentityHashSet();
@@ -512,11 +506,12 @@ public class ClassInitializationAnalysis {
         enqueue(clazz.type, visited, worklist);
       } else if (definition.isDexEncodedField()) {
         DexEncodedField field = definition.asDexEncodedField();
-        enqueue(field.field.holder, visited, worklist);
+        enqueue(field.holder(), visited, worklist);
       } else if (definition.isDexEncodedMethod()) {
+        assert instruction.isInvokeMethod();
         DexEncodedMethod method = definition.asDexEncodedMethod();
-        enqueue(method.method.holder, visited, worklist);
-        enqueueInitializedClassesOnNormalExit(method, visited, worklist);
+        enqueue(method.holder(), visited, worklist);
+        enqueueInitializedClassesOnNormalExit(method, instruction.inValues(), visited, worklist);
       } else {
         assert false;
       }
@@ -533,7 +528,8 @@ public class ClassInitializationAnalysis {
         if (clazz != null) {
           DexEncodedMethod classInitializer = clazz.getClassInitializer();
           if (classInitializer != null) {
-            enqueueInitializedClassesOnNormalExit(classInitializer, visited, worklist);
+            enqueueInitializedClassesOnNormalExit(
+                classInitializer, ImmutableList.of(), visited, worklist);
           }
         }
       }
@@ -548,9 +544,35 @@ public class ClassInitializationAnalysis {
     }
 
     private static void enqueueInitializedClassesOnNormalExit(
-        DexEncodedMethod method, Set<DexType> visited, Deque<DexType> worklist) {
+        DexEncodedMethod method,
+        List<Value> arguments,
+        Set<DexType> visited,
+        Deque<DexType> worklist) {
       for (DexType type : method.getOptimizationInfo().getInitializedClassesOnNormalExit()) {
         enqueue(type, visited, worklist);
+      }
+      // If an invoke to an instance method succeeds, then the receiver must be non-null, which
+      // implies that the type of the receiver must be initialized.
+      if (!method.isStatic()) {
+        assert arguments.size() > 0;
+        TypeElement type = arguments.get(0).getType();
+        if (type.isClassType()) {
+          enqueue(type.asClassType().getClassType(), visited, worklist);
+        }
+      }
+      // If an invoke to a method succeeds, and the method would have thrown and exception if the
+      // i'th argument was null, then the i'th argument must be non-null, which implies that the
+      // type of the i'th argument must be initialized.
+      BitSet nonNullParamOrThrowFacts = method.getOptimizationInfo().getNonNullParamOrThrow();
+      if (nonNullParamOrThrowFacts != null) {
+        for (int i = 0; i < arguments.size(); i++) {
+          if (nonNullParamOrThrowFacts.get(i)) {
+            TypeElement type = arguments.get(i).getType();
+            if (type.isClassType()) {
+              enqueue(type.asClassType().getClassType(), visited, worklist);
+            }
+          }
+        }
       }
     }
   }

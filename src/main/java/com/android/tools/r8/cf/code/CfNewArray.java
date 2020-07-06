@@ -5,12 +5,17 @@ package com.android.tools.r8.cf.code;
 
 import com.android.tools.r8.cf.CfPrinter;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.DexClassAndMethod;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.UseRegistry;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.CfState.Slot;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.utils.DescriptorUtils;
 import org.objectweb.asm.MethodVisitor;
@@ -61,7 +66,7 @@ public class CfNewArray extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     if (type.isPrimitiveArrayType()) {
       visitor.visitIntInsn(Opcodes.NEWARRAY, getPrimitiveTypeCode());
     } else {
@@ -75,7 +80,7 @@ public class CfNewArray extends CfInstruction {
   }
 
   @Override
-  public void registerUse(UseRegistry registry, DexType clazz) {
+  void internalRegisterUse(UseRegistry registry, DexClassAndMethod context) {
     if (!type.isPrimitiveArrayType()) {
       registry.registerTypeReference(type);
     }
@@ -91,5 +96,11 @@ public class CfNewArray extends CfInstruction {
     Slot size = state.pop();
     Slot push = state.push(type);
     builder.addNewArrayEmpty(push.register, size.register, type);
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return inliningConstraints.forNewArrayEmpty(type, context);
   }
 }

@@ -4,12 +4,16 @@
 
 package com.android.tools.r8.ir.optimize;
 
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.SubtypingInfo;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.MethodSignatureEquivalence;
+import com.google.common.base.Predicates;
+import java.util.function.Predicate;
 
 // Per-class collection of method signatures.
 //
@@ -28,8 +32,22 @@ import com.android.tools.r8.utils.MethodSignatureEquivalence;
 // TODO(b/66369976): to determine if a certain method can be made `final`.
 public class MethodPoolCollection extends MemberPoolCollection<DexMethod> {
 
-  public MethodPoolCollection(AppView<? extends AppInfoWithSubtyping> appView) {
-    super(appView, MethodSignatureEquivalence.get());
+  private final Predicate<DexEncodedMethod> methodTester;
+
+  public MethodPoolCollection(AppView<AppInfoWithLiveness> appView, SubtypingInfo subtypingInfo) {
+    this(appView, subtypingInfo, Predicates.alwaysTrue());
+  }
+
+  public MethodPoolCollection(
+      AppView<AppInfoWithLiveness> appView,
+      SubtypingInfo subtypingInfo,
+      Predicate<DexEncodedMethod> methodTester) {
+    super(appView, MethodSignatureEquivalence.get(), subtypingInfo);
+    this.methodTester = methodTester;
+  }
+
+  public static boolean excludesPrivateInstanceMethod(DexEncodedMethod method) {
+    return !method.isPrivateMethod() || method.isStatic();
   }
 
   @Override
@@ -39,8 +57,7 @@ public class MethodPoolCollection extends MemberPoolCollection<DexMethod> {
           memberPools.computeIfAbsent(clazz, k -> new MemberPool<>(equivalence));
       clazz.forEachMethod(
           encodedMethod -> {
-            // We will add private instance methods when we promote them.
-            if (!encodedMethod.isPrivateMethod() || encodedMethod.isStatic()) {
+            if (methodTester.test(encodedMethod)) {
               methodPool.seen(equivalence.wrap(encodedMethod.method));
             }
           });
@@ -54,7 +71,7 @@ public class MethodPoolCollection extends MemberPoolCollection<DexMethod> {
         }
       }
       if (clazz.isInterface()) {
-        for (DexType subtype : appView.appInfo().allImmediateSubtypes(clazz.type)) {
+        for (DexType subtype : subtypingInfo.allImmediateSubtypes(clazz.type)) {
           DexClass subClazz = appView.definitionFor(subtype);
           if (subClazz != null) {
             MemberPool<DexMethod> childPool =

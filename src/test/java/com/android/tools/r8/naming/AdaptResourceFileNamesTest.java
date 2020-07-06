@@ -5,10 +5,10 @@
 package com.android.tools.r8.naming;
 
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 import com.android.tools.r8.CompilationFailedException;
@@ -16,7 +16,6 @@ import com.android.tools.r8.DataDirectoryResource;
 import com.android.tools.r8.DataEntryResource;
 import com.android.tools.r8.DataResourceConsumer;
 import com.android.tools.r8.DataResourceProvider.Visitor;
-import com.android.tools.r8.DiagnosticsHandler;
 import com.android.tools.r8.R8Command;
 import com.android.tools.r8.StringConsumer;
 import com.android.tools.r8.ToolHelper;
@@ -87,7 +86,7 @@ public class AdaptResourceFileNamesTest extends ProguardCompatibilityTestBase {
     return String.join(
         System.lineSeparator(),
         adaptResourceFilenamesRule,
-        "-keep class " + adaptresourcefilenames.TestClass.class.getName() + " {",
+        "-keep class adaptresourcefilenames.TestClass {",
         "  public static void main(...);",
         "}");
   }
@@ -96,17 +95,16 @@ public class AdaptResourceFileNamesTest extends ProguardCompatibilityTestBase {
       boolean enableAdaptResourceFileNames, String adaptResourceFileNamesPathFilter) {
     return StringUtils.lines(
         getProguardConfig(enableAdaptResourceFileNames, adaptResourceFileNamesPathFilter),
-        "-neverinline class " + adaptresourcefilenames.A.class.getName() + " {",
+        "-neverinline class adaptresourcefilenames.A {",
         "  public void method();",
         "}",
-        "-neverinline class " + adaptresourcefilenames.B.Inner.class.getName() + " {",
+        "-neverinline class adaptresourcefilenames.B$Inner {",
         "  public void method();",
         "}",
-        "-assumemayhavesideeffects class " + adaptresourcefilenames.pkg.C.class.getName() + " {",
+        "-assumemayhavesideeffects class adaptresourcefilenames.pkg.C {",
         "  void <init>();",
         "}",
-        "-assumemayhavesideeffects class " + adaptresourcefilenames.pkg.innerpkg.D.class.getName(),
-        "{",
+        "-assumemayhavesideeffects class adaptresourcefilenames.pkg.innerpkg.D {",
         "  void <init>();",
         "}",
         "-neverclassinline class *");
@@ -116,7 +114,9 @@ public class AdaptResourceFileNamesTest extends ProguardCompatibilityTestBase {
   public void testEnabled() throws Exception {
     DataResourceConsumerForTesting dataResourceConsumer = new DataResourceConsumerForTesting();
     compileWithR8(
-        getProguardConfigWithNeverInline(true, null), dataResourceConsumer, this::checkR8Renamings);
+        getProguardConfigWithNeverInline(true, null),
+        dataResourceConsumer,
+        ToolHelper.consumeString(this::checkR8Renamings));
     // Check that the generated resources have the expected names.
     for (DataEntryResource dataResource : getOriginalDataResources()) {
       assertNotNull(
@@ -131,7 +131,7 @@ public class AdaptResourceFileNamesTest extends ProguardCompatibilityTestBase {
     compileWithR8(
         getProguardConfigWithNeverInline(true, "**.md"),
         dataResourceConsumer,
-        this::checkR8Renamings);
+        ToolHelper.consumeString(this::checkR8Renamings));
     // Check that the generated resources have the expected names.
     Map<String, String> expectedRenamings =
         ImmutableMap.of("adaptresourcefilenames/B.md", "adaptresourcefilenames/b.md");
@@ -161,7 +161,7 @@ public class AdaptResourceFileNamesTest extends ProguardCompatibilityTestBase {
     compileWithR8(
         getProguardConfigWithNeverInline(true, null),
         dataResourceConsumer,
-        this::checkR8Renamings,
+        ToolHelper.consumeString(this::checkR8Renamings),
         ImmutableList.<DataEntryResource>builder()
             .addAll(getOriginalDataResources())
             .add(
@@ -275,7 +275,7 @@ public class AdaptResourceFileNamesTest extends ProguardCompatibilityTestBase {
         });
   }
 
-  private void checkR8Renamings(String proguardMap, DiagnosticsHandler handler) {
+  private void checkR8Renamings(String proguardMap) {
     try {
       // Check that the renamings are as expected. These exact renamings are not important as
       // such, but the test expectations rely on them.

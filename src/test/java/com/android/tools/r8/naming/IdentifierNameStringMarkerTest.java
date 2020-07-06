@@ -3,11 +3,15 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.naming;
 
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import com.android.tools.r8.R8FullTestBuilder;
+import com.android.tools.r8.R8TestCompileResult;
+import com.android.tools.r8.ThrowableConsumer;
 import com.android.tools.r8.code.AputObject;
 import com.android.tools.r8.code.Const4;
 import com.android.tools.r8.code.ConstClass;
@@ -22,7 +26,6 @@ import com.android.tools.r8.code.SgetObject;
 import com.android.tools.r8.code.SputObject;
 import com.android.tools.r8.graph.DexCode;
 import com.android.tools.r8.graph.DexEncodedMethod;
-import com.android.tools.r8.graph.DexValue.DexValueString;
 import com.android.tools.r8.smali.SmaliBuilder;
 import com.android.tools.r8.smali.SmaliBuilder.MethodSignature;
 import com.android.tools.r8.smali.SmaliTestBase;
@@ -51,8 +54,9 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
     List<String> pgConfigs = ImmutableList.of(
         "-identifiernamestring class " + CLASS_NAME + " { java.lang.String aClassName; }",
         "-keep class " + CLASS_NAME,
+        "-keepclassmembers,allowobfuscation class " + CLASS_NAME + " { !static <fields>; }",
         "-dontoptimize");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -83,8 +87,9 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
     List<String> pgConfigs = ImmutableList.of(
         "-identifiernamestring class " + CLASS_NAME + " { java.lang.String aClassName; }",
         "-keep class " + CLASS_NAME,
+        "-keepclassmembers,allowobfuscation class " + CLASS_NAME + " { !static <fields>; }",
         "-dontoptimize");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -124,9 +129,10 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
     List<String> pgConfigs = ImmutableList.of(
         "-identifiernamestring class " + CLASS_NAME + " { java.lang.String aClassName; }",
         "-keep class " + CLASS_NAME,
+        "-keepclassmembers,allowobfuscation class " + CLASS_NAME + " { !static <fields>; }",
         "-keep,allowobfuscation class " + BOO,
         "-dontoptimize");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -162,8 +168,9 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
     List<String> pgConfigs = ImmutableList.of(
         "-identifiernamestring class " + CLASS_NAME + " { static java.lang.String sClassName; }",
         "-keep class " + CLASS_NAME,
+        "-keepclassmembers,allowobfuscation class " + CLASS_NAME + " { static <fields>; }",
         "-dontoptimize");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -193,8 +200,9 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
     List<String> pgConfigs = ImmutableList.of(
         "-identifiernamestring class " + CLASS_NAME + " { static java.lang.String sClassName; }",
         "-keep class " + CLASS_NAME,
+        "-keepclassmembers,allowobfuscation class " + CLASS_NAME + " { static <fields>; }",
         "-dontoptimize");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -230,9 +238,10 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
     List<String> pgConfigs = ImmutableList.of(
         "-identifiernamestring class " + CLASS_NAME + " { static java.lang.String sClassName; }",
         "-keep class " + CLASS_NAME,
+        "-keepclassmembers,allowobfuscation class " + CLASS_NAME + " { static <fields>; }",
         "-keep,allowobfuscation class " + BOO,
         "-dontoptimize");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -262,14 +271,14 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
         "-identifiernamestring class " + CLASS_NAME + " { static java.lang.String sClassName; }",
         "-keep class " + CLASS_NAME + " { static java.lang.String sClassName; }",
         "-dontshrink");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
     FieldSubject field = clazz.field("java.lang.String", "sClassName");
     assertTrue(field.isPresent());
-    assertTrue(field.getStaticValue() instanceof DexValueString);
-    String defaultValue = ((DexValueString) field.getStaticValue()).getValue().toString();
+    assertTrue(field.getStaticValue().isDexValueString());
+    String defaultValue = field.getStaticValue().asDexValueString().getValue().toString();
     assertEquals(BOO, defaultValue);
   }
 
@@ -284,14 +293,14 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
         "-keep class " + CLASS_NAME + " { static java.lang.String sClassName; }",
         "-keep,allowobfuscation class " + BOO,
         "-dontshrink");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
     FieldSubject field = clazz.field("java.lang.String", "sClassName");
     assertTrue(field.isPresent());
-    assertTrue(field.getStaticValue() instanceof DexValueString);
-    String defaultValue = ((DexValueString) field.getStaticValue()).getValue().toString();
+    assertTrue(field.getStaticValue().isDexValueString());
+    String defaultValue = field.getStaticValue().asDexValueString().getValue().toString();
     assertNotEquals(BOO, defaultValue);
   }
 
@@ -308,14 +317,14 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
         "-keep class " + CLASS_NAME + " { static java.lang.String sFieldName; }",
         "-keep,allowobfuscation class " + BOO + " { <fields>; }",
         "-dontshrink");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
     FieldSubject field = clazz.field("java.lang.String", "sFieldName");
     assertTrue(field.isPresent());
-    assertTrue(field.getStaticValue() instanceof DexValueString);
-    String defaultValue = ((DexValueString) field.getStaticValue()).getValue().toString();
+    assertTrue(field.getStaticValue().isDexValueString());
+    String defaultValue = field.getStaticValue().asDexValueString().getValue().toString();
     assertNotEquals(fooInBoo, defaultValue);
   }
 
@@ -332,14 +341,14 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
         "-keep class " + CLASS_NAME + " { static java.lang.String sMethodName; }",
         "-keep,allowobfuscation class " + BOO + " { <methods>; }",
         "-dontshrink");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
     FieldSubject field = clazz.field("java.lang.String", "sMethodName");
     assertTrue(field.isPresent());
-    assertTrue(field.getStaticValue() instanceof DexValueString);
-    String defaultValue = ((DexValueString) field.getStaticValue()).getValue().toString();
+    assertTrue(field.getStaticValue().isDexValueString());
+    String defaultValue = field.getStaticValue().asDexValueString().getValue().toString();
     assertNotEquals(fooInBoo, defaultValue);
   }
 
@@ -359,10 +368,20 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
         "invoke-static {v0, v1}, LExample;->foo(Ljava/lang/String;Ljava/lang/String;)V",
         "return-void");
 
-    List<String> pgConfigs = ImmutableList.of(
-        "-identifiernamestring class " + CLASS_NAME + " { static void foo(...); }",
-        "-keep class " + CLASS_NAME);
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector =
+        compileWithR8(
+                builder,
+                testBuilder ->
+                    testBuilder
+                        .addKeepRules(
+                            "-identifiernamestring class "
+                                + CLASS_NAME
+                                + " { static void foo(...); }",
+                            "-keep class " + CLASS_NAME)
+                        .allowDiagnosticWarningMessages())
+            .assertAllWarningMessagesMatch(
+                containsString("Cannot determine what 'Mixed/form.Boo' refers to"))
+            .inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -378,10 +397,10 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
             ConstString.class,
             InvokeStatic.class,
             ReturnVoid.class));
-    ConstString constString = (ConstString) code.instructions[1];
-    assertEquals(BOO, constString.getString().toString());
-    constString = (ConstString) code.instructions[2];
-    assertEquals("Mixed/form.Boo", constString.getString().toString());
+    String s1 = ((ConstString) code.instructions[1]).getString().toString();
+    String s2 = ((ConstString) code.instructions[2]).getString().toString();
+    assertTrue(BOO.equals(s1) || BOO.equals(s2));
+    assertTrue("Mixed/form.Boo".equals(s1) || "Mixed/form.Boo".equals(s2));
   }
 
   @Test
@@ -404,7 +423,7 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
     List<String> pgConfigs = ImmutableList.of(
         "-identifiernamestring class " + CLASS_NAME + " { static void foo(...); }",
         "-keep class " + CLASS_NAME);
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -450,7 +469,7 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
         "-identifiernamestring class " + CLASS_NAME + " { static void foo(...); }",
         "-keep class " + CLASS_NAME,
         "-keep,allowobfuscation class " + BOO);
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -504,7 +523,7 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
             + "}",
         "-keep class " + CLASS_NAME,
         "-keep class R { *; }");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -554,7 +573,7 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
             + "}",
         "-keep class " + CLASS_NAME,
         "-keep,allowobfuscation class R { *; }");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -611,7 +630,7 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
             + "}",
         "-keep class " + CLASS_NAME,
         "-keep class R { *; }");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -672,7 +691,7 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
             + "}",
         "-keep class " + CLASS_NAME,
         "-keep,allowobfuscation class R { *; }");
-    CodeInspector inspector = getInspectorAfterRunR8(builder, pgConfigs);
+    CodeInspector inspector = compileWithR8(builder, pgConfigs).inspector();
 
     ClassSubject clazz = inspector.clazz(CLASS_NAME);
     assertTrue(clazz.isPresent());
@@ -696,13 +715,17 @@ public class IdentifierNameStringMarkerTest extends SmaliTestBase {
     assertNotEquals("foo", constString.getString().toString());
   }
 
-  private CodeInspector getInspectorAfterRunR8(
+  private R8TestCompileResult compileWithR8(
       SmaliBuilder builder, List<String> proguardConfigurations) throws Exception {
+    return compileWithR8(builder, testBuilder -> testBuilder.addKeepRules(proguardConfigurations));
+  }
+
+  private R8TestCompileResult compileWithR8(
+      SmaliBuilder builder, ThrowableConsumer<R8FullTestBuilder> configuration) throws Exception {
     return testForR8(Backend.DEX)
         .addProgramDexFileData(builder.compile())
-        .addKeepRules(proguardConfigurations)
+        .apply(configuration)
         .debug()
-        .compile()
-        .inspector();
+        .compile();
   }
 }

@@ -17,7 +17,7 @@ class OneShotByteResource implements ProgramResource {
   private byte[] bytes;
   private final Set<String> classDescriptors;
 
-  static ProgramResource create(
+  public static OneShotByteResource create(
       Kind kind, Origin origin, byte[] bytes, Set<String> classDescriptors) {
     return new OneShotByteResource(origin, kind, bytes, classDescriptors);
   }
@@ -43,8 +43,13 @@ class OneShotByteResource implements ProgramResource {
 
   @Override
   public InputStream getByteStream() throws ResourceException {
+    return new ByteArrayInputStream(getBytes());
+  }
+
+  @Override
+  public byte[] getBytes() throws ResourceException {
     assert bytes != null;
-    InputStream result = new ByteArrayInputStream(bytes);
+    byte[] result = bytes;
     bytes = null;
     return result;
   }

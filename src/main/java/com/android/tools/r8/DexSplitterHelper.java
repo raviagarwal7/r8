@@ -4,6 +4,8 @@
 
 package com.android.tools.r8;
 
+import static com.android.tools.r8.utils.ExceptionUtils.unwrapExecutionException;
+
 import com.android.tools.r8.DexIndexedConsumer.DirectoryConsumer;
 import com.android.tools.r8.dex.ApplicationReader;
 import com.android.tools.r8.dex.ApplicationWriter;
@@ -12,6 +14,7 @@ import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.LazyLoadedDexApplication;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.naming.NamingLens;
@@ -19,6 +22,7 @@ import com.android.tools.r8.utils.ExceptionUtils;
 import com.android.tools.r8.utils.FeatureClassMapping;
 import com.android.tools.r8.utils.FeatureClassMapping.FeatureMappingException;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.InternalOptions.DesugarState;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
 import java.io.IOException;
@@ -56,7 +60,7 @@ public final class DexSplitterHelper {
       ExecutorService executor)
       throws IOException {
     InternalOptions options = command.getInternalOptions();
-    options.enableDesugaring = false;
+    options.desugarState = DesugarState.OFF;
     options.enableMainDexListCheck = false;
     options.ignoreMainDexMissingClasses = true;
     options.minimalMainDex = false;
@@ -79,8 +83,6 @@ public final class DexSplitterHelper {
           getDistribution(app, featureClassMapping, mapper);
       for (Entry<String, LazyLoadedDexApplication.Builder> entry : applications.entrySet()) {
         DexApplication featureApp = entry.getValue().build();
-        // We use the same factory, reset sorting.
-        featureApp.dexItemFactory.resetSortedIndices();
         assert !options.hasMethodsFilter();
 
         // Run d8 optimize to ensure jumbo strings are handled.
@@ -99,10 +101,9 @@ public final class DexSplitterHelper {
                   null,
                   options,
                   markers,
-                  null,
                   GraphLense.getIdentityLense(),
+                  InitClassLens.getDefault(),
                   NamingLens.getIdentityLens(),
-                  null,
                   null,
                   consumer)
               .write(executor);
@@ -112,7 +113,7 @@ public final class DexSplitterHelper {
         }
       }
     } catch (ExecutionException e) {
-      throw R8.unwrapExecutionException(e);
+      throw unwrapExecutionException(e);
     } catch (FeatureMappingException e) {
       options.reporter.error(e.getMessage());
     } finally {
@@ -130,7 +131,7 @@ public final class DexSplitterHelper {
       String feature = featureClassMapping.featureForClass(clazzName);
       LazyLoadedDexApplication.Builder featureApplication = applications.get(feature);
       if (featureApplication == null) {
-        featureApplication = DexApplication.builder(app.dexItemFactory, app.timing);
+        featureApplication = DexApplication.builder(app.options, app.timing);
         // If this is the base, we add the main dex list.
         if (feature.equals(featureClassMapping.getBaseName())) {
           featureApplication.addToMainDexList(app.mainDexList);

@@ -96,6 +96,7 @@ public class ProguardMapReader implements AutoCloseable {
   }
 
   private char nextChar() {
+    assert hasNext();
     try {
       return line.charAt(lineOffset++);
     } catch (ArrayIndexOutOfBoundsException e) {
@@ -110,7 +111,7 @@ public class ProguardMapReader implements AutoCloseable {
     return skipLine();
   }
 
-  private static boolean isEmptyOrCommentLine(String line) {
+  private boolean isEmptyOrCommentLine(String line) {
     if (line == null) {
       return true;
     }
@@ -118,7 +119,7 @@ public class ProguardMapReader implements AutoCloseable {
       char c = line.charAt(i);
       if (c == '#') {
         return true;
-      } else if (!Character.isWhitespace(c)) {
+      } else if (!StringUtils.isWhitespace(c)) {
         return false;
       }
     }
@@ -140,26 +141,36 @@ public class ProguardMapReader implements AutoCloseable {
 
   // Helpers for common pattern
   private void skipWhitespace() {
-    while (Character.isWhitespace(peekCodePoint())) {
+    while (hasNext() && StringUtils.isWhitespace(peekCodePoint())) {
       nextCodePoint();
     }
   }
 
-  private char expect(char c) {
+  private void expectWhitespace() {
+    boolean seen = false;
+    while (hasNext() && StringUtils.isWhitespace(peekCodePoint())) {
+      seen = seen || !StringUtils.isBOM(peekCodePoint());
+      nextCodePoint();
+    }
+    if (!seen) {
+      throw new ParseException("Expected whitespace", true);
+    }
+  }
+
+  private void expect(char c) {
     if (!hasNext()) {
       throw new ParseException("Expected '" + c + "'", true);
     }
     if (nextChar() != c) {
       throw new ParseException("Expected '" + c + "'");
     }
-    return c;
   }
 
   void parse(ProguardMap.Builder mapBuilder) throws IOException {
     // Read the first line.
     do {
-      lineNo++;
       line = reader.readLine();
+      lineNo++;
     } while (hasLine() && isEmptyOrCommentLine(line));
     parseClassMappings(mapBuilder);
   }
@@ -168,6 +179,7 @@ public class ProguardMapReader implements AutoCloseable {
 
   private void parseClassMappings(ProguardMap.Builder mapBuilder) throws IOException {
     while (hasLine()) {
+      skipWhitespace();
       String before = parseType(false);
       skipWhitespace();
       // Workaround for proguard map files that contain entries for package-info.java files.
@@ -186,9 +198,11 @@ public class ProguardMapReader implements AutoCloseable {
       }
       skipWhitespace();
       String after = parseType(false);
+      skipWhitespace();
       expect(':');
       ClassNaming.Builder currentClassBuilder =
           mapBuilder.classNamingBuilder(after, before, getPosition());
+      skipWhitespace();
       if (nextLine()) {
         parseMemberMappings(currentClassBuilder);
       }
@@ -196,114 +210,80 @@ public class ProguardMapReader implements AutoCloseable {
   }
 
   private void parseMemberMappings(ClassNaming.Builder classNamingBuilder) throws IOException {
+    MemberNaming lastAddedNaming = null;
     MemberNaming activeMemberNaming = null;
-    Range previousObfuscatedRange = null;
-    boolean previousWasPotentiallySynthesized = false;
-    Signature previousSignature = null;
-    String previousRenamedName = null;
-    boolean lastRound = false;
-    for (; ; ) {
-      Signature signature = null;
+    Range previousMappedRange = null;
+    do {
       Object originalRange = null;
-      String renamedName = null;
-      Range obfuscatedRange = null;
+      Range mappedRange = null;
 
-      // In the last round we're only here to flush the last line read (which may trigger adding a
-      // new MemberNaming) and flush activeMemberNaming, so skip parsing.
-      if (!lastRound) {
-        if (!Character.isWhitespace(peekCodePoint())) {
-          lastRound = true;
-          continue;
-        }
-        skipWhitespace();
-        Object maybeRangeOrInt = maybeParseRangeOrInt();
-        if (maybeRangeOrInt != null) {
-          if (!(maybeRangeOrInt instanceof Range)) {
-            throw new ParseException(
-                String.format("Invalid obfuscated line number range (%s).", maybeRangeOrInt));
-          }
-          obfuscatedRange = (Range) maybeRangeOrInt;
-          expect(':');
-        }
-        signature = parseSignature();
-        if (peekChar(0) == ':') {
-          // This is a mapping or inlining definition
-          nextChar();
-          originalRange = maybeParseRangeOrInt();
-          if (originalRange == null) {
-            throw new ParseException("No number follows the colon after the method signature.");
-          }
-        }
-        skipWhitespace();
-        skipArrow();
-        skipWhitespace();
-        renamedName = parseMethodName();
-      }
-
-      // If this line refers to a member that should be added to classNamingBuilder (as opposed to
-      // an inner inlined callee) and it's different from the activeMemberNaming, then flush (add)
-      // the current activeMemberNaming and create a new one.
-      // We're also entering this in the last round when there's no current line.
-      if (previousRenamedName != null
-          && (!Objects.equals(previousObfuscatedRange, obfuscatedRange)
-              || !Objects.equals(previousRenamedName, renamedName)
-              || (originalRange != null && originalRange instanceof Range))) {
-        // Flush activeMemberNaming if it's for a different member.
-        if (activeMemberNaming != null) {
-          if (!activeMemberNaming.getOriginalSignature().equals(previousSignature)) {
-            classNamingBuilder.addMemberEntry(activeMemberNaming);
-            activeMemberNaming = null;
-          } else {
-            if (activeMemberNaming.getRenamedName().equals(previousRenamedName)) {
-              // The method was potentially synthesized.
-              previousWasPotentiallySynthesized = previousObfuscatedRange == null;
-            } else {
-              assert previousWasPotentiallySynthesized;
-            }
-          }
-        }
-        if (activeMemberNaming == null) {
-          activeMemberNaming =
-              new MemberNaming(previousSignature, previousRenamedName, getPosition());
-        }
-      }
-
-      if (lastRound) {
-        if (activeMemberNaming != null) {
-          classNamingBuilder.addMemberEntry(activeMemberNaming);
-        }
+      // Parse the member line '  x:y:name:z:q -> renamedName'.
+      if (!StringUtils.isWhitespace(peekCodePoint())) {
         break;
       }
-
-      // Interpret what we've just parsed.
-      if (obfuscatedRange == null) {
-        if (originalRange != null) {
-          throw new ParseException("No mapping for original range " + originalRange + ".");
+      skipWhitespace();
+      Object maybeRangeOrInt = maybeParseRangeOrInt();
+      if (maybeRangeOrInt != null) {
+        if (!(maybeRangeOrInt instanceof Range)) {
+          throw new ParseException(
+              String.format("Invalid obfuscated line number range (%s).", maybeRangeOrInt));
         }
-        // Here we have a line like 'a() -> b' or a field like 'a -> b'
-        if (activeMemberNaming != null) {
-          classNamingBuilder.addMemberEntry(activeMemberNaming);
-        }
-        activeMemberNaming = new MemberNaming(signature, renamedName, getPosition());
-      } else {
-
-        // Note that at this point originalRange may be null which either means, it's the same as
-        // the obfuscatedRange (identity mapping) or that it's unknown (source line number
-        // information was not available).
-        assert signature instanceof MethodSignature;
+        mappedRange = (Range) maybeRangeOrInt;
+        skipWhitespace();
+        expect(':');
       }
+      skipWhitespace();
+      Signature signature = parseSignature();
+      skipWhitespace();
+      if (peekChar(0) == ':') {
+        // This is a mapping or inlining definition
+        nextChar();
+        skipWhitespace();
+        originalRange = maybeParseRangeOrInt();
+        if (originalRange == null) {
+          throw new ParseException("No number follows the colon after the method signature.");
+        }
+      }
+      if (mappedRange == null && originalRange != null) {
+        throw new ParseException("No mapping for original range " + originalRange + ".");
+      }
+
+      skipWhitespace();
+      skipArrow();
+      skipWhitespace();
+      String renamedName = parseMethodName();
 
       if (signature instanceof MethodSignature) {
         classNamingBuilder.addMappedRange(
-            obfuscatedRange, (MethodSignature) signature, originalRange, renamedName);
+            mappedRange, (MethodSignature) signature, originalRange, renamedName);
       }
 
-      previousRenamedName = renamedName;
-      previousObfuscatedRange = obfuscatedRange;
-      previousSignature = signature;
+      assert mappedRange == null || signature instanceof MethodSignature;
 
-      if (!nextLine()) {
-        lastRound = true;
+      // If this line refers to a member that should be added to classNamingBuilder (as opposed to
+      // an inner inlined callee) and it's different from the the previous activeMemberNaming, then
+      // flush (add) the current activeMemberNaming.
+      if (activeMemberNaming != null) {
+        boolean changedName = !activeMemberNaming.getRenamedName().equals(renamedName);
+        boolean changedMappedRange = !Objects.equals(previousMappedRange, mappedRange);
+        if (changedName || previousMappedRange == null || changedMappedRange) {
+          if (lastAddedNaming == null
+              || !lastAddedNaming.getOriginalSignature().equals(activeMemberNaming.signature)) {
+            classNamingBuilder.addMemberEntry(activeMemberNaming);
+            lastAddedNaming = activeMemberNaming;
+          }
+        }
+      }
+      activeMemberNaming = new MemberNaming(signature, renamedName, getPosition());
+      previousMappedRange = mappedRange;
+    } while (nextLine());
+
+    if (activeMemberNaming != null) {
+      boolean notAdded =
+          lastAddedNaming == null
+              || !lastAddedNaming.getOriginalSignature().equals(activeMemberNaming.signature);
+      if (previousMappedRange == null || notAdded) {
+        classNamingBuilder.addMemberEntry(activeMemberNaming);
       }
     }
   }
@@ -338,7 +318,8 @@ public class ProguardMapReader implements AutoCloseable {
       expect('>');
     }
     if (IdentifierUtils.isDexIdentifierPart(peekCodePoint())) {
-      throw new ParseException("End of identifier expected");
+      throw new ParseException(
+          "End of identifier expected (was 0x" + Integer.toHexString(peekCodePoint()) + ")");
     }
   }
 
@@ -383,19 +364,24 @@ public class ProguardMapReader implements AutoCloseable {
 
   private Signature parseSignature() {
     String type = parseType(true);
-    expect(' ');
+    expectWhitespace();
     String name = parseMethodName();
+    skipWhitespace();
     Signature signature;
     if (peekChar(0) == '(') {
       nextChar();
+      skipWhitespace();
       String[] arguments;
       if (peekChar(0) == ')') {
         arguments = new String[0];
       } else {
         List<String> items = new LinkedList<>();
         items.add(parseType(true));
+        skipWhitespace();
         while (peekChar(0) != ')') {
+          skipWhitespace();
           expect(',');
+          skipWhitespace();
           items.add(parseType(true));
         }
         arguments = items.toArray(StringUtils.EMPTY_ARRAY);
@@ -443,10 +429,12 @@ public class ProguardMapReader implements AutoCloseable {
       return null;
     }
     int from = parseNumber();
+    skipWhitespace();
     if (peekChar(0) != ':') {
       return from;
     }
     expect(':');
+    skipWhitespace();
     int to = parseNumber();
     return new Range(from, to);
   }

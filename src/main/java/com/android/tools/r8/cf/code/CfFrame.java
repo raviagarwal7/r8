@@ -8,10 +8,14 @@ import static org.objectweb.asm.Opcodes.F_NEW;
 import com.android.tools.r8.cf.CfPrinter;
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceSortedMap;
 import java.util.List;
@@ -70,6 +74,16 @@ public class CfFrame extends CfInstruction {
     }
 
     private FrameType() {}
+  }
+
+  @Override
+  public boolean isFrame() {
+    return true;
+  }
+
+  @Override
+  public CfFrame asFrame() {
+    return this;
   }
 
   private static class InitializedType extends FrameType {
@@ -209,7 +223,7 @@ public class CfFrame extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     int stackCount = computeStackCount();
     Object[] stackTypes = computeStackTypes(stackCount, lens);
     int localsCount = computeLocalsCount();
@@ -286,5 +300,11 @@ public class CfFrame extends CfInstruction {
   @Override
   public boolean emitsIR() {
     return false;
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return ConstraintWithTarget.ALWAYS;
   }
 }

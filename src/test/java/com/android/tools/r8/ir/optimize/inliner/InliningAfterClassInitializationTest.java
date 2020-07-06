@@ -6,19 +6,38 @@ package com.android.tools.r8.ir.optimize.inliner;
 
 import static com.android.tools.r8.utils.codeinspector.CodeMatchers.invokesMethod;
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.IsNot.not;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.KeepConstantArguments;
 import com.android.tools.r8.NeverInline;
 import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
+import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
+import java.util.Objects;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
+@RunWith(Parameterized.class)
 public class InliningAfterClassInitializationTest extends TestBase {
+
+  private final TestParameters parameters;
+
+  @Parameterized.Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
+  }
+
+  public InliningAfterClassInitializationTest(TestParameters parameters) {
+    this.parameters = parameters;
+  }
 
   @Test
   public void testClass1() throws Exception {
@@ -177,16 +196,37 @@ public class InliningAfterClassInitializationTest extends TestBase {
     assertThat(testMethod, invokesMethod(notInlineableMethod));
   }
 
-  private CodeInspector buildAndRun(Class<?> mainClass, String expectedOutput) throws Exception {
-    testForJvm().addTestClasspath().run(mainClass).assertSuccessWithOutput(expectedOutput);
+  @Test
+  public void testClass10() throws Exception {
+    Class<TestClass10> mainClass = TestClass10.class;
+    CodeInspector inspector =
+        buildAndRun(mainClass, StringUtils.lines("In A.<clinit>()", "In A.inlineable()"));
 
-    return testForR8(Backend.DEX)
+    ClassSubject classA = inspector.clazz(A.class);
+    assertThat(classA, isPresent());
+
+    MethodSubject inlineableMethod = classA.uniqueMethodWithName("inlineable");
+    assertThat(inlineableMethod, not(isPresent()));
+  }
+
+  private CodeInspector buildAndRun(Class<?> mainClass, String expectedOutput) throws Exception {
+    if (parameters.isCfRuntime()) {
+      testForJvm()
+          .addTestClasspath()
+          .run(parameters.getRuntime(), mainClass)
+          .assertSuccessWithOutput(expectedOutput);
+    }
+
+    return testForR8(parameters.getBackend())
         .addInnerClasses(InliningAfterClassInitializationTest.class)
+        .addLibraryFiles(ToolHelper.getAndroidJar(AndroidApiLevel.P))
         .addKeepMainRule(mainClass)
+        .addOptionsModification(
+            options -> options.enableInliningOfInvokesWithClassInitializationSideEffects = false)
         .enableConstantArgumentAnnotations()
         .enableInliningAnnotations()
-        .enableMergeAnnotations()
-        .run(mainClass)
+        .setMinApi(parameters.getApiLevel())
+        .run(parameters.getRuntime(), mainClass)
         .assertSuccessWithOutput(expectedOutput)
         .inspector();
   }
@@ -345,6 +385,21 @@ public class InliningAfterClassInitializationTest extends TestBase {
       }
 
       A.notInlineable();
+    }
+  }
+
+  static class TestClass10 {
+
+    public static void main(String[] args) {
+      test(new A());
+    }
+
+    @NeverInline
+    private static void test(A obj) {
+      Objects.requireNonNull(obj);
+
+      // A is guaranteed to be initialized since requireNonNull() will throw if `obj` is null.
+      A.inlineable();
     }
   }
 

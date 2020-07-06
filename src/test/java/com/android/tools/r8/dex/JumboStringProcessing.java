@@ -17,13 +17,15 @@ import com.android.tools.r8.code.IfNe;
 import com.android.tools.r8.code.IfNez;
 import com.android.tools.r8.code.Instruction;
 import com.android.tools.r8.code.ReturnVoid;
+import com.android.tools.r8.graph.DexAnnotationSet;
 import com.android.tools.r8.graph.DexCode;
 import com.android.tools.r8.graph.DexCode.Try;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.MethodAccessFlags;
-import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.graph.ParameterAnnotationsList;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -41,7 +43,6 @@ public class JumboStringProcessing extends TestBase {
   public void branching() {
     DexItemFactory factory = new DexItemFactory();
     DexString string = factory.createString("turn into jumbo");
-    factory.sort(NamingLens.getIdentityLens());
     Instruction[] instructions = buildInstructions(string, false);
     DexCode code = jumboStringProcess(factory, string, instructions);
     Instruction[] rewrittenInstructions = code.instructions;
@@ -58,7 +59,6 @@ public class JumboStringProcessing extends TestBase {
   public void branching2() {
     DexItemFactory factory = new DexItemFactory();
     DexString string = factory.createString("turn into jumbo");
-    factory.sort(NamingLens.getIdentityLens());
     Instruction[] instructions = buildInstructions(string, true);
     DexCode code = jumboStringProcess(factory, string, instructions);
     Instruction[] rewrittenInstructions = code.instructions;
@@ -128,19 +128,20 @@ public class JumboStringProcessing extends TestBase {
         .addDexProgramData(Files.toByteArray(originalDexFile.toFile()), Origin.unknown())
         .build();
     CodeInspector inspector = new CodeInspector(application);
-    DexEncodedMethod method = getMethod(
-        inspector,
-        "android.databinding.DataBinderMapperImpl",
-        "android.databinding.ViewDataBinding",
-        "getDataBinder",
-        ImmutableList.of("android.databinding.DataBindingComponent", "android.view.View", "int"));
-    Instruction[] instructions = method.getCode().asDexCode().instructions;
+    ProgramMethod method =
+        getMethod(
+            inspector,
+            "android.databinding.DataBinderMapperImpl",
+            "android.databinding.ViewDataBinding",
+            "getDataBinder",
+            ImmutableList.of(
+                "android.databinding.DataBindingComponent", "android.view.View", "int"));
+    Instruction[] instructions = method.getDefinition().getCode().asDexCode().instructions;
     assertEquals(0, countJumboStrings(instructions));
     assertEquals(1, countSimpleNops(instructions));
 
     DexItemFactory factory = inspector.getFactory();
     DexString string = factory.createString("view must have a tag");
-    factory.sort(NamingLens.getIdentityLens());
     DexCode code = jumboStringProcess(factory, string, instructions);
     Instruction[] rewrittenInstructions = code.instructions;
     assertEquals(289, countJumboStrings(rewrittenInstructions));
@@ -158,7 +159,9 @@ public class JumboStringProcessing extends TestBase {
         null,
         null);
     MethodAccessFlags flags = MethodAccessFlags.fromSharedAccessFlags(Constants.ACC_PUBLIC, false);
-    DexEncodedMethod method = new DexEncodedMethod(null, flags, null, null, code);
+    DexEncodedMethod method =
+        new DexEncodedMethod(
+            null, flags, DexAnnotationSet.empty(), ParameterAnnotationsList.empty(), code);
     return new JumboStringRewriter(method, string, factory).rewrite();
   }
 }

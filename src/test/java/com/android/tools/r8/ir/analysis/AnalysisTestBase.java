@@ -7,13 +7,11 @@ package com.android.tools.r8.ir.analysis;
 import static org.junit.Assert.fail;
 
 import com.android.tools.r8.TestBase;
-import com.android.tools.r8.dex.ApplicationReader;
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.utils.AndroidApp;
-import com.android.tools.r8.utils.InternalOptions;
-import com.android.tools.r8.utils.Timing;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import java.util.function.Consumer;
@@ -22,36 +20,49 @@ import org.junit.Before;
 
 public abstract class AnalysisTestBase extends TestBase {
 
+  protected final TestParameters parameters;
   private final AndroidApp app;
   private final String className;
-  private final InternalOptions options = new InternalOptions();
 
-  public AppInfo appInfo;
+  public AppView<?> appView;
 
-  public AnalysisTestBase(Class<?> clazz) throws Exception {
-    this.app = testForD8().release().addProgramClasses(clazz).compile().app;
+  public AnalysisTestBase(TestParameters parameters, Class<?> clazz) throws Exception {
+    this.parameters = parameters;
+    this.app =
+        testForD8()
+            .release()
+            .setMinApi(parameters.getRuntime())
+            .addProgramClasses(clazz)
+            .compile()
+            .app;
     this.className = clazz.getTypeName();
   }
 
-  public AnalysisTestBase(String mainClassName, Class<?>... classes) throws Exception {
-    this.app = testForD8().addProgramClasses(classes).compile().app;
+  public AnalysisTestBase(
+      TestParameters parameters, String mainClassName, Class<?>... classes) throws Exception {
+    this.parameters = parameters;
+    this.app =
+        testForD8()
+            .addProgramClasses(classes)
+            .setMinApi(parameters.getRuntime())
+            .compile()
+            .app;
     this.className = mainClassName;
   }
 
-  public AnalysisTestBase(AndroidApp app, String className) {
+  public AnalysisTestBase(TestParameters parameters, AndroidApp app, String className) {
+    this.parameters = parameters;
     this.app = app;
     this.className = className;
   }
 
   @Before
   public void setup() throws Exception {
-    appInfo =
-        new AppInfo(
-            new ApplicationReader(app, options, new Timing("AnalysisTestBase.appReader")).read());
+    appView = computeAppViewWithLiveness(app);
   }
 
-  public void buildAndCheckIR(String methodName, Consumer<IRCode> irInspector) throws Exception {
-    CodeInspector inspector = new CodeInspector(app);
+  public void buildAndCheckIR(String methodName, Consumer<IRCode> irInspector) {
+    CodeInspector inspector = new CodeInspector(appView.appInfo().app());
     MethodSubject methodSubject = inspector.clazz(className).uniqueMethodWithName(methodName);
     irInspector.accept(methodSubject.buildIR());
   }
@@ -60,8 +71,7 @@ public abstract class AnalysisTestBase extends TestBase {
   public static <T extends Instruction> T getMatchingInstruction(
       IRCode code, Predicate<Instruction> predicate) {
     Instruction result = null;
-    Iterable<Instruction> instructions = code::instructionIterator;
-    for (Instruction instruction : instructions) {
+    for (Instruction instruction : code.instructions()) {
       if (predicate.test(instruction)) {
         if (result != null) {
           fail();

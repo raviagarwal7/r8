@@ -8,14 +8,12 @@ import static com.android.tools.r8.utils.EncodedValueUtils.parseFloat;
 import static com.android.tools.r8.utils.EncodedValueUtils.parseSigned;
 import static com.android.tools.r8.utils.EncodedValueUtils.parseUnsigned;
 
-import com.android.tools.r8.DiagnosticsHandler;
 import com.android.tools.r8.ProgramResource.Kind;
 import com.android.tools.r8.code.Instruction;
 import com.android.tools.r8.code.InstructionFactory;
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.graph.ClassAccessFlags;
 import com.android.tools.r8.graph.ClassKind;
-import com.android.tools.r8.graph.Descriptor;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexAnnotationElement;
 import com.android.tools.r8.graph.DexAnnotationSet;
@@ -34,6 +32,7 @@ import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexItem;
 import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMember;
 import com.android.tools.r8.graph.DexMemberAnnotation;
 import com.android.tools.r8.graph.DexMemberAnnotation.DexFieldAnnotation;
 import com.android.tools.r8.graph.DexMemberAnnotation.DexMethodAnnotation;
@@ -41,15 +40,15 @@ import com.android.tools.r8.graph.DexMemberAnnotation.DexParameterAnnotation;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexMethodHandle;
 import com.android.tools.r8.graph.DexMethodHandle.MethodHandleType;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DexProgramClass.ChecksumSupplier;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexTypeList;
 import com.android.tools.r8.graph.DexValue;
-import com.android.tools.r8.graph.DexValue.DexValueMethodHandle;
-import com.android.tools.r8.graph.DexValue.DexValueMethodType;
+import com.android.tools.r8.graph.DexValue.DexValueKind;
 import com.android.tools.r8.graph.DexValue.DexValueNull;
-import com.android.tools.r8.graph.DexValue.DexValueString;
 import com.android.tools.r8.graph.EnclosingMethodAttribute;
 import com.android.tools.r8.graph.FieldAccessFlags;
 import com.android.tools.r8.graph.InnerClassAttribute;
@@ -59,11 +58,13 @@ import com.android.tools.r8.graph.ParameterAnnotationsList;
 import com.android.tools.r8.logging.Log;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.origin.PathOrigin;
+import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.Pair;
 import com.google.common.io.ByteStreams;
 import it.unimi.dsi.fastutil.ints.Int2IntArrayMap;
-import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2LongMap;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -85,7 +86,8 @@ public class DexParser {
   private final DexSection[] dexSections;
   private int[] stringIDs;
   private final ClassKind classKind;
-  private final DiagnosticsHandler reporter;
+  private final InternalOptions options;
+  private Object2LongMap<String> checksums;
 
   public static DexSection[] parseMapFrom(Path file) throws IOException {
     return parseMapFrom(Files.newInputStream(file), new PathOrigin(file));
@@ -96,9 +98,7 @@ public class DexParser {
   }
 
   private static DexSection[] parseMapFrom(DexReader dexReader) {
-    DexParser dexParser =
-        new DexParser(
-            dexReader, ClassKind.PROGRAM, new DexItemFactory(), new DiagnosticsHandler() {});
+    DexParser dexParser = new DexParser(dexReader, ClassKind.PROGRAM, new InternalOptions());
     return dexParser.dexSections;
   }
 
@@ -115,30 +115,33 @@ public class DexParser {
   private OffsetToObjectMapping indexedItems = new OffsetToObjectMapping();
 
   // Mapping from offset to code item;
-  private Int2ObjectMap<DexCode> codes = new Int2ObjectOpenHashMap<>();
+  private Int2ReferenceMap<DexCode> codes = new Int2ReferenceOpenHashMap<>();
 
   // Mapping from offset to dex item;
-  private Int2ObjectMap<Object> offsetMap = new Int2ObjectOpenHashMap<>();
+  private Int2ReferenceMap<Object> offsetMap = new Int2ReferenceOpenHashMap<>();
 
   // Factory to canonicalize certain dexitems.
   private final DexItemFactory dexItemFactory;
 
-  public DexParser(DexReader dexReader,
-      ClassKind classKind, DexItemFactory dexItemFactory, DiagnosticsHandler reporter) {
+  public DexParser(DexReader dexReader, ClassKind classKind, InternalOptions options) {
     assert dexReader.getOrigin() != null;
     this.origin = dexReader.getOrigin();
     this.dexReader = dexReader;
-    this.dexItemFactory = dexItemFactory;
+    this.dexItemFactory = options.itemFactory;
     dexReader.setByteOrder();
     dexSections = parseMap();
     parseStringIDs();
     this.classKind = classKind;
-    this.reporter = reporter;
+    this.options = options;
   }
 
-  private void ensureCodesInited() {
+  private void ensureCodesInited(int offset) {
+    if (offset == 0) {
+      return;
+    }
+
     if (codes == null) {
-      codes = new Int2ObjectOpenHashMap<>();
+      codes = new Int2ReferenceOpenHashMap<>();
     }
 
     if (classKind == ClassKind.LIBRARY) {
@@ -149,12 +152,14 @@ public class DexParser {
     if (dexSection.length == 0) {
       return;
     }
-    dexReader.position(dexSection.offset);
-    for (int i = 0; i < dexSection.length; i++) {
-      dexReader.align(4);  // code items are 4 byte aligned.
-      int offset = dexReader.position();
+
+    if (!codes.containsKey(offset)) {
+      int currentPos = dexReader.position();
+      dexReader.position(offset);
+      dexReader.align(4);
       DexCode code = parseCodeItem();
       codes.put(offset, code);  // Update the file local offset to code mapping.
+      dexReader.position(currentPos);
     }
   }
 
@@ -177,94 +182,124 @@ public class DexParser {
     int header = dexReader.get() & 0xff;
     int valueArg = header >> 5;
     int valueType = header & 0x1f;
-    switch (valueType) {
-      case DexValue.VALUE_BYTE: {
-        assert valueArg == 0;
-        byte value = (byte) parseSigned(dexReader, 1);
-        return DexValue.DexValueByte.create(value);
-      }
-      case DexValue.VALUE_SHORT: {
-        int size = valueArg + 1;
-        short value = (short) parseSigned(dexReader, size);
-        return DexValue.DexValueShort.create(value);
-      }
-      case DexValue.VALUE_CHAR: {
-        int size = valueArg + 1;
-        char value = (char) parseUnsigned(dexReader, size);
-        return DexValue.DexValueChar.create(value);
-      }
-      case DexValue.VALUE_INT: {
-        int size = valueArg + 1;
-        int value = (int) parseSigned(dexReader, size);
-        return DexValue.DexValueInt.create(value);
-      }
-      case DexValue.VALUE_LONG: {
-        int size = valueArg + 1;
-        long value = parseSigned(dexReader, size);
-        return DexValue.DexValueLong.create(value);
-      }
-      case DexValue.VALUE_FLOAT: {
-        int size = valueArg + 1;
-        return DexValue.DexValueFloat.create(parseFloat(dexReader, size));
-      }
-      case DexValue.VALUE_DOUBLE: {
-        int size = valueArg + 1;
-        return DexValue.DexValueDouble.create(parseDouble(dexReader, size));
-      }
-      case DexValue.VALUE_STRING: {
-        int size = valueArg + 1;
-        int index = (int) parseUnsigned(dexReader, size);
-        DexString value = indexedItems.getString(index);
-        return new DexValue.DexValueString(value);
-      }
-      case DexValue.VALUE_TYPE: {
-        int size = valueArg + 1;
-        DexType value = indexedItems.getType((int) parseUnsigned(dexReader, size));
-        return new DexValue.DexValueType(value);
-      }
-      case DexValue.VALUE_FIELD: {
-        int size = valueArg + 1;
-        DexField value = indexedItems.getField((int) parseUnsigned(dexReader, size));
-        return new DexValue.DexValueField(value);
-      }
-      case DexValue.VALUE_METHOD: {
-        int size = valueArg + 1;
-        DexMethod value = indexedItems.getMethod((int) parseUnsigned(dexReader, size));
-        return new DexValue.DexValueMethod(value);
-      }
-      case DexValue.VALUE_ENUM: {
-        int size = valueArg + 1;
-        DexField value = indexedItems.getField((int) parseUnsigned(dexReader, size));
-        return new DexValue.DexValueEnum(value);
-      }
-      case DexValue.VALUE_ARRAY: {
-        assert valueArg == 0;
-        return new DexValue.DexValueArray(parseEncodedArrayValues());
-      }
-      case DexValue.VALUE_ANNOTATION: {
-        assert valueArg == 0;
-        return new DexValue.DexValueAnnotation(parseEncodedAnnotation());
-      }
-      case DexValue.VALUE_NULL: {
-        assert valueArg == 0;
-        return DexValueNull.NULL;
-      }
-      case DexValue.VALUE_BOOLEAN: {
-        // 0 is false, and 1 is true.
-        return DexValue.DexValueBoolean.create(valueArg != 0);
-      }
-      case DexValue.VALUE_METHOD_TYPE: {
-        int size = valueArg + 1;
-        DexProto value = indexedItems.getProto((int) parseUnsigned(dexReader, size));
-        return new DexValue.DexValueMethodType(value);
-      }
-      case DexValue.VALUE_METHOD_HANDLE: {
-        int size = valueArg + 1;
-        DexMethodHandle value = indexedItems.getMethodHandle((int) parseUnsigned(dexReader, size));
-        return new DexValue.DexValueMethodHandle(value);
+    switch (DexValueKind.fromId(valueType)) {
+      case BYTE:
+        {
+          assert valueArg == 0;
+          byte value = (byte) parseSigned(dexReader, 1);
+          return DexValue.DexValueByte.create(value);
+        }
+      case SHORT:
+        {
+          int size = valueArg + 1;
+          short value = (short) parseSigned(dexReader, size);
+          return DexValue.DexValueShort.create(value);
+        }
+      case CHAR:
+        {
+          int size = valueArg + 1;
+          char value = (char) parseUnsigned(dexReader, size);
+          return DexValue.DexValueChar.create(value);
+        }
+      case INT:
+        {
+          int size = valueArg + 1;
+          int value = (int) parseSigned(dexReader, size);
+          return DexValue.DexValueInt.create(value);
+        }
+      case LONG:
+        {
+          int size = valueArg + 1;
+          long value = parseSigned(dexReader, size);
+          return DexValue.DexValueLong.create(value);
+        }
+      case FLOAT:
+        {
+          int size = valueArg + 1;
+          return DexValue.DexValueFloat.create(parseFloat(dexReader, size));
+        }
+      case DOUBLE:
+        {
+          int size = valueArg + 1;
+          return DexValue.DexValueDouble.create(parseDouble(dexReader, size));
+        }
+      case STRING:
+        {
+          int size = valueArg + 1;
+          int index = (int) parseUnsigned(dexReader, size);
+          DexString value = indexedItems.getString(index);
+          return new DexValue.DexValueString(value);
+        }
+      case TYPE:
+        {
+          int size = valueArg + 1;
+          DexType value = indexedItems.getType((int) parseUnsigned(dexReader, size));
+          return new DexValue.DexValueType(value);
+        }
+      case FIELD:
+        {
+          int size = valueArg + 1;
+          DexField value = indexedItems.getField((int) parseUnsigned(dexReader, size));
+          checkName(value.name);
+          return new DexValue.DexValueField(value);
+        }
+      case METHOD:
+        {
+          int size = valueArg + 1;
+          DexMethod value = indexedItems.getMethod((int) parseUnsigned(dexReader, size));
+          checkName(value.name);
+          return new DexValue.DexValueMethod(value);
+        }
+      case ENUM:
+        {
+          int size = valueArg + 1;
+          DexField value = indexedItems.getField((int) parseUnsigned(dexReader, size));
+          return new DexValue.DexValueEnum(value);
+        }
+      case ARRAY:
+        {
+          assert valueArg == 0;
+          return new DexValue.DexValueArray(parseEncodedArrayValues());
+        }
+      case ANNOTATION:
+        {
+          assert valueArg == 0;
+          return new DexValue.DexValueAnnotation(parseEncodedAnnotation());
+        }
+      case NULL:
+        {
+          assert valueArg == 0;
+          return DexValueNull.NULL;
+        }
+      case BOOLEAN:
+        {
+          // 0 is false, and 1 is true.
+          return DexValue.DexValueBoolean.create(valueArg != 0);
+        }
+      case METHOD_TYPE:
+        {
+          int size = valueArg + 1;
+          DexProto value = indexedItems.getProto((int) parseUnsigned(dexReader, size));
+          return new DexValue.DexValueMethodType(value);
+        }
+      case METHOD_HANDLE:
+        {
+          int size = valueArg + 1;
+          DexMethodHandle value =
+              indexedItems.getMethodHandle((int) parseUnsigned(dexReader, size));
+          return new DexValue.DexValueMethodHandle(value);
       }
       default:
         throw new IndexOutOfBoundsException();
+    }
+  }
+
+  private void checkName(DexString name) {
+    if (!options.itemFactory.getSkipNameValidationForTesting()
+        && !name.isValidSimpleName(options.minApiLevel)) {
+      throw new CompilationError("Space characters in SimpleName '"
+        + name.toASCIIString()
+        + "' are not allowed prior to DEX version 040");
     }
   }
 
@@ -426,8 +461,17 @@ public class DexParser {
       annotationOffsets[i] = dexReader.getUint();
     }
     DexAnnotation[] result = new DexAnnotation[size];
+    int actualSize = 0;
     for (int i = 0; i < size; i++) {
-      result[i] = annotationAt(annotationOffsets[i]);
+      DexAnnotation dexAnnotation = annotationAt(annotationOffsets[i]);
+      if (retainAnnotation(dexAnnotation)) {
+        result[actualSize++] = dexAnnotation;
+      }
+    }
+    if (actualSize < size) {
+      DexAnnotation[] temp = new DexAnnotation[actualSize];
+      System.arraycopy(result, 0, temp, 0, actualSize);
+      result = temp;
     }
     DexType dupType = DexAnnotationSet.findDuplicateEntryType(result);
     if (dupType != null) {
@@ -435,6 +479,11 @@ public class DexParser {
           "Multiple annotations of type `" + dupType.toSourceString() + "`");
     }
     return new DexAnnotationSet(result);
+  }
+
+  private boolean retainAnnotation(DexAnnotation annotation) {
+    return annotation.visibility != DexAnnotation.VISIBILITY_BUILD
+        || DexAnnotation.retainCompileTimeAnnotation(annotation.annotation.type, options);
   }
 
   private DexAnnotationSet annotationSetAt(int offset) {
@@ -538,21 +587,21 @@ public class DexParser {
     return new DexDebugInfo(start, parameters, events.toArray(DexDebugEvent.EMPTY_ARRAY));
   }
 
-  private static class MemberAnnotationIterator<S extends Descriptor<?, S>, T extends DexItem> {
+  private static class MemberAnnotationIterator<R extends DexMember<?, R>, T extends DexItem> {
 
     private int index = 0;
-    private final DexMemberAnnotation<S, T>[] annotations;
+    private final DexMemberAnnotation<R, T>[] annotations;
     private final Supplier<T> emptyValue;
 
-    private MemberAnnotationIterator(DexMemberAnnotation<S, T>[] annotations,
-        Supplier<T> emptyValue) {
+    private MemberAnnotationIterator(
+        DexMemberAnnotation<R, T>[] annotations, Supplier<T> emptyValue) {
       this.annotations = annotations;
       this.emptyValue = emptyValue;
     }
 
     // Get the annotation set for an item. This method assumes that it is always called with
     // an item that is higher in the sorting order than the last item.
-    T getNextFor(S item) {
+    T getNextFor(R item) {
       // TODO(ager): We could use the indices from the file to make this search faster using
       // compareTo instead of slowCompareTo. That would require us to assign indices during
       // reading. Those indices should be cleared after reading to make sure that we resort
@@ -589,8 +638,11 @@ public class DexParser {
     return fields;
   }
 
-  private DexEncodedMethod[] readMethods(int size, DexMethodAnnotation[] annotations,
-      DexParameterAnnotation[] parameters, boolean skipCodes) {
+  private DexEncodedMethod[] readMethods(
+      int size,
+      DexMethodAnnotation[] annotations,
+      DexParameterAnnotation[] parameters,
+      boolean skipCodes) {
     DexEncodedMethod[] methods = new DexEncodedMethod[size];
     int methodIndex = 0;
     MemberAnnotationIterator<DexMethod, DexAnnotationSet> annotationIterator =
@@ -603,18 +655,23 @@ public class DexParser {
       int codeOff = dexReader.getUleb128();
       DexCode code = null;
       if (!skipCodes) {
+        ensureCodesInited(codeOff);
         assert codeOff == 0 || codes.get(codeOff) != null;
         code = codes.get(codeOff);
       }
       DexMethod method = indexedItems.getMethod(methodIndex);
-      methods[i] = new DexEncodedMethod(method, accessFlags, annotationIterator.getNextFor(method),
-          parameterAnnotationsIterator.getNextFor(method), code);
+      methods[i] =
+          new DexEncodedMethod(
+              method,
+              accessFlags,
+              annotationIterator.getNextFor(method),
+              parameterAnnotationsIterator.getNextFor(method),
+              code);
     }
     return methods;
   }
 
   void addClassDefsTo(Consumer<DexClass> classCollection) {
-    ensureCodesInited();
     final DexSection dexSection = lookupSection(Constants.TYPE_CLASS_DEF_ITEM);
     final int length = dexSection.length;
     indexedItems.initializeClasses(length);
@@ -664,6 +721,15 @@ public class DexParser {
       DexEncodedMethod[] directMethods = DexEncodedMethod.EMPTY_ARRAY;
       DexEncodedMethod[] virtualMethods = DexEncodedMethod.EMPTY_ARRAY;
       AnnotationsDirectory annotationsDirectory = annotationsDirectoryAt(annotationsOffsets[i]);
+
+      Long checksum = null;
+      if (checksums != null && !checksums.isEmpty()) {
+        String desc = type.toDescriptorString();
+        checksum = checksums.getOrDefault(desc, null);
+        if (!options.dexClassChecksumFilter.test(desc, checksum)) {
+          continue;
+        }
+      }
       if (classDataOffsets[i] != 0) {
         DexEncodedArray staticValues = encodedArrayAt(staticValuesOffsets[i]);
 
@@ -691,7 +757,11 @@ public class DexParser {
       }
 
       AttributesAndAnnotations attrs =
-          new AttributesAndAnnotations(type, annotationsDirectory.clazz, dexItemFactory);
+          new AttributesAndAnnotations(type, annotationsDirectory.clazz, options.itemFactory);
+
+      Long finalChecksum = checksum;
+      ChecksumSupplier checksumSupplier =
+          finalChecksum == null ? DexProgramClass::invalidChecksumRequest : c -> finalChecksum;
 
       DexClass clazz =
           classKind.create(
@@ -711,7 +781,8 @@ public class DexParser {
               instanceFields,
               directMethods,
               virtualMethods,
-              dexItemFactory.getSkipNameValidationForTesting());
+              dexItemFactory.getSkipNameValidationForTesting(),
+              checksumSupplier);
       classCollection.accept(clazz);  // Update the application object.
     }
   }
@@ -749,6 +820,19 @@ public class DexParser {
       int unused = dexReader.getUshort();
       int size = dexReader.getUint();
       int offset = dexReader.getUint();
+      if (offset + size > dexReader.end()) {
+        throw new CompilationError(
+            "The dex file had an offset + size that pointed past the end of the dex file."
+                + "\nSection type: "
+                + DexSection.typeName(type)
+                + "\nSection offset: "
+                + offset
+                + "\nSection size: "
+                + size
+                + "\nFile size: "
+                + dexReader.end(),
+            origin);
+      }
       result[i] = new DexSection(type, unused, size, offset);
     }
     if (Log.ENABLED) {
@@ -838,6 +922,7 @@ public class DexParser {
   void populateIndexTables() {
     // Populate structures that are already sorted upon read.
     populateStrings();  // Depends on nothing.
+    populateChecksums(); // Depends on Strings.
     populateTypes();  // Depends on Strings.
     populateFields();  // Depends on Types, and Strings.
     populateProtos();  // Depends on Types and Strings.
@@ -876,6 +961,18 @@ public class DexParser {
     for (int i = 0; i < dexSection.length; i++) {
       indexedItems.setType(i, typeAt(i));
     }
+  }
+
+  private void populateChecksums() {
+    ClassesChecksum parsedChecksums = new ClassesChecksum();
+    for (int i = stringIDs.length - 1; i >= 0; i--) {
+      DexString value = indexedItems.getString(i);
+      if (ClassesChecksum.definitelyPrecedesChecksumMarker(value)) {
+        break;
+      }
+      parsedChecksums.tryParseAndAppend(value);
+    }
+    this.checksums = parsedChecksums.getChecksums();
   }
 
   /**
@@ -1109,7 +1206,7 @@ public class DexParser {
     MethodHandleType type = MethodHandleType.getKind(dexReader.getUshort());
     dexReader.getUshort(); // unused
     int indexFieldOrMethod = dexReader.getUshort();
-    Descriptor<? extends DexItem, ? extends Descriptor<?, ?>> fieldOrMethod;
+    DexMember<? extends DexItem, ? extends DexMember<?, ?>> fieldOrMethod;
     switch (type) {
       case INSTANCE_GET:
       case INSTANCE_PUT:
@@ -1144,14 +1241,14 @@ public class DexParser {
         dexReader.getUint(dexSection.offset + (Constants.TYPE_CALL_SITE_ID_ITEM_SIZE * index));
     DexEncodedArray callSiteEncodedArray = encodedArrayAt(callSiteOffset);
     DexValue[] values = callSiteEncodedArray.values;
-    assert values[0] instanceof DexValueMethodHandle;
-    assert values[1] instanceof DexValueString;
-    assert values[2] instanceof DexValueMethodType;
+    assert values[0].isDexValueMethodHandle();
+    assert values[1].isDexValueString();
+    assert values[2].isDexValueMethodType();
 
     return dexItemFactory.createCallSite(
-        ((DexValueString) values[1]).value,
-        ((DexValueMethodType) values[2]).value,
-        ((DexValueMethodHandle) values[0]).value,
+        values[1].asDexValueString().value,
+        values[2].asDexValueMethodType().value,
+        values[0].asDexValueMethodHandle().value,
         // 3 means first extra args
         Arrays.asList(Arrays.copyOfRange(values, 3, values.length)));
   }
@@ -1169,7 +1266,7 @@ public class DexParser {
     DexString shorty = indexedItems.getString(shortyIndex);
     DexType returnType = indexedItems.getType(returnTypeIndex);
     DexTypeList parameters = typeListAt(parametersOffsetIndex);
-    return dexItemFactory.createProto(returnType, shorty, parameters);
+    return dexItemFactory.createProto(returnType, parameters, shorty);
   }
 
   private DexMethod methodAt(int index) {

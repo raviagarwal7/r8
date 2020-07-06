@@ -10,9 +10,11 @@ import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.IsNot.not;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import com.android.tools.r8.DataEntryResource;
+import com.android.tools.r8.NeverPropagateValue;
 import com.android.tools.r8.R8TestRunResult;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.TestParameters;
@@ -47,7 +49,8 @@ public class ServiceLoaderTest extends TestBase {
 
   @Parameters(name = "{1}, include WorldGreeter: {0}")
   public static List<Object[]> data() {
-    return buildParameters(BooleanUtils.values(), getTestParameters().withAllRuntimes().build());
+    return buildParameters(
+        BooleanUtils.values(), getTestParameters().withAllRuntimesAndApiLevels().build());
   }
 
   public ServiceLoaderTest(boolean includeWorldGreeter, TestParameters parameters) {
@@ -88,7 +91,8 @@ public class ServiceLoaderTest extends TestBase {
                   options.enableInliningOfInvokesWithNullableReceivers = false;
                 })
             .enableGraphInspector()
-            .setMinApi(parameters.getRuntime())
+            .enableMemberValuePropagationAnnotations()
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), TestClass.class)
             .assertSuccessWithOutput(expectedOutput);
 
@@ -107,11 +111,17 @@ public class ServiceLoaderTest extends TestBase {
         includeWorldGreeter ? greeterSubject.getFinalName() : helloGreeterSubject.getFinalName();
     List<String> lines =
         dataResourceConsumer.get(AppServices.SERVICE_DIRECTORY_NAME + serviceFileName);
-    assertEquals(includeWorldGreeter ? 2 : 1, lines.size() - 1);
-    assertEquals(LINE_COMMENT, lines.get(0));
-    assertEquals(helloGreeterSubject.getFinalName() + POSTFIX_COMMENT, lines.get(1));
+    assertEquals(includeWorldGreeter ? 2 : 1, lines.size());
+    // Comments in application service files are not carried over to the output.
+    lines.forEach(line -> assertFalse(line.contains(LINE_COMMENT)));
+    lines.forEach(line -> assertFalse(line.contains(POSTFIX_COMMENT)));
     if (includeWorldGreeter) {
-      assertEquals(worldGreeterSubject.getFinalName(), lines.get(2));
+      assertTrue(
+          helloGreeterSubject.getFinalName().compareTo(worldGreeterSubject.getFinalName()) < 0);
+    }
+    assertEquals(helloGreeterSubject.getFinalName(), lines.get(0));
+    if (includeWorldGreeter) {
+      assertEquals(worldGreeterSubject.getFinalName(), lines.get(1));
     }
 
     verifyGraphInformation(result.graphInspector());
@@ -219,6 +229,7 @@ public class ServiceLoaderTest extends TestBase {
 
   public static class HelloGreeter implements Greeter {
 
+    @NeverPropagateValue
     @Override
     public String greeting() {
       return "Hello";

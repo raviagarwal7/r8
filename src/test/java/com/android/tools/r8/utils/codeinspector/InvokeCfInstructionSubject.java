@@ -13,8 +13,9 @@ public class InvokeCfInstructionSubject extends CfInstructionSubject
     implements InvokeInstructionSubject {
   private final CodeInspector codeInspector;
 
-  public InvokeCfInstructionSubject(CodeInspector codeInspector, CfInstruction instruction) {
-    super(instruction);
+  public InvokeCfInstructionSubject(
+      CodeInspector codeInspector, CfInstruction instruction, MethodSubject method) {
+    super(instruction, method);
     assert isInvoke();
     this.codeInspector = codeInspector;
   }
@@ -28,7 +29,7 @@ public class InvokeCfInstructionSubject extends CfInstructionSubject
   public DexMethod invokedMethod() {
     if (isInvokeDynamic()) {
       throw new Unimplemented(
-          "invokeMethod is not implemented for the INVOKEDYNAMIC CF instruction.");
+          "invokedMethod is not implemented for the INVOKEDYNAMIC CF instruction.");
     }
     return ((CfInvoke) instruction).getMethod();
   }

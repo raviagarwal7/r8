@@ -17,12 +17,13 @@ public abstract class TestShrinkerBuilder<
         C extends BaseCompilerCommand,
         B extends BaseCompilerCommand.Builder<C, B>,
         CR extends TestCompileResult<CR, RR>,
-        RR extends TestRunResult,
+        RR extends TestRunResult<RR>,
         T extends TestShrinkerBuilder<C, B, CR, RR, T>>
     extends TestCompilerBuilder<C, B, CR, RR, T> {
 
-  protected boolean enableMinification = true;
   protected boolean enableTreeShaking = true;
+  protected boolean enableOptimization = true;
+  protected boolean enableMinification = true;
 
   TestShrinkerBuilder(TestState state, B builder, Backend backend) {
     super(state, builder, backend);
@@ -35,6 +36,15 @@ public abstract class TestShrinkerBuilder<
 
   public T noTreeShaking() {
     return treeShaking(false);
+  }
+
+  public T optimization(boolean enable) {
+    enableOptimization = enable;
+    return self();
+  }
+
+  public T noOptimization() {
+    return optimization(false);
   }
 
   public T minification(boolean enable) {
@@ -60,6 +70,10 @@ public abstract class TestShrinkerBuilder<
     return addKeepRules(Arrays.asList(rules));
   }
 
+  public T addKeepKotlinMetadata() {
+    return addKeepRules("-keep class kotlin.Metadata { *; }");
+  }
+
   public T addKeepAllClassesRule() {
     return addKeepRules("-keep class ** { *; }");
   }
@@ -73,36 +87,61 @@ public abstract class TestShrinkerBuilder<
   }
 
   public T addKeepClassRules(Class<?>... classes) {
-    for (Class<?> clazz : classes) {
-      addKeepRules("-keep class " + clazz.getTypeName());
+    return addKeepClassRules(
+        Arrays.stream(classes).map(Class::getTypeName).toArray(String[]::new));
+  }
+
+  public T addKeepClassRules(String... classes) {
+    for (String clazz : classes) {
+      addKeepRules("-keep class " + clazz);
     }
     return self();
   }
 
   public T addKeepClassRulesWithAllowObfuscation(Class<?>... classes) {
-    for (Class<?> clazz : classes) {
-      addKeepRules("-keep,allowobfuscation class " + clazz.getTypeName());
+    return addKeepClassRulesWithAllowObfuscation(
+        Arrays.stream(classes).map(Class::getTypeName).toArray(String[]::new));
+  }
+
+  public T addKeepClassRulesWithAllowObfuscation(String... classes) {
+    for (String clazz : classes) {
+      addKeepRules("-keep,allowobfuscation class " + clazz);
     }
     return self();
   }
 
   public T addKeepClassAndMembersRules(Class<?>... classes) {
-    for (Class<?> clazz : classes) {
-      addKeepRules("-keep class " + clazz.getTypeName() + " { *; }");
+    return addKeepClassAndMembersRules(
+        Arrays.stream(classes).map(Class::getTypeName).toArray(String[]::new));
+  }
+
+  public T addKeepClassAndMembersRules(String... classes) {
+    for (String clazz : classes) {
+      addKeepRules("-keep class " + clazz + " { *; }");
     }
     return self();
   }
 
   public T addKeepClassAndMembersRulesWithAllowObfuscation(Class<?>... classes) {
-    for (Class<?> clazz : classes) {
-      addKeepRules("-keep,allowobfuscation class " + clazz.getTypeName() + " { *; }");
+    return addKeepClassAndMembersRulesWithAllowObfuscation(
+        Arrays.stream(classes).map(Class::getTypeName).toArray(String[]::new));
+  }
+
+  public T addKeepClassAndMembersRulesWithAllowObfuscation(String... classes) {
+    for (String clazz : classes) {
+      addKeepRules("-keep,allowobfuscation class " + clazz + " { *; }");
     }
     return self();
   }
 
   public T addKeepClassAndDefaultConstructor(Class<?>... classes) {
-    for (Class<?> clazz : classes) {
-      addKeepRules("-keep class " + clazz.getTypeName() + " { <init>(); }");
+    return addKeepClassAndDefaultConstructor(
+        Arrays.stream(classes).map(Class::getTypeName).toArray(String[]::new));
+  }
+
+  public T addKeepClassAndDefaultConstructor(String... classes) {
+    for (String clazz : classes) {
+      addKeepRules("-keep class " + clazz + " { <init>(); }");
     }
     return self();
   }
@@ -115,9 +154,32 @@ public abstract class TestShrinkerBuilder<
     return addKeepMainRule(mainClass.getTypeName());
   }
 
+  public T addKeepMainRules(Class<?>[] mainClasses) {
+    for (Class<?> mainClass : mainClasses) {
+      this.addKeepMainRule(mainClass);
+    }
+    return self();
+  }
+
   public T addKeepMainRule(String mainClass) {
     return addKeepRules(
         "-keep class " + mainClass + " { public static void main(java.lang.String[]); }");
+  }
+
+  public T addKeepMainRules(List<String> mainClasses) {
+    mainClasses.forEach(this::addKeepMainRule);
+    return self();
+  }
+
+  public T addKeepMethodRules(Class<?> clazz, String... methodSignatures) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("-keep class " + clazz.getTypeName() + " {\n");
+    for (String methodSignature : methodSignatures) {
+      sb.append("  " + methodSignature + ";\n");
+    }
+    sb.append("}");
+    addKeepRules(sb.toString());
+    return self();
   }
 
   public T addKeepMethodRules(MethodReference... methods) {
@@ -132,8 +194,31 @@ public abstract class TestShrinkerBuilder<
     return self();
   }
 
+  public T allowAccessModification() {
+    return allowAccessModification(true);
+  }
+
+  public T allowAccessModification(boolean allowAccessModification) {
+    if (allowAccessModification) {
+      return addKeepRules("-allowaccessmodification");
+    }
+    return self();
+  }
+
+  public T addKeepAttributes(String... attributes) {
+    return addKeepRules("-keepattributes " + String.join(",", attributes));
+  }
+
+  public T addKeepAttributeLineNumberTable() {
+    return addKeepAttributes("LineNumberTable");
+  }
+
+  public T addKeepRuntimeVisibleAnnotations() {
+    return addKeepAttributes("RuntimeVisibleAnnotations");
+  }
+
   public T addKeepAllAttributes() {
-    return addKeepRules("-keepattributes *");
+    return addKeepAttributes("*");
   }
 
   public abstract T addApplyMapping(String proguardMap);
@@ -141,7 +226,11 @@ public abstract class TestShrinkerBuilder<
   private static String getMethodLine(MethodReference method) {
     // Should we encode modifiers in method references?
     StringBuilder builder = new StringBuilder();
-    builder.append(method.getMethodName()).append("(");
+    builder
+        .append(method.getReturnType() == null ? "void" : method.getReturnType().getTypeName())
+        .append(' ')
+        .append(method.getMethodName())
+        .append("(");
     boolean first = true;
     for (TypeReference parameterType : method.getFormalTypes()) {
       if (!first) {

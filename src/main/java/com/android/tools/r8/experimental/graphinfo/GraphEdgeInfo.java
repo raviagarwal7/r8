@@ -16,6 +16,8 @@ public class GraphEdgeInfo {
     // Prioritized list of edge types.
     KeepRule,
     CompatibilityRule,
+    ConditionalKeepRule,
+    KeepRulePrecondition,
     InstantiatedIn,
     InvokedViaSuper,
     TargetedBySuper,
@@ -27,7 +29,10 @@ public class GraphEdgeInfo {
     ReachableFromLiveType,
     ReferencedInAnnotation,
     IsLibraryMethod,
+    OverridingMethod,
     MethodHandleUseFrom,
+    CompanionClass,
+    CompanionMethod,
     Unknown
   }
 
@@ -45,7 +50,10 @@ public class GraphEdgeInfo {
     switch (edgeKind()) {
       case KeepRule:
       case CompatibilityRule:
+      case ConditionalKeepRule:
         return "referenced in keep rule";
+      case KeepRulePrecondition:
+        return "satisfied with precondition";
       case InstantiatedIn:
         return "instantiated in";
       case InvokedViaSuper:
@@ -66,10 +74,17 @@ public class GraphEdgeInfo {
         return "reachable from";
       case ReferencedInAnnotation:
         return "referenced in annotation";
+      case OverridingMethod:
+        return "overriding method";
       case IsLibraryMethod:
-        return "defined in library";
+        // TODO(b/120959039): It would be good to also surface the defining library type.
+        return "defined in library method overridden by";
       case MethodHandleUseFrom:
         return "referenced by method handle";
+      case CompanionClass:
+        return "companion class for";
+      case CompanionMethod:
+        return "companion method for";
       default:
         assert false : "Unknown edge kind: " + edgeKind();
         // fall through

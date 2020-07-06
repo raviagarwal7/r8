@@ -4,12 +4,15 @@
 package com.android.tools.r8.ir.optimize;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 
-import com.android.tools.r8.NeverInline;
+import com.android.tools.r8.R8FullTestBuilder;
+import com.android.tools.r8.R8TestBuilder;
 import com.android.tools.r8.TestBase;
-import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
+import com.android.tools.r8.ThrowableConsumer;
 import com.android.tools.r8.ir.optimize.nonnull.IntrinsicsDeputy;
 import com.android.tools.r8.ir.optimize.nonnull.NonNullParamAfterInvokeDirect;
 import com.android.tools.r8.ir.optimize.nonnull.NonNullParamAfterInvokeInterface;
@@ -20,6 +23,7 @@ import com.android.tools.r8.ir.optimize.nonnull.NonNullParamAfterInvokeVirtualMa
 import com.android.tools.r8.ir.optimize.nonnull.NonNullParamInterface;
 import com.android.tools.r8.ir.optimize.nonnull.NonNullParamInterfaceImpl;
 import com.android.tools.r8.ir.optimize.nonnull.NotPinnedClass;
+import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -28,7 +32,6 @@ import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Streams;
 import java.util.Collection;
-import java.util.function.Consumer;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -36,37 +39,33 @@ import org.junit.runners.Parameterized;
 @RunWith(Parameterized.class)
 public class NonNullParamTest extends TestBase {
 
-  private Backend backend;
+  private final TestParameters parameters;
 
-  @Parameterized.Parameters(name = "Backend: {0}")
-  public static Backend[] data() {
-    return ToolHelper.getBackends();
+  @Parameterized.Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
   }
 
-  public NonNullParamTest(Backend backend) {
-    this.backend = backend;
+  public NonNullParamTest(TestParameters parameters) {
+    this.parameters = parameters;
   }
 
   private void disableDevirtualization(InternalOptions options) {
     options.enableDevirtualization = false;
   }
 
-  CodeInspector buildAndRun(
+  private CodeInspector buildAndRun(
       Class<?> mainClass,
       Collection<Class<?>> classes,
-      Consumer<InternalOptions> optionsModification)
+      ThrowableConsumer<R8FullTestBuilder> configuration)
       throws Exception {
     String javaOutput = runOnJava(mainClass);
 
-    return testForR8(backend)
+    return testForR8(parameters.getBackend())
         .addProgramClasses(classes)
-        .enableProguardTestOptions()
-        .enableInliningAnnotations()
-        .enableClassInliningAnnotations()
-        .enableMergeAnnotations()
         .addKeepMainRule(mainClass)
-        .addKeepRules(
-            ImmutableList.of("-keepattributes InnerClasses,Signature,EnclosingMethod"))
+        .addKeepRules(ImmutableList.of("-keepattributes InnerClasses,Signature,EnclosingMethod"))
+        .addTestingAnnotationsAsProgramClasses()
         // All tests are checking if invocations to certain null-check utils are gone.
         .noMinification()
         .addOptionsModification(
@@ -74,8 +73,9 @@ public class NonNullParamTest extends TestBase {
               // Need to increase a little bit to inline System.out.println
               options.inliningInstructionLimit = 4;
             })
-        .addOptionsModification(optionsModification)
-        .run(mainClass)
+        .apply(configuration)
+        .setMinApi(parameters.getApiLevel())
+        .run(parameters.getRuntime(), mainClass)
         .assertSuccessWithOutput(javaOutput)
         .inspector();
   }
@@ -84,7 +84,8 @@ public class NonNullParamTest extends TestBase {
   public void testIntrinsics() throws Exception {
     Class<?> mainClass = IntrinsicsDeputy.class;
     CodeInspector inspector =
-        buildAndRun(mainClass, ImmutableList.of(NeverInline.class, mainClass), null);
+        buildAndRun(
+            mainClass, ImmutableList.of(mainClass), R8TestBuilder::enableInliningAnnotations);
 
     ClassSubject mainSubject = inspector.clazz(mainClass);
     assertThat(mainSubject, isPresent());
@@ -118,9 +119,8 @@ public class NonNullParamTest extends TestBase {
     CodeInspector inspector =
         buildAndRun(
             mainClass,
-            ImmutableList.of(
-                NeverInline.class, IntrinsicsDeputy.class, NotPinnedClass.class, mainClass),
-            null);
+            ImmutableList.of(IntrinsicsDeputy.class, NotPinnedClass.class, mainClass),
+            R8TestBuilder::enableInliningAnnotations);
 
     ClassSubject mainSubject = inspector.clazz(mainClass);
     assertThat(mainSubject, isPresent());
@@ -147,9 +147,8 @@ public class NonNullParamTest extends TestBase {
     CodeInspector inspector =
         buildAndRun(
             mainClass,
-            ImmutableList.of(
-                NeverInline.class, IntrinsicsDeputy.class, NotPinnedClass.class, mainClass),
-            null);
+            ImmutableList.of(IntrinsicsDeputy.class, NotPinnedClass.class, mainClass),
+            R8TestBuilder::enableInliningAnnotations);
 
     ClassSubject mainSubject = inspector.clazz(mainClass);
     assertThat(mainSubject, isPresent());
@@ -157,7 +156,7 @@ public class NonNullParamTest extends TestBase {
     MethodSubject checkViaCall = mainSubject.uniqueMethodWithName("checkViaCall");
     assertThat(checkViaCall, isPresent());
     assertEquals(0, countActCall(checkViaCall));
-    assertEquals(2, countPrintCall(checkViaCall));
+    assertEquals(canSharePrintCallInSuccessorBlock() ? 1 : 2, countPrintCall(checkViaCall));
 
     MethodSubject checkViaIntrinsic = mainSubject.uniqueMethodWithName("checkViaIntrinsic");
     assertThat(checkViaIntrinsic, isPresent());
@@ -177,12 +176,11 @@ public class NonNullParamTest extends TestBase {
         buildAndRun(
             mainClass,
             ImmutableList.of(
-                NeverInline.class,
                 IntrinsicsDeputy.class,
                 NonNullParamAfterInvokeVirtual.class,
                 NotPinnedClass.class,
                 mainClass),
-            null);
+            builder -> builder.enableNeverClassInliningAnnotations().enableInliningAnnotations());
 
     ClassSubject mainSubject = inspector.clazz(NonNullParamAfterInvokeVirtual.class);
     assertThat(mainSubject, isPresent());
@@ -190,7 +188,7 @@ public class NonNullParamTest extends TestBase {
     MethodSubject checkViaCall = mainSubject.uniqueMethodWithName("checkViaCall");
     assertThat(checkViaCall, isPresent());
     assertEquals(0, countActCall(checkViaCall));
-    assertEquals(2, countPrintCall(checkViaCall));
+    assertEquals(canSharePrintCallInSuccessorBlock() ? 1 : 2, countPrintCall(checkViaCall));
 
     MethodSubject checkViaIntrinsic = mainSubject.uniqueMethodWithName("checkViaIntrinsic");
     assertThat(checkViaIntrinsic, isPresent());
@@ -203,6 +201,13 @@ public class NonNullParamTest extends TestBase {
     assertEquals(0, countThrow(checkAtOneLevelHigher));
   }
 
+  private boolean canSharePrintCallInSuccessorBlock() {
+    // With API level >= Q we get a register assignment that allows us to share the print call in a
+    // successor block. See also InternalOptions.canHaveThisJitCodeDebuggingBug().
+    return parameters.isDexRuntime()
+        && parameters.getApiLevel().getLevel() >= AndroidApiLevel.Q.getLevel();
+  }
+
   @Test
   public void testNonNullParamAfterInvokeInterface() throws Exception {
     Class<?> mainClass = NonNullParamAfterInvokeInterfaceMain.class;
@@ -210,14 +215,18 @@ public class NonNullParamTest extends TestBase {
         buildAndRun(
             mainClass,
             ImmutableList.of(
-                NeverInline.class,
                 IntrinsicsDeputy.class,
                 NonNullParamInterface.class,
                 NonNullParamInterfaceImpl.class,
                 NonNullParamAfterInvokeInterface.class,
                 NotPinnedClass.class,
                 mainClass),
-            this::disableDevirtualization);
+            builder ->
+                builder
+                    .addOptionsModification(this::disableDevirtualization)
+                    .enableInliningAnnotations()
+                    .enableNeverClassInliningAnnotations()
+                    .enableMergeAnnotations());
 
     ClassSubject mainSubject = inspector.clazz(NonNullParamAfterInvokeInterface.class);
     assertThat(mainSubject, isPresent());
@@ -226,7 +235,7 @@ public class NonNullParamTest extends TestBase {
     assertThat(checkViaCall, isPresent());
     assertEquals(0, countActCall(checkViaCall));
     // The DEX backend reuses the System.out.println invoke.
-    assertEquals(backend == Backend.CF ? 2 : 1, countPrintCall(checkViaCall));
+    assertEquals(parameters.isCfRuntime() ? 2 : 1, countPrintCall(checkViaCall));
   }
 
   private long countCallToParamNullCheck(MethodSubject method) {
@@ -244,5 +253,4 @@ public class NonNullParamTest extends TestBase {
   private long countThrow(MethodSubject method) {
     return Streams.stream(method.iterateInstructions(InstructionSubject::isThrow)).count();
   }
-
 }

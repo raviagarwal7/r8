@@ -4,6 +4,8 @@
 
 package com.android.tools.r8;
 
+import static com.android.tools.r8.utils.ExceptionUtils.unwrapExecutionException;
+
 import com.android.tools.r8.dex.ApplicationReader;
 import com.android.tools.r8.dex.ApplicationWriter;
 import com.android.tools.r8.dex.Marker;
@@ -11,10 +13,12 @@ import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.ExceptionUtils;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.InternalOptions.DesugarState;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
 import java.io.IOException;
@@ -69,7 +73,7 @@ public class DexFileMergerHelper {
       Boolean minimalMainDex,
       Map<String, Integer> inputOrdering)
       throws IOException {
-    options.enableDesugaring = false;
+    options.desugarState = DesugarState.OFF;
     options.enableMainDexListCheck = false;
     options.minimalMainDex = minimalMainDex;
     assert !options.isMinifying();
@@ -98,15 +102,14 @@ public class DexFileMergerHelper {
                 null,
                 options,
                 markers,
-                null,
                 GraphLense.getIdentityLense(),
+                InitClassLens.getDefault(),
                 NamingLens.getIdentityLens(),
-                null,
                 null);
         writer.write(executor);
         options.printWarnings();
       } catch (ExecutionException e) {
-        throw R8.unwrapExecutionException(e);
+        throw unwrapExecutionException(e);
       } finally {
         options.signalFinishedToConsumers();
       }

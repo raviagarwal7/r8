@@ -3,21 +3,22 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.resolution;
 
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
 import com.android.tools.r8.AsmTestBase;
-import com.android.tools.r8.dex.ApplicationReader;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
-import com.android.tools.r8.graph.AppServices;
+import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexEncodedMethod;
-import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.LookupResult;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult;
 import com.android.tools.r8.resolution.singletarget.Main;
 import com.android.tools.r8.resolution.singletarget.one.AbstractSubClass;
 import com.android.tools.r8.resolution.singletarget.one.AbstractTopClass;
 import com.android.tools.r8.resolution.singletarget.one.InterfaceWithDefault;
-import com.android.tools.r8.resolution.singletarget.one.IrrelevantInterfaceWithDefault;
 import com.android.tools.r8.resolution.singletarget.one.IrrelevantInterfaceWithDefaultDump;
 import com.android.tools.r8.resolution.singletarget.one.SubSubClassOne;
 import com.android.tools.r8.resolution.singletarget.one.SubSubClassThree;
@@ -31,27 +32,11 @@ import com.android.tools.r8.resolution.singletarget.two.OtherAbstractTopClass;
 import com.android.tools.r8.resolution.singletarget.two.OtherSubSubClassOne;
 import com.android.tools.r8.resolution.singletarget.two.OtherSubSubClassTwo;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import com.android.tools.r8.shaking.Enqueuer;
-import com.android.tools.r8.shaking.ProguardClassFilter;
-import com.android.tools.r8.shaking.ProguardClassNameList;
-import com.android.tools.r8.shaking.ProguardConfigurationRule;
-import com.android.tools.r8.shaking.ProguardKeepRule;
-import com.android.tools.r8.shaking.ProguardKeepRule.Builder;
-import com.android.tools.r8.shaking.ProguardKeepRuleType;
-import com.android.tools.r8.shaking.ProguardTypeMatcher;
-import com.android.tools.r8.shaking.RootSetBuilder;
-import com.android.tools.r8.shaking.RootSetBuilder.RootSet;
-import com.android.tools.r8.utils.AndroidApp;
-import com.android.tools.r8.utils.DescriptorUtils;
-import com.android.tools.r8.utils.InternalOptions;
-import com.android.tools.r8.utils.Timing;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Sets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.stream.Collectors;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -62,73 +47,52 @@ import org.junit.runners.Parameterized.Parameters;
 @RunWith(Parameterized.class)
 public class SingleTargetLookupTest extends AsmTestBase {
 
-  /**
-   * Initialized in @Before rule.
-   */
+  /** Initialized in @Before rule. */
+  public static AppView<AppInfoWithLiveness> appView;
+
   public static AppInfoWithLiveness appInfo;
 
-  public static List<Class> CLASSES = ImmutableList.of(
-      InterfaceWithDefault.class,
-      AbstractTopClass.class,
-      AbstractSubClass.class,
-      SubSubClassOne.class,
-      SubSubClassTwo.class,
-      SubSubClassThree.class,
-      OtherAbstractTopClass.class,
-      OtherAbstractSubClassOne.class,
-      OtherAbstractSubClassTwo.class,
-      OtherSubSubClassOne.class,
-      OtherSubSubClassTwo.class,
-      ThirdAbstractTopClass.class,
-      ThirdSubClassOne.class,
-      Main.class
-  );
+  public static List<Class<?>> CLASSES =
+      ImmutableList.of(
+          InterfaceWithDefault.class,
+          AbstractTopClass.class,
+          AbstractSubClass.class,
+          SubSubClassOne.class,
+          SubSubClassTwo.class,
+          SubSubClassThree.class,
+          OtherAbstractTopClass.class,
+          OtherAbstractSubClassOne.class,
+          OtherAbstractSubClassTwo.class,
+          OtherSubSubClassOne.class,
+          OtherSubSubClassTwo.class,
+          ThirdAbstractTopClass.class,
+          ThirdSubClassOne.class,
+          Main.class);
 
   public static List<byte[]> ASM_CLASSES = ImmutableList.of(
       getBytesFromAsmClass(IrrelevantInterfaceWithDefaultDump::dump),
       getBytesFromAsmClass(ThirdSubClassTwoDump::dump)
   );
 
-  public SingleTargetLookupTest(String methodName, Class invokeReceiver,
-      Class singleTargetHolderOrNull, List<Class> allTargetHolders) {
+  public SingleTargetLookupTest(
+      String methodName,
+      Class<?> invokeReceiver,
+      Class<?> singleTargetHolderOrNull,
+      List<Class<?>> virtualTargetHolders) {
     this.methodName = methodName;
     this.invokeReceiver = invokeReceiver;
     this.singleTargetHolderOrNull = singleTargetHolderOrNull;
-    this.allTargetHolders = allTargetHolders;
+    this.virtualTargetHolders = virtualTargetHolders;
   }
 
   @BeforeClass
   public static void computeAppInfo() throws Exception {
-    // Run the tree shaker to compute an instance of AppInfoWithLiveness.
-    Timing timing = new Timing(SingleTargetLookupTest.class.getCanonicalName());
-    InternalOptions options = new InternalOptions();
-    AndroidApp app = readClassesAndAsmDump(CLASSES, ASM_CLASSES);
-    DexApplication application = new ApplicationReader(app, options, timing).read().toDirect();
-    AppView<? extends AppInfoWithSubtyping> appView =
-        AppView.createForR8(new AppInfoWithSubtyping(application), options);
-    appView.setAppServices(AppServices.builder(appView).build());
-
-    ExecutorService executor = Executors.newSingleThreadExecutor();
-    RootSet rootSet =
-        new RootSetBuilder(
-                appView, application, buildKeepRuleForClass(Main.class, application.dexItemFactory))
-            .run(executor);
-    appInfo =
-        new Enqueuer(appView, options, null)
-            .traceApplication(rootSet, ProguardClassFilter.empty(), executor, timing);
-    // We do not run the tree pruner to ensure that the hierarchy is as designed and not modified
-    // due to liveness.
+    appView = computeAppViewWithLiveness(readClassesAndAsmDump(CLASSES, ASM_CLASSES), Main.class);
+    appInfo = appView.appInfo();
   }
 
-  private static List<ProguardConfigurationRule> buildKeepRuleForClass(Class clazz,
-      DexItemFactory factory) {
-    Builder keepRuleBuilder = ProguardKeepRule.builder();
-    keepRuleBuilder.setSource("buildKeepRuleForClass " + clazz.getTypeName());
-    keepRuleBuilder.setType(ProguardKeepRuleType.KEEP);
-    keepRuleBuilder.setClassNames(
-        ProguardClassNameList.singletonList(ProguardTypeMatcher.create(factory
-            .createType(DescriptorUtils.javaTypeToDescriptor(clazz.getCanonicalName())))));
-    return Collections.singletonList(keepRuleBuilder.build());
+  private static Object[] noVirtualSingleTarget(String name, Class<?> receiverAndTarget) {
+    return new Object[] {name, receiverAndTarget, null, Collections.emptyList()};
   }
 
   private static Object[] singleTarget(String name, Class<?> receiverAndTarget) {
@@ -157,90 +121,104 @@ public class SingleTargetLookupTest extends AsmTestBase {
 
   @Parameters(name = "{1}.{0} -> {2}")
   public static List<Object[]> getData() {
-    return ImmutableList.copyOf(new Object[][]{
-        singleTarget("singleTargetAtTop", AbstractTopClass.class),
-        singleTargetWithAbstracts("singleShadowingOverride", AbstractTopClass.class,
-            AbstractSubClass.class, AbstractTopClass.class),
-        manyTargets("abstractTargetAtTop", AbstractTopClass.class, AbstractTopClass.class,
-            SubSubClassOne.class, SubSubClassTwo.class),
-        singleTargetWithAbstracts("overridenInAbstractClassOnly", AbstractTopClass.class,
-            AbstractTopClass.class, SubSubClassThree.class),
-        onlyUnreachableTargets("overridenInAbstractClassOnly", SubSubClassThree.class,
-            SubSubClassThree.class),
-        manyTargets("overriddenInTwoSubTypes", AbstractTopClass.class, AbstractTopClass.class,
-            SubSubClassOne.class, SubSubClassTwo.class),
-        manyTargets("definedInTwoSubTypes", AbstractTopClass.class, AbstractTopClass.class,
-            SubSubClassOne.class, SubSubClassTwo.class),
-        onlyUnreachableTargets("staticMethod", AbstractTopClass.class, AbstractTopClass.class),
-        manyTargets("overriddenInTwoSubTypes", OtherAbstractTopClass.class,
-            OtherAbstractTopClass.class, OtherSubSubClassOne.class, OtherSubSubClassTwo.class),
-        manyTargets("abstractOverriddenInTwoSubTypes", OtherAbstractTopClass.class,
-            OtherAbstractTopClass.class, OtherSubSubClassOne.class, OtherSubSubClassTwo.class),
-        manyTargets("overridesOnDifferentLevels", OtherAbstractTopClass.class,
-            OtherAbstractTopClass.class, OtherSubSubClassOne.class, OtherAbstractSubClassTwo.class),
-        singleTarget("defaultMethod", AbstractTopClass.class, InterfaceWithDefault.class),
-        manyTargets("overriddenDefault", AbstractTopClass.class, InterfaceWithDefault.class,
-            SubSubClassTwo.class),
-        singleTarget("overriddenDefault", SubSubClassTwo.class),
-        singleTarget("overriddenByIrrelevantInterface", AbstractTopClass.class),
-        singleTarget("overriddenByIrrelevantInterface", SubSubClassOne.class,
-            AbstractTopClass.class),
-        manyTargets("overriddenInOtherInterface", AbstractTopClass.class,
-            InterfaceWithDefault.class,
-            IrrelevantInterfaceWithDefault.class),
-        manyTargets("overriddenInOtherInterface", SubSubClassOne.class,
-            InterfaceWithDefault.class,
-            IrrelevantInterfaceWithDefault.class),
-        manyTargets("abstractMethod", ThirdAbstractTopClass.class, ThirdAbstractTopClass.class,
-            ThirdSubClassOne.class),
-        singleTarget("instanceMethod", ThirdAbstractTopClass.class, ThirdAbstractTopClass.class),
-        singleTarget(
-            "otherInstanceMethod", ThirdAbstractTopClass.class, ThirdAbstractTopClass.class)
-    });
+    return ImmutableList.copyOf(
+        new Object[][] {
+          singleTarget("singleTargetAtTop", AbstractTopClass.class),
+          singleTargetWithAbstracts(
+              "singleShadowingOverride", AbstractTopClass.class, AbstractSubClass.class),
+          manyTargets(
+              "abstractTargetAtTop",
+              AbstractTopClass.class,
+              SubSubClassOne.class,
+              SubSubClassTwo.class),
+          singleTargetWithAbstracts(
+              "overridenInAbstractClassOnly", AbstractTopClass.class, AbstractTopClass.class),
+          onlyUnreachableTargets("overridenInAbstractClassOnly", SubSubClassThree.class),
+          manyTargets(
+              "overriddenInTwoSubTypes",
+              AbstractTopClass.class,
+              SubSubClassOne.class,
+              SubSubClassTwo.class),
+          manyTargets(
+              "definedInTwoSubTypes",
+              AbstractTopClass.class,
+              SubSubClassOne.class,
+              SubSubClassTwo.class),
+          onlyUnreachableTargets("staticMethod", AbstractTopClass.class),
+          manyTargets("overriddenInTwoSubTypes", OtherAbstractTopClass.class),
+          manyTargets("abstractOverriddenInTwoSubTypes", OtherAbstractTopClass.class),
+          manyTargets("overridesOnDifferentLevels", OtherAbstractTopClass.class),
+          singleTarget("defaultMethod", AbstractTopClass.class, InterfaceWithDefault.class),
+          manyTargets(
+              "overriddenDefault",
+              AbstractTopClass.class,
+              InterfaceWithDefault.class,
+              SubSubClassTwo.class),
+          singleTarget("overriddenDefault", SubSubClassTwo.class),
+          singleTarget("overriddenByIrrelevantInterface", AbstractTopClass.class),
+          singleTarget(
+              "overriddenByIrrelevantInterface", SubSubClassOne.class, AbstractTopClass.class),
+          singleTarget(
+              "overriddenInOtherInterface", AbstractTopClass.class, InterfaceWithDefault.class),
+          manyTargets("abstractMethod", ThirdAbstractTopClass.class),
+          noVirtualSingleTarget("instanceMethod", ThirdAbstractTopClass.class),
+          noVirtualSingleTarget("otherInstanceMethod", ThirdAbstractTopClass.class),
+        });
   }
 
-  private static DexMethod buildMethod(Class clazz, String name) {
-    return appInfo
-        .dexItemFactory()
-        .createMethod(
-            toType(clazz),
-            appInfo.dexItemFactory().createProto(appInfo.dexItemFactory().voidType),
-            name);
-  }
-
-  private static DexType toType(Class clazz) {
-    return appInfo
-        .dexItemFactory()
-        .createType(DescriptorUtils.javaTypeToDescriptor(clazz.getCanonicalName()));
+  private static DexType toType(Class<?> clazz, AppInfo appInfo) {
+    return buildType(clazz, appInfo.dexItemFactory());
   }
 
   private final String methodName;
-  private final Class invokeReceiver;
-  private final Class singleTargetHolderOrNull;
-  private final List<Class> allTargetHolders;
+  private final Class<?> invokeReceiver;
+  private final Class<?> singleTargetHolderOrNull;
+  private final List<Class<?>> virtualTargetHolders;
 
   @Test
   public void lookupSingleTarget() {
-    DexMethod method = buildMethod(invokeReceiver, methodName);
-    Assert.assertNotNull(appInfo.resolveMethod(toType(invokeReceiver), method).asResultOfResolve());
-    DexEncodedMethod singleVirtualTarget = appInfo.lookupSingleVirtualTarget(method);
+    DexMethod reference =
+        buildNullaryVoidMethod(invokeReceiver, methodName, appInfo.dexItemFactory());
+    ProgramMethod context =
+        appInfo.definitionForProgramType(reference.holder).getProgramDefaultInitializer();
+    Assert.assertNotNull(appInfo.resolveMethodOnClass(reference).getSingleTarget());
+    DexEncodedMethod singleVirtualTarget =
+        appInfo.lookupSingleVirtualTarget(reference, context, false);
     if (singleTargetHolderOrNull == null) {
       Assert.assertNull(singleVirtualTarget);
     } else {
       Assert.assertNotNull(singleVirtualTarget);
-      Assert.assertEquals(toType(singleTargetHolderOrNull), singleVirtualTarget.method.holder);
+      Assert.assertEquals(toType(singleTargetHolderOrNull, appInfo), singleVirtualTarget.holder());
     }
   }
 
   @Test
   public void lookupVirtualTargets() {
-    DexMethod method = buildMethod(invokeReceiver, methodName);
-    Assert.assertNotNull(appInfo.resolveMethod(toType(invokeReceiver), method).asResultOfResolve());
-    Set<DexEncodedMethod> targets = appInfo.lookupVirtualTargets(method);
-    Set<DexType> targetHolders = targets.stream().map(m -> m.method.holder)
-        .collect(Collectors.toSet());
-    Assert.assertEquals(allTargetHolders.size(), targetHolders.size());
-    Assert.assertTrue(allTargetHolders.stream().map(SingleTargetLookupTest::toType)
-        .allMatch(targetHolders::contains));
+    DexMethod method = buildNullaryVoidMethod(invokeReceiver, methodName, appInfo.dexItemFactory());
+    Assert.assertNotNull(appInfo.resolveMethodOnClass(method).getSingleTarget());
+    ResolutionResult resolutionResult = appInfo.resolveMethodOnClass(method);
+    if (resolutionResult.isVirtualTarget()) {
+      LookupResult lookupResult =
+          resolutionResult.lookupVirtualDispatchTargets(
+              appView.definitionForProgramType(buildType(Main.class, appView.dexItemFactory())),
+              appInfo);
+      assertTrue(lookupResult.isLookupResultSuccess());
+      assertFalse(lookupResult.asLookupResultSuccess().hasLambdaTargets());
+      Set<DexType> targetHolders = Sets.newIdentityHashSet();
+      lookupResult
+          .asLookupResultSuccess()
+          .forEach(
+              methodTarget -> targetHolders.add(methodTarget.getHolder().type),
+              lambdaTarget -> {
+                assert false;
+              });
+      Assert.assertEquals(virtualTargetHolders.size(), targetHolders.size());
+      assertTrue(
+          virtualTargetHolders.stream()
+              .map(t -> toType(t, appInfo))
+              .allMatch(targetHolders::contains));
+    } else {
+      assertTrue(virtualTargetHolders.isEmpty());
+    }
   }
 }

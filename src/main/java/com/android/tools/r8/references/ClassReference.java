@@ -4,6 +4,7 @@
 package com.android.tools.r8.references;
 
 import com.android.tools.r8.Keep;
+import com.android.tools.r8.utils.DescriptorUtils;
 
 /** Reference to a class type or interface type. */
 @Keep
@@ -19,9 +20,18 @@ public final class ClassReference implements TypeReference {
     return new ClassReference(descriptor);
   }
 
+  public String getBinaryName() {
+    return DescriptorUtils.getBinaryNameFromDescriptor(descriptor);
+  }
+
   @Override
   public boolean isClass() {
     return true;
+  }
+
+  @Override
+  public ClassReference asClass() {
+    return this;
   }
 
   @Override

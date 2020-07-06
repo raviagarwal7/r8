@@ -11,6 +11,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 
 import com.android.tools.r8.AssumeMayHaveSideEffects;
+import com.android.tools.r8.R8FullTestBuilder;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -35,6 +36,12 @@ public class MergedReturnTypeTest extends MergedTypeBaseTest {
 
   public MergedReturnTypeTest(TestParameters parameters, boolean enableVerticalClassMerging) {
     super(parameters, enableVerticalClassMerging);
+  }
+
+  @Override
+  public void configure(R8FullTestBuilder builder) {
+    super.configure(builder);
+    builder.enableSideEffectAnnotations();
   }
 
   @Override
@@ -83,6 +90,12 @@ public class MergedReturnTypeTest extends MergedTypeBaseTest {
     }
 
     @Override
+    public void configure(R8FullTestBuilder builder) {
+      super.configure(builder);
+      builder.enableSideEffectAnnotations();
+    }
+
+    @Override
     public Class<?> getTestClass() {
       return TestClass.class;
     }
@@ -107,7 +120,8 @@ public class MergedReturnTypeTest extends MergedTypeBaseTest {
       if (enableVerticalClassMerging) {
         // Verify that SuperTestClass has been merged into TestClass.
         assertThat(inspector.clazz(SuperTestClass.class), not(isPresent()));
-        assertEquals("java.lang.Object", testClassSubject.getDexClass().superType.toSourceString());
+        assertEquals(
+            "java.lang.Object", testClassSubject.getDexProgramClass().superType.toSourceString());
 
         // Verify that TestClass.method has been removed.
         List<FoundMethodSubject> methods =

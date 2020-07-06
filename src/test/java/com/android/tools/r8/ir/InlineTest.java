@@ -6,57 +6,92 @@ package com.android.tools.r8.ir;
 
 import static org.junit.Assert.assertEquals;
 
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.DexIndexedConsumer;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppServices;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexApplication;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
+import com.android.tools.r8.graph.SubtypingInfo;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.shaking.Enqueuer;
+import com.android.tools.r8.shaking.EnqueuerFactory;
 import com.android.tools.r8.shaking.ProguardClassFilter;
+import com.android.tools.r8.shaking.ProguardConfiguration;
 import com.android.tools.r8.shaking.ProguardKeepRule;
 import com.android.tools.r8.shaking.RootSetBuilder;
 import com.android.tools.r8.smali.SmaliBuilder;
 import com.android.tools.r8.smali.SmaliBuilder.MethodSignature;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.Reporter;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Sets;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
+@RunWith(Parameterized.class)
 public class InlineTest extends IrInjectionTestBase {
 
-  public TestApplication buildTestApplication(
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withNoneRuntime().build();
+  }
+
+  public InlineTest(TestParameters parameters) {
+    parameters.assertNoneRuntime();
+  }
+
+  private TestApplication buildTestApplication(
       DexApplication application,
       InternalOptions options,
       MethodSubject method,
       List<IRCode> additionalCode)
       throws ExecutionException {
-    AppView<AppInfoWithSubtyping> appView =
-        AppView.createForR8(new AppInfoWithSubtyping(application), options);
+    DirectMappedDexApplication directApp = application.asDirect();
+    AppView<AppInfoWithClassHierarchy> appView =
+        AppView.createForR8(new AppInfoWithClassHierarchy(directApp));
     appView.setAppServices(AppServices.builder(appView).build());
     ExecutorService executorService = ThreadUtils.getExecutorService(options);
+    SubtypingInfo subtypingInfo = new SubtypingInfo(directApp.allClasses(), directApp);
     appView.setRootSet(
         new RootSetBuilder(
                 appView,
-                application,
+                subtypingInfo,
                 ImmutableList.of(ProguardKeepRule.defaultKeepAllRule(unused -> {})))
             .run(executorService));
-    Timing timing = new Timing(getClass().getSimpleName());
-    Enqueuer enqueuer = new Enqueuer(appView, options, null);
+    Timing timing = Timing.empty();
+    Enqueuer enqueuer = EnqueuerFactory.createForInitialTreeShaking(appView, subtypingInfo);
     appView.setAppInfo(
         enqueuer.traceApplication(
             appView.rootSet(), ProguardClassFilter.empty(), executorService, timing));
     return new TestApplication(appView, method, additionalCode);
+  }
+
+  private static InternalOptions createOptions() {
+    Reporter reporter = new Reporter();
+    ProguardConfiguration proguardConfiguration =
+        ProguardConfiguration.builder(new DexItemFactory(), reporter).build();
+    InternalOptions options = new InternalOptions(proguardConfiguration, reporter);
+    options.programConsumer = DexIndexedConsumer.emptyConsumer();
+    return options;
   }
 
   private TestApplication codeForMethodReplaceTest(int a, int b) throws ExecutionException {
@@ -105,17 +140,17 @@ public class InlineTest extends IrInjectionTestBase {
         "    return-void"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
     MethodSubject methodSubject = getMethodSubject(application, signature);
 
     MethodSubject methodASubject = getMethodSubject(application, signatureA);
-    IRCode codeA = methodASubject.buildIR(options.itemFactory);
+    IRCode codeA = methodASubject.buildIR();
 
     MethodSubject methodBSubject = getMethodSubject(application, signatureB);
-    IRCode codeB = methodBSubject.buildIR(options.itemFactory);
+    IRCode codeB = methodBSubject.buildIR();
 
     return buildTestApplication(
         application, options, methodSubject, ImmutableList.of(codeA, codeB));
@@ -131,7 +166,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining a.
     test = codeForMethodReplaceTest(a, b);
-    iterator = test.code.entryBlock().listIterator();
+    iterator = test.code.entryBlock().listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(0));
@@ -140,7 +175,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining b (where a is actually called).
     test = codeForMethodReplaceTest(a, b);
-    iterator = test.code.entryBlock().listIterator();
+    iterator = test.code.entryBlock().listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(1));
@@ -187,14 +222,14 @@ public class InlineTest extends IrInjectionTestBase {
         "    return-void"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
     MethodSubject methodSubject = getMethodSubject(application, signature);
 
     MethodSubject methodASubject = getMethodSubject(application, signatureA);
-    IRCode codeA = methodASubject.buildIR(options.itemFactory);
+    IRCode codeA = methodASubject.buildIR();
 
     return buildTestApplication(application, options, methodSubject, ImmutableList.of(codeA));
   }
@@ -210,7 +245,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining a.
     test = codeForMethodReplaceReturnVoidTest(1, 2);
-    iterator = test.code.entryBlock().listIterator();
+    iterator = test.code.entryBlock().listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(0));
@@ -264,7 +299,7 @@ public class InlineTest extends IrInjectionTestBase {
         "    return-void"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
@@ -274,13 +309,13 @@ public class InlineTest extends IrInjectionTestBase {
     List<IRCode> additionalCode = new ArrayList<>();
     for (int i = 0; i < 3; i++) {
       MethodSubject methodASubject = getMethodSubject(application, signatureA);
-      IRCode codeA = methodASubject.buildIR(options.itemFactory);
+      IRCode codeA = methodASubject.buildIR();
       additionalCode.add(codeA);
     }
 
     for (int i = 0; i < 3; i++) {
       MethodSubject methodBSubject = getMethodSubject(application, signatureB);
-      IRCode codeB = methodBSubject.buildIR(options.itemFactory);
+      IRCode codeB = methodBSubject.buildIR();
       additionalCode.add(codeB);
     }
 
@@ -299,10 +334,10 @@ public class InlineTest extends IrInjectionTestBase {
     test = codeForMultipleMethodReplaceTest(a, b);
     ListIterator<BasicBlock> blocksIterator = test.code.listIterator();
     Iterator<IRCode> inlinee = test.additionalCode.listIterator();  // IR code for a's
-    List<BasicBlock> blocksToRemove = new ArrayList<>();
+    Set<BasicBlock> blocksToRemove = Sets.newIdentityHashSet();
     while (blocksIterator.hasNext()) {
       BasicBlock block = blocksIterator.next();
-      iterator = block.listIterator();
+      iterator = block.listIterator(test.code);
       Instruction invoke = iterator.nextUntil(Instruction::isInvoke);
       if (invoke != null) {
         iterator.previous();
@@ -320,7 +355,7 @@ public class InlineTest extends IrInjectionTestBase {
     inlinee = test.additionalCode.listIterator(3);  // IR code for b's
     while (blocksIterator.hasNext()) {
       BasicBlock block = blocksIterator.next();
-      iterator = block.listIterator();
+      iterator = block.listIterator(test.code);
       Instruction invoke = iterator.nextUntil(Instruction::isInvoke);
       if (invoke != null) {
         iterator.previous();
@@ -397,17 +432,17 @@ public class InlineTest extends IrInjectionTestBase {
         "    return-void"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
     MethodSubject methodSubject = getMethodSubject(application, signature);
 
     MethodSubject methodASubject = getMethodSubject(application, signatureA);
-    IRCode codeA = methodASubject.buildIR(options.itemFactory);
+    IRCode codeA = methodASubject.buildIR();
 
     MethodSubject methodBSubject = getMethodSubject(application, signatureB);
-    IRCode codeB = methodBSubject.buildIR(options.itemFactory);
+    IRCode codeB = methodBSubject.buildIR();
 
     return buildTestApplication(
         application, options, methodSubject, ImmutableList.of(codeA, codeB));
@@ -424,7 +459,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining a.
     test = codeForMethodReplaceTestWithCatchHandler(a, b, twoGuards);
-    iterator = test.code.blocks.get(1).listIterator();
+    iterator = test.code.blocks.get(1).listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(0));
@@ -433,7 +468,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining b (where a is actually called).
     test = codeForMethodReplaceTestWithCatchHandler(a, b, twoGuards);
-    iterator = test.code.blocks.get(1).listIterator();
+    iterator = test.code.blocks.get(1).listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(1));
@@ -510,17 +545,17 @@ public class InlineTest extends IrInjectionTestBase {
         "    goto :print_result"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
     MethodSubject methodSubject = getMethodSubject(application, signature);
 
     MethodSubject methodASubject = getMethodSubject(application, signatureA);
-    IRCode codeA = methodASubject.buildIR(options.itemFactory);
+    IRCode codeA = methodASubject.buildIR();
 
     MethodSubject methodBSubject = getMethodSubject(application, signatureB);
-    IRCode codeB = methodBSubject.buildIR(options.itemFactory);
+    IRCode codeB = methodBSubject.buildIR();
 
     return buildTestApplication(
         application, options, methodSubject, ImmutableList.of(codeA, codeB));
@@ -537,7 +572,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining a.
     test = codeForInlineCanThrow(a, b, twoGuards);
-    iterator = test.code.entryBlock().listIterator();
+    iterator = test.code.entryBlock().listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(0));
@@ -546,7 +581,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining b (where a is actually called).
     test = codeForInlineCanThrow(a, b, twoGuards);
-    iterator = test.code.entryBlock().listIterator();
+    iterator = test.code.entryBlock().listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(1));
@@ -621,17 +656,17 @@ public class InlineTest extends IrInjectionTestBase {
         "    goto :print_result"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
     MethodSubject methodSubject = getMethodSubject(application, signature);
 
     MethodSubject methodASubject = getMethodSubject(application, signatureA);
-    IRCode codeA = methodASubject.buildIR(options.itemFactory);
+    IRCode codeA = methodASubject.buildIR();
 
     MethodSubject methodBSubject = getMethodSubject(application, signatureB);
-    IRCode codeB = methodBSubject.buildIR(options.itemFactory);
+    IRCode codeB = methodBSubject.buildIR();
 
     return buildTestApplication(
         application, options, methodSubject, ImmutableList.of(codeA, codeB));
@@ -648,7 +683,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining a.
     test = codeForInlineAlwaysThrows(twoGuards);
-    iterator = test.code.entryBlock().listIterator();
+    iterator = test.code.entryBlock().listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(0));
@@ -658,7 +693,7 @@ public class InlineTest extends IrInjectionTestBase {
 
     // Run code inlining b (where a is actually called).
     test = codeForInlineAlwaysThrows(twoGuards);
-    iterator = test.code.entryBlock().listIterator();
+    iterator = test.code.entryBlock().listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(1));
@@ -734,7 +769,7 @@ public class InlineTest extends IrInjectionTestBase {
         "    goto :print_result"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
@@ -744,13 +779,13 @@ public class InlineTest extends IrInjectionTestBase {
     List<IRCode> additionalCode = new ArrayList<>();
     for (int i = 0; i < 3; i++) {
       MethodSubject methodASubject = getMethodSubject(application, signatureA);
-      IRCode codeA = methodASubject.buildIR(options.itemFactory);
+      IRCode codeA = methodASubject.buildIR();
       additionalCode.add(codeA);
     }
 
     for (int i = 0; i < 3; i++) {
       MethodSubject methodBSubject = getMethodSubject(application, signatureB);
-      IRCode codeB = methodBSubject.buildIR(options.itemFactory);
+      IRCode codeB = methodBSubject.buildIR();
       additionalCode.add(codeB);
     }
 
@@ -770,14 +805,14 @@ public class InlineTest extends IrInjectionTestBase {
       TestApplication test = codeForInlineAlwaysThrowsMultiple(twoGuards);
       ListIterator<BasicBlock> blocksIterator = test.code.listIterator();
       Iterator<IRCode> inlinee = test.additionalCode.listIterator(); // IR code for a's.
-      List<BasicBlock> blocksToRemove = new ArrayList<>();
+      Set<BasicBlock> blocksToRemove = Sets.newIdentityHashSet();
       InstructionListIterator iterator;
       while (blocksIterator.hasNext()) {
         BasicBlock block = blocksIterator.next();
         if (blocksToRemove.contains(block)) {
           continue;
         }
-        iterator = block.listIterator();
+        iterator = block.listIterator(test.code);
         Instruction invoke = iterator.nextUntil(Instruction::isInvoke);
         if (invoke != null) {
           iterator.previous();
@@ -794,14 +829,14 @@ public class InlineTest extends IrInjectionTestBase {
       TestApplication test = codeForInlineAlwaysThrowsMultiple(twoGuards);
       ListIterator<BasicBlock> blocksIterator = test.code.listIterator();
       Iterator<IRCode> inlinee = test.additionalCode.listIterator(3); // IR code for b's.
-      List<BasicBlock> blocksToRemove = new ArrayList<>();
+      Set<BasicBlock> blocksToRemove = Sets.newIdentityHashSet();
       InstructionListIterator iterator;
       while (blocksIterator.hasNext()) {
         BasicBlock block = blocksIterator.next();
         if (blocksToRemove.contains(block)) {
           continue;
         }
-        iterator = block.listIterator();
+        iterator = block.listIterator(test.code);
         Instruction invoke = iterator.nextUntil(Instruction::isInvoke);
         if (invoke != null) {
           iterator.previous();
@@ -890,7 +925,7 @@ public class InlineTest extends IrInjectionTestBase {
         "    goto :print_result"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
@@ -900,13 +935,13 @@ public class InlineTest extends IrInjectionTestBase {
     List<IRCode> additionalCode = new ArrayList<>();
     for (int i = 0; i < 3; i++) {
       MethodSubject methodASubject = getMethodSubject(application, signatureA);
-      IRCode codeA = methodASubject.buildIR(options.itemFactory);
+      IRCode codeA = methodASubject.buildIR();
       additionalCode.add(codeA);
     }
 
     for (int i = 0; i < 3; i++) {
       MethodSubject methodBSubject = getMethodSubject(application, signatureB);
-      IRCode codeB = methodBSubject.buildIR(options.itemFactory);
+      IRCode codeB = methodBSubject.buildIR();
       additionalCode.add(codeB);
     }
 
@@ -926,14 +961,14 @@ public class InlineTest extends IrInjectionTestBase {
       TestApplication test = codeForInlineAlwaysThrowsMultipleWithControlFlow(a, twoGuards);
       ListIterator<BasicBlock> blocksIterator = test.code.listIterator();
       Iterator<IRCode> inlinee = test.additionalCode.listIterator(); // IR code for a's.
-      List<BasicBlock> blocksToRemove = new ArrayList<>();
+      Set<BasicBlock> blocksToRemove = Sets.newIdentityHashSet();
       InstructionListIterator iterator;
       while (blocksIterator.hasNext()) {
         BasicBlock block = blocksIterator.next();
         if (blocksToRemove.contains(block)) {
           continue;
         }
-        iterator = block.listIterator();
+        iterator = block.listIterator(test.code);
         Instruction invoke = iterator.nextUntil(Instruction::isInvoke);
         if (invoke != null) {
           iterator.previous();
@@ -950,14 +985,14 @@ public class InlineTest extends IrInjectionTestBase {
       TestApplication test = codeForInlineAlwaysThrowsMultipleWithControlFlow(a, twoGuards);
       ListIterator<BasicBlock> blocksIterator = test.code.listIterator();
       Iterator<IRCode> inlinee = test.additionalCode.listIterator(3); // IR code for b's.
-      List<BasicBlock> blocksToRemove = new ArrayList<>();
+      Set<BasicBlock> blocksToRemove = Sets.newIdentityHashSet();
       InstructionListIterator iterator;
       while (blocksIterator.hasNext()) {
         BasicBlock block = blocksIterator.next();
         if (blocksToRemove.contains(block)) {
           continue;
         }
-        iterator = block.listIterator();
+        iterator = block.listIterator(test.code);
         Instruction invoke = iterator.nextUntil(Instruction::isInvoke);
         if (invoke != null) {
           iterator.previous();
@@ -1136,17 +1171,17 @@ public class InlineTest extends IrInjectionTestBase {
         "    goto :print_result"
     );
 
-    InternalOptions options = new InternalOptions();
+    InternalOptions options = createOptions();
     DexApplication application = buildApplication(builder, options).toDirect();
 
     // Return the processed method for inspection.
     MethodSubject methodSubject = getMethodSubject(application, signature);
 
     MethodSubject methodASubject = getMethodSubject(application, signatureA);
-    IRCode codeA = methodASubject.buildIR(options.itemFactory);
+    IRCode codeA = methodASubject.buildIR();
 
     MethodSubject methodBSubject = getMethodSubject(application, signatureB);
-    IRCode codeB = methodBSubject.buildIR(options.itemFactory);
+    IRCode codeB = methodBSubject.buildIR();
 
     return buildTestApplication(
         application, options, methodSubject, ImmutableList.of(codeA, codeB));
@@ -1166,7 +1201,7 @@ public class InlineTest extends IrInjectionTestBase {
     // Run code inlining a.
     test = codeForInlineWithHandlersCanThrow(
         a, b, c, twoGuards, callerHasCatchAll, inlineeHasCatchAll);
-    iterator = test.code.blocks.get(1).listIterator();
+    iterator = test.code.blocks.get(1).listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(0));
@@ -1176,7 +1211,7 @@ public class InlineTest extends IrInjectionTestBase {
     // Run code inlining b (where a is actually called).
     test = codeForInlineWithHandlersCanThrow(
         a, b, c, twoGuards, callerHasCatchAll, inlineeHasCatchAll);
-    iterator = test.code.blocks.get(1).listIterator();
+    iterator = test.code.blocks.get(1).listIterator(test.code);
     iterator.nextUntil(Instruction::isInvoke);
     iterator.previous();
     iterator.inlineInvoke(test.appView, test.code, test.additionalCode.get(1));

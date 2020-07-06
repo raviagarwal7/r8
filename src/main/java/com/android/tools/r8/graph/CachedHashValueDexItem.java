@@ -26,7 +26,18 @@ public abstract class CachedHashValueDexItem extends DexItem {
       }
       hash = cache;
     }
+    assert verifyHashCodeConsistent(cache);
     return cache;
+  }
+
+  private boolean verifyHashCodeConsistent(int computedValue) {
+    int newComputedValue = computeHashCode();
+    if (newComputedValue == NOT_COMPUTED_HASH_VALUE) {
+      newComputedValue = SENTINEL_HASH_VALUE;
+    }
+    assert computedValue == newComputedValue
+        : "Hash code for " + this + " has changed from " + hash + " to " + newComputedValue;
+    return true;
   }
 
   @Override

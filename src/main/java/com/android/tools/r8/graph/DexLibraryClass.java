@@ -8,7 +8,7 @@ import com.android.tools.r8.ProgramResource.Kind;
 import com.android.tools.r8.dex.IndexedItemCollection;
 import com.android.tools.r8.dex.MixedSectionCollection;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.kotlin.KotlinInfo;
+import com.android.tools.r8.kotlin.KotlinClassLevelInfo;
 import com.android.tools.r8.origin.Origin;
 import java.util.Arrays;
 import java.util.List;
@@ -58,7 +58,7 @@ public class DexLibraryClass extends DexClass implements Supplier<DexLibraryClas
     // Set all static field values to unknown. We don't want to use the value from the library
     // at compile time, as it can be different at runtime.
     for (DexEncodedField staticField : staticFields) {
-      staticField.setStaticValue(DexValue.UNKNOWN);
+      staticField.clearStaticValue();
     }
     assert kind == Kind.CF : "Invalid kind " + kind + " for library-path class " + type;
   }
@@ -114,8 +114,8 @@ public class DexLibraryClass extends DexClass implements Supplier<DexLibraryClas
   }
 
   @Override
-  public KotlinInfo getKotlinInfo() {
-    return null;
+  public KotlinClassLevelInfo getKotlinInfo() {
+    throw new Unreachable("We should never consider metadata for library classes");
   }
 
   @Override

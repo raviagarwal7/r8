@@ -3,25 +3,25 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import java.util.List;
 
 public abstract class JumpInstruction extends Instruction {
 
-  public JumpInstruction(Value out) {
+  public JumpInstruction() {
     super(null);
   }
 
-  public JumpInstruction(Value out, Value in) {
-    super(out, in);
+  public JumpInstruction(Value in) {
+    super(null, in);
   }
 
-  public JumpInstruction(Value out, List<? extends Value> ins) {
-    super(out, ins);
+  public JumpInstruction(List<? extends Value> ins) {
+    super(null, ins);
   }
 
   public BasicBlock fallthroughBlock() {
@@ -33,8 +33,8 @@ public abstract class JumpInstruction extends Instruction {
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    return false;
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
+    return DeadInstructionResult.notDead();
   }
 
   @Override
@@ -49,12 +49,17 @@ public abstract class JumpInstruction extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forJumpInstruction();
   }
 
   @Override
   public boolean hasInvariantOutType() {
     return true;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

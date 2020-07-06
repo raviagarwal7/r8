@@ -1,55 +1,82 @@
-// Copyright (c) 2018, the R8 project authors. Please see the AUTHORS file
+// Copyright (c) 2020, the R8 project authors. Please see the AUTHORS file
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.kotlin;
 
-import com.android.tools.r8.DiagnosticsHandler;
+import static com.android.tools.r8.kotlin.KotlinMetadataUtils.INVALID_KOTLIN_INFO;
+import static com.android.tools.r8.kotlin.KotlinMetadataUtils.NO_KOTLIN_INFO;
+
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexAnnotationElement;
 import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexDefinitionSupplier;
+import com.android.tools.r8.graph.DexEncodedAnnotation;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexValue;
 import com.android.tools.r8.graph.DexValue.DexValueArray;
-import com.android.tools.r8.graph.DexValue.DexValueString;
+import com.android.tools.r8.utils.Reporter;
 import com.android.tools.r8.utils.StringDiagnostic;
 import java.util.IdentityHashMap;
 import java.util.Map;
+import java.util.function.Consumer;
 import kotlinx.metadata.InconsistentKotlinMetadataException;
 import kotlinx.metadata.jvm.KotlinClassHeader;
 import kotlinx.metadata.jvm.KotlinClassMetadata;
 
-final class KotlinClassMetadataReader {
+public final class KotlinClassMetadataReader {
 
-  static KotlinInfo getKotlinInfo(
+  private static int KOTLIN_METADATA_KIND_LAMBDA = 3;
+
+  public static KotlinClassLevelInfo getKotlinInfo(
       Kotlin kotlin,
       DexClass clazz,
-      DiagnosticsHandler reporter) {
-    if (clazz.annotations.isEmpty()) {
-      return null;
-    }
-    DexAnnotation meta = clazz.annotations.getFirstMatching(kotlin.metadata.kotlinMetadataType);
+      DexItemFactory factory,
+      Reporter reporter,
+      boolean onlyProcessLambda,
+      Consumer<DexEncodedMethod> keepByteCode) {
+    DexAnnotation meta = clazz.annotations().getFirstMatching(factory.kotlinMetadataType);
     if (meta != null) {
       try {
-        return createKotlinInfo(kotlin, clazz, meta);
+        KotlinClassMetadata kMetadata = toKotlinClassMetadata(kotlin, meta.annotation);
+        if (onlyProcessLambda && kMetadata.getHeader().getKind() != KOTLIN_METADATA_KIND_LAMBDA) {
+          return NO_KOTLIN_INFO;
+        }
+        return createKotlinInfo(kotlin, clazz, kMetadata, factory, reporter, keepByteCode);
       } catch (ClassCastException | InconsistentKotlinMetadataException | MetadataError e) {
         reporter.info(
-            new StringDiagnostic("Class " + clazz.type.toSourceString()
-                + " has malformed kotlin.Metadata: " + e.getMessage()));
+            new StringDiagnostic(
+                "Class "
+                    + clazz.type.toSourceString()
+                    + " has malformed kotlin.Metadata: "
+                    + e.getMessage()));
+        return INVALID_KOTLIN_INFO;
       } catch (Throwable e) {
         reporter.info(
-            new StringDiagnostic("Unexpected error while reading " + clazz.type.toSourceString()
-                + "'s kotlin.Metadata: " + e.getMessage()));
+            new StringDiagnostic(
+                "Unexpected error while reading "
+                    + clazz.type.toSourceString()
+                    + "'s kotlin.Metadata: "
+                    + e.getMessage()));
+        return INVALID_KOTLIN_INFO;
       }
     }
-    return null;
+    return NO_KOTLIN_INFO;
   }
 
-  private static KotlinInfo createKotlinInfo(
-      Kotlin kotlin,
-      DexClass clazz,
-      DexAnnotation meta) {
+  public static boolean hasKotlinClassMetadataAnnotation(
+      DexClass clazz, DexDefinitionSupplier definitionSupplier) {
+    return clazz
+            .annotations()
+            .getFirstMatching(definitionSupplier.dexItemFactory().kotlinMetadataType)
+        != null;
+  }
+
+  public static KotlinClassMetadata toKotlinClassMetadata(
+      Kotlin kotlin, DexEncodedAnnotation metadataAnnotation) {
     Map<DexString, DexAnnotationElement> elementMap = new IdentityHashMap<>();
-    for (DexAnnotationElement element : meta.annotation.elements) {
+    for (DexAnnotationElement element : metadataAnnotation.elements) {
       elementMap.put(element.name, element);
     }
 
@@ -74,28 +101,65 @@ final class KotlinClassMetadataReader {
     Integer xi = extraInt == null ? null : (Integer) extraInt.value.getBoxedValue();
 
     KotlinClassHeader header = new KotlinClassHeader(k, mv, bv, d1, d2, xs, pn, xi);
-    KotlinClassMetadata kMetadata = KotlinClassMetadata.read(header);
+    return KotlinClassMetadata.read(header);
+  }
 
+  public static KotlinClassLevelInfo createKotlinInfo(
+      Kotlin kotlin,
+      DexClass clazz,
+      KotlinClassMetadata kMetadata,
+      DexItemFactory factory,
+      Reporter reporter,
+      Consumer<DexEncodedMethod> keepByteCode) {
+    String packageName = kMetadata.getHeader().getPackageName();
     if (kMetadata instanceof KotlinClassMetadata.Class) {
-      return KotlinClass.fromKotlinClassMetadata(kMetadata, clazz);
+      return KotlinClassInfo.create(
+          ((KotlinClassMetadata.Class) kMetadata).toKmClass(),
+          packageName,
+          clazz,
+          factory,
+          reporter,
+          keepByteCode);
     } else if (kMetadata instanceof KotlinClassMetadata.FileFacade) {
-      return KotlinFile.fromKotlinClassMetadata(kMetadata);
+      // e.g., B.kt becomes class `BKt`
+      return KotlinFileFacadeInfo.create(
+          (KotlinClassMetadata.FileFacade) kMetadata,
+          packageName,
+          clazz,
+          factory,
+          reporter,
+          keepByteCode);
     } else if (kMetadata instanceof KotlinClassMetadata.MultiFileClassFacade) {
-      return KotlinClassFacade.fromKotlinClassMetadata(kMetadata);
+      // multi-file class with the same @JvmName.
+      return KotlinMultiFileClassFacadeInfo.create(
+          (KotlinClassMetadata.MultiFileClassFacade) kMetadata, packageName, factory);
     } else if (kMetadata instanceof KotlinClassMetadata.MultiFileClassPart) {
-      return KotlinClassPart.fromKotlinClassMetdata(kMetadata);
+      // A single file, which is part of multi-file class.
+      return KotlinMultiFileClassPartInfo.create(
+          (KotlinClassMetadata.MultiFileClassPart) kMetadata,
+          packageName,
+          clazz,
+          factory,
+          reporter,
+          keepByteCode);
     } else if (kMetadata instanceof KotlinClassMetadata.SyntheticClass) {
-      return KotlinSyntheticClass.fromKotlinClassMetadata(kMetadata, kotlin, clazz);
+      return KotlinSyntheticClassInfo.create(
+          (KotlinClassMetadata.SyntheticClass) kMetadata,
+          packageName,
+          clazz,
+          kotlin,
+          factory,
+          reporter);
     } else {
-      throw new MetadataError("unsupported 'k' value: " + k);
+      throw new MetadataError("unsupported 'k' value: " + kMetadata.getHeader().getKind());
     }
   }
 
   private static int[] getUnboxedIntArray(DexValue v, String elementName) {
-    if (!(v instanceof DexValueArray)) {
+    if (!v.isDexValueArray()) {
       throw new MetadataError("invalid '" + elementName + "' value: " + v.toSourceString());
     }
-    DexValueArray intArrayValue = (DexValueArray) v;
+    DexValueArray intArrayValue = v.asDexValueArray();
     DexValue[] values = intArrayValue.getValues();
     int[] result = new int [values.length];
     for (int i = 0; i < values.length; i++) {
@@ -105,10 +169,10 @@ final class KotlinClassMetadataReader {
   }
 
   private static String[] getUnboxedStringArray(DexValue v, String elementName) {
-    if (!(v instanceof DexValueArray)) {
+    if (!v.isDexValueArray()) {
       throw new MetadataError("invalid '" + elementName + "' value: " + v.toSourceString());
     }
-    DexValueArray stringArrayValue = (DexValueArray) v;
+    DexValueArray stringArrayValue = v.asDexValueArray();
     DexValue[] values = stringArrayValue.getValues();
     String[] result = new String [values.length];
     for (int i = 0; i < values.length; i++) {
@@ -118,10 +182,10 @@ final class KotlinClassMetadataReader {
   }
 
   private static String getUnboxedString(DexValue v, String elementName) {
-    if (!(v instanceof DexValueString)) {
+    if (!v.isDexValueString()) {
       throw new MetadataError("invalid '" + elementName + "' value: " + v.toSourceString());
     }
-    return ((DexValueString) v).getValue().toString();
+    return v.asDexValueString().getValue().toString();
   }
 
   private static class MetadataError extends RuntimeException {
@@ -129,5 +193,4 @@ final class KotlinClassMetadataReader {
       super(cause);
     }
   }
-
 }

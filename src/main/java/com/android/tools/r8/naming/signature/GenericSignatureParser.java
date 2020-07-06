@@ -4,6 +4,7 @@
 
 package com.android.tools.r8.naming.signature;
 
+import com.android.tools.r8.naming.signature.GenericSignatureAction.ParserPosition;
 import java.lang.reflect.GenericSignatureFormatError;
 import java.nio.CharBuffer;
 
@@ -25,7 +26,7 @@ import java.nio.CharBuffer;
  *
  * FieldTypeSignature ::=
  *     ClassTypeSignature | ArrayTypeSignature | TypeVariableSignature.
- * ArrayTypeSignature ::= "[" TypSignature.
+ * ArrayTypeSignature ::= "[" TypeSignature.
  *
  * ClassTypeSignature ::=
  *     "L" {Ident "/"} Ident OptTypeArguments {"." Ident OptTypeArguments} ";".
@@ -48,9 +49,11 @@ import java.nio.CharBuffer;
  * VoidDescriptor ::= "V".
  * </pre>
  */
+// TODO(b/129925954): Deprecate this once ...graph.GenericSignature is ready and rewriter is
+//   reimplemented based on the internal encoding and transformation logic.
 public class GenericSignatureParser<T> {
 
-  private final GenericSignatureAction<T> actions;
+  private GenericSignatureAction<T> actions;
 
   /*
    * Parser:
@@ -110,7 +113,7 @@ public class GenericSignatureParser<T> {
     try {
       actions.start();
       setInput(signature);
-      parseFieldTypeSignature();
+      parseFieldTypeSignature(ParserPosition.MEMBER_ANNOTATION);
       actions.stop();
     } catch (GenericSignatureFormatError e) {
       throw e;
@@ -135,21 +138,21 @@ public class GenericSignatureParser<T> {
   // Parser:
   //
 
-  void parseClassSignature() {
+  private void parseClassSignature() {
     // ClassSignature ::= OptFormalTypeParameters SuperclassSignature {SuperinterfaceSignature}.
 
     parseOptFormalTypeParameters();
 
     // SuperclassSignature ::= ClassTypeSignature.
-    parseClassTypeSignature();
+    parseClassTypeSignature(ParserPosition.CLASS_SUPER_OR_INTERFACE_ANNOTATION);
 
     while (symbol > 0) {
       // SuperinterfaceSignature ::= ClassTypeSignature.
-      parseClassTypeSignature();
+      parseClassTypeSignature(ParserPosition.CLASS_SUPER_OR_INTERFACE_ANNOTATION);
     }
   }
 
-  void parseOptFormalTypeParameters() {
+  private void parseOptFormalTypeParameters() {
     // OptFormalTypeParameters ::= ["<" FormalTypeParameter {FormalTypeParameter} ">"].
 
     if (symbol == '<') {
@@ -167,7 +170,7 @@ public class GenericSignatureParser<T> {
     }
   }
 
-  void updateFormalTypeParameter() {
+  private void updateFormalTypeParameter() {
     // FormalTypeParameter ::= Ident ClassBound {InterfaceBound}.
     scanIdentifier();
     assert identifier != null;
@@ -178,28 +181,28 @@ public class GenericSignatureParser<T> {
     expect(':');
 
     if (symbol == 'L' || symbol == '[' || symbol == 'T') {
-      parseFieldTypeSignature();
+      parseFieldTypeSignature(ParserPosition.MEMBER_ANNOTATION);
     }
 
     while (symbol == ':') {
       // InterfaceBound ::= ":" FieldTypeSignature.
       actions.parsedSymbol(symbol);
       scanSymbol();
-      parseFieldTypeSignature();
+      parseFieldTypeSignature(ParserPosition.MEMBER_ANNOTATION);
     }
   }
 
-  private void parseFieldTypeSignature() {
+  private void parseFieldTypeSignature(ParserPosition parserPosition) {
     // FieldTypeSignature ::= ClassTypeSignature | ArrayTypeSignature | TypeVariableSignature.
     switch (symbol) {
       case 'L':
-        parseClassTypeSignature();
+        parseClassTypeSignature(parserPosition);
         break;
       case '[':
-        // ArrayTypeSignature ::= "[" TypSignature.
+        // ArrayTypeSignature ::= "[" TypeSignature.
         actions.parsedSymbol(symbol);
         scanSymbol();
-        updateTypeSignature();
+        updateTypeSignature(parserPosition);
         break;
       case 'T':
         updateTypeVariableSignature();
@@ -209,7 +212,7 @@ public class GenericSignatureParser<T> {
     }
   }
 
-  private void parseClassTypeSignature() {
+  private void parseClassTypeSignature(ParserPosition parserPosition) {
     // ClassTypeSignature ::= "L" {Ident "/"} Ident OptTypeArguments {"." Ident OptTypeArguments}
     //  ";".
     actions.parsedSymbol(symbol);
@@ -226,12 +229,12 @@ public class GenericSignatureParser<T> {
     }
 
     qualIdent.append(this.identifier);
-    T parsedEnclosingType = actions.parsedTypeName(qualIdent.toString());
+    T parsedEnclosingType = actions.parsedTypeName(qualIdent.toString(), parserPosition);
 
     updateOptTypeArguments();
 
     while (symbol == '.') {
-      // Deal with Member Classes:
+      // Deal with Member Classes.
       actions.parsedSymbol(symbol);
       scanSymbol();
       scanIdentifier();
@@ -268,17 +271,17 @@ public class GenericSignatureParser<T> {
     } else if (symbol == '+') {
       actions.parsedSymbol(symbol);
       scanSymbol();
-      parseFieldTypeSignature();
+      parseFieldTypeSignature(ParserPosition.ENCLOSING_INNER_OR_TYPE_ANNOTATION);
     } else if (symbol == '-') {
       actions.parsedSymbol(symbol);
       scanSymbol();
-      parseFieldTypeSignature();
+      parseFieldTypeSignature(ParserPosition.ENCLOSING_INNER_OR_TYPE_ANNOTATION);
     } else {
-      parseFieldTypeSignature();
+      parseFieldTypeSignature(ParserPosition.ENCLOSING_INNER_OR_TYPE_ANNOTATION);
     }
   }
 
- private  void updateTypeVariableSignature() {
+  private void updateTypeVariableSignature() {
     // TypeVariableSignature ::= "T" Ident ";".
     actions.parsedSymbol(symbol);
     expect('T');
@@ -291,7 +294,7 @@ public class GenericSignatureParser<T> {
     expect(';');
   }
 
-  private void updateTypeSignature() {
+  private void updateTypeSignature(ParserPosition parserPosition) {
     switch (symbol) {
       case 'B':
       case 'C':
@@ -306,7 +309,7 @@ public class GenericSignatureParser<T> {
         break;
       default:
         // Not an elementary type, but a FieldTypeSignature.
-        parseFieldTypeSignature();
+        parseFieldTypeSignature(parserPosition);
     }
   }
 
@@ -319,7 +322,7 @@ public class GenericSignatureParser<T> {
     expect('(');
 
     while (symbol != ')' && (symbol > 0)) {
-      updateTypeSignature();
+      updateTypeSignature(ParserPosition.MEMBER_ANNOTATION);
     }
 
     actions.parsedSymbol(symbol);
@@ -336,7 +339,7 @@ public class GenericSignatureParser<T> {
         if (symbol == 'T') {
           updateTypeVariableSignature();
         } else {
-          parseClassTypeSignature();
+          parseClassTypeSignature(ParserPosition.MEMBER_ANNOTATION);
         }
       } while (symbol == '^');
     }
@@ -345,7 +348,7 @@ public class GenericSignatureParser<T> {
   private void updateReturnType() {
     // ReturnType ::= TypeSignature | "V".
     if (symbol != 'V') {
-      updateTypeSignature();
+      updateTypeSignature(ParserPosition.MEMBER_ANNOTATION);
     } else {
       actions.parsedSymbol(symbol);
       scanSymbol();
@@ -383,7 +386,7 @@ public class GenericSignatureParser<T> {
     }
   }
 
- private  boolean isStopSymbol(char ch) {
+  private boolean isStopSymbol(char ch) {
     switch (ch) {
       case ':':
       case '/':
@@ -404,7 +407,6 @@ public class GenericSignatureParser<T> {
       if (!isStopSymbol(symbol)) {
         identBuf.append(symbol);
 
-        // FINDBUGS
         char[] bufferLocal = buffer;
         assert bufferLocal != null;
         do {

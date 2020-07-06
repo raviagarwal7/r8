@@ -5,23 +5,26 @@ package com.android.tools.r8.ir.code;
 
 import com.android.tools.r8.cf.code.CfInvoke;
 import com.android.tools.r8.code.InvokePolymorphicRange;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DefaultInliningOracle;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.Inliner.InlineAction;
+import com.android.tools.r8.ir.optimize.Inliner.Reason;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
-import com.android.tools.r8.ir.optimize.InliningOracle;
+import com.android.tools.r8.ir.optimize.inliner.WhyAreYouNotInliningReporter;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import java.util.Collection;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
 import java.util.List;
-import org.objectweb.asm.Opcodes;
 
 public class InvokePolymorphic extends InvokeMethod {
 
@@ -30,6 +33,16 @@ public class InvokePolymorphic extends InvokeMethod {
   public InvokePolymorphic(DexMethod target, DexProto proto, Value result, List<Value> arguments) {
     super(target, result, arguments);
     this.proto = proto;
+  }
+
+  @Override
+  public boolean getInterfaceBit() {
+    return false;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INVOKE_POLYMORPHIC;
   }
 
   @Override
@@ -91,7 +104,7 @@ public class InvokePolymorphic extends InvokeMethod {
     // To translate InvokePolymorphic back into InvokeVirtual, use the original prototype
     // that is stored in getProto().
     DexMethod method = factory.createMethod(dexMethod.holder, getProto(), dexMethod.name);
-    builder.add(new CfInvoke(Opcodes.INVOKEVIRTUAL, method, false));
+    builder.add(new CfInvoke(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, method, false));
   }
 
   @Override
@@ -112,30 +125,38 @@ public class InvokePolymorphic extends InvokeMethod {
   }
 
   @Override
-  public DexEncodedMethod lookupSingleTarget(AppInfoWithLiveness appInfo,
-      DexType invocationContext) {
+  public DexEncodedMethod lookupSingleTarget(AppView<?> appView, ProgramMethod context) {
     // TODO(herhut): Implement lookup target for invokePolymorphic.
     return null;
   }
 
   @Override
-  public Collection<DexEncodedMethod> lookupTargets(AppInfoWithSubtyping appInfo,
-      DexType invocationContext) {
+  public ProgramMethodSet lookupProgramDispatchTargets(
+      AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
     // TODO(herhut): Implement lookup target for invokePolymorphic.
     return null;
   }
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInvokePolymorphic(getInvokedMethod(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInvokePolymorphic(getInvokedMethod(), context.getHolder());
   }
 
   @Override
   public InlineAction computeInlining(
-      InliningOracle decider,
-      DexType invocationContext,
-      ClassInitializationAnalysis classInitializationAnalysis) {
-    return decider.computeForInvokePolymorphic(this, invocationContext);
+      ProgramMethod singleTarget,
+      Reason reason,
+      DefaultInliningOracle decider,
+      ClassInitializationAnalysis classInitializationAnalysis,
+      WhyAreYouNotInliningReporter whyAreYouNotInliningReporter) {
+    // We never determine a single target for invoke-polymorphic.
+    if (singleTarget != null) {
+      throw new Unreachable(
+          "Unexpected invoke-polymorphic with `"
+              + singleTarget.toSourceString()
+              + "` as single target");
+    }
+    throw new Unreachable("Unexpected attempt to inline invoke that does not have a single target");
   }
 }

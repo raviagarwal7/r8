@@ -3,47 +3,53 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
-import static com.android.tools.r8.optimize.MemberRebindingAnalysis.isMemberVisibleFromOriginalContext;
-
 import com.android.tools.r8.cf.code.CfInvoke;
 import com.android.tools.r8.code.InvokeDirectRange;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
+import com.android.tools.r8.ir.analysis.fieldvalueanalysis.AbstractFieldSet;
+import com.android.tools.r8.ir.analysis.modeling.LibraryMethodReadSetModeling;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
-import java.util.function.Predicate;
-import org.objectweb.asm.Opcodes;
 
 public class InvokeDirect extends InvokeMethodWithReceiver {
 
-  private final boolean itf;
+  private final boolean isInterface;
 
   public InvokeDirect(DexMethod target, Value result, List<Value> arguments) {
     this(target, result, arguments, false);
   }
 
-  public InvokeDirect(DexMethod target, Value result, List<Value> arguments, boolean itf) {
+  public InvokeDirect(DexMethod target, Value result, List<Value> arguments, boolean isInterface) {
     super(target, result, arguments);
-    this.itf = itf;
+    this.isInterface = isInterface;
     // invoke-direct <init> should have no out value.
     assert !target.name.toString().equals(Constants.INSTANCE_INITIALIZER_NAME)
         || result == null;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INVOKE_DIRECT;
+  }
+
+  @Override
+  public boolean getInterfaceBit() {
+    return isInterface;
   }
 
   @Override
@@ -113,34 +119,41 @@ public class InvokeDirect extends InvokeMethodWithReceiver {
   }
 
   @Override
-  public DexEncodedMethod lookupSingleTarget(AppInfoWithLiveness appInfo,
-      DexType invocationContext) {
-    return appInfo.lookupDirectTarget(getInvokedMethod());
-  }
-
-  @Override
-  public Collection<DexEncodedMethod> lookupTargets(AppInfoWithSubtyping appInfo,
-      DexType invocationContext) {
-    DexEncodedMethod target = appInfo.lookupDirectTarget(getInvokedMethod());
-    return target == null ? Collections.emptyList() : Collections.singletonList(target);
+  public DexEncodedMethod lookupSingleTarget(
+      AppView<?> appView,
+      ProgramMethod context,
+      TypeElement receiverUpperBoundType,
+      ClassTypeElement receiverLowerBoundType) {
+    DexMethod invokedMethod = getInvokedMethod();
+    if (appView.appInfo().hasLiveness()) {
+      AppInfoWithLiveness appInfo = appView.appInfo().withLiveness();
+      DexEncodedMethod result = appInfo.lookupDirectTarget(invokedMethod, context);
+      assert verifyD8LookupResult(
+          result, appView.appInfo().lookupDirectTargetOnItself(invokedMethod, context));
+      return result;
+    }
+    // In D8, we can treat invoke-direct instructions as having a single target if the invoke is
+    // targeting a method in the enclosing class.
+    return appView.appInfo().lookupDirectTargetOnItself(invokedMethod, context);
   }
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInvokeDirect(getInvokedMethod(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInvokeDirect(getInvokedMethod(), context.getHolder());
   }
 
   @Override
   public void buildCf(CfBuilder builder) {
-    builder.add(new CfInvoke(Opcodes.INVOKESPECIAL, getInvokedMethod(), itf));
+    builder.add(
+        new CfInvoke(org.objectweb.asm.Opcodes.INVOKESPECIAL, getInvokedMethod(), isInterface));
   }
 
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forInvokeDirect(
@@ -148,113 +161,37 @@ public class InvokeDirect extends InvokeMethodWithReceiver {
   }
 
   @Override
-  public boolean instructionMayHaveSideEffects(
-      AppView<? extends AppInfo> appView, DexType context) {
-    if (!appView.enableWholeProgramOptimizations()) {
-      return true;
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
+    ProgramMethod context = code.context();
+    if (instructionMayHaveSideEffects(appView, context)) {
+      return DeadInstructionResult.notDead();
     }
-
-    if (appView.options().debug) {
-      return true;
+    if (!getInvokedMethod().isInstanceInitializer(appView)) {
+      return DeadInstructionResult.deadIfOutValueIsDead();
     }
-
-    // Check if it could throw a NullPointerException as a result of the receiver being null.
-    Value receiver = getReceiver();
-    if (receiver.getTypeLattice().isNullable()) {
-      return true;
+    // Super-constructor calls cannot be removed.
+    if (getReceiver().getAliasedValue() == code.getThis()) {
+      return DeadInstructionResult.notDead();
     }
-
-    // Find the target and check if the invoke may have side effects.
-    if (appView.appInfo().hasLiveness()) {
-      AppInfoWithLiveness appInfoWithLiveness = appView.appInfo().withLiveness();
-      DexEncodedMethod target = lookupSingleTarget(appInfoWithLiveness, context);
-      if (target == null) {
-        return true;
-      }
-
-      // Verify that the target method is accessible in the current context.
-      if (!isMemberVisibleFromOriginalContext(
-          appView, context, target.method.holder, target.accessFlags)) {
-        return true;
-      }
-
-      // Verify that the target method does not have side-effects. For program methods, we use
-      // optimization info, and for library methods, we use modeling.
-      DexClass clazz = appView.definitionFor(target.method.holder);
-      if (clazz == null) {
-        assert false : "Expected to be able to find the enclosing class of a method definition";
-        return true;
-      }
-
-      boolean targetMayHaveSideEffects;
-      if (clazz.isProgramClass()) {
-        targetMayHaveSideEffects =
-            target.getOptimizationInfo().mayHaveSideEffects()
-                && !appInfoWithLiveness.noSideEffects.containsKey(target.method);
-      } else {
-        targetMayHaveSideEffects =
-            !appView.dexItemFactory().libraryMethodsWithoutSideEffects.contains(target.method);
-      }
-
-      if (targetMayHaveSideEffects) {
-        return true;
-      }
-
-      // Success, the instruction does not have any side effects.
-      return false;
-    }
-
-    return true;
+    // Constructor calls can only be removed if the receiver is dead.
+    return DeadInstructionResult.deadIfInValueIsDead(getReceiver());
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    DexEncodedMethod method = code.method;
-    if (instructionMayHaveSideEffects(appView, method.method.holder)) {
-      return false;
-    }
+  public AbstractFieldSet readSet(AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    DexMethod invokedMethod = getInvokedMethod();
 
-    if (appView.dexItemFactory().isConstructor(getInvokedMethod())) {
-      // If it is a constructor call that initializes an uninitialized object, then the
-      // uninitialized object must be dead. This is the case if all the constructor calls cannot
-      // have side effects and the instance is dead except for the constructor calls.
-      List<Instruction> otherInitCalls = null;
-      for (Instruction user : getReceiver().uniqueUsers()) {
-        if (user == this) {
-          continue;
-        }
-        if (user.isInvokeDirect()) {
-          InvokeDirect invoke = user.asInvokeDirect();
-          if (appView.dexItemFactory().isConstructor(invoke.getInvokedMethod())
-              && invoke.getReceiver() == getReceiver()) {
-            // If another constructor call than `this` is found, then it must not have side effects.
-            if (invoke.instructionMayHaveSideEffects(appView, method.method.holder)) {
-              return false;
-            }
-            if (otherInitCalls == null) {
-              otherInitCalls = new ArrayList<>();
-            }
-            otherInitCalls.add(invoke);
-          }
-        }
-      }
+    // Trivial instance initializers do not read any fields.
+    if (appView.dexItemFactory().isConstructor(invokedMethod)) {
+      DexEncodedMethod singleTarget = lookupSingleTarget(appView, context);
 
-      // Now check that the instance is dead except for the constructor calls.
-      final List<Instruction> finalOtherInitCalls = otherInitCalls;
-      Predicate<Instruction> ignoreConstructorCalls =
-          instruction ->
-              instruction == this
-                  || (finalOtherInitCalls != null && finalOtherInitCalls.contains(instruction));
-      if (!getReceiver().isDead(appView, code, ignoreConstructorCalls)) {
-        return false;
-      }
-
-      // Verify that it is not a super-constructor call (these cannot be removed).
-      if (getReceiver() == code.getThis()) {
-        return false;
+      // If we have a single target in the program, then use the computed initializer info.
+      // If we have a single target in the library, then fallthrough to the library modeling below.
+      if (singleTarget != null && singleTarget.isProgramMethod(appView)) {
+        return singleTarget.getOptimizationInfo().getInstanceInitializerInfo().readSet();
       }
     }
 
-    return true;
+    return LibraryMethodReadSetModeling.getModeledReadSetOrUnknown(this, appView.dexItemFactory());
   }
 }

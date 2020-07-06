@@ -62,11 +62,10 @@ public class PrintUsageTest extends TestBase {
     testForR8(backend)
         .addProgramFiles(Paths.get(programFile))
         .addKeepRuleFiles(ListUtils.map(keepRulesFiles, Paths::get))
-        .addKeepRules(
-            "-printusage " + out.resolve(test + PRINT_USAGE_FILE_SUFFIX)
-        )
+        .addKeepRules("-printusage " + out.resolve(test + PRINT_USAGE_FILE_SUFFIX))
         // Disable inlining to make this test not depend on inlining decisions.
         .addOptionsModification(o -> o.enableInlining = false)
+        .enableProguardTestOptions()
         .compile();
   }
 
@@ -159,7 +158,9 @@ public class PrintUsageTest extends TestBase {
     Optional<ClassSubject> thing = inspector.clazz("shaking8.Thing");
     assertTrue(thing.isPresent());
     assertTrue(thing.get().field("int", "aField"));
-    assertFalse(inspector.clazz("shaking8.OtherThing").isPresent());
+    Optional<ClassSubject> otherThing = inspector.clazz("shaking8.OtherThing");
+    assertTrue(otherThing.isPresent());
+    assertTrue(otherThing.get().field("int", "otherField"));
     assertTrue(inspector.clazz("shaking8.YetAnotherThing").isPresent());
   }
 
@@ -202,6 +203,10 @@ public class PrintUsageTest extends TestBase {
     private ClassSubject lastClazz = null;
 
     private void readClazz(String line) {
+      int length = line.length();
+      if (line.charAt(length - 1) == ':') {
+        line = line.substring(0, length - 1);
+      }
       if (printedUsage.containsKey(line)) {
         lastClazz = printedUsage.get(line);
       } else {

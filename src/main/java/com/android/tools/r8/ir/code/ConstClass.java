@@ -8,16 +8,20 @@ import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.cf.code.CfConstClass;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AccessControl;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
+import com.android.tools.r8.ir.analysis.value.AbstractValue;
+import com.android.tools.r8.ir.analysis.value.UnknownValue;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 
 public class ConstClass extends ConstInstruction {
 
@@ -29,20 +33,23 @@ public class ConstClass extends ConstInstruction {
   }
 
   @Override
+  public int opcode() {
+    return Opcodes.CONST_CLASS;
+  }
+
+  @Override
   public <T> T accept(InstructionVisitor<T> visitor) {
     return visitor.visit(this);
   }
 
   public static ConstClass copyOf(IRCode code, ConstClass original) {
     Value newValue =
-        new Value(
-            code.valueNumberGenerator.next(),
-            original.outValue().getTypeLattice(),
-            original.getLocalInfo());
+        new Value(code.valueNumberGenerator.next(), original.getOutType(), original.getLocalInfo());
     return copyOf(newValue, original);
   }
 
   public static ConstClass copyOf(Value newValue, ConstClass original) {
+    assert newValue != original.outValue();
     return new ConstClass(newValue, original.getValue());
   }
 
@@ -77,41 +84,52 @@ public class ConstClass extends ConstInstruction {
   }
 
   @Override
+  public boolean instructionTypeCanBeCanonicalized() {
+    return true;
+  }
+
+  @Override
   public boolean instructionTypeCanThrow() {
     return true;
   }
 
   @Override
   public boolean instructionInstanceCanThrow() {
-    // TODO(christofferqa): Should return false in R8 if the class is in the program.
     return true;
   }
 
   @Override
-  public boolean instructionMayHaveSideEffects(
-      AppView<? extends AppInfo> appView, DexType context) {
+  public boolean instructionInstanceCanThrow(AppView<?> appView, ProgramMethod context) {
     DexType baseType = getValue().toBaseType(appView.dexItemFactory());
     if (baseType.isPrimitiveType()) {
       return false;
     }
 
-    if (appView.enableWholeProgramOptimizations()) {
-      DexClass clazz = appView.definitionFor(baseType);
-      if (clazz != null && clazz.isProgramClass()) {
+    // Not applicable for D8.
+    if (!appView.enableWholeProgramOptimizations()) {
+      // Unless the type of interest is same as the context.
+      if (baseType == context.getHolderType()) {
         return false;
       }
-    } else {
-      if (baseType == context) {
-        return false;
-      }
+      return true;
     }
 
-    return true;
+    DexClass clazz = appView.definitionFor(baseType);
+    // * Check that the class and its super types are present.
+    if (clazz == null || !clazz.isResolvable(appView)) {
+      return true;
+    }
+    // * Check that the class is accessible.
+    if (AccessControl.isClassAccessible(clazz, context, appView).isPossiblyFalse()) {
+      return true;
+    }
+    return false;
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    return !instructionMayHaveSideEffects(appView, code.method.method.holder);
+  public boolean instructionMayHaveSideEffects(
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    return instructionInstanceCanThrow(appView, context);
   }
 
   @Override
@@ -136,18 +154,17 @@ public class ConstClass extends ConstInstruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forConstClass(clazz, invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forConstClass(clazz, context.getHolder());
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.classClassType(appView, Nullability.definitelyNotNull());
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.classClassType(appView, Nullability.definitelyNotNull());
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return appView.dexItemFactory().classType;
   }
 
@@ -159,5 +176,14 @@ public class ConstClass extends ConstInstruction {
   @Override
   public void buildCf(CfBuilder builder) {
     builder.add(new CfConstClass(clazz));
+  }
+
+  @Override
+  public AbstractValue getAbstractValue(
+      AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    if (!instructionMayHaveSideEffects(appView, context)) {
+      return appView.abstractValueFactory().createSingleConstClassValue(clazz);
+    }
+    return UnknownValue.getInstance();
   }
 }

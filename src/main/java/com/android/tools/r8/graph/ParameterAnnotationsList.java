@@ -5,8 +5,10 @@ package com.android.tools.r8.graph;
 
 import com.android.tools.r8.dex.IndexedItemCollection;
 import com.android.tools.r8.dex.MixedSectionCollection;
+import com.android.tools.r8.utils.ArrayUtils;
 import java.util.Arrays;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 
 /**
@@ -46,7 +48,7 @@ public class ParameterAnnotationsList extends DexItem {
   }
 
   private ParameterAnnotationsList() {
-    this.values = new DexAnnotationSet[0];
+    this.values = DexAnnotationSet.EMPTY_ARRAY;
     this.missingParameterAnnotations = 0;
   }
 
@@ -192,5 +194,13 @@ public class ParameterAnnotationsList extends DexItem {
       return ParameterAnnotationsList.empty();
     }
     return new ParameterAnnotationsList(filtered, missingParameterAnnotations);
+  }
+
+  public ParameterAnnotationsList rewrite(Function<DexAnnotationSet, DexAnnotationSet> mapper) {
+    DexAnnotationSet[] rewritten = ArrayUtils.map(DexAnnotationSet[].class, values, mapper);
+    if (rewritten != values) {
+      return new ParameterAnnotationsList(rewritten, missingParameterAnnotations);
+    }
+    return this;
   }
 }

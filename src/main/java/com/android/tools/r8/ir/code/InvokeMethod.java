@@ -3,20 +3,33 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.LookupResult;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
+import com.android.tools.r8.ir.analysis.fieldvalueanalysis.AbstractFieldSet;
+import com.android.tools.r8.ir.analysis.modeling.LibraryMethodReadSetModeling;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
+import com.android.tools.r8.ir.analysis.value.AbstractValue;
+import com.android.tools.r8.ir.analysis.value.UnknownValue;
+import com.android.tools.r8.ir.optimize.DefaultInliningOracle;
 import com.android.tools.r8.ir.optimize.Inliner.InlineAction;
-import com.android.tools.r8.ir.optimize.InliningOracle;
+import com.android.tools.r8.ir.optimize.Inliner.Reason;
+import com.android.tools.r8.ir.optimize.inliner.WhyAreYouNotInliningReporter;
 import com.android.tools.r8.ir.regalloc.RegisterAllocator;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import java.util.Collection;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
+import java.util.BitSet;
 import java.util.List;
 
 public abstract class InvokeMethod extends Invoke {
@@ -27,6 +40,8 @@ public abstract class InvokeMethod extends Invoke {
     super(result, arguments);
     this.method = target;
   }
+
+  public abstract boolean getInterfaceBit();
 
   @Override
   public DexType getReturnType() {
@@ -59,16 +74,79 @@ public abstract class InvokeMethod extends Invoke {
 
   // In subclasses, e.g., invoke-virtual or invoke-super, use a narrower receiver type by using
   // receiver type and calling context---the holder of the method where the current invocation is.
-  public abstract DexEncodedMethod lookupSingleTarget(
-      AppInfoWithLiveness appInfo, DexType invocationContext);
+  // TODO(b/140204899): Refactor lookup methods to be defined in a single place.
+  public abstract DexEncodedMethod lookupSingleTarget(AppView<?> appView, ProgramMethod context);
 
-  public abstract Collection<DexEncodedMethod> lookupTargets(
-      AppInfoWithSubtyping appInfo, DexType invocationContext);
+  public final ProgramMethod lookupSingleProgramTarget(AppView<?> appView, ProgramMethod context) {
+    DexEncodedMethod singleTarget = lookupSingleTarget(appView, context);
+    return singleTarget != null ? singleTarget.asProgramMethod(appView) : null;
+  }
+
+  // TODO(b/140204899): Refactor lookup methods to be defined in a single place.
+  public ProgramMethodSet lookupProgramDispatchTargets(
+      AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    if (!getInvokedMethod().holder.isClassType()) {
+      return null;
+    }
+    if (!isInvokeMethodWithDynamicDispatch()) {
+      ProgramMethod singleTarget = lookupSingleProgramTarget(appView, context);
+      return singleTarget != null ? ProgramMethodSet.create(singleTarget) : null;
+    }
+    DexProgramClass refinedReceiverUpperBound =
+        asProgramClassOrNull(
+            appView.definitionFor(
+                TypeAnalysis.getRefinedReceiverType(appView, asInvokeMethodWithReceiver())));
+    DexProgramClass refinedReceiverLowerBound = null;
+    ClassTypeElement refinedReceiverLowerBoundType =
+        asInvokeMethodWithReceiver().getReceiver().getDynamicLowerBoundType(appView);
+    if (refinedReceiverLowerBoundType != null) {
+      refinedReceiverLowerBound =
+          asProgramClassOrNull(appView.definitionFor(refinedReceiverLowerBoundType.getClassType()));
+      // TODO(b/154822960): Check if the lower bound is a subtype of the upper bound.
+      if (refinedReceiverUpperBound != null
+          && refinedReceiverLowerBound != null
+          && !appView
+              .appInfo()
+              .isSubtype(refinedReceiverLowerBound.type, refinedReceiverUpperBound.type)) {
+        refinedReceiverLowerBound = null;
+      }
+    }
+    ResolutionResult resolutionResult = appView.appInfo().resolveMethod(method, getInterfaceBit());
+    LookupResult lookupResult;
+    if (refinedReceiverUpperBound != null) {
+      lookupResult =
+          resolutionResult.lookupVirtualDispatchTargets(
+              context.getHolder(),
+              appView.withLiveness().appInfo(),
+              refinedReceiverUpperBound,
+              refinedReceiverLowerBound);
+    } else {
+      lookupResult =
+          resolutionResult.lookupVirtualDispatchTargets(
+              context.getHolder(), appView.withLiveness().appInfo());
+    }
+    if (lookupResult.isLookupResultFailure()) {
+      return null;
+    }
+    ProgramMethodSet result = ProgramMethodSet.create();
+    lookupResult.forEach(
+        methodTarget -> {
+          if (methodTarget.isProgramMethod()) {
+            result.add(methodTarget.asProgramMethod());
+          }
+        },
+        lambda -> {
+          // TODO(b/150277553): Support lambda targets.
+        });
+    return result;
+  }
 
   public abstract InlineAction computeInlining(
-      InliningOracle decider,
-      DexType invocationContext,
-      ClassInitializationAnalysis classInitializationAnalysis);
+      ProgramMethod singleTarget,
+      Reason reason,
+      DefaultInliningOracle decider,
+      ClassInitializationAnalysis classInitializationAnalysis,
+      WhyAreYouNotInliningReporter whyAreYouNotInliningReporter);
 
   @Override
   public boolean identicalAfterRegisterAllocation(Instruction other, RegisterAllocator allocator) {
@@ -84,7 +162,7 @@ public abstract class InvokeMethod extends Invoke {
       // incorrectly join the types of these arrays to Object[].
       for (int i = 0; i < arguments().size(); ++i) {
         Value argument = arguments().get(i);
-        if (argument.getTypeLattice().isArrayType() && argument != invoke.arguments().get(i)) {
+        if (argument.getType().isArrayType() && argument != invoke.arguments().get(i)) {
           return false;
         }
       }
@@ -113,9 +191,50 @@ public abstract class InvokeMethod extends Invoke {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return getReturnType();
   }
 
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return true;
+  }
+
+  @Override
+  public AbstractFieldSet readSet(AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    return LibraryMethodReadSetModeling.getModeledReadSetOrUnknown(this, appView.dexItemFactory());
+  }
+
+  @Override
+  public AbstractValue getAbstractValue(
+      AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    assert hasOutValue();
+    DexEncodedMethod method = lookupSingleTarget(appView, context);
+    if (method != null) {
+      return method.getOptimizationInfo().getAbstractReturnValue();
+    }
+    return UnknownValue.getInstance();
+  }
+
+  boolean verifyD8LookupResult(
+      DexEncodedMethod hierarchyResult, DexEncodedMethod lookupDirectTargetOnItself) {
+    if (lookupDirectTargetOnItself == null) {
+      return true;
+    }
+    assert lookupDirectTargetOnItself == hierarchyResult;
+    return true;
+  }
+
+  @Override
+  public boolean throwsNpeIfValueIsNull(Value value, AppView<?> appView, ProgramMethod context) {
+    DexEncodedMethod singleTarget = lookupSingleTarget(appView, context);
+    if (singleTarget != null) {
+      BitSet nonNullParamOrThrow = singleTarget.getOptimizationInfo().getNonNullParamOrThrow();
+      if (nonNullParamOrThrow != null) {
+        int argumentIndex = inValues.indexOf(value);
+        return argumentIndex >= 0 && nonNullParamOrThrow.get(argumentIndex);
+      }
+    }
+    return false;
+  }
 }

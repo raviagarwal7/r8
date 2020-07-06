@@ -92,6 +92,11 @@ public class MethodAccessFlags extends AccessFlags<MethodAccessFlags> {
   }
 
   @Override
+  public int getAsCfAccessFlags() {
+    return materialize() & ~Constants.ACC_CONSTRUCTOR;
+  }
+
+  @Override
   public int getAsDexAccessFlags() {
     MethodAccessFlags copy = copy();
     if (copy.isSynchronized() && !copy.isNative()) {
@@ -99,11 +104,6 @@ public class MethodAccessFlags extends AccessFlags<MethodAccessFlags> {
       copy.setDeclaredSynchronized();
     }
     return copy.materialize();
-  }
-
-  @Override
-  public int getAsCfAccessFlags() {
-    return materialize() & ~Constants.ACC_CONSTRUCTOR;
   }
 
   public boolean isSynchronized() {
@@ -128,6 +128,10 @@ public class MethodAccessFlags extends AccessFlags<MethodAccessFlags> {
 
   public void unsetBridge() {
     unset(Constants.ACC_BRIDGE);
+  }
+
+  public void demoteFromBridge() {
+    demote(Constants.ACC_BRIDGE);
   }
 
   public boolean isVarargs() {

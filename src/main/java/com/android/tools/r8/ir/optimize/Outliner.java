@@ -9,16 +9,18 @@ import static com.android.tools.r8.ir.analysis.type.Nullability.maybeNull;
 
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.ClassAccessFlags;
+import com.android.tools.r8.graph.ClasspathMethod;
 import com.android.tools.r8.graph.Code;
 import com.android.tools.r8.graph.DebugLocalInfo;
 import com.android.tools.r8.graph.DexAnnotationSet;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DexProgramClass.ChecksumSupplier;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
@@ -26,9 +28,12 @@ import com.android.tools.r8.graph.DexTypeList;
 import com.android.tools.r8.graph.GraphLense;
 import com.android.tools.r8.graph.MethodAccessFlags;
 import com.android.tools.r8.graph.ParameterAnnotationsList;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.graph.UseRegistry;
-import com.android.tools.r8.ir.analysis.type.PrimitiveTypeLatticeElement;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.ArrayTypeElement;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
+import com.android.tools.r8.ir.analysis.type.PrimitiveTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Add;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.BasicBlock.ThrowingInfo;
@@ -52,7 +57,6 @@ import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.ir.code.ValueType;
 import com.android.tools.r8.ir.code.ValueTypeConstraint;
 import com.android.tools.r8.ir.conversion.IRBuilder;
-import com.android.tools.r8.ir.conversion.IRConverter;
 import com.android.tools.r8.ir.conversion.SourceCode;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.naming.ClassNameMapper;
@@ -61,9 +65,12 @@ import com.android.tools.r8.origin.SynthesizedOrigin;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.InternalOptions.OutlineOptions;
+import com.android.tools.r8.utils.ListUtils;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.StringUtils.BraceType;
-import com.google.common.collect.Sets;
+import com.android.tools.r8.utils.collections.LongLivedProgramMethodMultisetBuilder;
+import com.android.tools.r8.utils.collections.ProgramMethodMultiset;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -73,8 +80,7 @@ import java.util.ListIterator;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
-import java.util.Set;
-import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 /**
  * Support class for implementing outlining (i.e. extracting common code patterns as methods).
@@ -83,32 +89,29 @@ import java.util.function.BiConsumer;
  *
  * <ul>
  *   <li>First, all methods are converted to IR and passed to {@link
- *       Outliner#identifyCandidateMethods()} to identify outlining candidates and the methods
- *       containing each candidate. IR is converted to the output format (DEX or CF) and thrown away
- *       along with the outlining candidates; only a list of lists of methods is kept, where each
- *       list of methods corresponds to methods containing an outlining candidate.
+ *       Outliner#createOutlineMethodIdentifierGenerator()}} to identify outlining candidates and
+ *       the methods containing each candidate. IR is converted to the output format (DEX or CF) and
+ *       thrown away along with the outlining candidates; only a list of lists of methods is kept,
+ *       where each list of methods corresponds to methods containing an outlining candidate.
  *   <li>Second, {@link Outliner#selectMethodsForOutlining()} is called to retain the lists of
  *       methods found in the first step that are large enough (see {@link InternalOptions#outline}
- *       {@link OutlineOptions#threshold}), and the methods to be further analyzed for outlining is
- *       returned by {@link Outliner#getMethodsSelectedForOutlining}. Each selected method is then
- *       converted back to IR and passed to {@link Outliner#identifyOutlineSites(IRCode,
- *       DexEncodedMethod)}, which then stores concrete outlining candidates in {@link
- *       Outliner#outlineSites}.
+ *       {@link OutlineOptions#threshold}). Each selected method is then converted back to IR and
+ *       passed to {@link Outliner#identifyOutlineSites(IRCode)}, which then stores concrete
+ *       outlining candidates in {@link Outliner#outlineSites}.
  *   <li>Third, {@link Outliner#buildOutlinerClass(DexType)} is called to construct the <em>outline
  *       support class</em> containing a static helper method for each outline candidate that occurs
  *       frequently enough. Each selected method is then converted to IR, passed to {@link
- *       Outliner#applyOutliningCandidate(IRCode, DexEncodedMethod)} to perform the outlining, and
- *       converted back to the output format (DEX or CF).
+ *       Outliner#applyOutliningCandidate(IRCode)} to perform the outlining, and converted back to
+ *       the output format (DEX or CF).
  * </ul>
  */
 public class Outliner {
 
-  /** Result of first step (see {@link Outliner#identifyCandidateMethods()}. */
-  private final List<List<DexEncodedMethod>> candidateMethodLists = new ArrayList<>();
+  /** Result of first step (see {@link Outliner#createOutlineMethodIdentifierGenerator()}. */
+  private final List<LongLivedProgramMethodMultisetBuilder> candidateMethodLists =
+      new ArrayList<>();
   /** Result of second step (see {@link Outliner#selectMethodsForOutlining()}. */
-  private final Set<DexEncodedMethod> methodsSelectedForOutlining = Sets.newIdentityHashSet();
-  /** Result of second step (see {@link Outliner#selectMethodsForOutlining()}. */
-  private final Map<Outline, List<DexEncodedMethod>> outlineSites = new HashMap<>();
+  private final Map<Outline, List<ProgramMethod>> outlineSites = new HashMap<>();
   /** Result of third step (see {@link Outliner#buildOutlinerClass(DexType)}. */
   private final Map<Outline, DexMethod> generatedOutlines = new HashMap<>();
 
@@ -274,7 +277,7 @@ public class Outliner {
         inValues.add(
             builder.readRegister(register, ValueTypeConstraint.fromNumericType(numericType)));
       }
-      TypeLatticeElement latticeElement = PrimitiveTypeLatticeElement.fromNumericType(numericType);
+      TypeElement latticeElement = PrimitiveTypeElement.fromNumericType(numericType);
       Value outValue =
           builder.writeRegister(outline.argumentCount(), latticeElement, ThrowingInfo.CAN_THROW);
       Instruction newInstruction = null;
@@ -356,8 +359,8 @@ public class Outliner {
 
     @Override
     public int createInstruction(IRBuilder builder, Outline outline, int argumentMapIndex) {
-      TypeLatticeElement latticeElement =
-          TypeLatticeElement.fromDexType(clazz, definitelyNotNull(), builder.appView);
+      TypeElement latticeElement =
+          TypeElement.fromDexType(clazz, definitelyNotNull(), builder.appView);
       Value outValue =
           builder.writeRegister(outline.argumentCount(), latticeElement, ThrowingInfo.CAN_THROW);
       Instruction newInstruction = new NewInstance(clazz, outValue);
@@ -492,8 +495,8 @@ public class Outliner {
       }
       Value outValue = null;
       if (hasOutValue) {
-        TypeLatticeElement latticeElement =
-            TypeLatticeElement.fromDexType(method.proto.returnType, maybeNull(), builder.appView);
+        TypeElement latticeElement =
+            TypeElement.fromDexType(method.proto.returnType, maybeNull(), builder.appView);
         outValue =
             builder.writeRegister(outline.argumentCount(), latticeElement, ThrowingInfo.CAN_THROW);
       }
@@ -554,6 +557,8 @@ public class Outliner {
           templateInstructions.add(OutlineInstruction.fromInstruction(current));
         } else if (current.isConstInstruction()) {
           // Don't include const instructions in the template.
+        } else if (current.isAssume()) {
+          // Don't include assume instructions in the template.
         } else {
           assert false : "Unexpected type of instruction in outlining template.";
         }
@@ -582,8 +587,9 @@ public class Outliner {
       if (!(other instanceof Outline)) {
         return false;
       }
+      Outline otherOutline = (Outline) other;
       List<OutlineInstruction> instructions0 = this.templateInstructions;
-      List<OutlineInstruction> instructions1 = ((Outline) other).templateInstructions;
+      List<OutlineInstruction> instructions1 = otherOutline.templateInstructions;
       if (instructions0.size() != instructions1.size()) {
         return false;
       }
@@ -594,8 +600,9 @@ public class Outliner {
           return false;
         }
       }
-      return argumentMap.equals(((Outline) other).argumentMap)
-          && returnType == ((Outline) other).returnType;
+      return argumentTypes.equals(otherOutline.argumentTypes)
+          && argumentMap.equals(otherOutline.argumentMap)
+          && returnType == otherOutline.returnType;
     }
 
     @Override
@@ -709,7 +716,7 @@ public class Outliner {
   // replacing.
   abstract private class OutlineSpotter {
 
-    final DexEncodedMethod method;
+    final ProgramMethod method;
     final BasicBlock block;
     // instructionArrayCache is block.getInstructions() copied to an ArrayList.
     private List<Instruction> instructionArrayCache = null;
@@ -726,7 +733,7 @@ public class Outliner {
     int returnValueUsersLeft;
     int pendingNewInstanceIndex = -1;
 
-    OutlineSpotter(DexEncodedMethod method, BasicBlock block) {
+    OutlineSpotter(ProgramMethod method, BasicBlock block) {
       this.method = method;
       this.block = block;
       reset(0);
@@ -784,6 +791,12 @@ public class Outliner {
           include = true;
           instructionIncrement = 0;
         }
+      } else if (instruction.isAssume()) {
+        // Technically, assume instructions will be removed, and thus it should not be included.
+        // However, we should keep searching, so here we pretend to include it with 0 increment.
+        // When adding instruction into the outline candidate, we filter out assume instructions.
+        include = true;
+        instructionIncrement = 0;
       } else {
         include = canIncludeInstruction(instruction);
       }
@@ -795,13 +808,13 @@ public class Outliner {
         includeInstruction(instruction);
         // Check if this instruction ends the outline.
         if (actualInstructions >= appView.options().outline.maxSize) {
-          candidate(start, index + 1);
+          candidate(start, index + 1, actualInstructions);
         } else {
           index++;
         }
       } else if (index > start) {
         // Do not add this instruction, candidate ends with previous instruction.
-        candidate(start, index);
+        candidate(start, index, actualInstructions);
       } else {
         // Restart search from next instruction.
         reset(index + 1);
@@ -848,8 +861,7 @@ public class Outliner {
 
       // See whether we could move this invoke somewhere else. We reuse the logic from inlining
       // here, as the constraints are the same.
-      ConstraintWithTarget constraint =
-          invoke.inliningConstraint(inliningConstraints, method.method.holder);
+      ConstraintWithTarget constraint = invoke.inliningConstraint(inliningConstraints, method);
       if (constraint != ConstraintWithTarget.ALWAYS) {
         return false;
       }
@@ -861,6 +873,9 @@ public class Outliner {
           Value value = inValues.get(i);
           if (value == returnValue) {
             continue;
+          }
+          if (!supportedArgumentType(value)) {
+            return false;
           }
           if (invoke.isInvokeStatic()) {
             newArgumentRegisters += value.requiredRegisters();
@@ -900,8 +915,8 @@ public class Outliner {
     }
 
     private DexType argumentTypeFromInvoke(InvokeMethod invoke, int index) {
-      assert invoke.isInvokeMethodWithReceiver() || invoke.isInvokePolymorphic();
-      if (index == 0) {
+      boolean withReceiver =  invoke.isInvokeMethodWithReceiver() || invoke.isInvokePolymorphic();
+      if (withReceiver && index == 0) {
         return invoke.getInvokedMethod().holder;
       }
       DexProto methodProto;
@@ -911,18 +926,82 @@ public class Outliner {
       } else {
         methodProto = invoke.getInvokedMethod().proto;
       }
-      // -1 due to receiver.
-      return methodProto.parameters.values[index - 1];
+      // Skip receiver if present.
+      return methodProto.parameters.values[index - (withReceiver ? 1 : 0)];
+    }
+
+    private boolean supportedArgumentType(Value value) {
+      // All non array types are supported.
+      if (!value.getType().isArrayType()) {
+        return true;
+      }
+      // Avoid array type elements which have interfaces, as Art does not have the same semantics
+      // for array types as the Java VM, see b/132420510.
+      if (appView.options().testing.allowOutlinerInterfaceArrayArguments
+          && appView.options().isGeneratingClassFiles()) {
+        return true;
+      }
+      ArrayTypeElement arrayType = value.getType().asArrayType();
+      TypeElement arrayBaseType = arrayType.getBaseType();
+      if (arrayBaseType.isPrimitiveType()) {
+        return true;
+      }
+      if (arrayBaseType.isClassType()) {
+        return arrayBaseType.asClassType().getInterfaces().size() == 0;
+      }
+      return false;
+    }
+
+    private DexType argumentTypeFromValue(Value value, InvokeMethod invoke, int argumentIndex) {
+      assert supportedArgumentType(value);
+      DexItemFactory itemFactory = appView.options().itemFactory;
+      DexType objectType = itemFactory.objectType;
+      TypeElement valueType = value.getType();
+      if (valueType.isClassType()) {
+        ClassTypeElement valueClassType = value.getType().asClassType();
+        // For values of lattice type java.lang.Object and only one interface use the interface as
+        // the type of the outline argument. If there are several interfaces these interfaces don't
+        // have a common super interface nor are they implemented by a common superclass so the
+        // argument type of the outline will be java.lang.Object.
+        if (valueClassType.getClassType() == objectType
+            && valueClassType.getInterfaces().size() == 1) {
+          return valueClassType.getInterfaces().iterator().next();
+        } else {
+          return valueClassType.getClassType();
+        }
+      } else if (valueType.isArrayType()) {
+        return value.getType().asArrayType().toDexType(itemFactory);
+      } else if (valueType.isNullType()) {
+        // For values which are always null use the actual type at the call site.
+        return argumentTypeFromInvoke(invoke, argumentIndex);
+      } else {
+        assert valueType.isPrimitiveType();
+        assert valueType.asPrimitiveType().hasDexType();
+        DexType type = valueType.asPrimitiveType().toDexType(itemFactory);
+        if (valueType.isInt()) {
+          // In the type lattice boolean, byte, short and char are all int. However, as the
+          // outline argument type use the actual primitive type at the call site.
+          assert type == itemFactory.intType;
+          type = argumentTypeFromInvoke(invoke, argumentIndex);
+        } else {
+          assert type == argumentTypeFromInvoke(invoke, argumentIndex);
+        }
+        return type;
+      }
     }
 
     // Add the current instruction to the outline.
     private void includeInstruction(Instruction instruction) {
+      if (instruction.isAssume()) {
+        return;
+      }
+
       List<Value> inValues = orderedInValues(instruction, returnValue);
 
       Value prevReturnValue = returnValue;
       if (returnValue != null) {
         for (Value value : inValues) {
-          if (value == returnValue) {
+          if (value.getAliasedValue() == returnValue) {
             assert returnValueUsersLeft > 0;
             returnValueUsersLeft--;
           }
@@ -944,35 +1023,26 @@ public class Outliner {
           || instruction.isArithmeticBinop();
       if (inValues.size() > 0) {
         for (int i = 0; i < inValues.size(); i++) {
-          Value value = inValues.get(i);
+          Value value = inValues.get(i).getAliasedValue();
           if (value == prevReturnValue) {
             argumentsMap.add(OutlineInstruction.OUTLINE_TEMP);
             continue;
           }
           if (instruction.isInvokeMethodWithReceiver() || instruction.isInvokePolymorphic()) {
-            InvokeMethod invoke = instruction.asInvokeMethod();
             int argumentIndex = arguments.indexOf(value);
             // For virtual calls only re-use the receiver argument.
             if (i == 0 && argumentIndex != -1) {
-              DexType receiverType = argumentTypeFromInvoke(invoke, i);
-              // Ensure that the outline argument type is specific enough.
-              if (receiverType.isClassType()) {
-                if (appView.appInfo().isSubtype(receiverType, argumentTypes.get(argumentIndex))) {
-                  argumentTypes.set(argumentIndex, receiverType);
-                }
-              }
               argumentsMap.add(argumentIndex);
             } else {
               arguments.add(value);
               argumentRegisters += value.requiredRegisters();
-              argumentTypes.add(argumentTypeFromInvoke(invoke, i));
+              argumentTypes.add(argumentTypeFromValue(value, instruction.asInvokeMethod(), i));
               argumentsMap.add(argumentTypes.size() - 1);
             }
           } else {
             arguments.add(value);
             if (instruction.isInvokeMethod()) {
-              argumentTypes
-                  .add(instruction.asInvokeMethod().getInvokedMethod().proto.parameters.values[i]);
+              argumentTypes.add(argumentTypeFromValue(value, instruction.asInvokeMethod(), i));
             } else {
               argumentTypes.add(
                   instruction.asBinop().getNumericType().dexTypeFor(appView.dexItemFactory()));
@@ -1007,10 +1077,9 @@ public class Outliner {
       }
     }
 
-
     protected abstract void handle(int start, int end, Outline outline);
 
-    private void candidate(int start, int index) {
+    private void candidate(int start, int index, int actualInstructions) {
       List<Instruction> instructions = getInstructionArray();
       assert !instructions.get(start).isConstInstruction();
 
@@ -1030,13 +1099,7 @@ public class Outliner {
       }
 
       // Check if the candidate qualifies.
-      int nonConstInstructions = 0;
-      for (int i = start; i < end; i++) {
-        if (!instructions.get(i).isConstInstruction()) {
-          nonConstInstructions++;
-        }
-      }
-      if (nonConstInstructions < appView.options().outline.minSize) {
+      if (actualInstructions < appView.options().outline.minSize) {
         reset(start + 1);
         return;
       }
@@ -1069,12 +1132,12 @@ public class Outliner {
   // TODO(sgjesse): This does not take several usages in the same method into account.
   private class OutlineMethodIdentifier extends OutlineSpotter {
 
-    private final Map<Outline, List<DexEncodedMethod>> candidateMap;
+    private final Map<Outline, LongLivedProgramMethodMultisetBuilder> candidateMap;
 
     OutlineMethodIdentifier(
-        DexEncodedMethod method,
+        ProgramMethod method,
         BasicBlock block,
-        Map<Outline, List<DexEncodedMethod>> candidateMap) {
+        Map<Outline, LongLivedProgramMethodMultisetBuilder> candidateMap) {
       super(method, block);
       this.candidateMap = candidateMap;
     }
@@ -1086,8 +1149,8 @@ public class Outliner {
       }
     }
 
-    private List<DexEncodedMethod> addOutlineMethodList(Outline outline) {
-      List<DexEncodedMethod> result = new ArrayList<>();
+    private LongLivedProgramMethodMultisetBuilder addOutlineMethodList(Outline outline) {
+      LongLivedProgramMethodMultisetBuilder result = LongLivedProgramMethodMultisetBuilder.create();
       candidateMethodLists.add(result);
       return result;
     }
@@ -1095,7 +1158,7 @@ public class Outliner {
 
   private class OutlineSiteIdentifier extends OutlineSpotter {
 
-    OutlineSiteIdentifier(DexEncodedMethod method, BasicBlock block) {
+    OutlineSiteIdentifier(ProgramMethod method, BasicBlock block) {
       super(method, block);
     }
 
@@ -1116,9 +1179,11 @@ public class Outliner {
     int argumentsMapIndex;
 
     OutlineRewriter(
-        DexEncodedMethod method, IRCode code,
-        ListIterator<BasicBlock> blocksIterator, BasicBlock block, List<Integer> toRemove) {
-      super(method, block);
+        IRCode code,
+        ListIterator<BasicBlock> blocksIterator,
+        BasicBlock block,
+        List<Integer> toRemove) {
+      super(code.context(), block);
       this.code = code;
       this.blocksIterator = blocksIterator;
       this.toRemove = toRemove;
@@ -1177,7 +1242,7 @@ public class Outliner {
           // and none had a position. The code no longer has the previous property.
           code.setAllThrowingInstructionsHavePositions(false);
         }
-        InstructionListIterator endIterator = block.listIterator(end - 1);
+        InstructionListIterator endIterator = block.listIterator(code, end - 1);
         Instruction instructionBeforeEnd = endIterator.next();
         invalidateInstructionArray(); // Because we're about to modify the original linked list.
         instructionBeforeEnd.clearBlock();
@@ -1193,55 +1258,68 @@ public class Outliner {
     /** When assertions are enabled, remove method from the outline's list. */
     private boolean removeMethodFromOutlineList(Outline outline) {
       synchronized (outlineSites) {
-        assert outlineSites.get(outline).remove(method);
+        assert ListUtils.removeFirstMatch(
+            outlineSites.get(outline),
+            element -> element.getDefinition() == method.getDefinition());
       }
       return true;
     }
   }
 
-  public Outliner(AppView<AppInfoWithLiveness> appView, IRConverter converter) {
+  public Outliner(AppView<AppInfoWithLiveness> appView) {
     this.appView = appView;
     this.inliningConstraints = new InliningConstraints(appView, GraphLense.getIdentityLense());
   }
 
-  public BiConsumer<IRCode, DexEncodedMethod> identifyCandidateMethods() {
+  public void createOutlineMethodIdentifierGenerator() {
     // Since optimizations may change the map identity of Outline objects (e.g. by setting the
     // out-value of invokes to null), this map must not be used except for identifying methods
     // potentially relevant to outlining. OutlineMethodIdentifier will add method lists to
     // candidateMethodLists whenever it adds an entry to candidateMap.
-    Map<Outline, List<DexEncodedMethod>> candidateMap = new HashMap<>();
+    Map<Outline, LongLivedProgramMethodMultisetBuilder> candidateMap = new HashMap<>();
     assert candidateMethodLists.isEmpty();
-    return (code, method) -> {
-      assert !(method.getCode() instanceof OutlineCode);
-      for (BasicBlock block : code.blocks) {
-        new OutlineMethodIdentifier(method, block, candidateMap).process();
-      }
-    };
+    assert outlineMethodIdentifierGenerator == null;
+    outlineMethodIdentifierGenerator =
+        code -> {
+          ProgramMethod context = code.context();
+          assert !context.getDefinition().getCode().isOutlineCode();
+          if (appView.options().featureSplitConfiguration != null
+              && appView.options().featureSplitConfiguration.isInFeature(context.getHolder())) {
+            return;
+          }
+          for (BasicBlock block : code.blocks) {
+            new OutlineMethodIdentifier(context, block, candidateMap).process();
+          }
+        };
   }
 
-  public void identifyOutlineSites(IRCode code, DexEncodedMethod method) {
-    assert !(method.getCode() instanceof OutlineCode);
+  private Consumer<IRCode> outlineMethodIdentifierGenerator;
+
+  public Consumer<IRCode> getOutlineMethodIdentifierGenerator() {
+    assert outlineMethodIdentifierGenerator != null;
+    return outlineMethodIdentifierGenerator;
+  }
+
+  public void identifyOutlineSites(IRCode code) {
+    ProgramMethod context = code.context();
+    assert !context.getDefinition().getCode().isOutlineCode();
+    assert appView.options().featureSplitConfiguration == null
+        || !appView.options().featureSplitConfiguration.isInFeature(context.getHolder());
     for (BasicBlock block : code.blocks) {
-      new OutlineSiteIdentifier(method, block).process();
+      new OutlineSiteIdentifier(context, block).process();
     }
   }
 
-  public boolean selectMethodsForOutlining() {
-    assert methodsSelectedForOutlining.size() == 0;
-    assert outlineSites.size() == 0;
-    for (List<DexEncodedMethod> outlineMethods : candidateMethodLists) {
+  public ProgramMethodSet selectMethodsForOutlining() {
+    ProgramMethodSet methodsSelectedForOutlining = ProgramMethodSet.create();
+    assert outlineSites.isEmpty();
+    for (LongLivedProgramMethodMultisetBuilder outlineMethods : candidateMethodLists) {
       if (outlineMethods.size() >= appView.options().outline.threshold) {
-        for (DexEncodedMethod outlineMethod : outlineMethods) {
-          methodsSelectedForOutlining.add(
-              appView.graphLense().mapDexEncodedMethod(outlineMethod, appView));
-        }
+        ProgramMethodMultiset multiset = outlineMethods.build(appView);
+        multiset.forEachEntry((method, ignore) -> methodsSelectedForOutlining.add(method));
       }
     }
     candidateMethodLists.clear();
-    return methodsSelectedForOutlining.size() > 0;
-  }
-
-  public Set<DexEncodedMethod> getMethodsSelectedForOutlining() {
     return methodsSelectedForOutlining;
   }
 
@@ -1260,7 +1338,7 @@ public class Outliner {
       DexString methodName =
           appView.dexItemFactory().createString(OutlineOptions.METHOD_PREFIX + count);
       DexMethod method = outline.buildMethod(type, methodName);
-      List<DexEncodedMethod> sites = outlineSites.get(outline);
+      List<ProgramMethod> sites = outlineSites.get(outline);
       assert !sites.isEmpty();
       direct[count] =
           new DexEncodedMethod(
@@ -1268,9 +1346,10 @@ public class Outliner {
               methodAccess,
               DexAnnotationSet.empty(),
               ParameterAnnotationsList.empty(),
-              new OutlineCode(outline));
+              new OutlineCode(outline),
+              true);
       if (appView.options().isGeneratingClassFiles()) {
-        direct[count].upgradeClassFileVersion(sites.get(0).getClassFileVersion());
+        direct[count].upgradeClassFileVersion(sites.get(0).getDefinition().getClassFileVersion());
       }
       generatedOutlines.put(outline, method);
       count++;
@@ -1278,38 +1357,39 @@ public class Outliner {
     // No need to sort the direct methods as they are generated in sorted order.
 
     // Build the outliner class.
-    DexType superType = appView.dexItemFactory().createType("Ljava/lang/Object;");
     DexTypeList interfaces = DexTypeList.empty();
     DexString sourceFile = appView.dexItemFactory().createString("outline");
     ClassAccessFlags accessFlags = ClassAccessFlags.fromSharedAccessFlags(Constants.ACC_PUBLIC);
-    DexProgramClass clazz =
-        new DexProgramClass(
-            type,
-            null,
-            new SynthesizedOrigin("outlining", getClass()),
-            accessFlags,
-            superType,
-            interfaces,
-            sourceFile,
-            null,
-            Collections.emptyList(),
-            null,
-            Collections.emptyList(),
-            // TODO: Build dex annotations structure.
-            DexAnnotationSet.empty(),
-            DexEncodedField.EMPTY_ARRAY, // Static fields.
-            DexEncodedField.EMPTY_ARRAY, // Instance fields.
-            direct,
-            DexEncodedMethod.EMPTY_ARRAY, // Virtual methods.
-            appView.dexItemFactory().getSkipNameValidationForTesting());
-    return clazz;
+    assert !appView.options().encodeChecksums;
+    // The outliner is R8 only and checksum is not a supported part of R8 compilation.
+    ChecksumSupplier checksumSupplier = DexProgramClass::invalidChecksumRequest;
+    return new DexProgramClass(
+        type,
+        null,
+        new SynthesizedOrigin("outlining", getClass()),
+        accessFlags,
+        appView.dexItemFactory().objectType,
+        interfaces,
+        sourceFile,
+        null,
+        Collections.emptyList(),
+        null,
+        Collections.emptyList(),
+        // TODO: Build dex annotations structure.
+        DexAnnotationSet.empty(),
+        DexEncodedField.EMPTY_ARRAY, // Static fields.
+        DexEncodedField.EMPTY_ARRAY, // Instance fields.
+        direct,
+        DexEncodedMethod.EMPTY_ARRAY, // Virtual methods.
+        appView.dexItemFactory().getSkipNameValidationForTesting(),
+        checksumSupplier);
   }
 
   private List<Outline> selectOutlines() {
-    assert outlineSites.size() > 0;
+    assert !outlineSites.isEmpty();
     assert candidateMethodLists.isEmpty();
     List<Outline> result = new ArrayList<>();
-    for (Entry<Outline, List<DexEncodedMethod>> entry : outlineSites.entrySet()) {
+    for (Entry<Outline, List<ProgramMethod>> entry : outlineSites.entrySet()) {
       if (entry.getValue().size() >= appView.options().outline.threshold) {
         result.add(entry.getKey());
       }
@@ -1317,13 +1397,13 @@ public class Outliner {
     return result;
   }
 
-  public void applyOutliningCandidate(IRCode code, DexEncodedMethod method) {
-    assert !(method.getCode() instanceof OutlineCode);
+  public void applyOutliningCandidate(IRCode code) {
+    assert !code.method().getCode().isOutlineCode();
     ListIterator<BasicBlock> blocksIterator = code.listIterator();
     while (blocksIterator.hasNext()) {
       BasicBlock block = blocksIterator.next();
       List<Integer> toRemove = new ArrayList<>();
-      new OutlineRewriter(method, code, blocksIterator, block, toRemove).process();
+      new OutlineRewriter(code, blocksIterator, block, toRemove).process();
       block.removeInstructions(toRemove);
     }
   }
@@ -1333,10 +1413,6 @@ public class Outliner {
       assert outlineSites.get(outline).isEmpty() : outlineSites.get(outline);
     }
     return true;
-  }
-
-  static public void noProcessing(IRCode code, DexEncodedMethod method) {
-    // No operation.
   }
 
   private class OutlineSourceCode implements SourceCode {
@@ -1396,11 +1472,17 @@ public class Outliner {
 
     @Override
     public void buildPrelude(IRBuilder builder) {
+      // If the assertion fails, check DexSourceCode#buildArgumentsWithUnusedArgumentStubs.
+      assert builder.getPrototypeChanges().isEmpty();
       // Fill in the Argument instructions in the argument block.
       for (int i = 0; i < outline.argumentTypes.size(); i++) {
-        TypeLatticeElement typeLattice =
-            TypeLatticeElement.fromDexType(outline.argumentTypes.get(i), maybeNull(), appView);
-        builder.addNonThisArgument(i, typeLattice);
+        if (outline.argumentTypes.get(i).isBooleanType()) {
+          builder.addBooleanNonThisArgument(i);
+        } else {
+          TypeElement typeLattice =
+              TypeElement.fromDexType(outline.argumentTypes.get(i), maybeNull(), appView);
+          builder.addNonThisArgument(i, typeLattice);
+        }
       }
       builder.flushArgumentInstructions();
     }
@@ -1514,11 +1596,9 @@ public class Outliner {
     }
 
     @Override
-    public IRCode buildIR(
-        DexEncodedMethod encodedMethod, AppView<? extends AppInfo> appView, Origin origin) {
-      assert getOwner() == encodedMethod;
-      OutlineSourceCode source = new OutlineSourceCode(outline, encodedMethod.method);
-      return new IRBuilder(encodedMethod, appView, source, origin).build(encodedMethod);
+    public IRCode buildIR(ProgramMethod method, AppView<?> appView, Origin origin) {
+      OutlineSourceCode source = new OutlineSourceCode(outline, method.getReference());
+      return IRBuilder.create(method, appView, source, origin).build(method);
     }
 
     @Override
@@ -1527,7 +1607,12 @@ public class Outliner {
     }
 
     @Override
-    public void registerCodeReferences(UseRegistry registry) {
+    public void registerCodeReferences(ProgramMethod method, UseRegistry registry) {
+      throw new Unreachable();
+    }
+
+    @Override
+    public void registerCodeReferencesForDesugaring(ClasspathMethod method, UseRegistry registry) {
       throw new Unreachable();
     }
 

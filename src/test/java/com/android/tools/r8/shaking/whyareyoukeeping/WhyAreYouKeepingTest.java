@@ -4,8 +4,9 @@
 
 package com.android.tools.r8.shaking.whyareyoukeeping;
 
+import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.CoreMatchers.not;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 
 import com.android.tools.r8.CompilationFailedException;
 import com.android.tools.r8.NeverInline;
@@ -46,16 +47,17 @@ public class WhyAreYouKeepingTest extends TestBase {
       StringUtils.lines(
           "com.android.tools.r8.shaking.whyareyoukeeping.A",
           "|- is referenced in keep rule:",
-          "|  -keep class com.android.tools.r8.shaking.whyareyoukeeping.A { foo(); }");
+          "|  -keep class com.android.tools.r8.shaking.whyareyoukeeping.A { void foo(); }");
 
-  // TODO(b/120959039): This should be "- is invoked from:\n  com.android.....A.bar()" etc.
   public static final String expectedPathToBaz =
       StringUtils.lines(
           "void com.android.tools.r8.shaking.whyareyoukeeping.A.baz()",
-          "|- is reachable from:",
-          "|  com.android.tools.r8.shaking.whyareyoukeeping.A",
+          "|- is invoked from:",
+          "|  void com.android.tools.r8.shaking.whyareyoukeeping.A.bar()",
+          "|- is invoked from:",
+          "|  void com.android.tools.r8.shaking.whyareyoukeeping.A.foo()",
           "|- is referenced in keep rule:",
-          "|  -keep class com.android.tools.r8.shaking.whyareyoukeeping.A { foo(); }");
+          "|  -keep class com.android.tools.r8.shaking.whyareyoukeeping.A { void foo(); }");
 
   @Parameters(name = "{0}")
   public static Backend[] parameters() {
@@ -76,10 +78,9 @@ public class WhyAreYouKeepingTest extends TestBase {
         .addKeepMethodRules(Reference.methodFromMethod(A.class.getMethod("foo")))
         .addKeepRules("-whyareyoukeeping class " + A.class.getTypeName())
         // Redirect the compilers stdout to intercept the '-whyareyoukeeping' output
-        .redirectStdOut(new PrintStream(baos))
-        .compile();
-    String output = new String(baos.toByteArray(), StandardCharsets.UTF_8);
-    assertEquals(expected, output);
+        .collectStdout()
+        .compile()
+        .assertStdoutThatMatches(equalTo(expected));
   }
 
   @Test
@@ -107,10 +108,9 @@ public class WhyAreYouKeepingTest extends TestBase {
         .addKeepRules("-whyareyoukeeping class " + A.class.getTypeName() + " { baz(); }")
         .addKeepMethodRules(Reference.methodFromMethod(A.class.getMethod("foo")))
         // Redirect the compilers stdout to intercept the '-whyareyoukeeping' output
-        .redirectStdOut(new PrintStream(baos))
-        .compile();
-    String output = new String(baos.toByteArray(), StandardCharsets.UTF_8);
-    assertEquals(expected + expectedPathToBaz, output);
+        .collectStdout()
+        .compile()
+        .assertStdoutThatMatches(equalTo(expected + expectedPathToBaz));
   }
 
   @Test
@@ -132,17 +132,15 @@ public class WhyAreYouKeepingTest extends TestBase {
 
   @Test
   public void testNonExistentClassWhyAreYouKeepingViaProguardConfig() throws Exception {
-    ByteArrayOutputStream baos = new ByteArrayOutputStream();
     testForR8(backend)
         .addProgramClasses(A.class)
         .addKeepMethodRules(Reference.methodFromMethod(A.class.getMethod("foo")))
         .addKeepRules("-whyareyoukeeping class NonExistentClass")
+        .allowUnusedProguardConfigurationRules()
         // Redirect the compilers stdout to intercept the '-whyareyoukeeping' output
-        .redirectStdOut(new PrintStream(baos))
-        .compile();
-    String output = new String(baos.toByteArray(), StandardCharsets.UTF_8);
-    // Expected outcome is empty.
-    assertEquals("", output);
+        .collectStdout()
+        .compile()
+        .assertNoStdout();
   }
 
   @Test
@@ -154,10 +152,8 @@ public class WhyAreYouKeepingTest extends TestBase {
         .addKeepMethodRules(Reference.methodFromMethod(A.class.getMethod("foo")))
         .addKeepRules("-whyareyoukeeping class " + aName + " { nonExistentMethod(); }")
         // Redirect the compilers stdout to intercept the '-whyareyoukeeping' output
-        .redirectStdOut(new PrintStream(baos))
-        .compile();
-    String output = new String(baos.toByteArray(), StandardCharsets.UTF_8);
-    // Expected outcome is empty.
-    assertFalse("b/122820741", output.isEmpty());
+        .collectStdout()
+        .compile()
+        .assertStdoutThatMatches(not(equalTo("")));
   }
 }

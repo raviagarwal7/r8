@@ -5,9 +5,9 @@
 package com.android.tools.r8.naming;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.jasmin.JasminBuilder;
@@ -62,7 +62,7 @@ public class CovariantReturnTypeTest extends TestBase {
             .addProgramFiles(inputJar)
             .addKeepMainRule("package.TestClass")
             .addKeepRules("-keepconstantarguments class * { *; }")
-            .enableConstantArgumentAnnotations()
+            .enableProguardTestOptions()
             .noTreeShaking()
             .compile()
             .inspector();
@@ -83,10 +83,10 @@ public class CovariantReturnTypeTest extends TestBase {
     Set<String> minifiedMethodNames = new HashSet<>();
     for (Set<MethodSubject> methodSubjects : methodSubjectsByName.values()) {
       for (MethodSubject methodSubject : methodSubjects) {
-        assertThat(methodSubject, isRenamed());
+        assertThat(methodSubject, isPresentAndRenamed());
         minifiedMethodNames.add(methodSubject.getFinalName());
       }
     }
-    assertEquals(3, minifiedMethodNames.size());
+    assertEquals(9, minifiedMethodNames.size());
   }
 }

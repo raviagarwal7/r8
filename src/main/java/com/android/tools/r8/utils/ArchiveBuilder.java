@@ -86,23 +86,19 @@ public class ArchiveBuilder implements OutputBuilder {
   }
 
   /** Get or open the zip output stream. */
-  private synchronized ZipOutputStream getStream(DiagnosticsHandler handler) {
+  private synchronized ZipOutputStream getStream() throws IOException {
     assert !closed;
-    try {
-      getStreamRaw();
-    } catch (IOException e) {
-      handler.error(new ExceptionDiagnostic(e, origin));
-    }
-    return stream;
+    return getStreamRaw();
   }
 
   private void handleIOException(IOException e, DiagnosticsHandler handler) {
+    ExceptionDiagnostic diagnostic = new ExceptionDiagnostic(e, origin);
     if (e instanceof ZipException && e.getMessage().startsWith("duplicate entry")) {
       // For now we stick to the Proguard behaviour, see section "Warning: can't write resource ...
       // Duplicate zip entry" on https://www.guardsquare.com/en/proguard/manual/troubleshooting.
-      handler.warning(new ExceptionDiagnostic(e, origin));
+      handler.warning(diagnostic);
     } else {
-      handler.error(new ExceptionDiagnostic(e, origin));
+      handler.error(diagnostic);
     }
   }
 
@@ -117,9 +113,9 @@ public class ArchiveBuilder implements OutputBuilder {
     }
     ZipEntry entry = new ZipEntry(name);
     entry.setTime(0);
-    ZipOutputStream zip = getStream(handler);
     synchronized (this) {
       try {
+        ZipOutputStream zip = getStream();
         zip.putNextEntry(entry);
         zip.closeEntry();
       } catch (IOException e) {
@@ -150,7 +146,7 @@ public class ArchiveBuilder implements OutputBuilder {
 
   private void writeFileNow(String name, ByteDataView content, DiagnosticsHandler handler) {
     try {
-      ZipUtils.writeToZipStream(getStream(handler), name, content, ZipEntry.DEFLATED);
+      ZipUtils.writeToZipStream(getStream(), name, content, ZipEntry.DEFLATED);
     } catch (IOException e) {
       handleIOException(e, handler);
     }

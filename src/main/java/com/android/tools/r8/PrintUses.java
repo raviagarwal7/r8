@@ -3,9 +3,10 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+
 import com.android.tools.r8.dex.ApplicationReader;
-import com.android.tools.r8.graph.AppInfo.ResolutionResult;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexCallSite;
@@ -19,11 +20,14 @@ import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexValue;
 import com.android.tools.r8.graph.DexValue.DexValueArray;
-import com.android.tools.r8.graph.DexValue.DexValueType;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult;
 import com.android.tools.r8.graph.UseRegistry;
 import com.android.tools.r8.ir.desugar.LambdaDescriptor;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.Timing;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
@@ -31,6 +35,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -51,36 +56,53 @@ import java.util.Set;
 public class PrintUses {
 
   private static final String USAGE =
-      "Arguments: [--keeprules] <rt.jar> <r8.jar> <sample.jar>\n"
+      "Arguments: [--keeprules, --keeprules-allowobfuscation] <rt.jar> <r8.jar> <sample.jar>\n"
           + "\n"
           + "PrintUses prints the classes, interfaces, methods and fields used by <sample.jar>,\n"
           + "restricted to classes and interfaces in <r8.jar> that are not in <sample.jar>.\n"
           + "<rt.jar> and <r8.jar> should point to libraries used by <sample.jar>.\n"
           + "\n"
           + "The output is in the same format as what is printed when specifying -printseeds in\n"
-          + "a ProGuard configuration file. Use --keeprules for outputting proguard keep rules. "
-          + "See also the "
+          + "a ProGuard configuration file. Use --keeprules or --keeprules-allowobfuscation for "
+          + "outputting proguard keep rules. See also the "
           + PrintSeeds.class.getSimpleName()
           + " program in R8.";
 
   private final Set<String> descriptors;
   private final Printer printer;
+  private final boolean allowObfuscation;
   private Set<DexType> types = Sets.newIdentityHashSet();
   private Map<DexType, Set<DexMethod>> methods = Maps.newIdentityHashMap();
   private Map<DexType, Set<DexField>> fields = Maps.newIdentityHashMap();
-  private final DexApplication application;
-  private final AppInfoWithSubtyping appInfo;
+  private Set<DexType> noObfuscationTypes = Sets.newIdentityHashSet();
+  private Set<String> keepPackageNames = Sets.newHashSet();
+  private final DirectMappedDexApplication application;
+  private final AppInfoWithClassHierarchy appInfo;
   private int errors;
 
   class UseCollector extends UseRegistry {
+
+    private DexProgramClass context;
 
     UseCollector(DexItemFactory factory) {
       super(factory);
     }
 
+    public void setContext(DexProgramClass context) {
+      this.context = context;
+    }
+
+    @Override
+    public boolean registerInitClass(DexType clazz) {
+      addType(clazz);
+      return false;
+    }
+
     @Override
     public boolean registerInvokeVirtual(DexMethod method) {
-      DexEncodedMethod target = appInfo.lookupVirtualTarget(method.holder, method);
+      ResolutionResult resolutionResult = appInfo.unsafeResolveMethodDueToDexFormat(method);
+      DexEncodedMethod target =
+          resolutionResult.isVirtualTarget() ? resolutionResult.getSingleTarget() : null;
       if (target != null && target.method != method) {
         addType(method.holder);
         addMethod(target.method);
@@ -98,7 +120,7 @@ public class PrintUses {
 
     @Override
     public boolean registerInvokeStatic(DexMethod method) {
-      DexEncodedMethod target = appInfo.lookupStaticTarget(method);
+      DexEncodedMethod target = appInfo.unsafeResolveMethodDueToDexFormat(method).getSingleTarget();
       if (target != null && target.method != method) {
         addType(method.holder);
         addMethod(target.method);
@@ -115,7 +137,7 @@ public class PrintUses {
 
     @Override
     public boolean registerInvokeSuper(DexMethod method) {
-      DexEncodedMethod superTarget = appInfo.lookupSuperTarget(method, method.holder);
+      DexEncodedMethod superTarget = appInfo.lookupSuperTarget(method, context);
       if (superTarget != null) {
         addMethod(superTarget.method);
       } else {
@@ -126,13 +148,13 @@ public class PrintUses {
 
     @Override
     public boolean registerInstanceFieldWrite(DexField field) {
-      addField(field, false);
+      addField(field);
       return false;
     }
 
     @Override
     public boolean registerInstanceFieldRead(DexField field) {
-      addField(field, false);
+      addField(field);
       return false;
     }
 
@@ -144,13 +166,13 @@ public class PrintUses {
 
     @Override
     public boolean registerStaticFieldRead(DexField field) {
-      addField(field, true);
+      addField(field);
       return false;
     }
 
     @Override
     public boolean registerStaticFieldWrite(DexField field) {
-      addField(field, true);
+      addField(field);
       return false;
     }
 
@@ -162,6 +184,13 @@ public class PrintUses {
 
     private void addType(DexType type) {
       if (isTargetType(type) && types.add(type)) {
+        DexClass clazz = appInfo.definitionFor(type);
+        if (clazz == null || !allowObfuscation) {
+          noObfuscationTypes.add(type);
+        }
+        if (clazz != null && clazz.accessFlags.isVisibilityDependingOnPackage()) {
+          keepPackageNames.add(clazz.type.getPackageName());
+        }
         methods.put(type, Sets.newIdentityHashSet());
         fields.put(type, Sets.newIdentityHashSet());
       }
@@ -171,18 +200,22 @@ public class PrintUses {
       return descriptors.contains(type.toDescriptorString());
     }
 
-    private void addField(DexField field, boolean isStatic) {
+    private void addField(DexField field) {
       addType(field.type);
-      DexEncodedField baseField =
-          isStatic
-              ? appInfo.lookupStaticTarget(field.holder, field)
-              : appInfo.lookupInstanceTarget(field.holder, field);
-      if (baseField != null && baseField.field.holder != field.holder) {
+      DexEncodedField baseField = appInfo.resolveField(field).getResolvedField();
+      if (baseField != null && baseField.holder() != field.holder) {
         field = baseField.field;
       }
       addType(field.holder);
       Set<DexField> typeFields = fields.get(field.holder);
       if (typeFields != null) {
+        assert baseField != null;
+        if (!allowObfuscation) {
+          noObfuscationTypes.add(field.holder);
+        }
+        if (baseField.accessFlags.isVisibilityDependingOnPackage()) {
+          keepPackageNames.add(baseField.holder().getPackageName());
+        }
         typeFields.add(field);
       }
     }
@@ -195,6 +228,15 @@ public class PrintUses {
       addType(method.proto.returnType);
       Set<DexMethod> typeMethods = methods.get(method.holder);
       if (typeMethods != null) {
+        DexClass holder = appInfo.definitionForHolder(method);
+        DexEncodedMethod definition = method.lookupOnClass(holder);
+        assert definition != null : "Could not find method " + method.toString();
+        if (!allowObfuscation) {
+          noObfuscationTypes.add(method.holder);
+        }
+        if (definition.accessFlags.isVisibilityDependingOnPackage()) {
+          keepPackageNames.add(definition.holder().getPackageName());
+        }
         typeMethods.add(method);
       }
     }
@@ -203,23 +245,26 @@ public class PrintUses {
       registerTypeReference(field.field.type);
     }
 
-    private void registerMethod(DexEncodedMethod method) {
-      DexEncodedMethod superTarget = appInfo.lookupSuperTarget(method.method, method.method.holder);
+    private void registerMethod(ProgramMethod method) {
+      DexEncodedMethod superTarget =
+          appInfo
+              .resolveMethodOn(method.getHolder(), method.getReference())
+              .lookupInvokeSpecialTarget(context, appInfo);
       if (superTarget != null) {
         addMethod(superTarget.method);
       }
-      for (DexType type : method.method.proto.parameters.values) {
+      for (DexType type : method.getDefinition().parameters().values) {
         registerTypeReference(type);
       }
-      for (DexAnnotation annotation : method.annotations.annotations) {
+      for (DexAnnotation annotation : method.getDefinition().annotations().annotations) {
         if (annotation.annotation.type == appInfo.dexItemFactory().annotationThrows) {
-          DexValueArray dexValues = (DexValueArray) annotation.annotation.elements[0].value;
+          DexValueArray dexValues = annotation.annotation.elements[0].value.asDexValueArray();
           for (DexValue dexValType : dexValues.getValues()) {
-            registerTypeReference(((DexValueType) dexValType).value);
+            registerTypeReference(dexValType.asDexValueType().value);
           }
         }
       }
-      registerTypeReference(method.method.proto.returnType);
+      registerTypeReference(method.getDefinition().returnType());
       method.registerCodeReferences(this);
     }
 
@@ -228,8 +273,10 @@ public class PrintUses {
       // If clazz overrides any methods in superType, we should keep those as well.
       clazz.forEachMethod(
           method -> {
-            ResolutionResult resolutionResult = appInfo.resolveMethod(superType, method.method);
-            for (DexEncodedMethod dexEncodedMethod : resolutionResult.asListOfTargets()) {
+            ResolutionResult resolutionResult =
+                appInfo.resolveMethodOn(superType, method.method, superType != clazz.superType);
+            DexEncodedMethod dexEncodedMethod = resolutionResult.getSingleTarget();
+            if (dexEncodedMethod != null) {
               addMethod(dexEncodedMethod.method);
             }
           });
@@ -244,13 +291,11 @@ public class PrintUses {
       List<DexType> directInterfaces = LambdaDescriptor.getInterfaces(callSite, appInfo);
       if (directInterfaces != null) {
         for (DexType directInterface : directInterfaces) {
-          DexClass clazz = appInfo.definitionFor(directInterface);
+          DexProgramClass clazz = asProgramClassOrNull(appInfo.definitionFor(directInterface));
           if (clazz != null) {
-            for (DexEncodedMethod encodedMethod : clazz.virtualMethods()) {
-              if (encodedMethod.method.name.equals(callSite.methodName)) {
-                registerMethod(encodedMethod);
-              }
-            }
+            clazz.forEachProgramVirtualMethodMatching(
+                definition -> definition.getReference().name.equals(callSite.methodName),
+                this::registerMethod);
           }
         }
       }
@@ -264,21 +309,31 @@ public class PrintUses {
     }
     int argumentIndex = 0;
     boolean printKeep = false;
-    if (args[0].equals("--keeprules")) {
+    boolean allowObfuscation = false;
+    if (args[0].equals("--keeprules") || args[0].equals("--keeprules-allowobfuscation")) {
       printKeep = true;
       argumentIndex++;
+      allowObfuscation = args[0].equals("--keeprules-allowobfuscation");
+      // Make sure there is only one argument that mentions --keeprules
+      for (int i = 1; i < args.length; i++) {
+        if (args[i].startsWith("-keeprules")) {
+          System.out.println("Use either --keeprules or --keeprules-allowobfuscation, not both.");
+          System.out.println(USAGE.replace("\n", System.lineSeparator()));
+          return;
+        }
+      }
     }
     AndroidApp.Builder builder = AndroidApp.builder();
     Path rtJar = Paths.get(args[argumentIndex++]);
     builder.addLibraryFile(rtJar);
     Path r8Jar = Paths.get(args[argumentIndex++]);
     builder.addLibraryFile(r8Jar);
-    Path sampleJar = Paths.get(args[argumentIndex++]);
+    Path sampleJar = Paths.get(args[argumentIndex]);
     builder.addProgramFile(sampleJar);
     Set<String> descriptors = new HashSet<>(getDescriptors(r8Jar));
     descriptors.removeAll(getDescriptors(sampleJar));
     Printer printer = printKeep ? new KeepPrinter() : new DefaultPrinter();
-    PrintUses printUses = new PrintUses(descriptors, builder.build(), printer);
+    PrintUses printUses = new PrintUses(descriptors, builder.build(), printer, allowObfuscation);
     printUses.analyze();
     printUses.print();
     if (printUses.errors > 0) {
@@ -291,30 +346,34 @@ public class PrintUses {
     return new ArchiveClassFileProvider(path).getClassDescriptors();
   }
 
-  private PrintUses(Set<String> descriptors, AndroidApp inputApp, Printer printer)
+  private PrintUses(
+      Set<String> descriptors, AndroidApp inputApp, Printer printer, boolean allowObfuscation)
       throws Exception {
     this.descriptors = descriptors;
     this.printer = printer;
+    this.allowObfuscation = allowObfuscation;
     InternalOptions options = new InternalOptions();
     application =
         new ApplicationReader(inputApp, options, new Timing("PrintUses")).read().toDirect();
-    appInfo = new AppInfoWithSubtyping(application);
+    appInfo = new AppInfoWithClassHierarchy(application);
   }
 
   private void analyze() {
     UseCollector useCollector = new UseCollector(appInfo.dexItemFactory());
-    for (DexProgramClass dexProgramClass : application.classes()) {
-      useCollector.registerSuperType(dexProgramClass, dexProgramClass.superType);
-      for (DexType implementsType : dexProgramClass.interfaces.values) {
-        useCollector.registerSuperType(dexProgramClass, implementsType);
+    for (DexProgramClass clazz : application.classes()) {
+      useCollector.setContext(clazz);
+      useCollector.registerSuperType(clazz, clazz.superType);
+      for (DexType implementsType : clazz.interfaces.values) {
+        useCollector.registerSuperType(clazz, implementsType);
       }
-      dexProgramClass.forEachMethod(useCollector::registerMethod);
-      dexProgramClass.forEachField(useCollector::registerField);
+      clazz.forEachProgramMethod(useCollector::registerMethod);
+      clazz.forEachField(useCollector::registerField);
     }
   }
 
   private void print() {
-    errors = printer.print(application, types, methods, fields);
+    errors =
+        printer.print(application, types, noObfuscationTypes, keepPackageNames, methods, fields);
   }
 
   private abstract static class Printer {
@@ -348,6 +407,8 @@ public class PrintUses {
 
     abstract void printMethod(DexEncodedMethod encodedMethod, String typeName);
 
+    abstract void printPackageNames(List<String> packageNames);
+
     void printNameAndReturn(DexEncodedMethod encodedMethod) {
       if (encodedMethod.accessFlags.isConstructor()) {
         printConstructorName(encodedMethod);
@@ -359,13 +420,15 @@ public class PrintUses {
       }
     }
 
-    abstract void printTypeHeader(DexClass dexClass);
+    abstract void printTypeHeader(DexClass dexClass, boolean allowObfuscation);
 
     abstract void printTypeFooter();
 
     int print(
         DexApplication application,
         Set<DexType> types,
+        Set<DexType> noObfuscationTypes,
+        Set<String> keepPackageNames,
         Map<DexType, Set<DexMethod>> methods,
         Map<DexType, Set<DexField>> fields) {
       int errors = 0;
@@ -378,7 +441,7 @@ public class PrintUses {
           errors++;
           continue;
         }
-        printTypeHeader(dexClass);
+        printTypeHeader(dexClass, !noObfuscationTypes.contains(type));
         List<DexEncodedMethod> methodDefinitions = new ArrayList<>(methods.size());
         for (DexMethod method : methods.get(type)) {
           DexEncodedMethod encodedMethod = dexClass.lookupMethod(method);
@@ -400,6 +463,9 @@ public class PrintUses {
         }
         printTypeFooter();
       }
+      ArrayList<String> packageNamesToKeep = new ArrayList<>(keepPackageNames);
+      Collections.sort(packageNamesToKeep);
+      printPackageNames(packageNamesToKeep);
       return errors;
     }
   }
@@ -411,7 +477,7 @@ public class PrintUses {
       if (encodedMethod.accessFlags.isStatic()) {
         append("<clinit>");
       } else {
-        String holderName = encodedMethod.method.holder.toSourceString();
+        String holderName = encodedMethod.holder().toSourceString();
         String constructorName = holderName.substring(holderName.lastIndexOf('.') + 1);
         append(constructorName);
       }
@@ -426,7 +492,12 @@ public class PrintUses {
     }
 
     @Override
-    void printTypeHeader(DexClass dexClass) {
+    void printPackageNames(List<String> packageNames) {
+      // No need to print package names for text output.
+    }
+
+    @Override
+    void printTypeHeader(DexClass dexClass, boolean allowObfuscation) {
       appendLine(dexClass.type.toSourceString());
     }
 
@@ -447,13 +518,14 @@ public class PrintUses {
   private static class KeepPrinter extends Printer {
 
     @Override
-    public void printTypeHeader(DexClass dexClass) {
+    public void printTypeHeader(DexClass dexClass, boolean allowObfuscation) {
+      append(allowObfuscation ? "-keep,allowobfuscation" : "-keep");
       if (dexClass.isInterface()) {
-        append("-keep interface " + dexClass.type.toSourceString() + " {\n");
+        append(" interface " + dexClass.type.toSourceString() + " {\n");
       } else if (dexClass.accessFlags.isEnum()) {
-        append("-keep enum " + dexClass.type.toSourceString() + " {\n");
+        append(" enum " + dexClass.type.toSourceString() + " {\n");
       } else {
-        append("-keep class " + dexClass.type.toSourceString() + " {\n");
+        append(" class " + dexClass.type.toSourceString() + " {\n");
       }
     }
 
@@ -485,6 +557,11 @@ public class PrintUses {
       printNameAndReturn(encodedMethod);
       printArguments(encodedMethod.method);
       appendLine(";");
+    }
+
+    @Override
+    void printPackageNames(List<String> packageNames) {
+      append("-keeppackagenames " + StringUtils.join(packageNames, ",") + "\n");
     }
 
     @Override

@@ -4,10 +4,12 @@
 package com.android.tools.apiusagesample;
 
 import com.android.tools.r8.ArchiveProgramResourceProvider;
+import com.android.tools.r8.AssertionsConfiguration;
 import com.android.tools.r8.CompilationFailedException;
 import com.android.tools.r8.CompilationMode;
 import com.android.tools.r8.D8;
 import com.android.tools.r8.D8Command;
+import com.android.tools.r8.DesugarGraphConsumer;
 import com.android.tools.r8.DexFilePerClassFileConsumer;
 import com.android.tools.r8.DexIndexedConsumer;
 import com.android.tools.r8.DiagnosticsHandler;
@@ -104,6 +106,7 @@ public class D8ApiUsageSample {
     useLibraryAndClasspathProvider(minApiLevel, libraries, classpath, inputs);
     useMainDexListFiles(minApiLevel, libraries, classpath, inputs, mainDexList);
     useMainDexClasses(minApiLevel, libraries, classpath, inputs, mainDexList);
+    useAssertionConfig(minApiLevel, libraries, classpath, inputs);
     useVArgVariants(minApiLevel, libraries, classpath, inputs, mainDexList);
     incrementalCompileAndMerge(minApiLevel, libraries, classpath, inputs);
   }
@@ -280,6 +283,54 @@ public class D8ApiUsageSample {
     }
   }
 
+  private static void useAssertionConfig(
+      int minApiLevel,
+      Collection<Path> libraries,
+      Collection<Path> classpath,
+      Collection<Path> inputs) {
+    try {
+      D8.run(
+          D8Command.builder(handler)
+              .setMinApiLevel(minApiLevel)
+              .setProgramConsumer(new EnsureOutputConsumer())
+              .addLibraryFiles(libraries)
+              .addClasspathFiles(classpath)
+              .addProgramFiles(inputs)
+              .addAssertionsConfiguration(b -> b.setScopeAll().setEnable().build())
+              .addAssertionsConfiguration(b -> b.setScopeAll().setDisable().build())
+              .addAssertionsConfiguration(
+                  b -> b.setScopePackage("com.android.tools.apiusagesample").setEnable().build())
+              .addAssertionsConfiguration(
+                  b ->
+                      b.setScopePackage("com.android.tools.apiusagesample")
+                          .setPassthrough()
+                          .build())
+              .addAssertionsConfiguration(
+                  b -> b.setScopePackage("com.android.tools.apiusagesample").setDisable().build())
+              .addAssertionsConfiguration(
+                  b ->
+                      b.setScopeClass("com.android.tools.apiusagesample.D8ApiUsageSample")
+                          .setEnable()
+                          .build())
+              .addAssertionsConfiguration(
+                  b ->
+                      b.setScopeClass("com.android.tools.apiusagesample.D8ApiUsageSample")
+                          .setPassthrough()
+                          .build())
+              .addAssertionsConfiguration(
+                  b ->
+                      b.setScopeClass("com.android.tools.apiusagesample.D8ApiUsageSample")
+                          .setDisable()
+                          .build())
+              .addAssertionsConfiguration(AssertionsConfiguration.Builder::enableAllAssertions)
+              .addAssertionsConfiguration(AssertionsConfiguration.Builder::passthroughAllAssertions)
+              .addAssertionsConfiguration(AssertionsConfiguration.Builder::disableAllAssertions)
+              .build());
+    } catch (CompilationFailedException e) {
+      throw new RuntimeException("Unexpected compilation exceptions", e);
+    }
+  }
+
   // Check API support for all the varg variants.
   private static void useVArgVariants(
       int minApiLevel,
@@ -335,6 +386,7 @@ public class D8ApiUsageSample {
               .addLibraryFiles(libraries)
               .addProgramFiles(inputs)
               .setDisableDesugaring(false)
+              .setDesugarGraphConsumer(new MyDesugarGraphConsumer())
               .build());
     } catch (CompilationFailedException e) {
       throw new RuntimeException("Unexpected compilation exceptions", e);
@@ -496,6 +548,17 @@ public class D8ApiUsageSample {
       if (!hasOutput) {
         handler.error(new StringDiagnostic("Expected to produce output but had none"));
       }
+    }
+  }
+
+  private static class MyDesugarGraphConsumer implements DesugarGraphConsumer {
+
+    @Override
+    public void accept(Origin dependent, Origin dependency) {
+    }
+
+    public void finished() {
+
     }
   }
 }

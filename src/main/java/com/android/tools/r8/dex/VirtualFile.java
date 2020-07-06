@@ -3,6 +3,7 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.dex;
 
+import com.android.tools.r8.FeatureSplit;
 import com.android.tools.r8.errors.DexFileOverflowDiagnostic;
 import com.android.tools.r8.errors.InternalCompilerError;
 import com.android.tools.r8.graph.DexApplication;
@@ -17,6 +18,7 @@ import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.ObjectToOffsetMapping;
 import com.android.tools.r8.logging.Log;
 import com.android.tools.r8.naming.ClassNameMapper;
@@ -26,6 +28,7 @@ import com.android.tools.r8.utils.FileUtils;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.Reporter;
 import com.android.tools.r8.utils.StringDiagnostic;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Sets;
 import java.io.IOException;
@@ -69,18 +72,35 @@ public class VirtualFile {
   private final int id;
   private final VirtualFileIndexedItemCollection indexedItems;
   private final IndexedItemTransaction transaction;
+  private final FeatureSplit featureSplit;
 
   private final DexProgramClass primaryClass;
 
-  VirtualFile(int id, NamingLens namingLens) {
-    this(id, namingLens, null);
+  VirtualFile(int id, InitClassLens initClassLens, NamingLens namingLens) {
+    this(id, initClassLens, namingLens, null, null);
   }
 
-  private VirtualFile(int id, NamingLens namingLens, DexProgramClass primaryClass) {
+  VirtualFile(
+      int id, InitClassLens initClassLens, NamingLens namingLens, FeatureSplit featureSplit) {
+    this(id, initClassLens, namingLens, null, featureSplit);
+  }
+
+  private VirtualFile(
+      int id, InitClassLens initClassLens, NamingLens namingLens, DexProgramClass primaryClass) {
+    this(id, initClassLens, namingLens, primaryClass, null);
+  }
+
+  private VirtualFile(
+      int id,
+      InitClassLens initClassLens,
+      NamingLens namingLens,
+      DexProgramClass primaryClass,
+      FeatureSplit featureSplit) {
     this.id = id;
-    this.indexedItems = new VirtualFileIndexedItemCollection(namingLens);
-    this.transaction = new IndexedItemTransaction(indexedItems, namingLens);
+    this.indexedItems = new VirtualFileIndexedItemCollection(initClassLens, namingLens);
+    this.transaction = new IndexedItemTransaction(indexedItems, initClassLens, namingLens);
     this.primaryClass = primaryClass;
+    this.featureSplit = featureSplit;
   }
 
   public int getId() {
@@ -94,6 +114,10 @@ public class VirtualFile {
       assert added;
     }
     return classDescriptors;
+  }
+
+  public FeatureSplit getFeatureSplit() {
+    return featureSplit;
   }
 
   public String getPrimaryClassDescriptor() {
@@ -125,13 +149,19 @@ public class VirtualFile {
     return prefix;
   }
 
+  public void injectString(DexString string) {
+    transaction.addString(string);
+    commitTransaction();
+  }
+
   private static Map<DexProgramClass, String> computeOriginalNameMapping(
-      Collection<DexProgramClass> classes,
-      ClassNameMapper proguardMap) {
-    Map<DexProgramClass, String> originalNames = new HashMap<>();
-    classes.forEach((DexProgramClass c) ->
-        originalNames.put(c,
-            DescriptorUtils.descriptorToJavaType(c.type.toDescriptorString(), proguardMap)));
+      Collection<DexProgramClass> classes, ClassNameMapper proguardMap) {
+    Map<DexProgramClass, String> originalNames = new HashMap<>(classes.size());
+    classes.forEach(
+        (DexProgramClass c) -> {
+          originalNames.put(
+              c, DescriptorUtils.descriptorToJavaType(c.type.toDescriptorString(), proguardMap));
+        });
     return originalNames;
   }
 
@@ -151,10 +181,13 @@ public class VirtualFile {
     return prefix;
   }
 
-  public ObjectToOffsetMapping computeMapping(DexApplication application) {
+  public ObjectToOffsetMapping computeMapping(
+      DexApplication application, NamingLens namingLens, InitClassLens initClassLens) {
     assert transaction.isEmpty();
     return new ObjectToOffsetMapping(
         application,
+        namingLens,
+        initClassLens,
         indexedItems.classes,
         indexedItems.protos,
         indexedItems.types,
@@ -207,6 +240,14 @@ public class VirtualFile {
     transaction.commit();
   }
 
+  public boolean containsString(DexString string) {
+    return indexedItems.strings.contains(string);
+  }
+
+  public boolean containsType(DexType type) {
+    return indexedItems.types.contains(type);
+  }
+
   public boolean isEmpty() {
     return indexedItems.classes.isEmpty();
   }
@@ -225,7 +266,7 @@ public class VirtualFile {
       this.writer = writer;
     }
 
-    public abstract Collection<VirtualFile> run() throws ExecutionException, IOException;
+    public abstract List<VirtualFile> run() throws ExecutionException, IOException;
   }
 
   /**
@@ -244,13 +285,14 @@ public class VirtualFile {
     }
 
     @Override
-    public Collection<VirtualFile> run() {
+    public List<VirtualFile> run() {
       HashMap<DexProgramClass, VirtualFile> files = new HashMap<>();
       Collection<DexProgramClass> synthetics = new ArrayList<>();
       // Assign dedicated virtual files for all program classes.
       for (DexProgramClass clazz : application.classes()) {
         if (!combineSyntheticClassesWithPrimaryClass || clazz.getSynthesizedFrom().isEmpty()) {
-          VirtualFile file = new VirtualFile(virtualFiles.size(), writer.namingLens, clazz);
+          VirtualFile file =
+              new VirtualFile(virtualFiles.size(), writer.initClassLens, writer.namingLens, clazz);
           virtualFiles.add(file);
           file.addClass(clazz);
           files.put(clazz, file);
@@ -283,18 +325,22 @@ public class VirtualFile {
       this.options = options;
 
       // Create the primary dex file. The distribution will add more if needed.
-      mainDexFile = new VirtualFile(0, writer.namingLens);
+      mainDexFile = new VirtualFile(0, writer.initClassLens, writer.namingLens);
       assert virtualFiles.isEmpty();
       virtualFiles.add(mainDexFile);
-      if (writer.markerStrings != null && !writer.markerStrings.isEmpty()) {
-        for (DexString markerString : writer.markerStrings) {
-          mainDexFile.transaction.addString(markerString);
-        }
-        mainDexFile.commitTransaction();
-      }
+      addMarkers(mainDexFile);
 
       classes = Sets.newHashSet(application.classes());
       originalNames = computeOriginalNameMapping(classes, application.getProguardMap());
+    }
+
+    private void addMarkers(VirtualFile virtualFile) {
+      if (writer.markerStrings != null && !writer.markerStrings.isEmpty()) {
+        for (DexString markerString : writer.markerStrings) {
+          virtualFile.transaction.addString(markerString);
+        }
+        virtualFile.commitTransaction();
+      }
     }
 
     protected void fillForMainDexList(Set<DexProgramClass> classes) {
@@ -362,6 +408,60 @@ public class VirtualFile {
       sortedClasses.addAll(classes);
       return sortedClasses;
     }
+
+    protected Map<FeatureSplit, Set<DexProgramClass>> removeFeatureSplitClassesGetMapping() {
+      if (options.featureSplitConfiguration == null) {
+        return ImmutableMap.of();
+      }
+
+      // Pull out the classes that should go into feature splits.
+      Map<FeatureSplit, Set<DexProgramClass>> featureSplitClasses =
+          options.featureSplitConfiguration.getFeatureSplitClasses(
+              classes, application.getProguardMap());
+      if (featureSplitClasses.size() > 0) {
+        for (Set<DexProgramClass> featureClasses : featureSplitClasses.values()) {
+          classes.removeAll(featureClasses);
+        }
+      }
+      return featureSplitClasses;
+    }
+
+    protected void addFeatureSplitFiles(Map<FeatureSplit, Set<DexProgramClass>> featureSplitClasses)
+        throws IOException {
+      addFeatureSplitFiles(featureSplitClasses, FillStrategy.FILL_MAX);
+    }
+
+    protected void addFeatureSplitFiles(
+        Map<FeatureSplit, Set<DexProgramClass>> featureSplitClasses, FillStrategy fillStrategy)
+        throws IOException {
+      if (featureSplitClasses.isEmpty()) {
+        return;
+      }
+      List<VirtualFile> filesForDistribution;
+      for (Map.Entry<FeatureSplit, Set<DexProgramClass>> featureSplitSetEntry :
+          featureSplitClasses.entrySet()) {
+        // Add a new virtual file, start from index 0 again
+        VirtualFile featureFile =
+            new VirtualFile(
+                0, writer.initClassLens, writer.namingLens, featureSplitSetEntry.getKey());
+        virtualFiles.add(featureFile);
+        addMarkers(featureFile);
+        Set<DexProgramClass> featureClasses =
+            sortClassesByPackage(featureSplitSetEntry.getValue(), originalNames);
+        filesForDistribution = virtualFiles.subList(virtualFiles.size() - 1, virtualFiles.size());
+
+        new PackageSplitPopulator(
+                filesForDistribution,
+                featureClasses,
+                originalNames,
+                application.dexItemFactory,
+                fillStrategy,
+                0,
+                writer.initClassLens,
+                writer.namingLens)
+            .call();
+      }
+    }
   }
 
   public static class FillFilesDistributor extends DistributorBase {
@@ -376,7 +476,7 @@ public class VirtualFile {
     }
 
     @Override
-    public Collection<VirtualFile> run() throws IOException {
+    public List<VirtualFile> run() throws IOException {
       int totalClassNumber = classes.size();
       // First fill required classes into the main dex file.
       fillForMainDexList(classes);
@@ -392,24 +492,42 @@ public class VirtualFile {
         assert !virtualFiles.get(0).isEmpty();
         assert virtualFiles.size() == 1;
         // The main dex file is filtered out, so ensure at least one file for the remaining classes.
-        virtualFiles.add(new VirtualFile(1, writer.namingLens));
+        virtualFiles.add(new VirtualFile(1, writer.initClassLens, writer.namingLens));
         filesForDistribution = virtualFiles.subList(1, virtualFiles.size());
         fileIndexOffset = 1;
       }
 
+      Map<FeatureSplit, Set<DexProgramClass>> featureSplitClasses =
+          removeFeatureSplitClassesGetMapping();
+
       if (multidexLegacy && options.enableInheritanceClassInDexDistributor) {
-        new InheritanceClassInDexDistributor(mainDexFile, filesForDistribution, classes,
-            originalNames, fileIndexOffset, writer.namingLens, writer.application, executorService)
+        new InheritanceClassInDexDistributor(
+                mainDexFile,
+                filesForDistribution,
+                classes,
+                fileIndexOffset,
+                writer.initClassLens,
+                writer.namingLens,
+                writer.application,
+                executorService)
             .distribute();
       } else {
         // Sort the remaining classes based on the original names.
         // This with make classes from the same package be adjacent.
         classes = sortClassesByPackage(classes, originalNames);
         new PackageSplitPopulator(
-            filesForDistribution, classes, originalNames, application.dexItemFactory,
-            fillStrategy, fileIndexOffset, writer.namingLens)
+                filesForDistribution,
+                classes,
+                originalNames,
+                application.dexItemFactory,
+                fillStrategy,
+                fileIndexOffset,
+                writer.initClassLens,
+                writer.namingLens)
             .call();
       }
+      addFeatureSplitFiles(featureSplitClasses, fillStrategy);
+
       assert totalClassNumber == virtualFiles.stream().mapToInt(dex -> dex.classes().size()).sum();
       return virtualFiles;
     }
@@ -421,19 +539,28 @@ public class VirtualFile {
     }
 
     @Override
-    public Collection<VirtualFile> run() throws ExecutionException, IOException {
+    public List<VirtualFile> run() throws ExecutionException, IOException {
+      Map<FeatureSplit, Set<DexProgramClass>> featureSplitClasses =
+          removeFeatureSplitClassesGetMapping();
       // Add all classes to the main dex file.
       for (DexProgramClass programClass : classes) {
         mainDexFile.addClass(programClass);
       }
       mainDexFile.commitTransaction();
       mainDexFile.throwIfFull(false, options.reporter);
+      if (options.featureSplitConfiguration != null) {
+        if (!featureSplitClasses.isEmpty()) {
+          // TODO(141334414): Figure out if we allow multidex in features even when mono-dexing
+          addFeatureSplitFiles(featureSplitClasses);
+        }
+      }
       return virtualFiles;
     }
   }
 
   private static class VirtualFileIndexedItemCollection implements IndexedItemCollection {
 
+    private final InitClassLens initClassLens;
     private final NamingLens namingLens;
 
     private final Set<DexProgramClass> classes = Sets.newIdentityHashSet();
@@ -445,10 +572,9 @@ public class VirtualFile {
     private final Set<DexCallSite> callSites = Sets.newIdentityHashSet();
     private final Set<DexMethodHandle> methodHandles = Sets.newIdentityHashSet();
 
-    public VirtualFileIndexedItemCollection(
-        NamingLens namingLens) {
+    public VirtualFileIndexedItemCollection(InitClassLens initClassLens, NamingLens namingLens) {
+      this.initClassLens = initClassLens;
       this.namingLens = namingLens;
-
     }
 
     @Override
@@ -504,13 +630,18 @@ public class VirtualFile {
     }
 
     @Override
+    public InitClassLens getInitClassLens() {
+      return initClassLens;
+    }
+
+    @Override
     public DexString getRenamedDescriptor(DexType type) {
       return namingLens.lookupDescriptor(type);
     }
 
     @Override
     public DexString getRenamedName(DexMethod method) {
-      assert namingLens.checkTargetCanBeTranslated(method);
+      assert namingLens.verifyRenamingConsistentWithResolution(method);
       return namingLens.lookupName(method);
     }
 
@@ -520,9 +651,10 @@ public class VirtualFile {
     }
   }
 
-  private static class IndexedItemTransaction implements IndexedItemCollection {
+  public static class IndexedItemTransaction implements IndexedItemCollection {
 
     private final VirtualFileIndexedItemCollection base;
+    private final InitClassLens initClassLens;
     private final NamingLens namingLens;
 
     private final Set<DexProgramClass> classes = new LinkedHashSet<>();
@@ -534,9 +666,10 @@ public class VirtualFile {
     private final Set<DexCallSite> callSites = new LinkedHashSet<>();
     private final Set<DexMethodHandle> methodHandles = new LinkedHashSet<>();
 
-    private IndexedItemTransaction(VirtualFileIndexedItemCollection base,
-        NamingLens namingLens) {
+    private IndexedItemTransaction(
+        VirtualFileIndexedItemCollection base, InitClassLens initClassLens, NamingLens namingLens) {
       this.base = base;
+      this.initClassLens = initClassLens;
       this.namingLens = namingLens;
     }
 
@@ -593,13 +726,18 @@ public class VirtualFile {
     }
 
     @Override
+    public InitClassLens getInitClassLens() {
+      return initClassLens;
+    }
+
+    @Override
     public DexString getRenamedDescriptor(DexType type) {
       return namingLens.lookupDescriptor(type);
     }
 
     @Override
     public DexString getRenamedName(DexMethod method) {
-      assert namingLens.checkTargetCanBeTranslated(method);
+      assert namingLens.verifyRenamingConsistentWithResolution(method);
       return namingLens.lookupName(method);
     }
 
@@ -668,17 +806,27 @@ public class VirtualFile {
   static class VirtualFileCycler {
 
     private final List<VirtualFile> files;
+    private final InitClassLens initClassLens;
     private final NamingLens namingLens;
 
     private int nextFileId;
     private Iterator<VirtualFile> allFilesCyclic;
     private Iterator<VirtualFile> activeFiles;
+    private FeatureSplit featuresplit;
 
-    VirtualFileCycler(List<VirtualFile> files, NamingLens namingLens, int fileIndexOffset) {
+    VirtualFileCycler(
+        List<VirtualFile> files,
+        InitClassLens initClassLens,
+        NamingLens namingLens,
+        int fileIndexOffset) {
       this.files = files;
+      this.initClassLens = initClassLens;
       this.namingLens = namingLens;
 
       nextFileId = files.size() + fileIndexOffset;
+      if (files.size() > 0) {
+        featuresplit = files.get(0).getFeatureSplit();
+      }
 
       reset();
     }
@@ -703,7 +851,8 @@ public class VirtualFile {
       if (hasNext()) {
         return activeFiles.next();
       } else {
-        VirtualFile newFile = new VirtualFile(nextFileId++, namingLens);
+        VirtualFile newFile =
+            new VirtualFile(nextFileId++, initClassLens, namingLens, featuresplit);
         files.add(newFile);
         allFilesCyclic = Iterators.cycle(files);
         return newFile;
@@ -734,7 +883,7 @@ public class VirtualFile {
     }
 
     VirtualFile addFile() {
-      VirtualFile newFile = new VirtualFile(nextFileId++, namingLens);
+      VirtualFile newFile = new VirtualFile(nextFileId++, initClassLens, namingLens, featuresplit);
       files.add(newFile);
 
       reset();
@@ -779,12 +928,13 @@ public class VirtualFile {
         DexItemFactory dexItemFactory,
         FillStrategy fillStrategy,
         int fileIndexOffset,
+        InitClassLens initClassLens,
         NamingLens namingLens) {
       this.classes = new ArrayList<>(classes);
       this.originalNames = originalNames;
       this.dexItemFactory = dexItemFactory;
       this.fillStrategy = fillStrategy;
-      this.cycler = new VirtualFileCycler(files, namingLens, fileIndexOffset);
+      this.cycler = new VirtualFileCycler(files, initClassLens, namingLens, fileIndexOffset);
     }
 
     static boolean coveredByPrefix(String originalName, String currentPrefix) {

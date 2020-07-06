@@ -3,14 +3,9 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.analysis.type;
 
-import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
-import static com.android.tools.r8.ir.analysis.type.Nullability.maybeNull;
-import static com.android.tools.r8.ir.analysis.type.TypeLatticeElement.fromDexType;
-
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.IRCode;
@@ -23,34 +18,32 @@ import java.util.ArrayDeque;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
+import java.util.Set;
 
 public class TypeAnalysis {
 
   private enum Mode {
     UNSET,
-    WIDENING,   // initial analysis, including fixed-point iteration for phis.
-    NARROWING,  // updating with more specific info, e.g., passing the return value of the inlinee.
+    WIDENING,  // initial analysis, including fixed-point iteration for phis and updating with less
+               // specific info, e.g., removing assume nodes.
+    NARROWING, // updating with more specific info, e.g., passing the return value of the inlinee.
+    NO_CHANGE  // utility to ensure types are up to date
   }
 
   private final boolean mayHaveImpreciseTypes;
 
   private Mode mode = Mode.UNSET;
 
-  private final AppView<? extends AppInfo> appView;
-  private final DexEncodedMethod context;
+  private final AppView<?> appView;
 
   private final Deque<Value> worklist = new ArrayDeque<>();
 
-  public TypeAnalysis(AppView<? extends AppInfo> appView, DexEncodedMethod encodedMethod) {
-    this(appView, encodedMethod, false);
+  public TypeAnalysis(AppView<?> appView) {
+    this(appView, false);
   }
 
-  public TypeAnalysis(
-      AppView<? extends AppInfo> appView,
-      DexEncodedMethod encodedMethod,
-      boolean mayHaveImpreciseTypes) {
+  public TypeAnalysis(AppView<?> appView, boolean mayHaveImpreciseTypes) {
     this.appView = appView;
-    this.context = encodedMethod;
     this.mayHaveImpreciseTypes = mayHaveImpreciseTypes;
   }
 
@@ -60,28 +53,34 @@ public class TypeAnalysis {
     }
   }
 
-  public void widening(DexEncodedMethod encodedMethod, IRCode code) {
+  public void widening(IRCode code) {
     mode = Mode.WIDENING;
     assert worklist.isEmpty();
-    code.topologicallySortedBlocks().forEach(b -> analyzeBasicBlock(encodedMethod, b));
+    code.topologicallySortedBlocks().forEach(this::analyzeBasicBlock);
     analyze();
   }
 
   public void widening(Iterable<Value> values) {
-    mode = Mode.WIDENING;
-    assert worklist.isEmpty();
-    values.forEach(this::enqueue);
-    analyze();
+    analyzeValues(values, Mode.WIDENING);
   }
 
-  public void narrowing(Iterable<Value> values) {
+  public void narrowing(Iterable<? extends Value> values) {
     // TODO(b/125492155) Not sorting causes us to have non-deterministic behaviour. This should be
     //  removed when the bug is fixed.
     List<Value> sortedValues = Lists.newArrayList(values);
     sortedValues.sort(Comparator.comparingInt(Value::getNumber));
-    mode = Mode.NARROWING;
+    analyzeValues(sortedValues, Mode.NARROWING);
+  }
+
+  public boolean verifyValuesUpToDate(Iterable<? extends Value> values) {
+    analyzeValues(values, Mode.NO_CHANGE);
+    return true;
+  }
+
+  private void analyzeValues(Iterable<? extends Value> values, Mode mode) {
+    this.mode = mode;
     assert worklist.isEmpty();
-    sortedValues.forEach(this::enqueue);
+    values.forEach(this::enqueue);
     analyze();
   }
 
@@ -92,33 +91,17 @@ public class TypeAnalysis {
     }
   }
 
-  public void analyzeBasicBlock(DexEncodedMethod encodedMethod, BasicBlock block) {
-    int argumentsSeen = encodedMethod.accessFlags.isStatic() ? 0 : -1;
+  private void analyzeBasicBlock(BasicBlock block) {
     for (Instruction instruction : block.getInstructions()) {
       Value outValue = instruction.outValue();
       if (outValue == null) {
         continue;
       }
-      // The type for Argument, a quasi instruction, can be inferred from the method signature.
       if (instruction.isArgument()) {
-        TypeLatticeElement derived;
-        if (argumentsSeen < 0) {
-          // Receiver
-          derived =
-              fromDexType(
-                  encodedMethod.method.holder,
-                  // Now we try inlining even when the receiver could be null.
-                  encodedMethod == context ? definitelyNotNull() : maybeNull(),
-                  appView);
-        } else {
-          DexType argType = encodedMethod.method.proto.parameters.values[argumentsSeen];
-          derived = fromDexType(argType, maybeNull(), appView);
-        }
-        argumentsSeen++;
-        updateTypeOfValue(outValue, derived);
+        // The type for Argument, a quasi instruction is already set correctly during IR building.
         // Note that we don't need to enqueue the out value of arguments here because it's constant.
       } else if (instruction.hasInvariantOutType()) {
-        TypeLatticeElement derived = instruction.evaluate(appView);
+        TypeElement derived = instruction.evaluate(appView);
         updateTypeOfValue(outValue, derived);
       } else {
         enqueue(outValue);
@@ -130,25 +113,28 @@ public class TypeAnalysis {
   }
 
   private void analyzeValue(Value value) {
-    TypeLatticeElement previous = value.getTypeLattice();
-    TypeLatticeElement derived =
+    TypeElement previous = value.getType();
+    TypeElement derived =
         value.isPhi() ? value.asPhi().computePhiType(appView) : value.definition.evaluate(appView);
     assert mayHaveImpreciseTypes || derived.isPreciseType();
     assert !previous.isPreciseType() || derived.isPreciseType();
     updateTypeOfValue(value, derived);
   }
 
-  private void updateTypeOfValue(Value value, TypeLatticeElement type) {
+  private void updateTypeOfValue(Value value, TypeElement type) {
     assert mode != Mode.UNSET;
 
-    TypeLatticeElement current = value.getTypeLattice();
+    TypeElement current = value.getType();
     if (current.equals(type)) {
       return;
     }
 
+    assert mode != Mode.NO_CHANGE;
+
     if (type.isBottom()) {
       return;
     }
+
     if (mode == Mode.WIDENING) {
       value.widening(appView, type);
     } else {
@@ -170,16 +156,33 @@ public class TypeAnalysis {
   }
 
   public static DexType getRefinedReceiverType(
-      AppInfoWithSubtyping appInfo, InvokeMethodWithReceiver invoke) {
-    DexType receiverType = invoke.getInvokedMethod().holder;
-    TypeLatticeElement lattice = invoke.getReceiver().getTypeLattice();
-    if (lattice.isClassType()) {
-      DexType refinedType = lattice.asClassTypeLatticeElement().getClassType();
-      if (appInfo.isSubtype(refinedType, receiverType)) {
+      AppView<? extends AppInfoWithClassHierarchy> appView, InvokeMethodWithReceiver invoke) {
+    return getRefinedReceiverType(appView, invoke.getInvokedMethod(), invoke.getReceiver());
+  }
+
+  public static DexType getRefinedReceiverType(
+      AppView<? extends AppInfoWithClassHierarchy> appView, DexMethod method, Value receiver) {
+    return toRefinedReceiverType(receiver.getDynamicUpperBoundType(appView), method, appView);
+  }
+
+  public static DexType toRefinedReceiverType(
+      TypeElement receiverUpperBoundType,
+      DexMethod method,
+      AppView<? extends AppInfoWithClassHierarchy> appView) {
+    DexType staticReceiverType = method.holder;
+    if (receiverUpperBoundType.isClassType()) {
+      ClassTypeElement classType = receiverUpperBoundType.asClassType();
+      DexType refinedType = classType.getClassType();
+      if (refinedType == appView.dexItemFactory().objectType) {
+        Set<DexType> interfaces = classType.getInterfaces();
+        if (interfaces.size() == 1) {
+          refinedType = interfaces.iterator().next();
+        }
+      }
+      if (appView.appInfo().isSubtype(refinedType, staticReceiverType)) {
         return refinedType;
       }
     }
-    return receiverType;
+    return staticReceiverType;
   }
-
 }

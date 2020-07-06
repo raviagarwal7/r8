@@ -9,53 +9,56 @@ import com.android.tools.r8.experimental.graphinfo.GraphNode;
 import com.android.tools.r8.graph.DexDefinition;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItem;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 
 // TODO(herhut): Canonicalize reason objects.
 public abstract class KeepReason {
 
   public abstract GraphEdgeInfo.EdgeKind edgeKind();
 
-  public abstract GraphNode getSourceNode(Enqueuer enqueuer);
+  public abstract GraphNode getSourceNode(GraphReporter graphReporter);
 
   static KeepReason annotatedOn(DexDefinition definition) {
     return new AnnotatedOn(definition);
   }
 
-  static KeepReason dueToKeepRule(ProguardKeepRule rule) {
-    return new DueToKeepRule(rule);
-  }
-
-  static KeepReason dueToProguardCompatibilityKeepRule(ProguardKeepRule rule) {
-    return new DueToProguardCompatibilityKeepRule(rule);
-  }
-
   static KeepReason instantiatedIn(DexEncodedMethod method) {
-    return new InstatiatedIn(method);
+    return new InstantiatedIn(method);
+  }
+
+  static KeepReason instantiatedIn(ProgramMethod method) {
+    return new InstantiatedIn(method.getDefinition());
   }
 
   public static KeepReason invokedViaSuperFrom(DexEncodedMethod from) {
     return new InvokedViaSuper(from);
   }
 
+  public static KeepReason invokedViaSuperFrom(ProgramMethod from) {
+    return new InvokedViaSuper(from.getDefinition());
+  }
+
   public static KeepReason reachableFromLiveType(DexType type) {
     return new ReachableFromLiveType(type);
   }
 
-  public static KeepReason invokedFrom(DexEncodedMethod method) {
-    return new InvokedFrom(method);
+  public static KeepReason invokedFrom(DexProgramClass holder, DexEncodedMethod method) {
+    return new InvokedFrom(holder, method);
   }
 
-  public static KeepReason invokedFromLambdaCreatedIn(DexEncodedMethod method) {
-    return new InvokedFromLambdaCreatedIn(method);
+  public static KeepReason invokedFrom(ProgramMethod context) {
+    return invokedFrom(context.getHolder(), context.getDefinition());
   }
 
-  public static KeepReason isLibraryMethod() {
-    return new IsLibraryMethod();
+  public static KeepReason invokedFromLambdaCreatedIn(ProgramMethod method) {
+    return new InvokedFromLambdaCreatedIn(method.getDefinition());
   }
 
-  public static KeepReason fieldReferencedIn(DexEncodedMethod method) {
-    return new ReferencedFrom(method);
+  public static KeepReason fieldReferencedIn(ProgramMethod method) {
+    return new ReferencedFrom(method.getDefinition());
   }
 
   public static KeepReason referencedInAnnotation(DexItem holder) {
@@ -70,69 +73,16 @@ public abstract class KeepReason {
     return false;
   }
 
-  public boolean isDueToProguardCompatibility() {
-    return false;
+  public static KeepReason targetedBySuperFrom(ProgramMethod from) {
+    return new TargetedBySuper(from.getDefinition());
   }
 
-  public ProguardKeepRule getProguardKeepRule() {
-    return null;
+  public static KeepReason reflectiveUseIn(ProgramMethod method) {
+    return new ReflectiveUseFrom(method.getDefinition());
   }
 
-  public static KeepReason targetedBySuperFrom(DexEncodedMethod from) {
-    return new TargetedBySuper(from);
-  }
-
-  public static KeepReason reflectiveUseIn(DexEncodedMethod method) {
-    return new ReflectiveUseFrom(method);
-  }
-
-  public static KeepReason methodHandleReferencedIn(DexEncodedMethod method) {
-    return new MethodHandleReferencedFrom(method);
-  }
-
-  private static class DueToKeepRule extends KeepReason {
-
-    final ProguardKeepRule keepRule;
-
-    private DueToKeepRule(ProguardKeepRule keepRule) {
-      this.keepRule = keepRule;
-    }
-
-    @Override
-    public EdgeKind edgeKind() {
-      return EdgeKind.KeepRule;
-    }
-
-    @Override
-    public boolean isDueToKeepRule() {
-      return true;
-    }
-
-    @Override
-    public ProguardKeepRule getProguardKeepRule() {
-      return keepRule;
-    }
-
-    @Override
-    public GraphNode getSourceNode(Enqueuer enqueuer) {
-      return enqueuer.getKeepRuleGraphNode(keepRule);
-    }
-  }
-
-  private static class DueToProguardCompatibilityKeepRule extends DueToKeepRule {
-    private DueToProguardCompatibilityKeepRule(ProguardKeepRule keepRule) {
-      super(keepRule);
-    }
-
-    @Override
-    public EdgeKind edgeKind() {
-      return EdgeKind.CompatibilityRule;
-    }
-
-    @Override
-    public boolean isDueToProguardCompatibility() {
-      return true;
-    }
+  public static KeepReason methodHandleReferencedIn(ProgramMethod method) {
+    return new MethodHandleReferencedFrom(method.getDefinition());
   }
 
   private abstract static class BasedOnOtherMethod extends KeepReason {
@@ -145,15 +95,19 @@ public abstract class KeepReason {
 
     abstract String getKind();
 
+    public DexMethod getMethod() {
+      return method.method;
+    }
+
     @Override
-    public GraphNode getSourceNode(Enqueuer enqueuer) {
-      return enqueuer.getMethodGraphNode(method.method);
+    public GraphNode getSourceNode(GraphReporter graphReporter) {
+      return graphReporter.getMethodGraphNode(method.method);
     }
   }
 
-  private static class InstatiatedIn extends BasedOnOtherMethod {
+  public static class InstantiatedIn extends BasedOnOtherMethod {
 
-    private InstatiatedIn(DexEncodedMethod method) {
+    private InstantiatedIn(DexEncodedMethod method) {
       super(method);
     }
 
@@ -204,8 +158,9 @@ public abstract class KeepReason {
 
   private static class InvokedFrom extends BasedOnOtherMethod {
 
-    private InvokedFrom(DexEncodedMethod method) {
+    private InvokedFrom(DexProgramClass holder, DexEncodedMethod method) {
       super(method);
+      assert holder.type == method.holder();
     }
 
     @Override
@@ -267,24 +222,8 @@ public abstract class KeepReason {
     }
 
     @Override
-    public GraphNode getSourceNode(Enqueuer enqueuer) {
-      return enqueuer.getClassGraphNode(type);
-    }
-  }
-
-  private static class IsLibraryMethod extends KeepReason {
-
-    private IsLibraryMethod() {
-    }
-
-    @Override
-    public EdgeKind edgeKind() {
-      return EdgeKind.IsLibraryMethod;
-    }
-
-    @Override
-    public GraphNode getSourceNode(Enqueuer enqueuer) {
-      return null;
+    public GraphNode getSourceNode(GraphReporter graphReporter) {
+      return graphReporter.getClassGraphNode(type);
     }
   }
 
@@ -302,8 +241,8 @@ public abstract class KeepReason {
     }
 
     @Override
-    public GraphNode getSourceNode(Enqueuer enqueuer) {
-      return enqueuer.getAnnotationGraphNode(holder);
+    public GraphNode getSourceNode(GraphReporter graphReporter) {
+      return graphReporter.getAnnotationGraphNode(holder);
     }
   }
 
@@ -321,14 +260,14 @@ public abstract class KeepReason {
     }
 
     @Override
-    public GraphNode getSourceNode(Enqueuer enqueuer) {
+    public GraphNode getSourceNode(GraphReporter graphReporter) {
       if (holder.isDexClass()) {
-        return enqueuer.getClassGraphNode(holder.asDexClass().type);
+        return graphReporter.getClassGraphNode(holder.asDexClass().type);
       } else if (holder.isDexEncodedField()) {
-        return enqueuer.getFieldGraphNode(holder.asDexEncodedField().field);
+        return graphReporter.getFieldGraphNode(holder.asDexEncodedField().field);
       } else {
         assert holder.isDexEncodedMethod();
-        return enqueuer.getMethodGraphNode(holder.asDexEncodedMethod().method);
+        return graphReporter.getMethodGraphNode(holder.asDexEncodedMethod().method);
       }
     }
   }

@@ -5,22 +5,23 @@ package com.android.tools.r8.ir.optimize.string;
 
 import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
 import static com.android.tools.r8.ir.optimize.CodeRewriter.removeOrReplaceByDebugLocalWrite;
-import static com.android.tools.r8.ir.optimize.ReflectionOptimizer.ClassNameComputationInfo.ClassNameComputationOption.CANONICAL_NAME;
-import static com.android.tools.r8.ir.optimize.ReflectionOptimizer.ClassNameComputationInfo.ClassNameComputationOption.NAME;
-import static com.android.tools.r8.ir.optimize.ReflectionOptimizer.ClassNameComputationInfo.ClassNameComputationOption.SIMPLE_NAME;
-import static com.android.tools.r8.ir.optimize.ReflectionOptimizer.computeClassName;
+import static com.android.tools.r8.naming.dexitembasedstring.ClassNameComputationInfo.ClassNameMapping.CANONICAL_NAME;
+import static com.android.tools.r8.naming.dexitembasedstring.ClassNameComputationInfo.ClassNameMapping.NAME;
+import static com.android.tools.r8.naming.dexitembasedstring.ClassNameComputationInfo.ClassNameMapping.SIMPLE_NAME;
 import static com.android.tools.r8.utils.DescriptorUtils.INNER_CLASS_SEPARATOR;
 
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.EscapeAnalysis;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.escape.EscapeAnalysis;
+import com.android.tools.r8.ir.analysis.escape.EscapeAnalysisConfiguration;
+import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.BasicBlock.ThrowingInfo;
 import com.android.tools.r8.ir.code.ConstClass;
 import com.android.tools.r8.ir.code.ConstNumber;
@@ -28,29 +29,89 @@ import com.android.tools.r8.ir.code.ConstString;
 import com.android.tools.r8.ir.code.DexItemBasedConstString;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Instruction;
-import com.android.tools.r8.ir.code.InstructionIterator;
+import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.InvokeStatic;
 import com.android.tools.r8.ir.code.InvokeVirtual;
 import com.android.tools.r8.ir.code.Value;
-import com.android.tools.r8.ir.optimize.ReflectionOptimizer.ClassNameComputationInfo;
-import com.google.common.annotations.VisibleForTesting;
+import com.android.tools.r8.logging.Log;
+import com.android.tools.r8.naming.dexitembasedstring.ClassNameComputationInfo;
+import com.android.tools.r8.naming.dexitembasedstring.ClassNameComputationInfo.ClassNameMapping;
+import com.android.tools.r8.utils.StringUtils;
+import com.google.common.collect.Sets;
+import it.unimi.dsi.fastutil.objects.Object2IntArrayMap;
+import it.unimi.dsi.fastutil.objects.Object2IntMap;
+import java.io.UTFDataFormatException;
 import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
 public class StringOptimizer {
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   private final DexItemFactory factory;
   private final ThrowingInfo throwingInfo;
 
-  public StringOptimizer(AppView<? extends AppInfo> appView) {
+  private int numberOfSimplifiedOperations = 0;
+  private final Object2IntMap<ClassNameMapping> numberOfComputedNames;
+  private final Object2IntMap<ClassNameMapping> numberOfDeferredComputationOfNames;
+  private final Object2IntMap<Integer> histogramOfLengthOfNames;
+  private final Object2IntMap<Integer> histogramOfLengthOfDeferredNames;
+  private int numberOfSimplifiedConversions = 0;
+
+  public StringOptimizer(AppView<?> appView) {
     this.appView = appView;
     this.factory = appView.dexItemFactory();
     this.throwingInfo = ThrowingInfo.defaultForConstString(appView.options());
+    if (Log.ENABLED && Log.isLoggingEnabledFor(StringOptimizer.class)) {
+      numberOfComputedNames = new Object2IntArrayMap<>();
+      numberOfDeferredComputationOfNames = new Object2IntArrayMap<>();
+      histogramOfLengthOfNames = new Object2IntArrayMap<>();
+      histogramOfLengthOfDeferredNames = new Object2IntArrayMap<>();
+    } else {
+      numberOfComputedNames = null;
+      numberOfDeferredComputationOfNames = null;
+      histogramOfLengthOfNames = null;
+      histogramOfLengthOfDeferredNames = null;
+    }
   }
 
-  // int String#length()
+  public void logResult() {
+    assert Log.ENABLED;
+    Log.info(getClass(),
+        "# trivial operations on const-string: %s", numberOfSimplifiedOperations);
+    Log.info(getClass(),
+        "# trivial conversions from/to const-string: %s", numberOfSimplifiedConversions);
+    if (numberOfComputedNames != null) {
+      Log.info(getClass(), "------ # of get*Name() computation ------");
+      numberOfComputedNames.forEach((kind, count) -> {
+        Log.info(getClass(),
+            "%s: %s (%s)", kind, StringUtils.times("*", Math.min(count, 53)), count);
+      });
+    }
+    if (numberOfDeferredComputationOfNames != null) {
+      Log.info(getClass(), "------ # of deferred get*Name() computation ------");
+      numberOfDeferredComputationOfNames.forEach((kind, count) -> {
+        Log.info(getClass(),
+            "%s: %s (%s)", kind, StringUtils.times("*", Math.min(count, 53)), count);
+      });
+    }
+    if (histogramOfLengthOfNames != null) {
+      Log.info(getClass(), "------ histogram of get*Name() result lengths ------");
+      histogramOfLengthOfNames.forEach((length, count) -> {
+        Log.info(getClass(),
+            "%s: %s (%s)", length, StringUtils.times("*", Math.min(count, 53)), count);
+      });
+    }
+    if (histogramOfLengthOfDeferredNames != null) {
+      Log.info(getClass(),
+          "------ histogram of original type length for deferred get*Name() ------");
+      histogramOfLengthOfDeferredNames.forEach((length, count) -> {
+        Log.info(getClass(),
+            "%s: %s (%s)", length, StringUtils.times("*", Math.min(count, 53)), count);
+      });
+    }
+  }
+
   // boolean String#isEmpty()
   // boolean String#startsWith(String)
   // boolean String#endsWith(String)
@@ -58,6 +119,8 @@ public class StringOptimizer {
   // boolean String#equals(String)
   // boolean String#equalsIgnoreCase(String)
   // boolean String#contentEquals(String)
+  // int String#hashCode()
+  // int String#length()
   // int String#indexOf(String)
   // int String#indexOf(int)
   // int String#lastIndexOf(String)
@@ -66,11 +129,13 @@ public class StringOptimizer {
   // int String#compareToIgnoreCase(String)
   // String String#substring(int)
   // String String#substring(int, int)
+  // String String#trim()
   public void computeTrivialOperationsOnConstString(IRCode code) {
-    if (!code.hasConstString) {
+    if (!code.metadata().mayHaveConstString()) {
       return;
     }
-    InstructionIterator it = code.instructionIterator();
+    Set<Value> affectedValues = Sets.newIdentityHashSet();
+    InstructionListIterator it = code.instructionListIterator();
     while (it.hasNext()) {
       Instruction instr = it.next();
       if (!instr.isInvokeVirtual()) {
@@ -119,50 +184,77 @@ public class StringOptimizer {
         String sub = rcvString.substring(beginIndexValue, endIndexValue);
         Value stringValue =
             code.createValue(
-                TypeLatticeElement.stringClassType(appView, definitelyNotNull()),
-                invoke.getLocalInfo());
+                TypeElement.stringClassType(appView, definitelyNotNull()), invoke.getLocalInfo());
+        affectedValues.addAll(invoke.outValue().affectedValues());
         it.replaceCurrentInstruction(
             new ConstString(stringValue, factory.createString(sub), throwingInfo));
+        numberOfSimplifiedOperations++;
         continue;
       }
 
-      Function<String, Integer> operatorWithNoArg = null;
-      BiFunction<String, String, Integer> operatorWithString = null;
-      BiFunction<String, Integer, Integer> operatorWithInt = null;
-      if (invokedMethod == factory.stringMethods.length) {
-        operatorWithNoArg = String::length;
-      } else if (invokedMethod == factory.stringMethods.isEmpty) {
-        operatorWithNoArg = rcv -> rcv.isEmpty() ? 1 : 0;
-      } else if (invokedMethod == factory.stringMethods.contains) {
-        operatorWithString = (rcv, arg) -> rcv.contains(arg) ? 1 : 0;
-      } else if (invokedMethod == factory.stringMethods.startsWith) {
+      if (invokedMethod == factory.stringMembers.trim) {
+        Value receiver = invoke.getReceiver().getAliasedValue();
+        if (receiver.hasLocalInfo() || receiver.isPhi() || !receiver.definition.isConstString()) {
+          continue;
+        }
+        DexString resultString =
+            factory.createString(receiver.definition.asConstString().getValue().toString().trim());
+        Value newOutValue =
+            code.createValue(
+                TypeElement.stringClassType(appView, definitelyNotNull()), invoke.getLocalInfo());
+        affectedValues.addAll(invoke.outValue().affectedValues());
+        it.replaceCurrentInstruction(new ConstString(newOutValue, resultString, throwingInfo));
+        numberOfSimplifiedOperations++;
+        continue;
+      }
+
+      Function<DexString, Integer> operatorWithNoArg = null;
+      BiFunction<DexString, DexString, Integer> operatorWithString = null;
+      BiFunction<DexString, Integer, Integer> operatorWithInt = null;
+      if (invokedMethod == factory.stringMembers.hashCode) {
+        operatorWithNoArg = rcv -> {
+          try {
+            return rcv.decodedHashCode();
+          } catch (UTFDataFormatException e) {
+            // It is already guaranteed that the string does not throw.
+            throw new Unreachable();
+          }
+        };
+      } else if (invokedMethod == factory.stringMembers.length) {
+        operatorWithNoArg = rcv -> rcv.size;
+      } else if (invokedMethod == factory.stringMembers.isEmpty) {
+        operatorWithNoArg = rcv -> rcv.size == 0 ? 1 : 0;
+      } else if (invokedMethod == factory.stringMembers.contains) {
+        operatorWithString = (rcv, arg) -> rcv.toString().contains(arg.toString()) ? 1 : 0;
+      } else if (invokedMethod == factory.stringMembers.startsWith) {
         operatorWithString = (rcv, arg) -> rcv.startsWith(arg) ? 1 : 0;
-      } else if (invokedMethod == factory.stringMethods.endsWith) {
+      } else if (invokedMethod == factory.stringMembers.endsWith) {
         operatorWithString = (rcv, arg) -> rcv.endsWith(arg) ? 1 : 0;
-      } else if (invokedMethod == factory.stringMethods.equals) {
+      } else if (invokedMethod == factory.stringMembers.equals) {
         operatorWithString = (rcv, arg) -> rcv.equals(arg) ? 1 : 0;
-      } else if (invokedMethod == factory.stringMethods.equalsIgnoreCase) {
-        operatorWithString = (rcv, arg) -> rcv.equalsIgnoreCase(arg) ? 1 : 0;
-      } else if (invokedMethod == factory.stringMethods.contentEqualsCharSequence) {
-        operatorWithString = (rcv, arg) -> rcv.contentEquals(arg) ? 1 : 0;
-      } else if (invokedMethod == factory.stringMethods.indexOfInt) {
-        operatorWithInt = String::indexOf;
-      } else if (invokedMethod == factory.stringMethods.indexOfString) {
-        operatorWithString = String::indexOf;
-      } else if (invokedMethod == factory.stringMethods.lastIndexOfInt) {
-        operatorWithInt = String::lastIndexOf;
-      } else if (invokedMethod == factory.stringMethods.lastIndexOfString) {
-        operatorWithString = String::lastIndexOf;
-      } else if (invokedMethod == factory.stringMethods.compareTo) {
-        operatorWithString = String::compareTo;
-      } else if (invokedMethod == factory.stringMethods.compareToIgnoreCase) {
-        operatorWithString = String::compareToIgnoreCase;
+      } else if (invokedMethod == factory.stringMembers.equalsIgnoreCase) {
+        operatorWithString = (rcv, arg) -> rcv.toString().equalsIgnoreCase(arg.toString()) ? 1 : 0;
+      } else if (invokedMethod == factory.stringMembers.contentEqualsCharSequence) {
+        operatorWithString = (rcv, arg) -> rcv.toString().contentEquals(arg.toString()) ? 1 : 0;
+      } else if (invokedMethod == factory.stringMembers.indexOfInt) {
+        operatorWithInt = (rcv, idx) -> rcv.toString().indexOf(idx);
+      } else if (invokedMethod == factory.stringMembers.indexOfString) {
+        operatorWithString = (rcv, arg) -> rcv.toString().indexOf(arg.toString());
+      } else if (invokedMethod == factory.stringMembers.lastIndexOfInt) {
+        operatorWithInt = (rcv, idx) -> rcv.toString().lastIndexOf(idx);
+      } else if (invokedMethod == factory.stringMembers.lastIndexOfString) {
+        operatorWithString = (rcv, arg) -> rcv.toString().lastIndexOf(arg.toString());
+      } else if (invokedMethod == factory.stringMembers.compareTo) {
+        operatorWithString = (rcv, arg) -> rcv.toString().compareTo(arg.toString());
+      } else if (invokedMethod == factory.stringMembers.compareToIgnoreCase) {
+        operatorWithString = (rcv, arg) -> rcv.toString().compareToIgnoreCase(arg.toString());
       } else {
         continue;
       }
       Value rcv = invoke.getReceiver().getAliasedValue();
       if (rcv.definition == null
           || !rcv.definition.isConstString()
+          || rcv.definition.asConstString().instructionInstanceCanThrow()
           || rcv.hasLocalInfo()) {
         continue;
       }
@@ -171,7 +263,7 @@ public class StringOptimizer {
       ConstNumber constNumber;
       if (operatorWithNoArg != null) {
         assert invoke.inValues().size() == 1;
-        int v = operatorWithNoArg.apply(rcvString.toString());
+        int v = operatorWithNoArg.apply(rcvString);
         constNumber = code.createIntConstant(v);
       } else if (operatorWithString != null) {
         assert invoke.inValues().size() == 2;
@@ -181,9 +273,7 @@ public class StringOptimizer {
             || arg.hasLocalInfo()) {
           continue;
         }
-        int v = operatorWithString.apply(
-            rcvString.toString(),
-            arg.definition.asConstString().getValue().toString());
+        int v = operatorWithString.apply(rcvString, arg.definition.asConstString().getValue());
         constNumber = code.createIntConstant(v);
       } else {
         assert operatorWithInt != null;
@@ -194,24 +284,27 @@ public class StringOptimizer {
             || arg.hasLocalInfo()) {
           continue;
         }
-        int v = operatorWithInt.apply(
-            rcvString.toString(),
-            arg.definition.asConstNumber().getIntValue());
+        int v = operatorWithInt.apply(rcvString, arg.definition.asConstNumber().getIntValue());
         constNumber = code.createIntConstant(v);
       }
 
+      numberOfSimplifiedOperations++;
       it.replaceCurrentInstruction(constNumber);
+    }
+    // Computed substring is not null, and thus propagate that information.
+    if (!affectedValues.isEmpty()) {
+      new TypeAnalysis(appView).narrowing(affectedValues);
     }
   }
 
   // Find Class#get*Name() with a constant-class and replace it with a const-string if possible.
-  public void rewriteClassGetName(AppView<? extends AppInfo> appView, IRCode code) {
+  public void rewriteClassGetName(AppView<?> appView, IRCode code) {
     // Conflict with {@link CodeRewriter#collectClassInitializerDefaults}.
-    if (code.method.isClassInitializer()) {
+    if (code.method().isClassInitializer()) {
       return;
     }
-    boolean markUseIdentifierNameString = false;
-    InstructionIterator it = code.instructionIterator();
+    Set<Value> affectedValues = Sets.newIdentityHashSet();
+    InstructionListIterator it = code.instructionListIterator();
     while (it.hasNext()) {
       Instruction instr = it.next();
       if (!instr.isInvokeVirtual()) {
@@ -225,15 +318,7 @@ public class StringOptimizer {
 
       Value out = invoke.outValue();
       // Skip the call if the computed name is already discarded or not used anywhere.
-      if (out == null || out.numberOfAllUsers() == 0) {
-        continue;
-      }
-      // b/120138731: Filter out local uses, which are likely one-time name computation. In such
-      // case, the result of this optimization can lead to a regression if the corresponding class
-      // is in a deep package hierarchy.
-      if (!appView.options().testing.forceNameReflectionOptimization
-          && !hasPotentialReadOutside(
-              appView.appInfo(), code.method, EscapeAnalysis.escape(code, out))) {
+      if (out == null || !out.hasAnyUsers()) {
         continue;
       }
 
@@ -268,22 +353,39 @@ public class StringOptimizer {
       if (holder == null) {
         continue;
       }
+      boolean mayBeRenamed =
+          appView.enableWholeProgramOptimizations()
+              && appView.withLiveness().appInfo().isMinificationAllowed(holder.type);
+      // b/120138731: Filter out escaping uses. In such case, the result of this optimization will
+      // be stored somewhere, which can lead to a regression if the corresponding class is in a deep
+      // package hierarchy. For local cases, it is likely a one-time computation, but make sure the
+      // result is used reasonably, such as library calls. For example, if a class may be minified
+      // while its name is used to compute hash code, which won't be optimized, it's better not to
+      // compute the name.
+      if (!appView.options().testing.forceNameReflectionOptimization) {
+        EscapeAnalysis escapeAnalysis =
+            new EscapeAnalysis(appView, StringOptimizerEscapeAnalysisConfiguration.getInstance());
+        if (mayBeRenamed || escapeAnalysis.isEscaping(code, out)) {
+          continue;
+        }
+      }
 
       String descriptor = baseType.toDescriptorString();
       boolean assumeTopLevel = descriptor.indexOf(INNER_CLASS_SEPARATOR) < 0;
       DexItemBasedConstString deferred = null;
       DexString name = null;
       if (invokedMethod == factory.classMethods.getName) {
-        if (appView.options().isMinifying()
-            && !appView.rootSet().noObfuscation.contains(holder.type)) {
+        if (mayBeRenamed) {
           deferred =
               new DexItemBasedConstString(
                   invoke.outValue(),
                   baseType,
-                  throwingInfo,
-                  new ClassNameComputationInfo(NAME, arrayDepth));
+                  ClassNameComputationInfo.create(NAME, arrayDepth),
+                  throwingInfo);
+          logDeferredNameComputation(NAME);
         } else {
-          name = computeClassName(descriptor, holder, NAME, factory, arrayDepth);
+          name = NAME.map(descriptor, holder, factory, arrayDepth);
+          logNameComputation(NAME);
         }
       } else if (invokedMethod == factory.classMethods.getTypeName) {
         // TODO(b/119426668): desugar Type#getTypeName
@@ -291,6 +393,7 @@ public class StringOptimizer {
       } else if (invokedMethod == factory.classMethods.getCanonicalName) {
         // Always returns null if the target type is local or anonymous class.
         if (holder.isLocalClass() || holder.isAnonymousClass()) {
+          affectedValues.addAll(invoke.outValue().affectedValues());
           ConstNumber constNull = code.createConstNull();
           it.replaceCurrentInstruction(constNull);
         } else {
@@ -299,16 +402,17 @@ public class StringOptimizer {
           if (!assumeTopLevel) {
             continue;
           }
-          if (appView.options().isMinifying()
-              && !appView.rootSet().noObfuscation.contains(holder.type)) {
+          if (mayBeRenamed) {
             deferred =
                 new DexItemBasedConstString(
                     invoke.outValue(),
                     baseType,
-                    throwingInfo,
-                    new ClassNameComputationInfo(CANONICAL_NAME, arrayDepth));
+                    ClassNameComputationInfo.create(CANONICAL_NAME, arrayDepth),
+                    throwingInfo);
+            logDeferredNameComputation(CANONICAL_NAME);
           } else {
-            name = computeClassName(descriptor, holder, CANONICAL_NAME, factory, arrayDepth);
+            name = CANONICAL_NAME.map(descriptor, holder, factory, arrayDepth);
+            logNameComputation(CANONICAL_NAME);
           }
         }
       } else if (invokedMethod == factory.classMethods.getSimpleName) {
@@ -321,77 +425,97 @@ public class StringOptimizer {
           if (!assumeTopLevel) {
             continue;
           }
-          if (appView.options().isMinifying()
-              && !appView.rootSet().noObfuscation.contains(holder.type)) {
+          if (mayBeRenamed) {
             deferred =
                 new DexItemBasedConstString(
                     invoke.outValue(),
                     baseType,
-                    throwingInfo,
-                    new ClassNameComputationInfo(SIMPLE_NAME, arrayDepth));
+                    ClassNameComputationInfo.create(SIMPLE_NAME, arrayDepth),
+                    throwingInfo);
+            logDeferredNameComputation(SIMPLE_NAME);
           } else {
-            name = computeClassName(descriptor, holder, SIMPLE_NAME, factory, arrayDepth);
+            name = SIMPLE_NAME.map(descriptor, holder, factory, arrayDepth);
+            logNameComputation(SIMPLE_NAME);
           }
         }
       }
       if (name != null) {
+        affectedValues.addAll(invoke.outValue().affectedValues());
         Value stringValue =
             code.createValue(
-                TypeLatticeElement.stringClassType(appView, definitelyNotNull()),
-                invoke.getLocalInfo());
+                TypeElement.stringClassType(appView, definitelyNotNull()), invoke.getLocalInfo());
         ConstString constString = new ConstString(stringValue, name, throwingInfo);
         it.replaceCurrentInstruction(constString);
+        logHistogramOfNames(name);
       } else if (deferred != null) {
+        affectedValues.addAll(invoke.outValue().affectedValues());
         it.replaceCurrentInstruction(deferred);
-        markUseIdentifierNameString = true;
+        logHistogramOfNames(deferred);
       }
     }
-    if (markUseIdentifierNameString) {
-      code.method.getMutableOptimizationInfo().markUseIdentifierNameString();
+    // Computed name is not null or literally null (for canonical name of local/anonymous class).
+    // In either way, that is narrower information, and thus propagate that.
+    if (!affectedValues.isEmpty()) {
+      new TypeAnalysis(appView).narrowing(affectedValues);
     }
   }
 
-  @VisibleForTesting
-  public static boolean hasPotentialReadOutside(
-      AppInfo appInfo, DexEncodedMethod invocationContext, Set<Instruction> escapingInstructions) {
-    for (Instruction instr : escapingInstructions) {
-      if (instr.isReturn() || instr.isThrow() || instr.isStaticPut()) {
-        return true;
-      }
-      if (instr.isInvokeMethod()) {
-        DexMethod invokedMethod = instr.asInvokeMethod().getInvokedMethod();
-        DexClass holder = appInfo.definitionFor(invokedMethod.holder);
-        // For most cases, library call is not interesting, e.g.,
-        // System.out.println(...), String.valueOf(...), etc.
-        // If it's too broad, we can introduce black-list.
-        if (holder == null || holder.isNotProgramClass()) {
-          continue;
-        }
-        // Heuristic: if the call target has the same method name, it could be still local.
-        if (invokedMethod.name == invocationContext.method.name) {
-          continue;
-        }
-        // Add more cases to filter out, if any.
-        return true;
-      }
-      if (instr.isArrayPut()) {
-        return instr.asArrayPut().array().isArgument();
+  private void logNameComputation(ClassNameMapping kind) {
+    if (Log.ENABLED && Log.isLoggingEnabledFor(StringOptimizer.class)) {
+      assert numberOfComputedNames != null;
+      synchronized (numberOfComputedNames) {
+        int count = numberOfComputedNames.getOrDefault(kind, 0);
+        numberOfComputedNames.put(kind, count + 1);
       }
     }
-    return false;
+  }
+
+  private void logHistogramOfNames(DexString name) {
+    if (Log.ENABLED && Log.isLoggingEnabledFor(StringOptimizer.class)) {
+      Integer length = name.size;
+      assert histogramOfLengthOfNames != null;
+      synchronized (histogramOfLengthOfNames) {
+        int count = histogramOfLengthOfNames.getOrDefault(length, 0);
+        histogramOfLengthOfNames.put(length, count + 1);
+      }
+    }
+  }
+
+  private void logDeferredNameComputation(ClassNameMapping kind) {
+    if (Log.ENABLED && Log.isLoggingEnabledFor(StringOptimizer.class)) {
+      assert numberOfDeferredComputationOfNames != null;
+      synchronized (numberOfDeferredComputationOfNames) {
+        int count = numberOfDeferredComputationOfNames.getOrDefault(kind, 0);
+        numberOfDeferredComputationOfNames.put(kind, count + 1);
+      }
+    }
+  }
+
+  private void logHistogramOfNames(DexItemBasedConstString deferred) {
+    if (Log.ENABLED && Log.isLoggingEnabledFor(StringOptimizer.class)) {
+      assert deferred.getItem().isDexType();
+      DexType original = deferred.getItem().asDexType();
+      Integer length = original.descriptor.size;
+      assert histogramOfLengthOfDeferredNames != null;
+      synchronized (histogramOfLengthOfDeferredNames) {
+        int count = histogramOfLengthOfDeferredNames.getOrDefault(length, 0);
+        histogramOfLengthOfDeferredNames.put(length, count + 1);
+      }
+    }
   }
 
   // String#valueOf(null) -> "null"
   // String#valueOf(String s) -> s
   // str.toString() -> str
   public void removeTrivialConversions(IRCode code) {
-    InstructionIterator it = code.instructionIterator();
+    Set<Value> affectedValues = Sets.newIdentityHashSet();
+    InstructionListIterator it = code.instructionListIterator();
     while (it.hasNext()) {
       Instruction instr = it.next();
       if (instr.isInvokeStatic()) {
         InvokeStatic invoke = instr.asInvokeStatic();
         DexMethod invokedMethod = invoke.getInvokedMethod();
-        if (invokedMethod != factory.stringMethods.valueOf) {
+        if (invokedMethod != factory.stringMembers.valueOf) {
           continue;
         }
         assert invoke.inValues().size() == 1;
@@ -399,46 +523,99 @@ public class StringOptimizer {
         if (in.hasLocalInfo()) {
           continue;
         }
-        TypeLatticeElement inType = in.getTypeLattice();
-        if (in.isAlwaysNull(appView)) {
+        Value out = invoke.outValue();
+        TypeElement inType = in.getType();
+        if (out != null && in.isAlwaysNull(appView)) {
+          affectedValues.addAll(out.affectedValues());
           Value nullStringValue =
               code.createValue(
-                  TypeLatticeElement.stringClassType(appView, definitelyNotNull()),
-                  invoke.getLocalInfo());
+                  TypeElement.stringClassType(appView, definitelyNotNull()), invoke.getLocalInfo());
           ConstString nullString =
               new ConstString(nullStringValue, factory.createString("null"), throwingInfo);
           it.replaceCurrentInstruction(nullString);
+          numberOfSimplifiedConversions++;
         } else if (inType.nullability().isDefinitelyNotNull()
             && inType.isClassType()
-            && inType.asClassTypeLatticeElement().getClassType().equals(factory.stringType)) {
-          Value out = invoke.outValue();
+            && inType.asClassType().getClassType().equals(factory.stringType)) {
           if (out != null) {
+            affectedValues.addAll(out.affectedValues());
             removeOrReplaceByDebugLocalWrite(invoke, it, in, out);
           } else {
             it.removeOrReplaceByDebugLocalRead();
           }
+          numberOfSimplifiedConversions++;
         }
       } else if (instr.isInvokeVirtual()) {
         InvokeVirtual invoke = instr.asInvokeVirtual();
         DexMethod invokedMethod = invoke.getInvokedMethod();
-        if (invokedMethod != factory.stringMethods.toString) {
+        if (invokedMethod != factory.stringMembers.toString) {
           continue;
         }
         assert invoke.inValues().size() == 1;
         Value in = invoke.getReceiver();
-        TypeLatticeElement inType = in.getTypeLattice();
+        TypeElement inType = in.getType();
         if (inType.nullability().isDefinitelyNotNull()
             && inType.isClassType()
-            && inType.asClassTypeLatticeElement().getClassType().equals(factory.stringType)) {
+            && inType.asClassType().getClassType().equals(factory.stringType)) {
           Value out = invoke.outValue();
           if (out != null) {
+            affectedValues.addAll(out.affectedValues());
             removeOrReplaceByDebugLocalWrite(invoke, it, in, out);
           } else {
             it.removeOrReplaceByDebugLocalRead();
           }
+          numberOfSimplifiedConversions++;
         }
       }
     }
+    // Newly added "null" string is not null, and thus propagate that information.
+    if (!affectedValues.isEmpty()) {
+      new TypeAnalysis(appView).narrowing(affectedValues);
+    }
   }
 
+  static class StringOptimizerEscapeAnalysisConfiguration
+      implements EscapeAnalysisConfiguration {
+
+    private static final StringOptimizerEscapeAnalysisConfiguration INSTANCE =
+        new StringOptimizerEscapeAnalysisConfiguration();
+
+    private StringOptimizerEscapeAnalysisConfiguration() {}
+
+    public static StringOptimizerEscapeAnalysisConfiguration getInstance() {
+      return INSTANCE;
+    }
+
+    @Override
+    public boolean isLegitimateEscapeRoute(
+        AppView<?> appView,
+        EscapeAnalysis escapeAnalysis,
+        Instruction escapeRoute,
+        ProgramMethod context) {
+      if (escapeRoute.isReturn() || escapeRoute.isThrow() || escapeRoute.isStaticPut()) {
+        return false;
+      }
+      if (escapeRoute.isInvokeMethod()) {
+        DexMethod invokedMethod = escapeRoute.asInvokeMethod().getInvokedMethod();
+        // b/120138731: Only allow known simple operations on const-string
+        if (invokedMethod == appView.dexItemFactory().stringMembers.hashCode
+            || invokedMethod == appView.dexItemFactory().stringMembers.isEmpty
+            || invokedMethod == appView.dexItemFactory().stringMembers.length) {
+          return true;
+        }
+        // Add more cases to filter out, if any.
+        return false;
+      }
+      if (escapeRoute.isArrayPut()) {
+        Value array = escapeRoute.asArrayPut().array().getAliasedValue();
+        return !array.isPhi() && array.definition.isCreatingArray();
+      }
+      if (escapeRoute.isInstancePut()) {
+        Value instance = escapeRoute.asInstancePut().object().getAliasedValue();
+        return !instance.isPhi() && instance.definition.isNewInstance();
+      }
+      // All other cases are not legitimate.
+      return false;
+    }
+  }
 }

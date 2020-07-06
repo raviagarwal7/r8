@@ -14,12 +14,17 @@ import java.util.ListIterator;
 public class Goto extends JumpInstruction {
 
   public Goto() {
-    super(null);
+    super();
   }
 
   public Goto(BasicBlock block) {
     this();
     setBlock(block);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.GOTO;
   }
 
   @Override
@@ -110,5 +115,10 @@ public class Goto extends JumpInstruction {
   @Override
   public void buildCf(CfBuilder builder) {
     builder.add(new CfGoto(builder.getLabel(getTarget())));
+  }
+
+  @Override
+  public boolean isAllowedAfterThrowingInstruction() {
+    return true;
   }
 }

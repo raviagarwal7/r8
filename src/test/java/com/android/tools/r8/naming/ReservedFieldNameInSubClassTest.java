@@ -4,12 +4,13 @@
 package com.android.tools.r8.naming;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
-import static org.hamcrest.CoreMatchers.not;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndNotRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 
 import com.android.tools.r8.NeverMerge;
+import com.android.tools.r8.NeverPropagateValue;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.utils.BooleanUtils;
@@ -34,7 +35,8 @@ public class ReservedFieldNameInSubClassTest extends TestBase {
 
   @Parameterized.Parameters(name = "{0}, reserve name: {1}")
   public static List<Object[]> data() {
-    return buildParameters(getTestParameters().withAllRuntimes().build(), BooleanUtils.values());
+    return buildParameters(
+        getTestParameters().withAllRuntimesAndApiLevels().build(), BooleanUtils.values());
   }
 
   public ReservedFieldNameInSubClassTest(TestParameters parameters, boolean reserveName) {
@@ -49,6 +51,7 @@ public class ReservedFieldNameInSubClassTest extends TestBase {
         testForR8(parameters.getBackend())
             .addProgramClasses(
                 TestClass.class, A.class, B.class, C.class, I.class, J.class, K.class)
+            .enableMemberValuePropagationAnnotations()
             .enableMergeAnnotations()
             .addKeepMainRule(TestClass.class)
             .addKeepRules(
@@ -57,7 +60,7 @@ public class ReservedFieldNameInSubClassTest extends TestBase {
                         + C.class.getTypeName()
                         + "{ java.lang.String a; }"
                     : "")
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), TestClass.class)
             .assertSuccessWithOutput(expectedOutput)
             .inspector();
@@ -99,40 +102,40 @@ public class ReservedFieldNameInSubClassTest extends TestBase {
     assertThat(aFieldSubject, isPresent());
 
     if (reserveName) {
-      assertThat(f1FieldSubject, isRenamed());
+      assertThat(f1FieldSubject, isPresentAndRenamed());
       assertEquals("e", f1FieldSubject.getFinalName());
 
-      assertThat(f2FieldSubject, isRenamed());
+      assertThat(f2FieldSubject, isPresentAndRenamed());
       assertEquals("f", f2FieldSubject.getFinalName());
 
-      assertThat(f3FieldSubject, isRenamed());
+      assertThat(f3FieldSubject, isPresentAndRenamed());
       assertEquals("b", f3FieldSubject.getFinalName());
 
-      assertThat(f4FieldSubject, isRenamed());
+      assertThat(f4FieldSubject, isPresentAndRenamed());
       assertEquals("c", f4FieldSubject.getFinalName());
 
-      assertThat(f5FieldSubject, isRenamed());
+      assertThat(f5FieldSubject, isPresentAndRenamed());
       assertEquals("d", f5FieldSubject.getFinalName());
 
       // B.a should not be renamed because it is not allowed to be minified.
-      assertThat(aFieldSubject, not(isRenamed()));
+      assertThat(aFieldSubject, isPresentAndNotRenamed());
     } else {
-      assertThat(f1FieldSubject, isRenamed());
+      assertThat(f1FieldSubject, isPresentAndRenamed());
       assertEquals("d", f1FieldSubject.getFinalName());
 
-      assertThat(f2FieldSubject, isRenamed());
+      assertThat(f2FieldSubject, isPresentAndRenamed());
       assertEquals("e", f2FieldSubject.getFinalName());
 
-      assertThat(f3FieldSubject, isRenamed());
+      assertThat(f3FieldSubject, isPresentAndRenamed());
       assertEquals("a", f3FieldSubject.getFinalName());
 
-      assertThat(f4FieldSubject, isRenamed());
+      assertThat(f4FieldSubject, isPresentAndRenamed());
       assertEquals("b", f4FieldSubject.getFinalName());
 
-      assertThat(f5FieldSubject, isRenamed());
+      assertThat(f5FieldSubject, isPresentAndRenamed());
       assertEquals("c", f5FieldSubject.getFinalName());
 
-      assertThat(aFieldSubject, isRenamed());
+      assertThat(aFieldSubject, isPresentAndRenamed());
       assertEquals("f", aFieldSubject.getFinalName());
     }
   }
@@ -140,13 +143,13 @@ public class ReservedFieldNameInSubClassTest extends TestBase {
   @NeverMerge
   static class A {
 
-    String f1 = "He";
+    @NeverPropagateValue String f1 = "He";
   }
 
   @NeverMerge
   static class B extends A {
 
-    String f2 = "l";
+    @NeverPropagateValue String f2 = "l";
   }
 
   @NeverMerge
@@ -169,7 +172,7 @@ public class ReservedFieldNameInSubClassTest extends TestBase {
 
   static class C extends B implements J, K {
 
-    String a = "!";
+    @NeverPropagateValue String a = "!";
 
     @Override
     public String toString() {

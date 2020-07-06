@@ -6,8 +6,8 @@ package com.android.tools.r8.shaking.forceproguardcompatibility.defaultctor;
 import static com.android.tools.r8.shaking.forceproguardcompatibility.defaultctor.ExternalizableDataClass.TYPE_1;
 import static com.android.tools.r8.shaking.forceproguardcompatibility.defaultctor.ExternalizableDataClass.TYPE_2;
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.shaking.forceproguardcompatibility.ProguardCompatibilityTestBase;
 import com.android.tools.r8.utils.AndroidApp;
@@ -287,6 +287,18 @@ public class ExternalizableTest extends ProguardCompatibilityTestBase {
         "  java.lang.Object readResolve();",
         "}");
 
+    if (shrinker.isFullModeR8()) {
+      // R8 full mode does not keep the default constructor unless explicitly specified.
+      config = ImmutableList.<String>builder()
+          .addAll(config)
+          .addAll(ImmutableList.of(
+              "-keepclassmembers class * implements java.io.Externalizable {",
+              "  public void <init>();",
+              "}"
+          ))
+          .build();
+    }
+
     AndroidApp processedApp = runShrinker(shrinker, CLASSES_FOR_EXTERNALIZABLE, config);
 
     // TODO(b/117302947): Need to update ART binary.
@@ -305,7 +317,7 @@ public class ExternalizableTest extends ProguardCompatibilityTestBase {
     CodeInspector codeInspector = new CodeInspector(processedApp, proguardMap);
     ClassSubject classSubject = codeInspector.clazz(ExternalizableDataClass.class);
     assertThat(classSubject, isPresent());
-    MethodSubject init = classSubject.init(ImmutableList.of());
+    MethodSubject init = classSubject.init();
     assertThat(init, isPresent());
   }
 

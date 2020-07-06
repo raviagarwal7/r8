@@ -11,6 +11,7 @@ import com.android.tools.r8.utils.FlagFile;
 import com.android.tools.r8.utils.StringDiagnostic;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -21,16 +22,18 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 
-public class D8CommandParser extends BaseCompilerCommandParser {
+public class D8CommandParser extends BaseCompilerCommandParser<D8Command, D8Command.Builder> {
 
   private static final Set<String> OPTIONS_WITH_PARAMETER =
       ImmutableSet.of(
           "--output",
           "--lib",
           "--classpath",
-          "--min-api",
+          MIN_API_FLAG,
           "--main-dex-list",
-          "--main-dex-list-output");
+          "--main-dex-list-output",
+          "--desugared-lib",
+          THREAD_COUNT_FLAG);
 
   private static final String APK_EXTENSION = ".apk";
   private static final String JAR_EXTENSION = ".jar";
@@ -107,29 +110,40 @@ public class D8CommandParser extends BaseCompilerCommandParser {
   static final String USAGE_MESSAGE =
       String.join(
           "\n",
-          Arrays.asList(
-              "Usage: d8 [options] <input-files>",
-              " where <input-files> are any combination of dex, class, zip, jar, or apk files",
-              " and options are:",
-              "  --debug                 # Compile with debugging information (default).",
-              "  --release               # Compile without debugging information.",
-              "  --output <file>         # Output result in <outfile>.",
-              "                          # <file> must be an existing directory or a zip file.",
-              "  --lib <file>            # Add <file> as a library resource.",
-              "  --classpath <file>      # Add <file> as a classpath resource.",
-              "  --min-api <number>      # Minimum Android API level compatibility, default: "
-                  + AndroidApiLevel.getDefault().getLevel()
-                  + ".",
-              "  --intermediate          # Compile an intermediate result intended for later",
-              "                          # merging.",
-              "  --file-per-class        # Produce a separate dex file per input class",
-              "  --no-desugaring         # Force disable desugaring.",
-              "  --main-dex-list <file>  # List of classes to place in the primary dex file.",
-              "  --main-dex-list-output <file>",
-              "                          # Output resulting main dex list in <file>.",
-              "  --version               # Print the version of d8.",
-              "  --help                  # Print this message."));
-
+          Iterables.concat(
+              Arrays.asList(
+                  "Usage: d8 [options] [@<argfile>] <input-files>",
+                  " where <input-files> are any combination of dex, class, zip, jar, or apk files",
+                  " and each <argfile> is a file containing additional arguments (one per line)",
+                  " and options are:",
+                  "  --debug                 # Compile with debugging information (default).",
+                  "  --release               # Compile without debugging information.",
+                  "  --output <file>         # Output result in <outfile>.",
+                  "                          # <file> must be an existing directory or a zip file.",
+                  "  --lib <file|jdk-home>   # Add <file|jdk-home> as a library resource.",
+                  "  --classpath <file>      # Add <file> as a classpath resource.",
+                  "  "
+                      + MIN_API_FLAG
+                      + " <number>      "
+                      + "# Minimum Android API level compatibility, default: "
+                      + AndroidApiLevel.getDefault().getLevel()
+                      + ".",
+                  "  --intermediate          # Compile an intermediate result intended for later",
+                  "                          # merging.",
+                  "  --file-per-class        # Produce a separate dex file per class.",
+                  "                          # Synthetic classes are in their own file.",
+                  "  --file-per-class-file   # Produce a separate dex file per input .class file.",
+                  "                          # Synthetic classes are with their originating class.",
+                  "  --no-desugaring         # Force disable desugaring.",
+                  "  --desugared-lib <file>  # Specify desugared library configuration.",
+                  "                          # <file> is a desugared library configuration (json).",
+                  "  --main-dex-list <file>  # List of classes to place in the primary dex file.",
+                  "  --main-dex-list-output <file>",
+                  "                          # Output resulting main dex list in <file>."),
+              ASSERTIONS_USAGE_MESSAGE,
+              Arrays.asList(
+                  "  --version               # Print the version of d8.",
+                  "  --help                  # Print this message.")));
   /**
    * Parse the D8 command-line.
    *
@@ -140,7 +154,7 @@ public class D8CommandParser extends BaseCompilerCommandParser {
    * @return D8 command builder with state set up according to parsed command line.
    */
   public static D8Command.Builder parse(String[] args, Origin origin) {
-    return parse(args, origin, D8Command.builder());
+    return new D8CommandParser().parse(args, origin, D8Command.builder());
   }
 
   /**
@@ -154,17 +168,17 @@ public class D8CommandParser extends BaseCompilerCommandParser {
    * @return D8 command builder with state set up according to parsed command line.
    */
   public static D8Command.Builder parse(String[] args, Origin origin, DiagnosticsHandler handler) {
-    return parse(args, origin, D8Command.builder(handler));
+    return new D8CommandParser().parse(args, origin, D8Command.builder(handler));
   }
 
-  private static D8Command.Builder parse(String[] args, Origin origin, D8Command.Builder builder) {
+  private D8Command.Builder parse(String[] args, Origin origin, D8Command.Builder builder) {
     CompilationMode compilationMode = null;
     Path outputPath = null;
     OutputMode outputMode = null;
     boolean hasDefinedApiLevel = false;
     OrderedClassFileResourceProvider.Builder classpathBuilder =
         OrderedClassFileResourceProvider.builder();
-    String[] expandedArgs = FlagFile.expandFlagFiles(args, builder);
+    String[] expandedArgs = FlagFile.expandFlagFiles(args, builder::error);
     for (int i = 0; i < expandedArgs.length; i++) {
       String arg = expandedArgs[i].trim();
       String nextArg = null;
@@ -199,6 +213,10 @@ public class D8CommandParser extends BaseCompilerCommandParser {
         compilationMode = CompilationMode.RELEASE;
       } else if (arg.equals("--file-per-class")) {
         outputMode = OutputMode.DexFilePerClass;
+      } else if (arg.equals("--file-per-class-file")) {
+        outputMode = OutputMode.DexFilePerClassFile;
+      } else if (arg.equals("--classfile")) {
+        outputMode = OutputMode.ClassFile;
       } else if (arg.equals("--output")) {
         if (outputPath != null) {
           builder.error(
@@ -209,7 +227,7 @@ public class D8CommandParser extends BaseCompilerCommandParser {
         }
         outputPath = Paths.get(nextArg);
       } else if (arg.equals("--lib")) {
-        builder.addLibraryFiles(Paths.get(nextArg));
+        addLibraryArgument(builder, origin, nextArg);
       } else if (arg.equals("--classpath")) {
         Path file = Paths.get(nextArg);
         try {
@@ -234,22 +252,32 @@ public class D8CommandParser extends BaseCompilerCommandParser {
         builder.setMainDexListOutputPath(Paths.get(nextArg));
       } else if (arg.equals("--optimize-multidex-for-linearalloc")) {
         builder.setOptimizeMultidexForLinearAlloc(true);
-      } else if (arg.equals("--min-api")) {
+      } else if (arg.equals(MIN_API_FLAG)) {
         if (hasDefinedApiLevel) {
-          builder.error(new StringDiagnostic("Cannot set multiple --min-api options", origin));
+          builder.error(
+              new StringDiagnostic("Cannot set multiple " + MIN_API_FLAG + " options", origin));
         } else {
-          parseMinApi(builder, nextArg, origin);
+          parsePositiveIntArgument(
+              builder::error, MIN_API_FLAG, nextArg, origin, builder::setMinApiLevel);
           hasDefinedApiLevel = true;
         }
+      } else if (arg.equals(THREAD_COUNT_FLAG)) {
+        parsePositiveIntArgument(
+            builder::error, THREAD_COUNT_FLAG, nextArg, origin, builder::setThreadCount);
       } else if (arg.equals("--intermediate")) {
         builder.setIntermediate(true);
       } else if (arg.equals("--no-desugaring")) {
         builder.setDisableDesugaring(true);
-      } else {
-        if (arg.startsWith("--")) {
+      } else if (arg.equals("--desugared-lib")) {
+        builder.addDesugaredLibraryConfiguration(StringResource.fromFile(Paths.get(nextArg)));
+      } else if (arg.startsWith("--")) {
+        if (!tryParseAssertionArgument(builder, arg, origin)) {
           builder.error(new StringDiagnostic("Unknown option: " + arg, origin));
           continue;
         }
+      } else if (arg.startsWith("@")) {
+        builder.error(new StringDiagnostic("Recursive @argfiles are not supported: ", origin));
+      } else {
         builder.addProgramFiles(Paths.get(arg));
       }
     }

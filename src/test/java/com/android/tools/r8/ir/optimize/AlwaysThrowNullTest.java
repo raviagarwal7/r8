@@ -7,7 +7,6 @@ import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
 import com.android.tools.r8.D8TestRunResult;
@@ -60,7 +59,7 @@ class AlwaysThrowNullTestClass {
     try {
       arg.dead = new Object();
     } catch (IllegalArgumentException e) {
-      fail("Unexpected exception kind");
+      throw new AssertionError("Unexpected exception kind");
     }
   }
 
@@ -110,34 +109,34 @@ class AlwaysThrowNullTestClass {
     try {
       uninstantiatedInstancePutWithNPEGuard(null);
     } catch (NullPointerException npe) {
-      fail("Unexpected NPE");
+      throw new AssertionError("Unexpected NPE");
     }
     try {
       uninstantiatedInstancePutWithOtherGuard(null);
-      fail("Expected NullPointerException");
+      throw new AssertionError("Expected NullPointerException");
     } catch (NullPointerException npe) {
       System.out.println("Expected NPE");
     }
     try {
       uninstantiatedInstanceInvoke(null);
-      fail("Expected NullPointerException");
+      throw new AssertionError("Expected NullPointerException");
     } catch (NullPointerException npe) {
       System.out.println("Expected NPE");
     }
     try {
       nullReferenceInvoke();
     } catch (NullPointerException npe) {
-      fail("Unexpected NPE");
+      throw new AssertionError("Unexpected NPE");
     }
     try {
       uninstantiatedInstancePut(null);
-      fail("Expected NullPointerException");
+      throw new AssertionError("Expected NullPointerException");
     } catch (NullPointerException npe) {
       System.out.println("Expected NPE");
     }
     try {
       uninstantiatedInstanceGet(null);
-      fail("Expected NullPointerException");
+      throw new AssertionError("Expected NullPointerException");
     } catch (NullPointerException npe) {
       System.out.println("Expected NPE");
     }
@@ -167,7 +166,7 @@ public class AlwaysThrowNullTest extends TestBase {
 
   @Parameterized.Parameters(name = "{0}")
   public static TestParametersCollection data() {
-    return getTestParameters().withAllRuntimes().build();
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
   }
 
   private final TestParameters parameters;
@@ -178,7 +177,7 @@ public class AlwaysThrowNullTest extends TestBase {
 
   @Test
   public void testJvmOutput() throws Exception {
-    assumeTrue("Only run JVM reference once (for CF backend)", parameters.isCfRuntime());
+    assumeTrue("Only run JVM reference on CF runtimes", parameters.isCfRuntime());
     testForJvm()
         .addTestClasspath()
         .run(parameters.getRuntime(), MAIN)
@@ -229,7 +228,7 @@ public class AlwaysThrowNullTest extends TestBase {
         testForD8()
             .release()
             .addProgramClassesAndInnerClasses(MAIN)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
     test(result, false);
@@ -245,10 +244,9 @@ public class AlwaysThrowNullTest extends TestBase {
             .enableMemberValuePropagationAnnotations()
             .addKeepMainRule(MAIN)
             .noMinification()
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
     test(result, true);
   }
-
 }

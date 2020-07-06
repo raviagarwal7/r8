@@ -5,7 +5,13 @@
 import os
 import utils
 
+ANDROID_N_API = '24'
 BASE = os.path.join(utils.THIRD_PARTY, 'chrome')
+
+V180917_BASE = os.path.join(BASE, 'chrome_180917_ffbaa8')
+V200430_BASE = os.path.join(BASE, 'chrome_200430')
+V200520_MINIMAL_BASE = os.path.join(
+    BASE, 'monochrome_public_minimal_apks', 'chrome_200520')
 
 INPUT_JARS = [
     'out/Release/gen/chrome/android/monochrome_public_apk/monochrome_public_apk.jar',
@@ -236,12 +242,38 @@ LIBRARIES = [
 ]
 
 VERSIONS = {
-  'default': {
+  '180917': {
     'deploy' : {
         'r8-flags': '--no-desugaring',
-        'inputs': [os.path.join(BASE, path) for path in INPUT_JARS],
-        'pgconf': [os.path.join(BASE, path) for path in PG_CONFS],
-        'libraries': [os.path.join(BASE, path) for path in LIBRARIES],
+        'inputs': [os.path.join(V180917_BASE, path) for path in INPUT_JARS],
+        'pgconf': [os.path.join(V180917_BASE, path) for path in PG_CONFS],
+        'libraries': [os.path.join(V180917_BASE, path) for path in LIBRARIES],
+    },
+  },
+  '200430': {
+    'deploy' : {
+        'inputs': [os.path.join(V200430_BASE, 'program.jar')],
+        'pgconf': [os.path.join(V200430_BASE, 'proguard.config')],
+        'libraries': [os.path.join(V200430_BASE, 'library.jar')],
+        'min-api': ANDROID_N_API
+    },
+  },
+  '200520-monochrome_public_minimal_apks': {
+    'deploy' : {
+        'inputs': [os.path.join(V200520_MINIMAL_BASE, 'program.jar')],
+        'features': [
+            { 'inputs': [os.path.join(V200520_MINIMAL_BASE, 'feature-1.jar')] },
+            { 'inputs': [os.path.join(V200520_MINIMAL_BASE, 'feature-2.jar')] },
+            { 'inputs': [os.path.join(V200520_MINIMAL_BASE, 'feature-3.jar')] },
+            { 'inputs': [os.path.join(V200520_MINIMAL_BASE, 'feature-4.jar')] },
+            { 'inputs': [os.path.join(V200520_MINIMAL_BASE, 'feature-5.jar')] },
+            { 'inputs': [os.path.join(V200520_MINIMAL_BASE, 'feature-6.jar')] },
+            { 'inputs': [os.path.join(V200520_MINIMAL_BASE, 'feature-7.jar')] },
+            { 'inputs': [os.path.join(V200520_MINIMAL_BASE, 'feature-8.jar')] }
+        ],
+        'pgconf': [os.path.join(V200520_MINIMAL_BASE, 'proguard.config')],
+        'libraries': [os.path.join(V200520_MINIMAL_BASE, 'library.jar')],
+        'min-api': ANDROID_N_API
     },
   },
 }

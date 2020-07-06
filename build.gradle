@@ -3,8 +3,11 @@
 // BSD-style license that can be found in the LICENSE file.
 
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import dx.DexMergerTask
+import dx.DxTask
 import net.ltgt.gradle.errorprone.CheckSeverity
 import org.gradle.internal.os.OperatingSystem
+import smali.SmaliTask
 import tasks.DownloadDependency
 import tasks.GetJarsFromConfiguration
 import utils.Utils
@@ -12,16 +15,14 @@ import utils.Utils
 buildscript {
     repositories {
         maven {
-            url 'http://storage.googleapis.com/r8-deps/maven_mirror/'
+            url 'https://storage.googleapis.com/r8-deps/maven_mirror/'
         }
         mavenCentral()
-        maven {
-            url "https://plugins.gradle.org/m2/"
-        }
+        gradlePluginPortal()
         jcenter()
     }
     dependencies {
-        classpath 'com.github.jengelman.gradle.plugins:shadow:2.0.4'
+        classpath 'com.github.jengelman.gradle.plugins:shadow:4.0.2'
     }
 }
 
@@ -34,7 +35,7 @@ apply plugin: 'idea'
 
 ext {
     androidSupportVersion = '25.4.0'
-    asmVersion = '7.1'
+    asmVersion = '8.0'
     espressoVersion = '3.0.0'
     fastutilVersion = '7.2.0'
     guavaVersion = '23.0'
@@ -42,21 +43,21 @@ ext {
     gsonVersion = '2.7'
     junitVersion = '4.13-beta-2'
     mockitoVersion = '2.10.0'
-    kotlinVersion = '1.3.11'
-    kotlinExtMetadataJVMVersion = '0.0.4'
+    kotlinVersion = '1.3.72'
+    kotlinExtMetadataJVMVersion = '0.1.0'
     smaliVersion = '2.2b4'
     errorproneVersion = '2.3.2'
+    testngVersion = '6.10'
 }
 
 apply from: 'copyAdditionalJctfCommonFiles.gradle'
 
 repositories {
     maven {
-       url 'http://storage.googleapis.com/r8-deps/maven_mirror/'
+       url 'https://storage.googleapis.com/r8-deps/maven_mirror/'
     }
-    maven { url 'https://maven.google.com' }
+    google()
     mavenCentral()
-    maven { url 'https://kotlin.bintray.com/kotlinx' }
 }
 
 if (project.hasProperty('with_code_coverage')) {
@@ -68,8 +69,8 @@ sourceSets {
     test {
         java {
             srcDirs = [
-                'src/test/java',
-                'build/generated/test/java',
+                    'src/test/java',
+                    'build/generated/test/java',
             ]
         }
     }
@@ -89,13 +90,11 @@ sourceSets {
         }
         output.resourcesDir = 'build/classes/cfSegments'
     }
-    classlib {
+    libraryDesugarConversions {
         java {
-            srcDirs = [
-                    'third_party/classlib/java',
-            ]
+            srcDirs = ['src/library_desugar/java']
         }
-        output.resourcesDir = 'build/classes/classlib'
+        output.resourcesDir = 'build/classes/library_desugar_conversions'
     }
     debugTestResources {
         java {
@@ -121,6 +120,35 @@ sourceSets {
         }
         output.resourcesDir = 'build/classes/examples'
     }
+    examplesJava9 {
+        java {
+            srcDirs = ['src/test/examplesJava9']
+        }
+    }
+    examplesJava10 {
+        java {
+            srcDirs = ['src/test/examplesJava10']
+        }
+    }
+    examplesJava11 {
+        java {
+            srcDirs = ['src/test/examplesJava11']
+        }
+    }
+    jdk11TimeTests {
+        java {
+            srcDirs = [
+                    'third_party/openjdk/jdk-11-test/java/time/tck',
+                    'third_party/openjdk/jdk-11-test/java/time/test'
+            ]
+            exclude '**/TestZoneTextPrinterParser.java'
+        }
+    }
+    examplesTestNGRunner {
+        java {
+            srcDirs = ['src/test/testngrunner']
+        }
+    }
     examplesKotlin {
         java {
             srcDirs = ['src/test/examplesKotlin']
@@ -144,6 +172,14 @@ sourceSets {
             srcDirs = ['src/test/examplesAndroidP']
         }
         output.resourcesDir = 'build/classes/examplesAndroidP'
+    }
+    examplesProto {
+        java {
+            srcDirs = ['src/test/examplesProto']
+        }
+        compileClasspath = files("third_party/protobuf-lite/libprotobuf_lite.jar")
+        compileClasspath += fileTree(dir: "build/generated/test/proto", include: "*.jar")
+        output.resourcesDir = 'build/classes/examplesProto'
     }
     jctfCommon {
         java {
@@ -217,6 +253,8 @@ dependencies {
     implementation group: 'org.ow2.asm', name: 'asm-tree', version: asmVersion
     implementation group: 'org.ow2.asm', name: 'asm-analysis', version: asmVersion
     implementation group: 'org.ow2.asm', name: 'asm-util', version: asmVersion
+    jdk11TimeTestsCompile group: 'org.testng', name: 'testng', version: testngVersion
+    examplesTestNGRunnerCompile group: 'org.testng', name: 'testng', version: testngVersion
     testCompile sourceSets.examples.output
     testCompile "junit:junit:$junitVersion"
     testCompile group: 'org.smali', name: 'smali', version: smaliVersion
@@ -226,7 +264,6 @@ dependencies {
     jctfCommonCompile "junit:junit:$junitVersion"
     jctfTestsCompile "junit:junit:$junitVersion"
     jctfTestsCompile sourceSets.jctfCommon.output
-    cfSegmentsCompile sourceSets.classlib.output
     examplesAndroidOCompile group: 'org.ow2.asm', name: 'asm', version: asmVersion
     examplesAndroidPCompile group: 'org.ow2.asm', name: 'asm', version: asmVersion
     // Import Guava for @Nullable annotation
@@ -242,13 +279,14 @@ dependencies {
     examplesKotlinCompileOnly "org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion"
     kotlinR8TestResourcesCompileOnly "org.jetbrains.kotlin:kotlin-stdlib:$kotlinVersion"
     errorprone("com.google.errorprone:error_prone_core:$errorproneVersion")
+    testImplementation "org.jetbrains.kotlin:kotlin-reflect:1.3.31"
 }
 
 def r8LibPath = "$buildDir/libs/r8lib.jar"
 def r8LibExludeDepsPath = "$buildDir/libs/r8lib-exclude-deps.jar"
 def r8LibGeneratedKeepRulesPath = "$buildDir/generated/keep.txt"
-def r8LibGeneratedKeepRulesExcludeDepsPath = "$buildDir/generated/keep-exclude-deps.txt"
 def r8LibTestPath = "$buildDir/classes/r8libtest"
+def java11ClassFiles = "build/classes/java/mainJava11"
 
 def osString = OperatingSystem.current().isLinux() ? "linux" :
         OperatingSystem.current().isMacOsX() ? "mac" : "windows"
@@ -271,20 +309,36 @@ def cloudDependencies = [
                 "android_jar/lib-v26",
                 "android_jar/lib-v27",
                 "android_jar/lib-v28",
+                "android_jar/lib-v29",
+                "android_jar/lib-v30",
                 "core-lambda-stubs",
                 "dart-sdk",
                 "ddmlib",
                 "gradle/gradle",
+                "google-java-format",
+                "iosched_2019",
                 "jacoco",
                 "jasmin",
                 "jctf",
                 "junit",
                 "jdwp-tests",
-                "kotlin",
+                "jsr223-api-1.0",
+                "rhino-1.7.10",
+                "rhino-android-1.1.1",
+                "kotlin/kotlin-compiler-1.3.11",
+                "kotlin/kotlin-compiler-1.3.41",
+                "kotlin/kotlin-compiler-1.3.72",
+                "kotlinx-coroutines-1.3.6",
                 "openjdk/openjdk-rt-1.8",
+                "openjdk/desugar_jdk_libs",
+                "openjdk/jdk-11-test",
                 "proguard/proguard5.2.1",
                 "proguard/proguard6.0.1",
+                "proguard/proguard-7.0.0",
                 "r8",
+                "r8-releases/2.0.74",
+                "r8mappings",
+                "tachiyomi"
         ],
         // All dex-vms have a fixed OS of Linux, as they are only supported on Linux, and will be run in a Docker
         // container on other platforms where supported.
@@ -295,6 +349,7 @@ def cloudDependencies = [
                 "linux/art-7.0.0",
                 "linux/art-8.1.0",
                 "linux/art-9.0.0",
+                "linux/art-10.0.0",
                 "linux/dalvik",
                 "linux/dalvik-4.0.4",
                 "${osString}/dx",
@@ -338,10 +393,6 @@ def getDownloadDepsTaskName(entryKey, entryFile) {
     return "download_deps_${entryKey}_${entryFile.replace('/', '_').replace('\\', '_')}"
 }
 
-def getFetchDepsTaskName(entryKey, entryFile) {
-    return "fetch_deps_${entryKey}_${entryFile.replace('/', '_').replace('\\', '_')}"
-}
-
 cloudDependencies.each { entry ->
     entry.value.each { entryFile ->
         task "${getDownloadDepsTaskName(entry.key, entryFile)}"(type: DownloadDependency) {
@@ -354,7 +405,9 @@ cloudDependencies.each { entry ->
 def x20Dependencies = [
     "third_party": [
         "benchmarks/kotlin-benches",
-        "chrome",
+        "chrome/chrome_180917_ffbaa8",
+        "chrome/chrome_200430",
+        "chrome/monochrome_public_minimal_apks/chrome_200520",
         "classlib",
         "cf_segments",
         "desugar/desugar_20180308",
@@ -374,10 +427,17 @@ def x20Dependencies = [
         "photos/2017-06-06",
         "proguard/proguard_internal_159423826",
         "proguardsettings",
+        "proto",
+        "protobuf-lite",
+        "retrace_internal",
         "youtube/youtube.android_12.10",
         "youtube/youtube.android_12.17",
         "youtube/youtube.android_12.22",
         "youtube/youtube.android_13.37",
+        "youtube/youtube.android_14.19",
+        "youtube/youtube.android_14.44",
+        "youtube/youtube.android_15.08",
+        "youtube/youtube.android_15.09"
     ],
 ]
 
@@ -457,10 +517,12 @@ println("NOTE: Current operating system isWindows: " + OperatingSystem.current()
 // Check if running with the JDK location from tools/jdk.py.
 if (OperatingSystem.current().isWindows()) {
     println "NOTE: Running with JDK: " + org.gradle.internal.jvm.Jvm.current().javaHome
+    compileJava.options.encoding = "UTF-8"
+    compileTestJava.options.encoding = "UTF-8"
 } else {
     def javaHomeOut = new StringBuilder()
     def javaHomeErr = new StringBuilder()
-    def javaHomeProc = './tools/jdk.py'.execute()
+    def javaHomeProc = './tools/jdk.py'.execute([], projectDir)
     javaHomeProc.waitForProcessOutput(javaHomeOut, javaHomeErr)
     def jdkHome = new File(javaHomeOut.toString().trim())
     if (!jdkHome.exists()) {
@@ -483,12 +545,68 @@ sourceSets.configureEach { sourceSet ->
         options.fork = true
         // Javac often runs out of stack space when compiling the tests.
         // Increase the stack size for the javac process.
-        options.forkOptions.jvmArgs << "-Xss4m"
+        options.forkOptions.jvmArgs << "-Xss256m"
         // Test compilation is sometimes hitting the default limit at 1g, increase it.
-        options.forkOptions.jvmArgs << "-Xmx2g"
+        options.forkOptions.jvmArgs << "-Xmx3g"
         // Set the bootclass path so compilation is consistent with 1.8 target compatibility.
         options.forkOptions.jvmArgs << "-Xbootclasspath/a:third_party/openjdk/openjdk-rt-1.8/rt.jar"
     }
+}
+
+tasks.named(sourceSets.examplesJava9.compileJavaTaskName).get().configure {
+    def jdkDir = 'third_party/openjdk/openjdk-9.0.4/'
+    options.fork = true
+    options.forkOptions.jvmArgs = []
+    if (OperatingSystem.current().isLinux()) {
+        options.forkOptions.javaHome = file(jdkDir + 'linux')
+    } else if (OperatingSystem.current().isMacOsX()) {
+        options.forkOptions.javaHome = file(jdkDir + 'osx')
+    } else {
+        options.forkOptions.javaHome = file(jdkDir + 'windows')
+    }
+    sourceCompatibility = JavaVersion.VERSION_1_9
+    targetCompatibility = JavaVersion.VERSION_1_9
+}
+
+def setJdk11CompilationWithCompatibility(String sourceSet, JavaVersion compatibility) {
+    tasks.named(sourceSet).get().configure {
+        def jdkDir = 'third_party/openjdk/jdk-11/'
+        options.fork = true
+        options.forkOptions.jvmArgs = []
+        if (OperatingSystem.current().isLinux()) {
+            options.forkOptions.javaHome = file(jdkDir + 'Linux')
+        } else if (OperatingSystem.current().isMacOsX()) {
+            options.forkOptions.javaHome = file(jdkDir + 'Mac/Contents/Home')
+        } else {
+            options.forkOptions.javaHome = file(jdkDir + 'Windows')
+        }
+        sourceCompatibility = compatibility
+        targetCompatibility = compatibility
+    }
+}
+
+setJdk11CompilationWithCompatibility(sourceSets.examplesJava10.compileJavaTaskName, JavaVersion.VERSION_1_10)
+setJdk11CompilationWithCompatibility(sourceSets.examplesJava11.compileJavaTaskName, JavaVersion.VERSION_11)
+setJdk11CompilationWithCompatibility(sourceSets.examplesTestNGRunner.compileJavaTaskName, JavaVersion.VERSION_11)
+setJdk11CompilationWithCompatibility(sourceSets.jdk11TimeTests.compileJavaTaskName, JavaVersion.VERSION_11)
+
+task compileMainWithJava11 (type: JavaCompile) {
+    dependsOn downloadDeps
+    def jdkDir = 'third_party/openjdk/jdk-11/'
+    options.fork = true
+    options.forkOptions.jvmArgs = []
+    if (OperatingSystem.current().isLinux()) {
+        options.forkOptions.javaHome = file(jdkDir + 'Linux')
+    } else if (OperatingSystem.current().isMacOsX()) {
+        options.forkOptions.javaHome = file(jdkDir + 'Mac/Contents/Home')
+    } else {
+        options.forkOptions.javaHome = file(jdkDir + 'Windows')
+    }
+    source = sourceSets.main.allSource
+    destinationDir = file(java11ClassFiles)
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+    classpath = sourceSets.main.compileClasspath
 }
 
 if (!project.hasProperty('without_error_prone') &&
@@ -499,6 +617,7 @@ if (!project.hasProperty('without_error_prone') &&
         options.errorprone.enabled = true
         options.errorprone.disableAllChecks = true
         options.errorprone.check('ClassCanBeStatic', CheckSeverity.ERROR)
+        options.errorprone.check('CollectionIncompatibleType', CheckSeverity.ERROR)
         options.errorprone.check('OperatorPrecedence', CheckSeverity.ERROR)
         options.errorprone.check('RemoveUnusedImports', CheckSeverity.ERROR)
         options.errorprone.check('MissingOverride', CheckSeverity.ERROR)
@@ -584,249 +703,309 @@ static mergeServiceFiles(ShadowJar task) {
     }
 }
 
-static configureRelocations(ShadowJar task) {
-    task.relocate('com.google.common', 'com.android.tools.r8.com.google.common')
-    task.relocate('com.google.gson', 'com.android.tools.r8.com.google.gson')
-    task.relocate('com.google.thirdparty', 'com.android.tools.r8.com.google.thirdparty')
-    task.relocate('joptsimple', 'com.android.tools.r8.joptsimple')
-    task.relocate('org.objectweb.asm', 'com.android.tools.r8.org.objectweb.asm')
-    task.relocate('it.unimi.dsi.fastutil', 'com.android.tools.r8.it.unimi.dsi.fastutil')
-    task.relocate('kotlin', 'com.android.tools.r8.jetbrains.kotlin')
-    task.relocate('kotlinx', 'com.android.tools.r8.jetbrains.kotlinx')
-    task.relocate('org.jetbrains', 'com.android.tools.r8.org.jetbrains')
-    task.relocate('org.intellij', 'com.android.tools.r8.org.intellij')
-}
-
-task repackageDepsNoRelocate(type: ShadowJar) {
+task repackageDepsNew(type: ShadowJar) {
     configurations = [project.configurations.runtimeClasspath]
     mergeServiceFiles(it)
     exclude { it.getRelativePath().getPathString() == "module-info.class" }
     exclude { it.getRelativePath().getPathString().startsWith("META-INF/maven/") }
-    baseName 'deps-not-relocated'
+    baseName 'deps_all'
 }
 
-task repackageDeps(type: ShadowJar) {
-    configurations = [project.configurations.runtimeClasspath]
-    mergeServiceFiles(it)
-    if (!project.hasProperty('lib_no_relocate')) {
-        configureRelocations(it)
-    }
-    exclude { it.getRelativePath().getPathString() == "module-info.class" }
-    exclude { it.getRelativePath().getPathString().startsWith("META-INF/maven/") }
-    baseName 'deps'
-}
-
-task repackageSources(type: ShadowJar) {
+task repackageSourcesNew(type: ShadowJar) {
     from sourceSets.main.output
     mergeServiceFiles(it)
-    if (!project.hasProperty('lib_no_relocate')) {
-        configureRelocations(it)
-    }
-    baseName 'sources'
+    baseName 'sources_main'
 }
 
-task r8WithRelocatedDeps(type: ShadowJar) {
-    from consolidatedLicense.outputs.files
-    baseName 'r8_with_relocated_deps'
-    classifier = null
-    version = null
-    manifest {
-        attributes 'Main-Class': 'com.android.tools.r8.SwissArmyKnife'
-    }
-    from repackageSources.outputs.files
-    from repackageDeps.outputs.files
-    configureRelocations(it)
-    exclude "META-INF/*.kotlin_module"
+task repackageSources11New(type: ShadowJar) {
+    dependsOn compileMainWithJava11
+    from file(java11ClassFiles)
+    mergeServiceFiles(it)
+    baseName 'sources_main_11'
 }
 
-task r8WithoutDeps(type: ShadowJar) {
-    from consolidatedLicense.outputs.files
-    baseName 'r8_without_deps'
-    classifier = null
-    version = null
-    manifest {
-        attributes 'Main-Class': 'com.android.tools.r8.SwissArmyKnife'
+def r8CreateTask(name, baseNameName, sources, includeSwissArmyKnife) {
+    return tasks.create("r8Create${name}", ShadowJar) {
+        from consolidatedLicense.outputs.files
+        from sources
+        baseName baseNameName
+        classifier = null
+        version = null
+        if (includeSwissArmyKnife) {
+            manifest {
+                attributes 'Main-Class': 'com.android.tools.r8.SwissArmyKnife'
+            }
+        }
+        exclude "META-INF/*.kotlin_module"
+        exclude "**/*.kotlin_metadata"
     }
-    from sourceSets.main.output
 }
 
-task R8(type: ShadowJar) {
-    from consolidatedLicense.outputs.files
-    baseName 'r8'
-    classifier = null
-    version = null
-    manifest {
-        attributes 'Main-Class': 'com.android.tools.r8.SwissArmyKnife'
+def r8RelocateTask(r8Task, output) {
+    return tasks.create("r8Relocate_${r8Task.name}", Exec) {
+        dependsOn r8WithDeps
+        dependsOn r8Task
+        outputs.file output
+        workingDir = projectDir
+        inputs.files r8Task.outputs.files + r8WithDeps.outputs.files
+        commandLine baseR8CommandLine([
+                "relocator",
+                "--input",
+                r8Task.outputs.files[0],
+                "--output",
+                output,
+                "--map",
+                "com.google.common->com.android.tools.r8.com.google.common",
+                "--map",
+                "com.google.gson->com.android.tools.r8.com.google.gson",
+                "--map",
+                "com.google.thirdparty->com.android.tools.r8.com.google.thirdparty",
+                "--map",
+                "joptsimple->com.android.tools.r8.joptsimple",
+                "--map",
+                "org.objectweb.asm->com.android.tools.r8.org.objectweb.asm",
+                "--map",
+                "it.unimi.dsi.fastutil->com.android.tools.r8.it.unimi.dsi.fastutil",
+                "--map",
+                "kotlin->com.android.tools.r8.jetbrains.kotlin",
+                "--map",
+                "kotlinx->com.android.tools.r8.jetbrains.kotlinx",
+                "--map",
+                "org.jetbrains->com.android.tools.r8.org.jetbrains",
+                "--map",
+                "org.intellij->com.android.tools.r8.org.intellij"
+        ])
     }
-    // In order to build without dependencies, pass the exclude_deps property using:
-    // gradle -Pexclude_deps R8
-    if (!project.hasProperty('exclude_deps')) {
-        from repackageSources.outputs.files
-        from repackageDeps.outputs.files
-    } else {
-        from sourceSets.main.output
-    }
-    exclude "META-INF/*.kotlin_module"
 }
 
-task R8NoManifestNoDeps(type: ShadowJar) {
-    from consolidatedLicense.outputs.files
-    baseName 'r8nomanifest-exclude-deps'
-    classifier = null
-    version = null
-    from sourceSets.main.output
+task r8WithDeps {
+    dependsOn repackageSourcesNew
+    dependsOn repackageDepsNew
+    inputs.files ([repackageSourcesNew.outputs, repackageDepsNew.outputs])
+    def r8Task = r8CreateTask(
+            'WithDeps',
+            'r8_with_deps',
+            repackageSourcesNew.outputs.files + repackageDepsNew.outputs.files,
+            true)
+    dependsOn r8Task
+    outputs.files r8Task.outputs.files
 }
 
-task R8NoManifest(type: ShadowJar) {
-    from consolidatedLicense.outputs.files
-    baseName 'r8nomanifest'
-    classifier = null
-    version = null
-    // In order to build without dependencies, pass the exclude_deps property using:
-    // gradle -Pexclude_deps R8
-    if (!project.hasProperty('exclude_deps')) {
-        from repackageSources.outputs.files
-        from repackageDeps.outputs.files
-    } else {
-        from sourceSets.main.output
-    }
-    exclude "META-INF/*.kotlin_module"
+task r8WithDeps11 {
+    dependsOn repackageSources11New
+    dependsOn repackageDepsNew
+    inputs.files ([repackageSources11New.outputs, repackageDepsNew.outputs])
+    def r8Task = r8CreateTask(
+            'WithDeps11',
+            'r8_with_deps_11',
+            repackageSources11New.outputs.files + repackageDepsNew.outputs.files,
+            true)
+    dependsOn r8Task
+    outputs.files r8Task.outputs.files
+}
+
+task r8WithRelocatedDeps {
+    def output = "${buildDir}/libs/r8_with_relocated_deps.jar"
+    dependsOn r8RelocateTask(r8WithDeps, output)
+    inputs.files r8WithDeps.outputs.files
+    outputs.file output
+}
+
+task r8WithRelocatedDeps11 {
+    def output = "${buildDir}/libs/r8_with_relocated_deps_11.jar"
+    dependsOn r8RelocateTask(r8WithDeps11, output)
+    inputs.files r8WithDeps11.outputs.files
+    outputs.file output
+}
+
+task r8WithoutDeps {
+    dependsOn repackageSourcesNew
+    inputs.files repackageSourcesNew.outputs
+    def r8Task = r8CreateTask(
+            'WithoutDeps',
+            'r8_without_deps',
+            repackageSourcesNew.outputs.files,
+            true)
+    dependsOn r8Task
+    outputs.files r8Task.outputs.files
+}
+
+task r8(type: Copy) {
+    def r8Task = project.hasProperty("exclude_deps")
+            ? r8WithoutDeps : r8WithRelocatedDeps
+    dependsOn r8Task
+    from r8Task.outputs.files[0]
+    into file("${buildDir}/libs")
+    rename { String fileName -> "r8.jar" }
+    outputs.file "${buildDir}/libs/r8.jar"
+}
+
+task r8NoManifestWithoutDeps {
+    dependsOn repackageSourcesNew
+    inputs.files repackageSourcesNew.outputs
+    def r8Task = r8CreateTask(
+            'NoManifestWithoutDeps',
+            'r8_no_manifest_without_deps',
+            repackageSourcesNew.outputs.files,
+            false)
+    dependsOn r8Task
+    outputs.files r8Task.outputs.files
+}
+
+task r8NoManifestWithDeps {
+    dependsOn repackageSourcesNew
+    inputs.files ([repackageSourcesNew.outputs, repackageDepsNew.outputs])
+    def r8Task = r8CreateTask(
+            'NoManifestWithDeps',
+            'r8_no_manifest_with_deps',
+            repackageSourcesNew.outputs.files + repackageDepsNew.outputs.files,
+            false)
+    dependsOn r8Task
+    outputs.files r8Task.outputs.files
+}
+
+task r8NoManifestWithRelocatedDeps {
+    def output = "${buildDir}/libs/r8_no_manifest_with_relocated_deps.jar"
+    dependsOn r8RelocateTask(r8NoManifestWithDeps, output)
+    inputs.files r8NoManifestWithDeps.outputs.files
+    outputs.file output
+}
+
+task r8NoManifest(type: Copy) {
+    def r8Task = project.hasProperty("exclude_deps")
+            ? r8NoManifestWithoutDeps : r8NoManifestWithRelocatedDeps
+    dependsOn r8Task
+    from r8Task.outputs.files[0]
+    into file("${buildDir}/libs")
+    rename { String fileName -> "r8_no_manifest.jar" }
+    outputs.file "${buildDir}/libs/r8_no_manifest.jar"
 }
 
 task D8(type: ShadowJar) {
-    from R8.outputs.files
+    dependsOn r8
+    from r8.outputs.files[0]
     baseName 'd8'
     manifest {
         attributes 'Main-Class': 'com.android.tools.r8.D8'
     }
 }
 
-task CompatDx(type: ShadowJar) {
-    from R8.outputs.files
-    baseName 'compatdx'
-    manifest {
-      attributes 'Main-Class': 'com.android.tools.r8.compatdx.CompatDx'
-    }
-}
-
-task CompatProguard(type: ShadowJar) {
-    from R8.outputs.files
-    baseName 'compatproguard'
-    manifest {
-        attributes 'Main-Class': 'com.android.tools.r8.compatproguard.CompatProguard'
-    }
-}
-
 def baseR8CommandLine(args = []) {
-    // Execute r8 commands against a stable r8 with relocated dependencies.
+    // Execute r8 commands against a stable r8 with dependencies.
+    // TODO(b/139725780): See if we can remove or lower the heap size (-Xmx6g).
     return [org.gradle.internal.jvm.Jvm.current().getJavaExecutable(),
-            "-ea", "-jar", r8WithRelocatedDeps.outputs.files[0]] + args
+            "-Xmx8g", "-ea", "-jar", r8WithDeps.outputs.files[0]] + args
 }
 
-def r8CfCommandLine(input, output, pgconf, args = [], libs = []) {
-    return baseR8CommandLine([
-            "--classfile", "--release",
+def r8CfCommandLine(input, output, pgConfs = [], args = ["--release"], libs = []) {
+    def allArgs = [
+            "--classfile",
             input,
             "--output", output,
-            "--pg-conf", pgconf,
             "--pg-map-output", output + ".map",
             "--lib", "third_party/openjdk/openjdk-rt-1.8/rt.jar"
-        ] + args + libs.collectMany { ["--lib", it] })
+    ] + args + libs.collectMany { ["--lib", it] } + pgConfs.collectMany { ["--pg-conf", it] }
+    return baseR8CommandLine(allArgs)
 }
 
-def r8LibCreateTask(name, pgConf, r8Task, output, args = [], libs = []) {
+def r8LibCreateTask(name, pgConfs = [], r8Task, output, args = ["--release"], libs = []) {
     return tasks.create("r8Lib${name}", Exec) {
-        inputs.files ([pgConf, r8WithRelocatedDeps.outputs, r8Task.outputs])
+        inputs.files ([pgConfs, r8WithRelocatedDeps.outputs, r8Task.outputs, libs])
         outputs.file output
         dependsOn downloadOpenJDKrt
         dependsOn r8WithRelocatedDeps
         dependsOn r8Task
-        commandLine r8CfCommandLine(r8Task.outputs.files[0], output, pgConf, args, libs)
+        commandLine r8CfCommandLine(r8Task.outputs.files[0], output, pgConfs, args, libs)
         workingDir = projectDir
     }
 }
 
-task testJar(type: ShadowJar, dependsOn: testClasses) {
-    baseName = "r8tests"
-    from sourceSets.test.output
+task buildLibraryDesugarConversions(type: Zip, dependsOn: downloadDeps) {
+    from sourceSets.libraryDesugarConversions.output
+    include "java/**/*.class"
+    baseName 'library_desugar_conversions'
+    destinationDir file('build/libs')
 }
 
-task testJarNoDeps(type: ShadowJar, dependsOn: testClasses) {
-    baseName = "r8tests-exclude-deps"
+task testJarSources(type: ShadowJar, dependsOn: [testClasses, buildLibraryDesugarConversions]) {
+    baseName = "r8testsbase"
     from sourceSets.test.output
+    // We only want to include tests that use R8 when generating keep rules for applymapping.
+    include "com/android/tools/r8/**"
+    include "dalvik/**"
 }
 
-def generateR8LibKeepRules(name, r8Source, testSource, output) {
-    return tasks.create("generateR8LibKeepRules_" + name, Exec) {
-        doFirst {
-            standardOutput new FileOutputStream(output)
-        }
-        dependsOn r8WithRelocatedDeps
-        dependsOn r8Source
-        dependsOn testSource
-        dependsOn downloadOpenJDKrt
-        inputs.files ([r8WithRelocatedDeps.outputs, r8Source.outputs, testSource.outputs])
-        outputs.file output
-        commandLine baseR8CommandLine([
-                "printuses",
-                "--keeprules",
-                "third_party/openjdk/openjdk-rt-1.8/rt.jar",
-                r8Source.outputs.files[0],
-                testSource.outputs.files[0]])
-        workingDir = projectDir
+task testJar(type: Exec) {
+    dependsOn r8WithDeps
+    dependsOn testJarSources
+    def output = "$buildDir/libs/r8tests.jar"
+    outputs.file output
+    workingDir = projectDir
+    inputs.files (testJarSources.outputs.files + r8WithDeps.outputs.files)
+    commandLine baseR8CommandLine([
+            "relocator",
+            "--input",
+            testJarSources.outputs.files[0],
+            "--output",
+            output,
+            "--map",
+            "kotlinx.metadata->com.android.tools.r8.jetbrains.kotlinx.metadata"
+    ])
+}
+
+task generateR8LibKeepRules(type: Exec) {
+    doFirst {
+        // TODO(b/154785341): We should remove this.
+        standardOutput new FileOutputStream(r8LibGeneratedKeepRulesPath)
     }
+    // Depend on r8WithDeps for running baseR8CommandLine.
+    dependsOn r8WithDeps
+    dependsOn r8NoManifestWithRelocatedDeps
+    dependsOn testJar
+    dependsOn downloadOpenJDKrt
+    inputs.files ([
+            r8WithDeps.outputs,
+            r8NoManifestWithRelocatedDeps.outputs,
+            testJar.outputs])
+    outputs.file r8LibGeneratedKeepRulesPath
+    commandLine baseR8CommandLine([
+            "printuses",
+            "--keeprules-allowobfuscation",
+            "third_party/openjdk/openjdk-rt-1.8/rt.jar",
+            r8NoManifestWithRelocatedDeps.outputs.files[0],
+            testJar.outputs.files[0]])
+    workingDir = projectDir
 }
 
 task R8LibApiOnly {
-    dependsOn r8LibCreateTask("Api", "src/main/keep.txt", R8NoManifest, r8LibPath)
+    dependsOn r8LibCreateTask("Api", ["src/main/keep.txt"], r8NoManifest, r8LibPath)
     outputs.file r8LibPath
 }
 
 task R8Lib {
-    def genRulesTask = generateR8LibKeepRules(
-            "Main",
-            R8NoManifest,
-            testJar,
-            r8LibGeneratedKeepRulesPath)
     dependsOn r8LibCreateTask(
             "Main",
-            "src/main/keep.txt",
-            R8NoManifest,
+            ["src/main/keep.txt",
+             "src/main/keep-applymapping.txt",
+             generateR8LibKeepRules.outputs.files[0]],
+            r8NoManifestWithRelocatedDeps,
             r8LibPath,
-            ["--pg-conf", genRulesTask.outputs.files[0]]
-    ).dependsOn(genRulesTask)
+    ).dependsOn(generateR8LibKeepRules)
+    inputs.files r8NoManifestWithRelocatedDeps.outputs.files
     outputs.file r8LibPath
 }
 
 task R8LibNoDeps {
-    def genRulesTask = generateR8LibKeepRules(
-            "NoDeps",
-            R8NoManifestNoDeps,
-            testJarNoDeps,
-            r8LibGeneratedKeepRulesExcludeDepsPath
-    )
     dependsOn r8LibCreateTask(
             "NoDeps",
-            "src/main/keep.txt",
-            R8NoManifestNoDeps,
+            ["src/main/keep.txt", "src/main/keep-applymapping.txt"],
+            r8NoManifestWithoutDeps,
             r8LibExludeDepsPath,
-            ["--pg-conf", genRulesTask.outputs.files[0]],
-            repackageDepsNoRelocate.outputs.files
-    ).dependsOn(repackageDepsNoRelocate, genRulesTask)
+            "--release",
+            repackageDepsNew.outputs.files
+    ).dependsOn(repackageDepsNew)
+    inputs.files ([r8NoManifestWithoutDeps.outputs, repackageDepsNew.outputs])
     outputs.file r8LibExludeDepsPath
-}
-
-task CompatDxLib {
-    dependsOn r8LibCreateTask(
-            "CompatDx", "src/main/keep-compatdx.txt", CompatDx, "build/libs/compatdxlib.jar")
-}
-
-task CompatProguardLib {
-    dependsOn r8LibCreateTask(
-            "CompatPg",
-            "src/main/keep-compatproguard.txt",
-            CompatProguard,
-            "build/libs/compatproguardlib.jar")
 }
 
 task sourceJar(type: Jar, dependsOn: classes) {
@@ -874,12 +1053,6 @@ task buildCfSegments(type: Jar, dependsOn: downloadDeps) {
     destinationDir file('build/libs')
 }
 
-task buildD8ApiUsageSample(type: Jar) {
-    from sourceSets.apiUsageSample.output
-    baseName 'd8_api_usage_sample'
-    destinationDir file('tests')
-}
-
 task buildR8ApiUsageSample(type: Jar) {
     from sourceSets.apiUsageSample.output
     baseName 'r8_api_usage_sample'
@@ -887,7 +1060,6 @@ task buildR8ApiUsageSample(type: Jar) {
 }
 
 task buildApiSampleJars {
-    dependsOn buildD8ApiUsageSample
     dependsOn buildR8ApiUsageSample
 }
 
@@ -962,7 +1134,7 @@ task buildDebugTestResourcesJars {
     }
     def kotlinResourcesDir = file("src/test/debugTestResourcesKotlin")
     def kotlinHostJar = "debug_test_resources_kotlin.jar"
-    task "jar_debugTestResourcesKotlin"(type: kotlin.Kotlinc) {
+    task "jar_debugTestResourcesKotlin"(type: kotlin.Kotlinc, dependsOn: downloadDeps) {
         source = fileTree(dir: kotlinResourcesDir, include: '**/*.kt')
         destination = file("build/test/${kotlinHostJar}")
     }
@@ -990,6 +1162,55 @@ task buildExampleKotlinJars {
             source = fileTree(dir: file("src/test/examplesKotlin/${name}"), include: '**/*.kt')
             destination = file("build/test/examplesKotlin/${name}.jar")
         }
+    }
+}
+
+task buildProtoGeneratedSources {
+    def examplesProtoDir = file("src/test/examplesProto")
+    examplesProtoDir.eachDir { dir ->
+        def name = dir.getName()
+        task "compile_proto_generated_source_${name}"(type: JavaCompile) {
+            source = {
+                file('third_party/proto').listFiles()
+                        .findAll { it.name.startsWith(name) && it.name.endsWith('-src.jar') }
+                        .collect { zipTree(it) }
+            }
+            destinationDir = file("build/generated/test/proto/${name}_classes")
+            classpath = files("third_party/protobuf-lite/libprotobuf_lite.jar")
+            sourceCompatibility = JavaVersion.VERSION_1_8
+            targetCompatibility = JavaVersion.VERSION_1_8
+        }
+        task "jar_proto_generated_source_${name}"(type: Jar, dependsOn: "compile_proto_generated_source_${name}") {
+            archiveName = "${name}.jar"
+            destinationDir = file("build/generated/test/proto")
+            from "build/generated/test/proto/${name}_classes"
+            include "/**/*.class"
+        }
+        dependsOn "jar_proto_generated_source_${name}"
+    }
+}
+
+task buildExamplesProto {
+    def examplesProtoDir = file("src/test/examplesProto")
+    def examplesProtoOutputDir = file("build/test/examplesProto");
+    dependsOn buildProtoGeneratedSources
+    task "compile_examples_proto"(type: JavaCompile) {
+        source = fileTree(dir: examplesProtoDir, include: "**/*.java")
+        destinationDir = file("build/test/examplesProto/classes")
+        classpath = files("third_party/protobuf-lite/libprotobuf_lite.jar")
+        classpath += fileTree(dir: "build/generated/test/proto", include: "*.jar")
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+    examplesProtoDir.eachDir { dir ->
+        def name = dir.getName()
+        task "jar_examples_proto_${name}"(type: Jar, dependsOn: "compile_examples_proto") {
+            archiveName = "${name}.jar"
+            destinationDir = examplesProtoOutputDir
+            from "build/test/examplesProto/classes"
+            include name + "/**/*.class"
+        }
+        dependsOn "jar_examples_proto_${name}"
     }
 }
 
@@ -1276,7 +1497,23 @@ task buildExampleJava9Jars {
         task "jar_examplesJava9_${name}"(type: Jar) {
             archiveName = jarName
             destinationDir = exampleOutputDir
-            from "src/test/examplesJava9"  // Java 1.9 classes
+            from sourceSets.examplesJava9.output
+            include "**/" + name + "/**/*.class"
+        }
+    }
+}
+
+task buildExampleJava10Jars {
+    def examplesDir = file("src/test/examplesJava10")
+    examplesDir.eachDir { dir ->
+        def name = dir.getName();
+        def exampleOutputDir = file("build/test/examplesJava10");
+        def jarName = "${name}.jar"
+        dependsOn "jar_examplesJava10_${name}"
+        task "jar_examplesJava10_${name}"(type: Jar) {
+            archiveName = jarName
+            destinationDir = exampleOutputDir
+            from sourceSets.examplesJava10.output
             include "**/" + name + "/**/*.class"
         }
     }
@@ -1292,9 +1529,45 @@ task buildExampleJava11Jars {
         task "jar_examplesJava11_${name}"(type: Jar) {
             archiveName = jarName
             destinationDir = exampleOutputDir
-            from "src/test/examplesJava11"  // Java 11 classes
+            from sourceSets.examplesJava11.output
             include "**/" + name + "/**/*.class"
         }
+    }
+}
+
+task provideArtFrameworksDependencies {
+    cloudDependencies.tools.forEach({ art ->
+        if (art.contains("art")) {
+            def taskName = art.replace('/','_')
+            dependsOn "patch_${taskName}"
+            task "patch_${taskName}"(type: org.gradle.api.tasks.Copy){
+                from "tools/${art}/framework"
+                include "**.jar"
+                into file("tools/${art}/out/host/linux-x86/framework")
+            }
+        }
+    })
+}
+
+task provideJdk11TestsDependencies(type: org.gradle.api.tasks.Copy) {
+    from sourceSets.jdk11TimeTests.compileClasspath
+    include "**/**.jar"
+    into file("build/test/jdk11Tests")
+}
+
+task buildJdk11TimeTestsJar {
+    def exampleOutputDir = file("build/test/jdk11Tests");
+    def jarName = "jdk11TimeTests.jar"
+    dependsOn "jar_jdk11TimeTests"
+    dependsOn provideJdk11TestsDependencies
+    task "jar_jdk11TimeTests"(type: Jar) {
+        archiveName = jarName
+        destinationDir = exampleOutputDir
+        from sourceSets.examplesTestNGRunner.output
+        include "**.class"
+        from sourceSets.jdk11TimeTests.output
+        include "**.class"
+        include "**/**.class"
     }
 }
 
@@ -1314,7 +1587,7 @@ task buildExamplesKotlin {
         dependsOn "dex_example_kotlin_${name}"
         def exampleOutputDir = file("build/test/examplesKotlin/" + name);
         def dexPath = file("${exampleOutputDir}")
-        task "dex_example_kotlin_${name}"(type: dx.Dx,
+        task "dex_example_kotlin_${name}"(type: DxTask,
                 dependsOn: "compile_example_kotlin_${name}") {
             doFirst {
                 if (!dexPath.exists()) {
@@ -1378,6 +1651,7 @@ task buildExamples {
     dependsOn buildExampleAndroidOJars
     dependsOn buildExampleAndroidPJars
     dependsOn buildExampleJava9Jars
+    dependsOn buildExampleJava10Jars
     dependsOn buildExampleJava11Jars
     dependsOn buildExampleAndroidApi
     def examplesDir = file("src/test/examples")
@@ -1396,7 +1670,7 @@ task buildExamples {
             if (!dexPath.exists()) {
                 dexPath.mkdirs()
             }
-            task "dex_example_${name}"(type: dx.Dx, dependsOn: "jar_example_${name}") {
+            task "dex_example_${name}"(type: DxTask, dependsOn: "jar_example_${name}") {
                 source = files(tasks.getByPath("jar_example_${name}")).asFileTree
                 destination = dexPath
                 debug = debug
@@ -1423,14 +1697,14 @@ task buildSmali {
         if (javaFiles.empty) {
             if (!smaliFiles.empty) {
                 dependsOn "${taskName}_smali"
-                task "${taskName}_smali"(type: smali.Smali) {
+                task "${taskName}_smali"(type: SmaliTask) {
                     source = smaliFiles
                     destination = destFile
                 }
             }
         } else {
             dependsOn "${taskName}_dexmerger"
-            task "${taskName}_smali"(type: smali.Smali) {
+            task "${taskName}_smali"(type: SmaliTask) {
                 source = smaliFiles
                 destination = intermediateFile
             }
@@ -1447,12 +1721,12 @@ task buildSmali {
                 destinationDir = destDir
                 from fileTree(dir: destDir, include: 'Test.class')
             }
-            task "${taskName}_dx"(type: dx.Dx, dependsOn: "${taskName}_jar") {
+            task "${taskName}_dx"(type: DxTask, dependsOn: "${taskName}_jar") {
                 source = fileTree(dir: destDir, include: 'Test.jar')
                 destination = destDir
             }
             task "${taskName}_dexmerger"(
-                    type: dx.DexMerger, dependsOn: ["${taskName}_dx", "${taskName}_smali"]) {
+                    type: DexMergerTask, dependsOn: ["${taskName}_dx", "${taskName}_smali"]) {
                 source = fileTree(dir: destDir, include: ["classes.dex", intermediateFileName])
                 destination = destFile
             }
@@ -1463,16 +1737,26 @@ task buildSmali {
 tasks.withType(Test) {
     println("NOTE: Number of processors " + Runtime.runtime.availableProcessors())
     def userDefinedCoresPerFork = System.getenv('R8_GRADLE_CORES_PER_FORK')
-    def coresPerFork = userDefinedCoresPerFork ? userDefinedCoresPerFork.toInteger() : 3
+    def processors = Runtime.runtime.availableProcessors()
     // See https://docs.gradle.org/current/dsl/org.gradle.api.tasks.testing.Test.html.
-    maxParallelForks = (Runtime.runtime.availableProcessors().intdiv(coresPerFork) ?: 1) + 1
+    if (userDefinedCoresPerFork) {
+      maxParallelForks = processors.intdiv(userDefinedCoresPerFork.toInteger()) ?: 1
+    } else {
+      // On normal work machines this seems to give the best test execution time (without freezing)
+      maxParallelForks = processors.intdiv(3) ?: 1
+    }
     println("NOTE: Max parallel forks " + maxParallelForks)
+
     forkEvery = 0
     if (project.hasProperty('disable_assertions')) {
         enableAssertions = false
     }
     // TODO(b/124091860): Increase the max heap size to avoid OOM when running tests.
-    maxHeapSize = "4g"
+    if (project.hasProperty('test_xmx')) {
+      maxHeapSize = project.property('test_xmx')
+    } else {
+      maxHeapSize = "4G"
+    }
 }
 
 task buildPreNJdwpTestsJar(type: Jar) {
@@ -1505,26 +1789,56 @@ task getJarsFromSupportLibs(type: GetJarsFromConfiguration) {
     setConfiguration(configurations.supportLibs)
 }
 
-def getR8LibTask() {
-    if (project.hasProperty('r8lib')) {
-        return R8Lib
-    } else if (project.hasProperty('r8lib_no_deps')) {
-        return R8LibNoDeps
+task generateR8TestKeepRules {
+    def path = "build/generated/r8tests-keep.txt"
+    outputs.file path
+    dependsOn R8Lib
+    doLast {
+        file(path).write """-keep class ** { *; }
+-dontshrink
+-dontoptimize
+-keepattributes *
+-applymapping ${R8Lib.outputs.files[0]}.map
+"""
     }
-    return null
+}
+
+task buildR8LibCfTestDeps(type: Exec) {
+    def outputPath = "build/libs/r8libtestdeps-cf.jar"
+    dependsOn downloadDeps
+    dependsOn r8NoManifest
+    dependsOn R8Lib
+    dependsOn generateR8TestKeepRules
+    dependsOn testJar
+    // Take all .jar files as libraries and append the generated test classes in classes/java/test.
+    def addedLibraries = sourceSets.test.runtimeClasspath.findAll { pkg ->
+        return pkg.toString().endsWith(".jar")
+    } + ["${buildDir}/classes/java/test"]
+    inputs.files testJar.outputs.files +
+            generateR8TestKeepRules.outputs.files +
+            R8Lib.outputs
+    commandLine = r8CfCommandLine(
+            testJar.outputs.files[0],
+            outputPath,
+            [generateR8TestKeepRules.outputs.files[0]],
+            ["--debug", "--classpath", r8NoManifest.outputs.files[0]],
+            r8NoManifest.outputs.files + addedLibraries)
+    workingDir = projectDir
+    outputs.file outputPath
 }
 
 task configureTestForR8Lib(type: Copy) {
     dependsOn testJar
-    inputs.files files("$buildDir/libs/r8tests.jar")
-    if (getR8LibTask() != null) {
-        dependsOn getR8LibTask()
-        delete r8LibTestPath
-        from zipTree(testJar.outputs.files[0])
-        into r8LibTestPath
-        include "com/android/tools/r8/**"
-        include "dalvik/**"
+    inputs.files buildR8LibCfTestDeps.outputs
+    dependsOn R8Lib
+    delete r8LibTestPath
+    from zipTree(buildR8LibCfTestDeps.outputs.files[0])
+    def examplesDir = file("build/test")
+    examplesDir.eachDir { dir ->
+        from ("${buildDir}/test/${dir.getName()}/classes")
     }
+    from ("${buildDir}/runtime/examples")
+    into r8LibTestPath
     outputs.dir r8LibTestPath
 }
 
@@ -1547,7 +1861,10 @@ def printStackTrace(TestResult result) {
         result.exception.printStackTrace(processIn)
         processIn.flush()
         processIn.close()
-        process.waitFor()
+        if (process.waitFor() != 0) {
+            out.append("ERROR DURING RETRACING\n")
+            out.append(err.toString())
+        }
         out.append("\n\n--------------------------------------\n")
         out.append("OBFUSCATED STACKTRACE\n")
         out.append("--------------------------------------\n")
@@ -1569,9 +1886,11 @@ test {
         assert project.hasProperty('HEAD_sha1')
         systemProperty 'test_git_HEAD_sha1', project.property('HEAD_sha1')
     }
+
+    dependsOn buildLibraryDesugarConversions
     dependsOn getJarsFromSupportLibs
     // R8.jar is required for running bootstrap tests.
-    dependsOn R8
+    dependsOn r8
     testLogging.exceptionFormat = 'full'
     if (project.hasProperty('print_test_stdout')) {
         testLogging.showStandardStreams = true
@@ -1585,6 +1904,10 @@ test {
     if (project.hasProperty('runtimes')) {
         println "NOTE: Running with runtimes: " + project.property('runtimes')
         systemProperty 'runtimes', project.property('runtimes')
+    }
+
+    if (project.hasProperty('slow_tests')) {
+        systemProperty 'slow_tests', project.property('slow_tests')
     }
 
     if (project.hasProperty('one_line_per_test')) {
@@ -1609,6 +1932,8 @@ test {
     }
     if (project.hasProperty('no_internal')) {
         exclude "com/android/tools/r8/internal/**"
+    } else {
+        dependsOn buildExamplesProto
     }
     if (project.hasProperty('only_internal')) {
         include "com/android/tools/r8/internal/**"
@@ -1661,14 +1986,14 @@ test {
     if (project.hasProperty('test_dir')) {
         systemProperty 'test_dir', project.property('test_dir')
     }
-    if (project.hasProperty('r8lib') || project.hasProperty('r8lib_no_deps')) {
+    if (project.hasProperty('r8lib')) {
         dependsOn configureTestForR8Lib
-        // We remove build/classes/test from classpath and rely on configureTestForR8Lib to provide
-        // all needed tests in r8LibTestPath.
-        classpath = files([r8LibPath, r8LibTestPath]) +
-                sourceSets.test.runtimeClasspath -
-                sourceSets.main.output -
-                files(['build/classes/test'])
+        // R8lib should be used instead of the main output and all the tests in
+        // r8 should be mapped and exists in r8LibTestPath.
+        classpath = sourceSets.test.runtimeClasspath.filter {
+            !it.getAbsolutePath().contains("/build/")
+        }
+        classpath += files([r8LibPath, r8LibTestPath])
         testClassesDirs = files(r8LibTestPath)
     }
     if (OperatingSystem.current().isLinux()
@@ -1693,6 +2018,8 @@ test {
         dependsOn buildDebugInfoExamplesDex
         dependsOn buildPreNJdwpTestsJar
         dependsOn buildPreNJdwpTestsDex
+        dependsOn buildJdk11TimeTestsJar
+        dependsOn provideArtFrameworksDependencies
     } else {
         logger.lifecycle("WARNING: Testing in not supported on your platform. Testing is only fully supported on " +
             "Linux and partially supported on Mac OS and Windows. Art does not run on other platforms.")
@@ -2063,92 +2390,10 @@ task printMavenDeps {
     }
 }
 
-
-
-
-// This task allows to build class files from Java 9 source in order to use them as inputs of
-// D8/R8 tests. Class files are generated in the same place than source files and must be commited
-// to the D8 repository because there is no way to generate them on all computers due to the need of
-// Java 9.
-// Use the following command to rebuild class files of tests:
-// ./tools/gradle.py -Pjava9Home=<java 9 home> buildJava9Tests
-task buildJava9Tests {
-    def javacOutputFolder = getTemporaryDir();
-    def examplesDir = file("src/test/examplesJava9")
-
-    task "compile_Java9examples"(type: JavaCompile) {
-        doFirst {
-            if (!project.hasProperty('java9Home') || project.property('java9Home').isEmpty()) {
-                throw new GradleException("Set java9Home property.")
-            }
-        }
-
-        source = fileTree(dir: examplesDir, include: '**/*.java')
-        destinationDir = javacOutputFolder
-        classpath = sourceSets.main.compileClasspath
-        options.compilerArgs += ["-Xlint:-options"]
-        sourceCompatibility = JavaVersion.VERSION_1_9
-        targetCompatibility = JavaVersion.VERSION_1_9
-        options.fork = true
-
-        if (project.hasProperty('java9Home')) {
-            options.forkOptions.javaHome = file(getProperty('java9Home'))
-        }
-
-        doLast {
-            def classfileFrom = copySpec {
-                from javacOutputFolder
-                include "**/*.class"
-            }
-            copy {
-                into examplesDir
-                with classfileFrom
-            }
-            delete javacOutputFolder
-        }
+allprojects {
+  tasks.withType(Exec) {
+    doFirst {
+      println commandLine.join(' ')
     }
-
-    dependsOn compile_Java9examples
-}
-
-// Same as above for Java 11
-// ./tools/gradle.py -Pjava11Home=<java 11 home> buildJava11Tests
-task buildJava11Tests {
-    def javacOutputFolder = getTemporaryDir();
-    def examplesDir = file("src/test/examplesJava11")
-
-    task "compile_Java11examples"(type: JavaCompile) {
-        doFirst {
-            if (!project.hasProperty('java11Home') || project.property('java11Home').isEmpty()) {
-                throw new GradleException("Set java11Home property.")
-            }
-        }
-
-        source = fileTree(dir: examplesDir, include: '**/*.java')
-        destinationDir = javacOutputFolder
-        classpath = sourceSets.main.compileClasspath
-        options.compilerArgs += ["-Xlint:-options"]
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
-        options.fork = true
-
-        if (project.hasProperty('java11Home')) {
-            options.forkOptions.javaHome = file(getProperty('java11Home'))
-        }
-
-        doLast {
-            def classfileFrom = copySpec {
-                from javacOutputFolder
-                include "**/*.class"
-            }
-            copy {
-                into examplesDir
-                with classfileFrom
-            }
-            delete javacOutputFolder
-            println "Warning: in my cases nested classes were not showed on IntelliJ"
-        }
-    }
-
-    dependsOn compile_Java11examples
+  }
 }

@@ -10,7 +10,7 @@ import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.code.CfIf;
 import com.android.tools.r8.cf.code.CfIfCmp;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.utils.CfgPrinter;
@@ -61,22 +61,27 @@ public class If extends JumpInstruction {
     }
   }
 
-  private static boolean verifyTypeCompatible(TypeLatticeElement valueType, If.Type ifType) {
+  private static boolean verifyTypeCompatible(TypeElement valueType, If.Type ifType) {
     return valueType.isInt()
         || (valueType.isFloat() && (ifType == Type.EQ || ifType == Type.NE))
-        || (valueType.isReference() && (ifType == Type.EQ || ifType == Type.NE));
+        || (valueType.isReferenceType() && (ifType == Type.EQ || ifType == Type.NE));
   }
 
   private Type type;
 
   public If(Type type, Value value) {
-    super(null, value);
+    super(value);
     this.type = type;
   }
 
   public If(Type type, List<Value> values) {
-    super(null, values);
+    super(values);
     this.type = type;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.IF;
   }
 
   @Override
@@ -84,8 +89,25 @@ public class If extends JumpInstruction {
     return visitor.visit(this);
   }
 
+  public boolean isNullTest() {
+    return isZeroTest() && lhs().getType().isReferenceType();
+  }
+
+  public boolean isNonTrivialNullTest() {
+    return isNullTest() && lhs().getType().isNullable();
+  }
+
   public boolean isZeroTest() {
     return inValues.size() == 1;
+  }
+
+  public Value lhs() {
+    return inValues.get(0);
+  }
+
+  public Value rhs() {
+    assert !isZeroTest();
+    return inValues.get(1);
   }
 
   public Type getType() {
@@ -185,14 +207,14 @@ public class If extends JumpInstruction {
 
   public BasicBlock targetFromCondition(ConstNumber value) {
     assert isZeroTest();
-    assert verifyTypeCompatible(value.outValue().getTypeLattice(), type);
+    assert verifyTypeCompatible(value.getOutType(), type);
     return targetFromCondition(Long.signum(value.getRawValue()));
   }
 
   public BasicBlock targetFromCondition(ConstNumber left, ConstNumber right) {
     assert !isZeroTest();
     assert left.outType() == right.outType();
-    assert verifyTypeCompatible(left.outValue().getTypeLattice(), type);
+    assert verifyTypeCompatible(left.getOutType(), type);
     return targetFromCondition(Long.signum(left.getRawValue() - right.getRawValue()));
   }
 

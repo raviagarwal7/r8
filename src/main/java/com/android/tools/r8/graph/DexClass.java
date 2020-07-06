@@ -6,36 +6,31 @@ package com.android.tools.r8.graph;
 import com.android.tools.r8.dex.MixedSectionCollection;
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.kotlin.KotlinInfo;
+import com.android.tools.r8.kotlin.KotlinClassLevelInfo;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.OptionalBool;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Predicates;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Iterators;
 import com.google.common.collect.Sets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Optional;
+import java.util.ListIterator;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 public abstract class DexClass extends DexDefinition {
-  public static final DexClass[] EMPTY_ARRAY = {};
 
   public interface FieldSetter {
     void setField(int index, DexEncodedField field);
   }
-
-  public interface MethodSetter {
-    void setMethod(int index, DexEncodedMethod method);
-  }
-
-  private Optional<DexEncodedMethod> cachedClassInitializer = null;
 
   public final Origin origin;
   public DexType type;
@@ -44,6 +39,8 @@ public abstract class DexClass extends DexDefinition {
   public DexTypeList interfaces;
   public DexString sourceFile;
 
+  private OptionalBool isResolvable = OptionalBool.unknown();
+
   /** Access has to be synchronized during concurrent collection/writing phase. */
   protected DexEncodedField[] staticFields = DexEncodedField.EMPTY_ARRAY;
 
@@ -51,10 +48,7 @@ public abstract class DexClass extends DexDefinition {
   protected DexEncodedField[] instanceFields = DexEncodedField.EMPTY_ARRAY;
 
   /** Access has to be synchronized during concurrent collection/writing phase. */
-  protected DexEncodedMethod[] directMethods = DexEncodedMethod.EMPTY_ARRAY;
-
-  /** Access has to be synchronized during concurrent collection/writing phase. */
-  protected DexEncodedMethod[] virtualMethods = DexEncodedMethod.EMPTY_ARRAY;
+  protected final MethodCollection methodCollection;
 
   /** Enclosing context of this class if it is an inner class, null otherwise. */
   private EnclosingMethodAttribute enclosingMethod;
@@ -62,10 +56,8 @@ public abstract class DexClass extends DexDefinition {
   /** InnerClasses table. If this class is an inner class, it will have an entry here. */
   private final List<InnerClassAttribute> innerClasses;
 
-  private final NestHostClassAttribute nestHost;
+  private NestHostClassAttribute nestHost;
   private final List<NestMemberClassAttribute> nestMembers;
-
-  public DexAnnotationSet annotations;
 
   public DexClass(
       DexString sourceFile,
@@ -84,6 +76,7 @@ public abstract class DexClass extends DexDefinition {
       DexAnnotationSet annotations,
       Origin origin,
       boolean skipNameValidationForTesting) {
+    super(annotations);
     assert origin != null;
     this.origin = origin;
     this.sourceFile = sourceFile;
@@ -93,14 +86,12 @@ public abstract class DexClass extends DexDefinition {
     this.type = type;
     setStaticFields(staticFields);
     setInstanceFields(instanceFields);
-    setDirectMethods(directMethods);
-    setVirtualMethods(virtualMethods);
+    this.methodCollection = new MethodCollection(this, directMethods, virtualMethods);
     this.nestHost = nestHost;
     this.nestMembers = nestMembers;
     assert nestMembers != null;
     this.enclosingMethod = enclosingMethod;
     this.innerClasses = innerClasses;
-    this.annotations = annotations;
     if (type == superType) {
       throw new CompilationError("Class " + type.toString() + " cannot extend itself");
     }
@@ -127,14 +118,20 @@ public abstract class DexClass extends DexDefinition {
         Iterables.filter(Arrays.asList(staticFields), predicate::test));
   }
 
-  public Iterable<DexEncodedMethod> methods() {
-    return methods(Predicates.alwaysTrue());
+  public Iterable<DexEncodedMember<?, ?>> members() {
+    return Iterables.concat(fields(), methods());
   }
 
-  public Iterable<DexEncodedMethod> methods(Predicate<? super DexEncodedMethod> predicate) {
-    return Iterables.concat(
-        Iterables.filter(Arrays.asList(directMethods), predicate::test),
-        Iterables.filter(Arrays.asList(virtualMethods), predicate::test));
+  public MethodCollection getMethodCollection() {
+    return methodCollection;
+  }
+
+  public Iterable<DexEncodedMethod> methods() {
+    return methodCollection.methods();
+  }
+
+  public Iterable<DexEncodedMethod> methods(Predicate<DexEncodedMethod> predicate) {
+    return methodCollection.methods(predicate);
   }
 
   @Override
@@ -142,180 +139,63 @@ public abstract class DexClass extends DexDefinition {
     throw new Unreachable();
   }
 
-  public List<DexEncodedMethod> directMethods() {
-    assert directMethods != null;
-    if (InternalOptions.assertionsEnabled()) {
-      return Collections.unmodifiableList(Arrays.asList(directMethods));
-    }
-    return Arrays.asList(directMethods);
+  public Iterable<DexEncodedMethod> directMethods() {
+    return methodCollection.directMethods();
   }
 
-  public void appendDirectMethod(DexEncodedMethod method) {
-    cachedClassInitializer = null;
-    DexEncodedMethod[] newMethods = new DexEncodedMethod[directMethods.length + 1];
-    System.arraycopy(directMethods, 0, newMethods, 0, directMethods.length);
-    newMethods[directMethods.length] = method;
-    directMethods = newMethods;
-    assert verifyCorrectnessOfMethodHolder(method);
-    assert verifyNoDuplicateMethods();
+  public Iterable<DexEncodedMethod> directMethods(Predicate<? super DexEncodedMethod> predicate) {
+    return Iterables.filter(directMethods(), predicate::test);
   }
 
-  public void appendDirectMethods(Collection<DexEncodedMethod> methods) {
-    cachedClassInitializer = null;
-    DexEncodedMethod[] newMethods = new DexEncodedMethod[directMethods.length + methods.size()];
-    System.arraycopy(directMethods, 0, newMethods, 0, directMethods.length);
-    int i = directMethods.length;
-    for (DexEncodedMethod method : methods) {
-      newMethods[i] = method;
-      i++;
-    }
-    directMethods = newMethods;
-    assert verifyCorrectnessOfMethodHolders(methods);
-    assert verifyNoDuplicateMethods();
+  public void addDirectMethods(Collection<DexEncodedMethod> methods) {
+    methodCollection.addDirectMethods(methods);
   }
 
-  public void removeDirectMethod(int index) {
-    cachedClassInitializer = null;
-    DexEncodedMethod[] newMethods = new DexEncodedMethod[directMethods.length - 1];
-    System.arraycopy(directMethods, 0, newMethods, 0, index);
-    System.arraycopy(directMethods, index + 1, newMethods, index, directMethods.length - index - 1);
-    directMethods = newMethods;
-  }
-
-  public void setDirectMethod(int index, DexEncodedMethod method) {
-    cachedClassInitializer = null;
-    directMethods[index] = method;
-    assert verifyCorrectnessOfMethodHolder(method);
-    assert verifyNoDuplicateMethods();
+  public DexEncodedMethod removeMethod(DexMethod method) {
+    return methodCollection.removeMethod(method);
   }
 
   public void setDirectMethods(DexEncodedMethod[] methods) {
-    cachedClassInitializer = null;
-    directMethods = MoreObjects.firstNonNull(methods, DexEncodedMethod.EMPTY_ARRAY);
-    assert verifyCorrectnessOfMethodHolders(directMethods());
-    assert verifyNoDuplicateMethods();
+    methodCollection.setDirectMethods(methods);
   }
 
-  public List<DexEncodedMethod> virtualMethods() {
-    assert virtualMethods != null;
-    if (InternalOptions.assertionsEnabled()) {
-      return Collections.unmodifiableList(Arrays.asList(virtualMethods));
-    }
-    return Arrays.asList(virtualMethods);
+  public Iterable<DexEncodedMethod> virtualMethods() {
+    return methodCollection.virtualMethods();
   }
 
-  public void appendVirtualMethod(DexEncodedMethod method) {
-    DexEncodedMethod[] newMethods = new DexEncodedMethod[virtualMethods.length + 1];
-    System.arraycopy(virtualMethods, 0, newMethods, 0, virtualMethods.length);
-    newMethods[virtualMethods.length] = method;
-    virtualMethods = newMethods;
-    assert verifyCorrectnessOfMethodHolder(method);
-    assert verifyNoDuplicateMethods();
+  public Iterable<DexEncodedMethod> virtualMethods(Predicate<? super DexEncodedMethod> predicate) {
+    return Iterables.filter(virtualMethods(), predicate::test);
   }
 
-  public void appendVirtualMethods(Collection<DexEncodedMethod> methods) {
-    DexEncodedMethod[] newMethods = new DexEncodedMethod[virtualMethods.length + methods.size()];
-    System.arraycopy(virtualMethods, 0, newMethods, 0, virtualMethods.length);
-    int i = virtualMethods.length;
-    for (DexEncodedMethod method : methods) {
-      newMethods[i] = method;
-      i++;
-    }
-    virtualMethods = newMethods;
-    assert verifyCorrectnessOfMethodHolders(methods);
-    assert verifyNoDuplicateMethods();
-  }
-
-  public void removeVirtualMethod(int index) {
-    DexEncodedMethod[] newMethods = new DexEncodedMethod[virtualMethods.length - 1];
-    System.arraycopy(virtualMethods, 0, newMethods, 0, index);
-    System.arraycopy(
-        virtualMethods, index + 1, newMethods, index, virtualMethods.length - index - 1);
-    virtualMethods = newMethods;
-  }
-
-  public void setVirtualMethod(int index, DexEncodedMethod method) {
-    virtualMethods[index] = method;
-    assert verifyCorrectnessOfMethodHolder(method);
-    assert verifyNoDuplicateMethods();
+  public void addVirtualMethods(Collection<DexEncodedMethod> methods) {
+    methodCollection.addVirtualMethods(methods);
   }
 
   public void setVirtualMethods(DexEncodedMethod[] methods) {
-    virtualMethods = MoreObjects.firstNonNull(methods, DexEncodedMethod.EMPTY_ARRAY);
-    assert verifyCorrectnessOfMethodHolders(virtualMethods());
-    assert verifyNoDuplicateMethods();
+    methodCollection.setVirtualMethods(methods);
   }
 
-  private boolean verifyCorrectnessOfMethodHolder(DexEncodedMethod method) {
-    assert method.method.holder == type
-        : "Expected method `"
-            + method.method.toSourceString()
-            + "` to have holder `"
-            + type.toSourceString()
-            + "`";
-    return true;
-  }
-
-  private boolean verifyCorrectnessOfMethodHolders(Iterable<DexEncodedMethod> methods) {
-    for (DexEncodedMethod method : methods) {
-      assert verifyCorrectnessOfMethodHolder(method);
-    }
-    return true;
-  }
-
-  private boolean verifyNoDuplicateMethods() {
-    Set<DexMethod> unique = Sets.newIdentityHashSet();
-    for (DexEncodedMethod method : methods()) {
-      boolean changed = unique.add(method.method);
-      assert changed : "Duplicate method `" + method.method.toSourceString() + "`";
+  private boolean verifyNoAbstractMethodsOnNonAbstractClasses(
+      Iterable<DexEncodedMethod> methods, InternalOptions options) {
+    if (options.canHaveDalvikAbstractMethodOnNonAbstractClassVerificationBug() && !isAbstract()) {
+      for (DexEncodedMethod method : methods) {
+        assert !method.isAbstract()
+            : "Non-abstract method on abstract class: `" + method.method.toSourceString() + "`";
+      }
     }
     return true;
   }
 
   public void forEachMethod(Consumer<DexEncodedMethod> consumer) {
-    for (DexEncodedMethod method : directMethods()) {
-      consumer.accept(method);
-    }
-    for (DexEncodedMethod method : virtualMethods()) {
-      consumer.accept(method);
-    }
+    methodCollection.forEachMethod(consumer);
   }
 
-  public DexEncodedMethod[] allMethodsSorted() {
-    int vLen = virtualMethods.length;
-    int dLen = directMethods.length;
-    DexEncodedMethod[] result = new DexEncodedMethod[vLen + dLen];
-    System.arraycopy(virtualMethods, 0, result, 0, vLen);
-    System.arraycopy(directMethods, 0, result, vLen, dLen);
-    Arrays.sort(result,
-        (DexEncodedMethod a, DexEncodedMethod b) -> a.method.slowCompareTo(b.method));
-    return result;
+  public List<DexEncodedMethod> allMethodsSorted() {
+    return methodCollection.allMethodsSorted();
   }
 
   public void virtualizeMethods(Set<DexEncodedMethod> privateInstanceMethods) {
-    int vLen = virtualMethods.length;
-    int dLen = directMethods.length;
-    int mLen = privateInstanceMethods.size();
-    assert mLen <= dLen;
-
-    DexEncodedMethod[] newDirectMethods = new DexEncodedMethod[dLen - mLen];
-    int index = 0;
-    for (int i = 0; i < dLen; i++) {
-      DexEncodedMethod encodedMethod = directMethods[i];
-      if (!privateInstanceMethods.contains(encodedMethod)) {
-        newDirectMethods[index++] = encodedMethod;
-      }
-    }
-    assert index == dLen - mLen;
-    setDirectMethods(newDirectMethods);
-
-    DexEncodedMethod[] newVirtualMethods = new DexEncodedMethod[vLen + mLen];
-    System.arraycopy(virtualMethods, 0, newVirtualMethods, 0, vLen);
-    index = vLen;
-    for (DexEncodedMethod encodedMethod : privateInstanceMethods) {
-      newVirtualMethods[index++] = encodedMethod;
-    }
-    setVirtualMethods(newVirtualMethods);
+    methodCollection.virtualizeMethods(privateInstanceMethods);
   }
 
   /**
@@ -323,30 +203,13 @@ public abstract class DexClass extends DexDefinition {
    * specified consumer.
    */
   public void forEachAnnotation(Consumer<DexAnnotation> consumer) {
-    for (DexAnnotation annotation : annotations.annotations) {
-      consumer.accept(annotation);
-    }
-    for (DexEncodedMethod method : directMethods()) {
-      for (DexAnnotation annotation : method.annotations.annotations) {
-        consumer.accept(annotation);
-      }
+    annotations().forEach(consumer);
+    for (DexEncodedMethod method : methods()) {
+      method.annotations().forEach(consumer);
       method.parameterAnnotationsList.forEachAnnotation(consumer);
     }
-    for (DexEncodedMethod method : virtualMethods()) {
-      for (DexAnnotation annotation : method.annotations.annotations) {
-        consumer.accept(annotation);
-      }
-      method.parameterAnnotationsList.forEachAnnotation(consumer);
-    }
-    for (DexEncodedField field : instanceFields()) {
-      for (DexAnnotation annotation : field.annotations.annotations) {
-        consumer.accept(annotation);
-      }
-    }
-    for (DexEncodedField field : staticFields()) {
-      for (DexAnnotation annotation : field.annotations.annotations) {
-        consumer.accept(annotation);
-      }
+    for (DexEncodedField field : fields()) {
+      field.annotations().forEach(consumer);
     }
   }
 
@@ -468,7 +331,7 @@ public abstract class DexClass extends DexDefinition {
   }
 
   private boolean verifyCorrectnessOfFieldHolder(DexEncodedField field) {
-    assert field.field.holder == type
+    assert field.holder() == type
         : "Expected field `"
             + field.field.toSourceString()
             + "` to have holder `"
@@ -493,63 +356,108 @@ public abstract class DexClass extends DexDefinition {
     return true;
   }
 
-  public DexEncodedField[] allFieldsSorted() {
-    int iLen = instanceFields.length;
-    int sLen = staticFields.length;
-    DexEncodedField[] result = new DexEncodedField[iLen + sLen];
-    System.arraycopy(instanceFields, 0, result, 0, iLen);
-    System.arraycopy(staticFields, 0, result, iLen, sLen);
-    Arrays.sort(result,
-        (DexEncodedField a, DexEncodedField b) -> a.field.slowCompareTo(b.field));
-    return result;
-  }
-
-  /**
-   * Find static field in this class matching field
-   */
+  /** Find static field in this class matching {@param field}. */
   public DexEncodedField lookupStaticField(DexField field) {
     return lookupTarget(staticFields, field);
   }
 
-  /**
-   * Find instance field in this class matching field.
-   */
+  /** Find instance field in this class matching {@param field}. */
   public DexEncodedField lookupInstanceField(DexField field) {
     return lookupTarget(instanceFields, field);
   }
 
-  /**
-   * Find field in this class matching field.
-   */
+  public DexField lookupUniqueInstanceFieldWithName(DexString name) {
+    DexField field = null;
+    for (DexEncodedField encodedField : instanceFields()) {
+      if (encodedField.field.name == name) {
+        if (field != null) {
+          return null;
+        }
+        field = encodedField.field;
+      }
+    }
+    return field;
+  }
+
+  /** Find field in this class matching {@param field}. */
   public DexEncodedField lookupField(DexField field) {
     DexEncodedField result = lookupInstanceField(field);
     return result == null ? lookupStaticField(field) : result;
   }
 
-  /**
-   * Find direct method in this class matching method.
-   */
+  /** Find direct method in this class matching {@param method}. */
   public DexEncodedMethod lookupDirectMethod(DexMethod method) {
-    return lookupTarget(directMethods, method);
+    return methodCollection.getDirectMethod(method);
   }
 
-  /**
-   * Find virtual method in this class matching method.
-   */
+  /** Find direct method in this class matching {@param predicate}. */
+  public DexEncodedMethod lookupDirectMethod(Predicate<DexEncodedMethod> predicate) {
+    return methodCollection.getDirectMethod(predicate);
+  }
+
+  /** Find virtual method in this class matching {@param method}. */
   public DexEncodedMethod lookupVirtualMethod(DexMethod method) {
-    return lookupTarget(virtualMethods, method);
+    return methodCollection.getVirtualMethod(method);
   }
 
-  /**
-   * Find method in this class matching method.
-   */
+  /** Find virtual method in this class matching {@param predicate}. */
+  public DexEncodedMethod lookupVirtualMethod(Predicate<DexEncodedMethod> predicate) {
+    return methodCollection.getVirtualMethod(predicate);
+  }
+
+  /** Find member in this class matching {@param member}. */
+  @SuppressWarnings("unchecked")
+  public <D extends DexEncodedMember<D, R>, R extends DexMember<D, R>> D lookupMember(
+      DexMember<D, R> member) {
+    DexEncodedMember<?, ?> definition =
+        member.isDexField() ? lookupField(member.asDexField()) : lookupMethod(member.asDexMethod());
+    return (D) definition;
+  }
+
+  /** Find method in this class matching {@param method}. */
   public DexEncodedMethod lookupMethod(DexMethod method) {
-    DexEncodedMethod result = lookupDirectMethod(method);
-    return result == null ? lookupVirtualMethod(method) : result;
+    return methodCollection.getMethod(method);
   }
 
-  private <T extends DexItem, S extends Descriptor<T, S>> T lookupTarget(T[] items, S descriptor) {
-    for (T entry : items) {
+  /** Find method in this class matching {@param method}. */
+  public DexEncodedMethod lookupMethod(Predicate<DexEncodedMethod> predicate) {
+    return methodCollection.getMethod(predicate);
+  }
+
+  public DexEncodedMethod lookupSignaturePolymorphicMethod(
+      DexString methodName, DexItemFactory factory) {
+    if (type != factory.methodHandleType && type != factory.varHandleType) {
+      return null;
+    }
+    DexEncodedMethod matchingName = null;
+    DexEncodedMethod signaturePolymorphicMethod = null;
+    for (DexEncodedMethod method : virtualMethods()) {
+      if (method.method.name == methodName) {
+        if (matchingName != null) {
+          // The jvm spec, section 5.4.3.3 details that there must be exactly one method with the
+          // given name only.
+          return null;
+        }
+        matchingName = method;
+        if (isSignaturePolymorphicMethod(method, factory)) {
+          signaturePolymorphicMethod = method;
+        }
+      }
+    }
+    return signaturePolymorphicMethod;
+  }
+
+  private boolean isSignaturePolymorphicMethod(DexEncodedMethod method, DexItemFactory factory) {
+    assert method.holder() == factory.methodHandleType || method.holder() == factory.varHandleType;
+    return method.accessFlags.isVarargs()
+        && method.accessFlags.isNative()
+        && method.method.proto.parameters.size() == 1
+        && method.method.proto.parameters.values[0] != factory.objectArrayType;
+  }
+
+  private <D extends DexEncodedMember<D, R>, R extends DexMember<D, R>> D lookupTarget(
+      D[] items, R descriptor) {
+    for (D entry : items) {
       if (descriptor.match(entry)) {
         return entry;
       }
@@ -557,7 +465,22 @@ public abstract class DexClass extends DexDefinition {
     return null;
   }
 
-  // Tells whether this is an interface.
+  public boolean isAbstract() {
+    return accessFlags.isAbstract();
+  }
+
+  public boolean isAnnotation() {
+    return accessFlags.isAnnotation();
+  }
+
+  public boolean isFinal() {
+    return accessFlags.isFinal();
+  }
+
+  public boolean isEffectivelyFinal(AppView<?> appView) {
+    return isFinal();
+  }
+
   public boolean isInterface() {
     return accessFlags.isInterface();
   }
@@ -583,14 +506,6 @@ public abstract class DexClass extends DexDefinition {
     return this;
   }
 
-  public boolean isProgramClass() {
-    return false;
-  }
-
-  public DexProgramClass asProgramClass() {
-    return null;
-  }
-
   public boolean isClasspathClass() {
     return false;
   }
@@ -609,6 +524,14 @@ public abstract class DexClass extends DexDefinition {
     return null;
   }
 
+  public boolean isPrivate() {
+    return accessFlags.isPrivate();
+  }
+
+  public boolean isPublic() {
+    return accessFlags.isPublic();
+  }
+
   @Override
   public boolean isStatic() {
     return accessFlags.isStatic();
@@ -619,17 +542,8 @@ public abstract class DexClass extends DexDefinition {
     return false;
   }
 
-  public DexEncodedMethod getClassInitializer() {
-    if (cachedClassInitializer == null) {
-      cachedClassInitializer = Optional.empty();
-      for (DexEncodedMethod directMethod : directMethods) {
-        if (directMethod.isClassInitializer()) {
-          cachedClassInitializer = Optional.of(directMethod);
-          break;
-        }
-      }
-    }
-    return cachedClassInitializer.orElse(null);
+  public synchronized DexEncodedMethod getClassInitializer() {
+    return methodCollection.getClassInitializer();
   }
 
   public Origin getOrigin() {
@@ -642,27 +556,6 @@ public abstract class DexClass extends DexDefinition {
 
   public boolean hasClassInitializer() {
     return getClassInitializer() != null;
-  }
-
-  public boolean hasTrivialClassInitializer() {
-    if (isLibraryClass()) {
-      // We don't know for library classes in general but assume that java.lang.Object is safe.
-      return superType == null;
-    }
-    DexEncodedMethod clinit = getClassInitializer();
-    return clinit != null && clinit.getCode() != null && clinit.getCode().isEmptyVoidMethod();
-  }
-
-  public boolean hasNonTrivialClassInitializer() {
-    if (isLibraryClass()) {
-      // We don't know for library classes in general but assume that java.lang.Object is safe.
-      return superType != null;
-    }
-    DexEncodedMethod clinit = getClassInitializer();
-    if (clinit == null || clinit.getCode() == null) {
-      return false;
-    }
-    return !clinit.getCode().isEmptyVoidMethod();
   }
 
   public boolean hasDefaultInitializer() {
@@ -683,7 +576,7 @@ public abstract class DexClass extends DexDefinition {
     return getInitializer(DexType.EMPTY_ARRAY);
   }
 
-  public boolean hasMissingSuperType(AppInfoWithSubtyping appInfo) {
+  public boolean hasMissingSuperType(AppInfoWithClassHierarchy appInfo) {
     if (superType != null && appInfo.isMissingOrHasMissingSuperType(superType)) {
       return true;
     }
@@ -695,31 +588,83 @@ public abstract class DexClass extends DexDefinition {
     return false;
   }
 
-  public boolean isSerializable(AppView<? extends AppInfoWithSubtyping> appView) {
+  public boolean isResolvable(AppView<?> appView) {
+    if (isResolvable.isUnknown()) {
+      boolean resolvable;
+      if (!isProgramClass()) {
+        resolvable = appView.dexItemFactory().libraryTypesAssumedToBePresent.contains(type);
+      } else {
+        resolvable = true;
+        for (DexType supertype : allImmediateSupertypes()) {
+          resolvable &= supertype.isResolvable(appView);
+          if (!resolvable) {
+            break;
+          }
+        }
+      }
+      isResolvable = OptionalBool.of(resolvable);
+    }
+    assert !isResolvable.isUnknown();
+    return isResolvable.isTrue();
+  }
+
+  public boolean isSerializable(AppView<? extends AppInfoWithClassHierarchy> appView) {
     return appView.appInfo().isSerializable(type);
   }
 
-  public boolean isExternalizable(AppView<? extends AppInfoWithSubtyping> appView) {
+  public boolean isExternalizable(AppView<? extends AppInfoWithClassHierarchy> appView) {
     return appView.appInfo().isExternalizable(type);
   }
 
-  public boolean classInitializationMayHaveSideEffects(DexDefinitionSupplier definitions) {
-    return classInitializationMayHaveSideEffects(definitions, Predicates.alwaysFalse());
+  public boolean classInitializationMayHaveSideEffects(AppView<?> appView) {
+    return classInitializationMayHaveSideEffects(
+        appView, Predicates.alwaysFalse(), Sets.newIdentityHashSet());
   }
 
   public boolean classInitializationMayHaveSideEffects(
-      DexDefinitionSupplier definitions, Predicate<DexType> ignore) {
-    if (ignore.test(type)
-        || definitions.dexItemFactory().libraryTypesWithoutStaticInitialization.contains(type)) {
+      AppView<?> appView, Predicate<DexType> ignore, Set<DexType> seen) {
+    if (!seen.add(type)) {
       return false;
     }
-    if (hasNonTrivialClassInitializer()) {
+    if (ignore.test(type)) {
+      return false;
+    }
+    if (isLibraryClass()) {
+      if (isInterface()) {
+        return appView.options().libraryInterfacesMayHaveStaticInitialization;
+      }
+      if (appView.dexItemFactory().libraryClassesWithoutStaticInitialization.contains(type)) {
+        return false;
+      }
+    }
+    if (hasClassInitializerThatCannotBePostponed()) {
       return true;
     }
     if (defaultValuesForStaticFieldsMayTriggerAllocation()) {
       return true;
     }
-    return initializationOfParentTypesMayHaveSideEffects(definitions, ignore);
+    return initializationOfParentTypesMayHaveSideEffects(appView, ignore, seen);
+  }
+
+  private boolean hasClassInitializerThatCannotBePostponed() {
+    if (isLibraryClass()) {
+      // We don't know for library classes in general but assume that java.lang.Object is safe.
+      return superType != null;
+    }
+    DexEncodedMethod clinit = getClassInitializer();
+    if (clinit == null || clinit.getCode() == null) {
+      return false;
+    }
+    return !clinit.getOptimizationInfo().classInitializerMayBePostponed();
+  }
+
+  public void forEachImmediateSupertype(Consumer<DexType> fn) {
+    if (superType != null) {
+      fn.accept(superType);
+    }
+    for (DexType iface : interfaces.values) {
+      fn.accept(iface);
+    }
   }
 
   public Iterable<DexType> allImmediateSupertypes() {
@@ -731,21 +676,27 @@ public abstract class DexClass extends DexDefinition {
     return () -> iterator;
   }
 
-  public boolean initializationOfParentTypesMayHaveSideEffects(DexDefinitionSupplier definitions) {
-    return initializationOfParentTypesMayHaveSideEffects(definitions, Predicates.alwaysFalse());
+  public boolean initializationOfParentTypesMayHaveSideEffects(AppView<?> appView) {
+    return initializationOfParentTypesMayHaveSideEffects(
+        appView, Predicates.alwaysFalse(), Sets.newIdentityHashSet());
   }
 
   public boolean initializationOfParentTypesMayHaveSideEffects(
-      DexDefinitionSupplier definitions, Predicate<DexType> ignore) {
+      AppView<?> appView, Predicate<DexType> ignore, Set<DexType> seen) {
     for (DexType iface : interfaces.values) {
-      if (iface.classInitializationMayHaveSideEffects(definitions, ignore)) {
+      if (iface.classInitializationMayHaveSideEffects(appView, ignore, seen)) {
         return true;
       }
     }
-    if (superType != null && superType.classInitializationMayHaveSideEffects(definitions, ignore)) {
+    if (superType != null
+        && superType.classInitializationMayHaveSideEffects(appView, ignore, seen)) {
       return true;
     }
     return false;
+  }
+
+  public boolean definesFinalizer(DexItemFactory factory) {
+    return lookupVirtualMethod(factory.objectMembers.finalize) != null;
   }
 
   public boolean defaultValuesForStaticFieldsMayTriggerAllocation() {
@@ -757,15 +708,15 @@ public abstract class DexClass extends DexDefinition {
     return innerClasses;
   }
 
-  public EnclosingMethodAttribute getEnclosingMethod() {
+  public EnclosingMethodAttribute getEnclosingMethodAttribute() {
     return enclosingMethod;
   }
 
-  public void clearEnclosingMethod() {
+  public void clearEnclosingMethodAttribute() {
     enclosingMethod = null;
   }
 
-  public void removeEnclosingMethod(Predicate<EnclosingMethodAttribute> predicate) {
+  public void removeEnclosingMethodAttribute(Predicate<EnclosingMethodAttribute> predicate) {
     if (enclosingMethod != null && predicate.test(enclosingMethod)) {
       enclosingMethod = null;
     }
@@ -788,31 +739,67 @@ public abstract class DexClass extends DexDefinition {
     return null;
   }
 
+  public void replaceInnerClassAttributeForThisClass(InnerClassAttribute newInnerClassAttribute) {
+    ListIterator<InnerClassAttribute> iterator = getInnerClasses().listIterator();
+    while (iterator.hasNext()) {
+      InnerClassAttribute innerClassAttribute = iterator.next();
+      if (type == innerClassAttribute.getInner()) {
+        iterator.set(newInnerClassAttribute);
+        return;
+      }
+    }
+    throw new Unreachable();
+  }
+
   public boolean isLocalClass() {
     InnerClassAttribute innerClass = getInnerClassAttributeForThisClass();
-    return innerClass != null
-        && innerClass.isNamed()
-        && getEnclosingMethod() != null;
+    // The corresponding enclosing-method attribute might be not available, e.g., CF version 50.
+    return innerClass != null && innerClass.getOuter() == null && innerClass.isNamed();
   }
 
   public boolean isMemberClass() {
     InnerClassAttribute innerClass = getInnerClassAttributeForThisClass();
-    return innerClass != null
-        && innerClass.getOuter() != null
-        && innerClass.isNamed()
-        && getEnclosingMethod() == null;
+    boolean isMember = innerClass != null && innerClass.getOuter() != null && innerClass.isNamed();
+    assert !isMember || getEnclosingMethodAttribute() == null;
+    return isMember;
   }
 
   public boolean isAnonymousClass() {
     InnerClassAttribute innerClass = getInnerClassAttributeForThisClass();
-    return innerClass != null
-        && innerClass.isAnonymous()
-        && getEnclosingMethod() != null;
+    // The corresponding enclosing-method attribute might be not available, e.g., CF version 50.
+    // We can't rely on outer type either because it's not null prior to 51 and null since 51.
+    return innerClass != null && innerClass.isAnonymous();
   }
 
   public boolean isInANest() {
-    assert nestMembers != null;
-    return !(nestMembers.isEmpty()) || (nestHost != null);
+    return isNestHost() || isNestMember();
+  }
+
+  public void clearNestHost() {
+    nestHost = null;
+  }
+
+  public void setNestHost(DexType type) {
+    assert type != null;
+    this.nestHost = new NestHostClassAttribute(type);
+  }
+
+  public boolean isNestHost() {
+    return !nestMembers.isEmpty();
+  }
+
+  public boolean isNestMember() {
+    return nestHost != null;
+  }
+
+  public DexType getNestHost() {
+    if (isNestMember()) {
+      return nestHost.getNestHost();
+    }
+    if (isNestHost()) {
+      return type;
+    }
+    return null;
   }
 
   public NestHostClassAttribute getNestHostClassAttribute() {
@@ -824,19 +811,48 @@ public abstract class DexClass extends DexDefinition {
   }
 
   /** Returns kotlin class info if the class is synthesized by kotlin compiler. */
-  public abstract KotlinInfo getKotlinInfo();
+  public abstract KotlinClassLevelInfo getKotlinInfo();
 
-  public final boolean hasKotlinInfo() {
-    return getKotlinInfo() != null;
+  public boolean hasInstanceFields() {
+    return instanceFields.length > 0;
   }
 
-  public boolean isValid() {
-    assert !isInterface()
-        || Arrays.stream(virtualMethods).noneMatch(method -> method.accessFlags.isFinal());
+  public boolean hasInstanceFieldsDirectlyOrIndirectly(AppView<?> appView) {
+    if (superType == null || type == appView.dexItemFactory().objectType) {
+      return false;
+    }
+    if (hasInstanceFields()) {
+      return true;
+    }
+    DexClass superClass = appView.definitionFor(superType);
+    return superClass == null || superClass.hasInstanceFieldsDirectlyOrIndirectly(appView);
+  }
+
+  public List<DexEncodedField> getDirectAndIndirectInstanceFields(AppView<?> appView) {
+    List<DexEncodedField> result = new ArrayList<>();
+    DexClass current = this;
+    while (current != null && current.type != appView.dexItemFactory().objectType) {
+      result.addAll(current.instanceFields());
+      current = appView.definitionFor(current.superType);
+    }
+    return result;
+  }
+
+  public boolean isValid(InternalOptions options) {
+    assert verifyNoAbstractMethodsOnNonAbstractClasses(virtualMethods(), options);
+    assert !isInterface() || !getMethodCollection().hasVirtualMethods(DexEncodedMethod::isFinal);
     assert verifyCorrectnessOfFieldHolders(fields());
     assert verifyNoDuplicateFields();
-    assert verifyCorrectnessOfMethodHolders(methods());
-    assert verifyNoDuplicateMethods();
+    assert methodCollection.verify();
     return true;
+  }
+
+  public boolean hasStaticSynchronizedMethods() {
+    for (DexEncodedMethod encodedMethod : directMethods()) {
+      if (encodedMethod.isStatic() && encodedMethod.isSynchronized()) {
+        return true;
+      }
+    }
+    return false;
   }
 }

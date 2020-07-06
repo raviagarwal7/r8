@@ -6,6 +6,8 @@ package com.android.tools.r8.utils.codeinspector;
 
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.retrace.RetraceBase;
+import com.android.tools.r8.retrace.RetraceMethodResult;
 
 public interface InstructionSubject {
 
@@ -13,6 +15,8 @@ public interface InstructionSubject {
     ALLOW,
     DISALLOW
   };
+
+  DexInstructionSubject asDexInstruction();
 
   boolean isFieldAccess();
 
@@ -34,6 +38,8 @@ public interface InstructionSubject {
 
   boolean isInvokeStatic();
 
+  boolean isInvokeSpecial();
+
   DexMethod getMethod();
 
   boolean isNop();
@@ -44,9 +50,17 @@ public interface InstructionSubject {
 
   boolean isConstNull();
 
+  default boolean isConstString() {
+    return isConstString(JumboStringMode.ALLOW);
+  }
+
   boolean isConstString(JumboStringMode jumboStringMode);
 
   boolean isConstString(String value, JumboStringMode jumboStringMode);
+
+  boolean isJumboString();
+
+  long getConstNumber();
 
   String getConstString();
 
@@ -76,11 +90,17 @@ public interface InstructionSubject {
 
   boolean isCheckCast(String type);
 
+  default CheckCastInstructionSubject asCheckCast() {
+    return null;
+  }
+
   boolean isInstanceOf();
 
   boolean isInstanceOf(String type);
 
   boolean isIf(); // Also include CF/if_cmp* instructions.
+
+  boolean isSwitch();
 
   boolean isPackedSwitch();
 
@@ -89,6 +109,8 @@ public interface InstructionSubject {
   boolean isMultiplication();
 
   boolean isNewArray();
+
+  boolean isArrayLength();
 
   boolean isArrayPut();
 
@@ -99,4 +121,26 @@ public interface InstructionSubject {
   int size();
 
   InstructionOffsetSubject getOffset(MethodSubject methodSubject);
+
+  MethodSubject getMethodSubject();
+
+  default int getLineNumber() {
+    LineNumberTable lineNumberTable = getMethodSubject().getLineNumberTable();
+    return lineNumberTable == null ? -1 : lineNumberTable.getLineForInstruction(this);
+  }
+
+  default RetraceMethodResult retrace(RetraceBase retraceBase) {
+    MethodSubject methodSubject = getMethodSubject();
+    assert methodSubject.isPresent();
+    return retraceBase.retrace(methodSubject.asFoundMethodSubject().asMethodReference());
+  }
+
+  default RetraceMethodResult retraceLinePosition(RetraceBase retraceBase) {
+    return retrace(retraceBase).narrowByLine(getLineNumber());
+  }
+
+  default RetraceMethodResult retracePcPosition(
+      RetraceBase retraceBase, MethodSubject methodSubject) {
+    return retrace(retraceBase).narrowByLine(getOffset(methodSubject).offset);
+  }
 }

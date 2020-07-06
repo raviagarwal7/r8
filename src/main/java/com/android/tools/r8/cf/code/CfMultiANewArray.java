@@ -4,12 +4,16 @@
 package com.android.tools.r8.cf.code;
 
 import com.android.tools.r8.cf.CfPrinter;
-import com.android.tools.r8.errors.Unimplemented;
+import com.android.tools.r8.graph.DexClassAndMethod;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.UseRegistry;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.utils.InternalOptions;
 import org.objectweb.asm.MethodVisitor;
@@ -33,7 +37,7 @@ public class CfMultiANewArray extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     visitor.visitMultiANewArrayInsn(lens.lookupInternalName(type), dimensions);
   }
 
@@ -43,7 +47,7 @@ public class CfMultiANewArray extends CfInstruction {
   }
 
   @Override
-  public void registerUse(UseRegistry registry, DexType clazz) {
+  void internalRegisterUse(UseRegistry registry, DexClassAndMethod context) {
     registry.registerTypeReference(type);
   }
 
@@ -55,11 +59,14 @@ public class CfMultiANewArray extends CfInstruction {
   @Override
   public void buildIR(IRBuilder builder, CfState state, CfSourceCode code) {
     InternalOptions options = builder.appView.options();
-    if (options.isGeneratingDex()) {
-      // TODO(b/109789539): Implement this case (see JarSourceCode.buildPrelude()/buildPostlude()).
-      throw new Unimplemented("CfMultiANewArray to DEX backend");
-    }
+    assert !options.isGeneratingDex();
     int[] dimensions = state.popReverse(this.dimensions);
     builder.addMultiNewArray(type, state.push(type).register, dimensions);
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return inliningConstraints.forInvokeMultiNewArray(type, context);
   }
 }

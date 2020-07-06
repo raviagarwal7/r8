@@ -8,6 +8,7 @@ import com.android.tools.r8.debug.DebugTestConfig;
 import com.android.tools.r8.errors.Unimplemented;
 import com.android.tools.r8.origin.Origin;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -40,13 +41,29 @@ public class GenerateMainDexListTestBuilder
   }
 
   @Override
-  public GenerateMainDexListRunResult run(TestRuntime runtime, String mainClass)
+  public GenerateMainDexListRunResult run(TestRuntime runtime, String mainClass, String... args)
       throws IOException, CompilationFailedException {
     throw new Unimplemented("No support for running with a main class");
   }
 
+  @Override
   public DebugTestConfig debugConfig() {
     throw new Unimplemented("No support for debug configuration");
+  }
+
+  @Override
+  public GenerateMainDexListTestBuilder addRunClasspathFiles(Collection<Path> files) {
+    throw new Unimplemented("No support for run class path");
+  }
+
+  @Override
+  public GenerateMainDexListTestBuilder addClasspathClasses(Collection<Class<?>> classes) {
+    throw new Unimplemented("No support for class path");
+  }
+
+  @Override
+  public GenerateMainDexListTestBuilder addClasspathFiles(Collection<Path> files) {
+    throw new Unimplemented("No support for class path");
   }
 
   public GenerateMainDexListRunResult run() throws CompilationFailedException {

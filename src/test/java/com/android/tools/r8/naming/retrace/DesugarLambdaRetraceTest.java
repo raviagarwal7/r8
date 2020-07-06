@@ -4,17 +4,19 @@
 
 package com.android.tools.r8.naming.retrace;
 
+import static com.android.tools.r8.naming.retrace.StackTrace.isSame;
 import static com.android.tools.r8.naming.retrace.StackTrace.isSameExceptForFileName;
 import static com.android.tools.r8.naming.retrace.StackTrace.isSameExceptForFileNameAndLineNumber;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
+import static org.junit.Assume.assumeTrue;
 
 import com.android.tools.r8.CompilationMode;
-import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.naming.retrace.StackTrace.StackTraceLine;
+import com.android.tools.r8.utils.BooleanUtils;
 import com.google.common.collect.ImmutableList;
 import java.util.Collection;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -23,13 +25,16 @@ import org.junit.runners.Parameterized.Parameters;
 @RunWith(Parameterized.class)
 public class DesugarLambdaRetraceTest extends RetraceTestBase {
 
-  @Parameters(name = "Backend: {0}, mode: {1}")
+  @Parameters(name = "{0}, mode: {1}, compat: {2}")
   public static Collection<Object[]> data() {
-    return buildParameters(ToolHelper.getBackends(), CompilationMode.values());
+    return buildParameters(
+        getTestParameters().withAllRuntimesAndApiLevels().build(),
+        CompilationMode.values(),
+        BooleanUtils.values());
   }
 
-  public DesugarLambdaRetraceTest(Backend backend, CompilationMode mode) {
-    super(backend, mode);
+  public DesugarLambdaRetraceTest(TestParameters parameters, CompilationMode mode, boolean compat) {
+    super(parameters, mode, compat);
   }
 
   @Override
@@ -43,9 +48,12 @@ public class DesugarLambdaRetraceTest extends RetraceTestBase {
   }
 
   private int expectedActualStackTraceHeight() {
-    // In debug mode the expected stack trace height differs since there is no lambda desugaring
-    // for CF.
-    return mode == CompilationMode.RELEASE ? 2 : (backend == Backend.CF ? 4 : 5);
+    // In DEX release the entire lambda is inlined.
+    if (parameters.isDexRuntime()) {
+      return mode == CompilationMode.RELEASE ? 1 : 5;
+    }
+    // In CF release it is not and in debug there is no lambda desugaring thus the shorter stack.
+    return mode == CompilationMode.RELEASE ? 2 : 4;
   }
 
   private boolean isSynthesizedLambdaFrame(StackTraceLine line) {
@@ -60,38 +68,31 @@ public class DesugarLambdaRetraceTest extends RetraceTestBase {
     }
     // Proguard retrace will take the class name until the first $ to construct the file
     // name, so for "-$$Lambda$...", the file name becomes "-.java".
-    assertEquals("-.java", lambdaFrames.get(0).fileName);
+    // TODO(b/141287349): Format the class name of desugard lambda classes.
+    // assertEquals("-.java", lambdaFrames.get(0).fileName);
+  }
+
+  private void checkIsSame(StackTrace actualStackTrace, StackTrace retracedStackTrace) {
+    // Even when SourceFile is present retrace replaces the file name in the stack trace.
+    if (parameters.isCfRuntime()) {
+      assertThat(retracedStackTrace, isSame(expectedStackTrace));
+    } else {
+      // With the frame from the lambda class filtered out the stack trace is the same.
+      assertThat(
+          retracedStackTrace.filter(line -> !isSynthesizedLambdaFrame(line)),
+          isSame(expectedStackTrace));
+      // Check the frame from the lambda class.
+      checkLambdaFrame(retracedStackTrace);
+    }
+    assertEquals(expectedActualStackTraceHeight(), actualStackTrace.size());
   }
 
   private void checkIsSameExceptForFileName(
       StackTrace actualStackTrace, StackTrace retracedStackTrace) {
     // Even when SourceFile is present retrace replaces the file name in the stack trace.
-    if (backend == Backend.CF) {
-      // TODO(122440196): Additional code to locate issue.
-      if (!isSameExceptForFileName(expectedStackTrace).matches(retracedStackTrace)) {
-        System.out.println("Expected original:");
-        System.out.println(expectedStackTrace.getOriginalStderr());
-        System.out.println("Actual original:");
-        System.out.println(retracedStackTrace.getOriginalStderr());
-        System.out.println("Parsed original:");
-        System.out.println(expectedStackTrace);
-        System.out.println("Parsed retraced:");
-        System.out.println(retracedStackTrace);
-      }
+    if (parameters.isCfRuntime()) {
       assertThat(retracedStackTrace, isSameExceptForFileName(expectedStackTrace));
     } else {
-      // TODO(122440196): Additional code to locate issue.
-      if (!isSameExceptForFileName(expectedStackTrace)
-          .matches(retracedStackTrace.filter(line -> !isSynthesizedLambdaFrame(line)))) {
-        System.out.println("Expected original:");
-        System.out.println(expectedStackTrace.getOriginalStderr());
-        System.out.println("Actual original:");
-        System.out.println(retracedStackTrace.getOriginalStderr());
-        System.out.println("Parsed original:");
-        System.out.println(expectedStackTrace);
-        System.out.println("Parsed retraced:");
-        System.out.println(retracedStackTrace);
-      }
       // With the frame from the lambda class filtered out the stack trace is the same.
       assertThat(
           retracedStackTrace.filter(line -> !isSynthesizedLambdaFrame(line)),
@@ -105,32 +106,9 @@ public class DesugarLambdaRetraceTest extends RetraceTestBase {
   private void checkIsSameExceptForFileNameAndLineNumber(
       StackTrace actualStackTrace, StackTrace retracedStackTrace) {
     // Even when SourceFile is present retrace replaces the file name in the stack trace.
-    if (backend == Backend.CF) {
-      // TODO(122440196): Additional code to locate issue.
-      if (!isSameExceptForFileNameAndLineNumber(expectedStackTrace).matches(retracedStackTrace)) {
-        System.out.println("Expected original:");
-        System.out.println(expectedStackTrace.getOriginalStderr());
-        System.out.println("Actual original:");
-        System.out.println(retracedStackTrace.getOriginalStderr());
-        System.out.println("Parsed original:");
-        System.out.println(expectedStackTrace);
-        System.out.println("Parsed retraced:");
-        System.out.println(retracedStackTrace);
-      }
+    if (parameters.isCfRuntime()) {
       assertThat(retracedStackTrace, isSameExceptForFileNameAndLineNumber(expectedStackTrace));
     } else {
-      // TODO(122440196): Additional code to locate issue.
-      if (!isSameExceptForFileNameAndLineNumber(expectedStackTrace)
-          .matches(retracedStackTrace.filter(line -> !isSynthesizedLambdaFrame(line)))) {
-        System.out.println("Expected original:");
-        System.out.println(expectedStackTrace.getOriginalStderr());
-        System.out.println("Actual original:");
-        System.out.println(retracedStackTrace.getOriginalStderr());
-        System.out.println("Parsed original:");
-        System.out.println(expectedStackTrace);
-        System.out.println("Parsed retraced:");
-        System.out.println(retracedStackTrace);
-      }
       // With the frame from the lambda class filtered out the stack trace is the same.
       assertThat(
           retracedStackTrace.filter(line -> !isSynthesizedLambdaFrame(line)),
@@ -142,27 +120,21 @@ public class DesugarLambdaRetraceTest extends RetraceTestBase {
   }
 
   @Test
-  @Ignore("b/122440196")
   public void testSourceFileAndLineNumberTable() throws Exception {
-    runTest(
-        ImmutableList.of("-keepattributes SourceFile,LineNumberTable"),
-        this::checkIsSameExceptForFileName);
+    runTest(ImmutableList.of("-keepattributes SourceFile,LineNumberTable"), this::checkIsSame);
   }
 
   @Test
-  @Ignore("b/122440196")
   public void testLineNumberTableOnly() throws Exception {
+    assumeTrue(compat);
     runTest(
-        ImmutableList.of("-keepattributes LineNumberTable"),
-        this::checkIsSameExceptForFileName);
+        ImmutableList.of("-keepattributes LineNumberTable"), this::checkIsSameExceptForFileName);
   }
 
   @Test
-  @Ignore("b/122440196")
   public void testNoLineNumberTable() throws Exception {
-    runTest(
-        ImmutableList.of(),
-        this::checkIsSameExceptForFileNameAndLineNumber);
+    assumeTrue(compat);
+    runTest(ImmutableList.of(), this::checkIsSameExceptForFileNameAndLineNumber);
   }
 }
 

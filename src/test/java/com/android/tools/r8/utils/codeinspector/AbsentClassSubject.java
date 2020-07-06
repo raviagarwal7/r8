@@ -5,11 +5,18 @@
 package com.android.tools.r8.utils.codeinspector;
 
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.references.ClassReference;
 import java.util.List;
 import java.util.function.Consumer;
+import kotlinx.metadata.jvm.KotlinClassMetadata;
 
 public class AbsentClassSubject extends ClassSubject {
+
+  public AbsentClassSubject(CodeInspector codeInspector, ClassReference reference) {
+    super(codeInspector, reference);
+  }
 
   @Override
   public boolean isPresent() {
@@ -18,6 +25,9 @@ public class AbsentClassSubject extends ClassSubject {
 
   @Override
   public void forAllMethods(Consumer<FoundMethodSubject> inspection) {}
+
+  @Override
+  public void forAllVirtualMethods(Consumer<FoundMethodSubject> inspection) {}
 
   @Override
   public MethodSubject method(String returnType, String name, List<String> parameters) {
@@ -33,12 +43,23 @@ public class AbsentClassSubject extends ClassSubject {
   public void forAllFields(Consumer<FoundFieldSubject> inspection) {}
 
   @Override
+  public void forAllInstanceFields(Consumer<FoundFieldSubject> inspection) {}
+
+  @Override
+  public void forAllStaticFields(Consumer<FoundFieldSubject> inspection) {}
+
+  @Override
   public FieldSubject field(String type, String name) {
     return new AbsentFieldSubject();
   }
 
   @Override
   public FieldSubject uniqueFieldWithName(String name) {
+    return new AbsentFieldSubject();
+  }
+
+  @Override
+  public FieldSubject uniqueFieldWithFinalName(String name) {
     return new AbsentFieldSubject();
   }
 
@@ -58,7 +79,7 @@ public class AbsentClassSubject extends ClassSubject {
   }
 
   @Override
-  public DexClass getDexClass() {
+  public DexProgramClass getDexProgramClass() {
     return null;
   }
 
@@ -78,12 +99,22 @@ public class AbsentClassSubject extends ClassSubject {
   }
 
   @Override
+  public String getOriginalBinaryName() {
+    return null;
+  }
+
+  @Override
   public String getFinalName() {
     return null;
   }
 
   @Override
   public String getFinalDescriptor() {
+    return null;
+  }
+
+  @Override
+  public String getFinalBinaryName() {
     return null;
   }
 
@@ -118,12 +149,32 @@ public class AbsentClassSubject extends ClassSubject {
   }
 
   @Override
+  public DexMethod getFinalEnclosingMethod() {
+    throw new Unreachable("Cannot determine EnclosingMethod attribute of an absent class");
+  }
+
+  @Override
   public String getOriginalSignatureAttribute() {
     return null;
   }
 
   @Override
   public String getFinalSignatureAttribute() {
+    return null;
+  }
+
+  @Override
+  public KmClassSubject getKmClass() {
+    return null;
+  }
+
+  @Override
+  public KmPackageSubject getKmPackage() {
+    return null;
+  }
+
+  @Override
+  public KotlinClassMetadata getKotlinClassMetadata() {
     return null;
   }
 }

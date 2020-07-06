@@ -47,8 +47,10 @@ import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexTypeList;
 import com.android.tools.r8.graph.DirectMappedDexApplication;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.MethodAccessFlags;
 import com.android.tools.r8.graph.ParameterAnnotationsList;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.code.CatchHandlers;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Position;
@@ -71,6 +73,7 @@ import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.ListUtils;
 import com.android.tools.r8.utils.MainDexList;
 import com.android.tools.r8.utils.Reporter;
+import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -81,6 +84,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -338,19 +342,65 @@ public class MainDexListTests extends TestBase {
 
   @Test
   public void validEntries() throws IOException {
-    List<String> list = ImmutableList.of(
-        "A.class",
-        "a/b/c/D.class",
-        "a/b/c/D$E.class"
-    );
+    List<String> lines = ImmutableList.of("A.class", "a/b/c/D.class", "a/b/c/D$E.class");
     DexItemFactory factory = new DexItemFactory();
     Path mainDexList = temp.getRoot().toPath().resolve("valid.txt");
-    FileUtils.writeTextFile(mainDexList, list);
+    FileUtils.writeTextFile(mainDexList, lines);
     Set<DexType> types = parse(mainDexList, factory);
-    for (String entry : list) {
+    for (String entry : lines) {
       DexType type = factory.createType("L" + entry.replace(".class", "") + ";");
       assertTrue(types.contains(type));
       assertSame(type, MainDexList.parseEntry(entry, factory));
+    }
+  }
+
+  @Test
+  public void leadingBOM() throws IOException {
+    List<String> lines =
+        ImmutableList.of(StringUtils.BOM + "A.class", "a/b/c/D.class", "a/b/c/D$E.class");
+    List<String> classes = ImmutableList.of("A", "a/b/c/D", "a/b/c/D$E");
+    DexItemFactory factory = new DexItemFactory();
+    Path mainDexList = temp.getRoot().toPath().resolve("valid.txt");
+    FileUtils.writeTextFile(mainDexList, lines);
+    Set<DexType> types = parse(mainDexList, factory);
+    assertEquals(types.size(), classes.size());
+    for (String clazz : classes) {
+      DexType type = factory.createType("L" + clazz + ";");
+      assertTrue(types.contains(type));
+    }
+  }
+
+  @Test
+  public void lotsOfWhitespace() throws IOException {
+    List<String> ws =
+        ImmutableList.of(
+            "",
+            " ",
+            "  ",
+            "\t ",
+            " \t",
+            "" + StringUtils.BOM,
+            StringUtils.BOM + " " + StringUtils.BOM);
+    for (String before : ws) {
+      for (String after : ws) {
+        List<String> lines =
+            ImmutableList.of(
+                before + "A.class" + after,
+                before + "a/b/c/D.class" + after,
+                before + "a/b/c/D$E.class" + after,
+                before + after);
+
+        List<String> classes = ImmutableList.of("A", "a/b/c/D", "a/b/c/D$E");
+        DexItemFactory factory = new DexItemFactory();
+        Path mainDexList = temp.getRoot().toPath().resolve("valid.txt");
+        FileUtils.writeTextFile(mainDexList, lines);
+        Set<DexType> types = parse(mainDexList, factory);
+        assertEquals(types.size(), classes.size());
+        for (String clazz : classes) {
+          DexType type = factory.createType("L" + clazz + ";");
+          assertTrue(types.contains(type));
+        }
+      }
     }
   }
 
@@ -376,18 +426,27 @@ public class MainDexListTests extends TestBase {
     parse(mainDexList, factory);
   }
 
+  enum TestMode {
+    FROM_CLASS_NAMES,
+    FROM_FILE,
+    FROM_FILE_WITH_BOM
+  }
+
   private Path runD8WithMainDexList(
-      CompilationMode mode, Path input, List<String> mainDexClasses, boolean useFile)
+      CompilationMode mode, Path input, List<String> mainDexClasses, TestMode testMode)
       throws Exception {
     Path testDir = temp.newFolder().toPath();
     Path listFile = testDir.resolve("main-dex-list.txt");
-    if (mainDexClasses != null && useFile) {
-      FileUtils.writeTextFile(
-          listFile,
-          mainDexClasses
-              .stream()
+    if (mainDexClasses != null
+        && (testMode == TestMode.FROM_FILE || testMode == TestMode.FROM_FILE_WITH_BOM)) {
+      List<String> lines =
+          mainDexClasses.stream()
               .map(clazz -> clazz.replace('.', '/') + ".class")
-              .collect(Collectors.toList()));
+              .collect(Collectors.toList());
+      if (testMode == TestMode.FROM_FILE_WITH_BOM) {
+        lines.set(0, StringUtils.BOM + lines.get(0));
+      }
+      FileUtils.writeTextFile(listFile, lines);
     }
 
     D8Command.Builder builder =
@@ -396,7 +455,7 @@ public class MainDexListTests extends TestBase {
             .setMode(mode)
             .setOutput(testDir, OutputMode.DexIndexed);
     if (mainDexClasses != null) {
-      if (useFile) {
+      if (testMode == TestMode.FROM_FILE) {
         builder.addMainDexListFiles(listFile);
       } else {
         builder.addMainDexClasses(mainDexClasses);
@@ -416,21 +475,25 @@ public class MainDexListTests extends TestBase {
       if (allClasses) {
         // If all classes are passed add a run without a main-dex list as well.
         testDirs.put(
-            runD8WithMainDexList(mode, input, null, true),
+            runD8WithMainDexList(mode, input, null, TestMode.FROM_CLASS_NAMES),
             mode.toString() + ": without a main-dex list");
       }
       testDirs.put(
-          runD8WithMainDexList(mode, input, mainDexClasses, true),
+          runD8WithMainDexList(mode, input, mainDexClasses, TestMode.FROM_FILE),
           mode.toString() + ": main-dex list files");
       testDirs.put(
-          runD8WithMainDexList(mode, input, mainDexClasses, false),
+          runD8WithMainDexList(mode, input, mainDexClasses, TestMode.FROM_FILE_WITH_BOM),
+          mode.toString() + ": main-dex list files (with BOM)");
+      testDirs.put(
+          runD8WithMainDexList(mode, input, mainDexClasses, TestMode.FROM_CLASS_NAMES),
           mode.toString() + ": main-dex classes");
       if (mainDexClasses != null) {
         testDirs.put(
-            runD8WithMainDexList(mode, input, Lists.reverse(mainDexClasses), true),
+            runD8WithMainDexList(mode, input, Lists.reverse(mainDexClasses), TestMode.FROM_FILE),
             mode.toString() + ": main-dex list files (reversed)");
         testDirs.put(
-            runD8WithMainDexList(mode, input, Lists.reverse(mainDexClasses), false),
+            runD8WithMainDexList(
+                mode, input, Lists.reverse(mainDexClasses), TestMode.FROM_CLASS_NAMES),
             mode.toString() + ": main-dex classes (reversed)");
       }
 
@@ -572,9 +635,10 @@ public class MainDexListTests extends TestBase {
         .forEach(
             p -> {
               try {
-                CodeInspector i = new CodeInspector(AndroidApp.builder().addProgramFiles(p).build());
+                CodeInspector i =
+                    new CodeInspector(AndroidApp.builder().addProgramFiles(p).build());
                 assertFalse("Found " + clazz + " in file " + p, i.clazz(clazz).isPresent());
-              } catch (IOException | ExecutionException e) {
+              } catch (IOException e) {
                 e.printStackTrace();
               }
             });
@@ -738,17 +802,38 @@ public class MainDexListTests extends TestBase {
       int methodCount,
       DiagnosticsHandler diagnosticsHandler)
       throws IOException, ExecutionException {
-    Timing timing = new Timing("MainDexListTests");
+    Timing timing = Timing.empty();
     InternalOptions options =
         new InternalOptions(new DexItemFactory(), new Reporter(diagnosticsHandler));
     options.minApiLevel = minApi;
     options.intermediate = intermediate;
     DexItemFactory factory = options.itemFactory;
-    AppInfo appInfo = new AppInfo(DexApplication.builder(factory, timing).build());
-    DexApplication.Builder builder = DexApplication.builder(factory, timing);
+    AppInfo appInfo = new AppInfo(DexApplication.builder(options, timing).build());
+    AppView<?> appView = AppView.createForR8(appInfo);
+    DexApplication.Builder<?> builder = DexApplication.builder(options, timing);
     for (String clazz : classes) {
       DexString desc = factory.createString(DescriptorUtils.javaTypeToDescriptor(clazz));
       DexType type = factory.createType(desc);
+      DexProgramClass programClass =
+          new DexProgramClass(
+              type,
+              null,
+              new SynthesizedOrigin("test", MainDexListTests.class),
+              ClassAccessFlags.fromSharedAccessFlags(0),
+              factory.objectType,
+              DexTypeList.empty(),
+              null,
+              null,
+              Collections.emptyList(),
+              null,
+              Collections.emptyList(),
+              DexAnnotationSet.empty(),
+              DexEncodedField.EMPTY_ARRAY,
+              DexEncodedField.EMPTY_ARRAY,
+              DexEncodedMethod.EMPTY_ARRAY,
+              DexEncodedMethod.EMPTY_ARRAY,
+              false,
+              DexProgramClass::invalidChecksumRequest);
       DexEncodedMethod[] directMethods = new DexEncodedMethod[methodCount];
       for (int i = 0; i < methodCount; i++) {
         MethodAccessFlags access = MethodAccessFlags.fromSharedAccessFlags(0, false);
@@ -770,31 +855,14 @@ public class MainDexListTests extends TestBase {
                 DexAnnotationSet.empty(),
                 ParameterAnnotationsList.empty(),
                 code);
-        AppView<? extends AppInfo> appView = AppView.createForR8(null, options);
-        IRCode ir = code.buildIR(method, appView, Origin.unknown());
+        ProgramMethod programMethod = new ProgramMethod(programClass, method);
+        IRCode ir = code.buildIR(programMethod, appView, Origin.unknown());
         RegisterAllocator allocator = new LinearScanRegisterAllocator(appView, ir);
-        method.setCode(ir, allocator, options);
+        method.setCode(ir, allocator, appView);
         directMethods[i] = method;
       }
-      builder.addProgramClass(
-          new DexProgramClass(
-              type,
-              null,
-              new SynthesizedOrigin("test", MainDexListTests.class),
-              ClassAccessFlags.fromSharedAccessFlags(0),
-              factory.objectType,
-              DexTypeList.empty(),
-              null,
-              null,
-              Collections.emptyList(),
-              null,
-              Collections.emptyList(),
-              DexAnnotationSet.empty(),
-              DexEncodedField.EMPTY_ARRAY,
-              DexEncodedField.EMPTY_ARRAY,
-              directMethods,
-              DexEncodedMethod.EMPTY_ARRAY,
-              false));
+      programClass.getMethodCollection().addDirectMethods(Arrays.asList(directMethods));
+      builder.addProgramClass(programClass);
     }
     DirectMappedDexApplication application = builder.build().toDirect();
     ApplicationWriter writer =
@@ -803,10 +871,9 @@ public class MainDexListTests extends TestBase {
             null,
             options,
             null,
-            null,
             GraphLense.getIdentityLense(),
+            InitClassLens.getDefault(),
             NamingLens.getIdentityLens(),
-            null,
             null);
     ExecutorService executor = ThreadUtils.getExecutorService(options);
     AndroidAppConsumers compatSink = new AndroidAppConsumers(options);

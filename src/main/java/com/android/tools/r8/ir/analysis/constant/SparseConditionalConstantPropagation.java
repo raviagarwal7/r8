@@ -3,16 +3,20 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.analysis.constant;
 
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.ConstNumber;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.If;
 import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.InstructionListIterator;
+import com.android.tools.r8.ir.code.IntSwitch;
 import com.android.tools.r8.ir.code.JumpInstruction;
 import com.android.tools.r8.ir.code.Phi;
-import com.android.tools.r8.ir.code.Switch;
+import com.android.tools.r8.ir.code.StringSwitch;
 import com.android.tools.r8.ir.code.Value;
+import com.google.common.collect.Sets;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Deque;
@@ -20,6 +24,7 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Implementation of Sparse Conditional Constant Propagation from the paper of Wegman and Zadeck
@@ -28,6 +33,7 @@ import java.util.Map;
  */
 public class SparseConditionalConstantPropagation {
 
+  private final AppView<?> appView;
   private final IRCode code;
   private final Map<Value, LatticeElement> mapping = new HashMap<>();
   private final Deque<Value> ssaEdges = new LinkedList<>();
@@ -36,7 +42,8 @@ public class SparseConditionalConstantPropagation {
   private final BitSet[] executableFlowEdges;
   private final BitSet visitedBlocks;
 
-  public SparseConditionalConstantPropagation(IRCode code) {
+  public SparseConditionalConstantPropagation(AppView<?> appView, IRCode code) {
+    this.appView = appView;
     this.code = code;
     nextBlockNumber = code.getHighestBlockNumber() + 1;
     executableFlowEdges = new BitSet[nextBlockNumber];
@@ -44,7 +51,6 @@ public class SparseConditionalConstantPropagation {
   }
 
   public void run() {
-
     BasicBlock firstBlock = code.entryBlock();
     visitInstructions(firstBlock);
 
@@ -76,45 +82,49 @@ public class SparseConditionalConstantPropagation {
   }
 
   private void rewriteCode() {
+    Set<Value> affectedValues = Sets.newIdentityHashSet();
     List<BasicBlock> blockToAnalyze = new ArrayList<>();
-
     mapping.entrySet().stream()
-        .filter((entry) -> entry.getValue().isConst())
-        .forEach((entry) -> {
-          Value value = entry.getKey();
-          ConstNumber evaluatedConst = entry.getValue().asConst().getConstNumber();
-          if (value.definition != evaluatedConst) {
-            if (value.isPhi()) {
-              // D8 relies on dead code removal to get rid of the dead phi itself.
-              if (value.numberOfAllUsers() != 0) {
-                BasicBlock block = value.asPhi().getBlock();
-                blockToAnalyze.add(block);
-                // Create a new constant, because it can be an existing constant that flow directly
-                // into the phi.
-                ConstNumber newConst = ConstNumber.copyOf(code, evaluatedConst);
-                InstructionListIterator iterator = block.listIterator();
-                Instruction inst = iterator.nextUntil((i) -> !i.isMoveException());
-                newConst.setPosition(inst.getPosition());
-                if (!inst.isDebugPosition()) {
-                  iterator.previous();
+        .filter(entry -> entry.getValue().isConst())
+        .forEach(
+            entry -> {
+              Value value = entry.getKey();
+              ConstNumber evaluatedConst = entry.getValue().asConst().getConstNumber();
+              if (value.definition != evaluatedConst) {
+                value.addAffectedValuesTo(affectedValues);
+                if (value.isPhi()) {
+                  // D8 relies on dead code removal to get rid of the dead phi itself.
+                  if (value.hasAnyUsers()) {
+                    BasicBlock block = value.asPhi().getBlock();
+                    blockToAnalyze.add(block);
+                    // Create a new constant, because it can be an existing constant that flow
+                    // directly
+                    // into the phi.
+                    ConstNumber newConst = ConstNumber.copyOf(code, evaluatedConst);
+                    InstructionListIterator iterator = block.listIterator(code);
+                    Instruction inst = iterator.nextUntil(i -> !i.isMoveException());
+                    newConst.setPosition(inst.getPosition());
+                    if (!inst.isDebugPosition()) {
+                      iterator.previous();
+                    }
+                    iterator.add(newConst);
+                    value.replaceUsers(newConst.outValue());
+                  }
+                } else {
+                  BasicBlock block = value.definition.getBlock();
+                  InstructionListIterator iterator = block.listIterator(code);
+                  iterator.nextUntil(i -> i == value.definition);
+                  iterator.replaceCurrentInstruction(evaluatedConst);
                 }
-                iterator.add(newConst);
-                value.replaceUsers(newConst.outValue());
               }
-            } else {
-              BasicBlock block = value.definition.getBlock();
-              InstructionListIterator iterator = block.listIterator();
-              Instruction toReplace = iterator.nextUntil((i) -> i == value.definition);
-              iterator.replaceCurrentInstruction(evaluatedConst);
-            }
-          }
-        });
-
+            });
     for (BasicBlock block : blockToAnalyze) {
       block.deduplicatePhis();
     }
-
-    code.removeAllTrivialPhis();
+    if (!affectedValues.isEmpty()) {
+      new TypeAnalysis(appView).narrowing(affectedValues);
+    }
+    code.removeAllDeadAndTrivialPhis();
   }
 
   private LatticeElement getLatticeElement(Value value) {
@@ -202,8 +212,8 @@ public class SparseConditionalConstantPropagation {
         assert !leftElement.isTop();
         assert !rightElement.isTop();
       }
-    } else if (jumpInstruction.isSwitch()) {
-      Switch switchInst = jumpInstruction.asSwitch();
+    } else if (jumpInstruction.isIntSwitch()) {
+      IntSwitch switchInst = jumpInstruction.asIntSwitch();
       LatticeElement switchElement = getLatticeElement(switchInst.value());
       if (switchElement.isConst()) {
         BasicBlock target = switchInst.getKeyToTargetMap()
@@ -216,6 +226,19 @@ public class SparseConditionalConstantPropagation {
         flowEdges.add(target);
         return;
       }
+    } else if (jumpInstruction.isStringSwitch()) {
+      StringSwitch switchInst = jumpInstruction.asStringSwitch();
+      LatticeElement switchElement = getLatticeElement(switchInst.value());
+      if (switchElement.isConst()) {
+        // There is currently no constant propagation for strings, so it must be null.
+        assert switchElement.asConst().getConstNumber().isZero();
+        BasicBlock target = switchInst.fallthroughBlock();
+        setExecutableEdge(jumpInstBlockNumber, target.getNumber());
+        flowEdges.add(target);
+        return;
+      }
+    } else {
+      assert jumpInstruction.isGoto() || jumpInstruction.isReturn() || jumpInstruction.isThrow();
     }
 
     for (BasicBlock dst : jumpInstBlock.getSuccessors()) {

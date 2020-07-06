@@ -83,6 +83,11 @@ public class ClassAccessFlags extends AccessFlags<ClassAccessFlags> {
   }
 
   @Override
+  public int getAsCfAccessFlags() {
+    return materialize();
+  }
+
+  @Override
   public int getAsDexAccessFlags() {
     // We unset the super flag here, as it is meaningless in DEX. Furthermore, we add missing
     // abstract to interfaces to work around a javac bug when generating package-info classes.
@@ -91,11 +96,6 @@ public class ClassAccessFlags extends AccessFlags<ClassAccessFlags> {
       return flags | Constants.ACC_ABSTRACT;
     }
     return flags;
-  }
-
-  @Override
-  public int getAsCfAccessFlags() {
-    return materialize();
   }
 
   /**
@@ -121,6 +121,10 @@ public class ClassAccessFlags extends AccessFlags<ClassAccessFlags> {
     }
   }
 
+  private boolean isClass() {
+    return !isInterface() && !isAnnotation() && !isEnum();
+  }
+
   public boolean isInterface() {
     return isSet(Constants.ACC_INTERFACE);
   }
@@ -135,6 +139,10 @@ public class ClassAccessFlags extends AccessFlags<ClassAccessFlags> {
 
   public boolean isAbstract() {
     return isSet(Constants.ACC_ABSTRACT);
+  }
+
+  public void demoteFromAbstract() {
+    demote(Constants.ACC_ABSTRACT);
   }
 
   public void setAbstract() {

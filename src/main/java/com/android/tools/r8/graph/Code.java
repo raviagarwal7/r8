@@ -9,41 +9,39 @@ import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Position;
 import com.android.tools.r8.ir.code.ValueNumberGenerator;
+import com.android.tools.r8.ir.conversion.MethodProcessor;
 import com.android.tools.r8.ir.optimize.Outliner.OutlineCode;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.origin.Origin;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
 
 public abstract class Code extends CachedHashValueDexItem {
 
-  private DexEncodedMethod owner;
-
-  public void setOwner(DexEncodedMethod encodedMethod) {
-    // When this Code is un/linked to DexEncodedMethod, the ownership should be updated accordingly.
-    owner = encodedMethod;
-  }
-
-  public DexEncodedMethod getOwner() {
-    // build*IR() will check if the current Code belongs to the given DexEncodedMethod.
-    return owner;
-  }
-
-  public abstract IRCode buildIR(
-      DexEncodedMethod encodedMethod, AppView<? extends AppInfo> appView, Origin origin);
+  public abstract IRCode buildIR(ProgramMethod method, AppView<?> appView, Origin origin);
 
   public IRCode buildInliningIR(
-      DexEncodedMethod context,
-      DexEncodedMethod encodedMethod,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      ProgramMethod method,
+      AppView<?> appView,
       ValueNumberGenerator valueNumberGenerator,
       Position callerPosition,
-      Origin origin) {
+      Origin origin,
+      MethodProcessor methodProcessor) {
     throw new Unreachable("Unexpected attempt to build IR graph for inlining from: "
         + getClass().getCanonicalName());
   }
 
-  public abstract void registerCodeReferences(UseRegistry registry);
+  public abstract void registerCodeReferences(ProgramMethod method, UseRegistry registry);
 
-  public void registerArgumentReferences(ArgumentUse registry) {
+  public abstract void registerCodeReferencesForDesugaring(
+      ClasspathMethod method, UseRegistry registry);
+
+  public void registerArgumentReferences(DexEncodedMethod method, ArgumentUse registry) {
+    throw new Unreachable();
+  }
+
+  public Int2ReferenceMap<DebugLocalInfo> collectParameterInfo(
+      DexEncodedMethod encodedMethod, AppView<?> appView) {
     throw new Unreachable();
   }
 
@@ -57,10 +55,6 @@ public abstract class Code extends CachedHashValueDexItem {
   }
 
   public boolean isDexCode() {
-    return false;
-  }
-
-  public boolean isJarCode() {
     return false;
   }
 
@@ -90,10 +84,6 @@ public abstract class Code extends CachedHashValueDexItem {
     throw new Unreachable(getClass().getCanonicalName() + ".asDexCode()");
   }
 
-  public JarCode asJarCode() {
-    throw new Unreachable(getClass().getCanonicalName() + ".asJarCode()");
-  }
-
   public OutlineCode asOutlineCode() {
     throw new Unreachable(getClass().getCanonicalName() + ".asOutlineCode()");
   }
@@ -110,4 +100,8 @@ public abstract class Code extends CachedHashValueDexItem {
   }
 
   public abstract boolean isEmptyVoidMethod();
+
+  public boolean verifyNoInputReaders() {
+    return true;
+  }
 }

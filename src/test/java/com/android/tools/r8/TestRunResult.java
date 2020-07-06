@@ -3,27 +3,35 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.ToolHelper.ProcessResult;
+import com.android.tools.r8.naming.retrace.StackTrace;
 import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.StringUtils;
+import com.android.tools.r8.utils.ThrowingConsumer;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import org.hamcrest.Matcher;
 
-public abstract class TestRunResult<RR extends TestRunResult<?>> {
+public abstract class TestRunResult<RR extends TestRunResult<RR>> {
   protected final AndroidApp app;
+  private final TestRuntime runtime;
   private final ProcessResult result;
 
-  public TestRunResult(AndroidApp app, ProcessResult result) {
+  public TestRunResult(AndroidApp app, TestRuntime runtime, ProcessResult result) {
     this.app = app;
+    this.runtime = runtime;
     this.result = result;
   }
 
@@ -48,6 +56,14 @@ public abstract class TestRunResult<RR extends TestRunResult<?>> {
 
   public String getStdErr() {
     return result.stderr;
+  }
+
+  public StackTrace getStackTrace() {
+    if (runtime.isDex()) {
+      return StackTrace.extractFromArt(getStdErr(), runtime.asDex().getVm());
+    } else {
+      return StackTrace.extractFromJvm(getStdErr());
+    }
   }
 
   public int getExitCode() {
@@ -77,10 +93,36 @@ public abstract class TestRunResult<RR extends TestRunResult<?>> {
     return self();
   }
 
+  public RR assertFailureWithErrorThatThrows(Class<? extends Throwable> expectedError) {
+    assertFailure();
+    assertThat(
+        errorMessage("Run stderr incorrect.", expectedError.getName()),
+        result.stderr,
+        containsString(expectedError.getName()));
+    return self();
+  }
+
+  public RR assertStderrMatches(Matcher<String> matcher) {
+    assertThat(errorMessage("Run stderr incorrect.", matcher.toString()), result.stderr, matcher);
+    return self();
+  }
+
   public RR assertSuccessWithOutput(String expected) {
     assertSuccess();
     assertEquals(errorMessage("Run stdout incorrect.", expected), expected, result.stdout);
     return self();
+  }
+
+  public RR assertSuccessWithEmptyOutput() {
+    return assertSuccessWithOutput("");
+  }
+
+  public RR assertSuccessWithOutputLines(String... expected) {
+    return assertSuccessWithOutputLines(Arrays.asList(expected));
+  }
+
+  public RR assertSuccessWithOutputLines(List<String> expected) {
+    return assertSuccessWithOutput(StringUtils.lines(expected));
   }
 
   public RR assertSuccessWithOutputThatMatches(Matcher<String> matcher) {
@@ -97,9 +139,25 @@ public abstract class TestRunResult<RR extends TestRunResult<?>> {
     return new CodeInspector(app);
   }
 
-  public RR inspect(Consumer<CodeInspector> consumer)
-      throws IOException, ExecutionException {
-    consumer.accept(inspector());
+  public <E extends Throwable> RR inspect(ThrowingConsumer<CodeInspector, E> consumer)
+      throws IOException, ExecutionException, E {
+    CodeInspector inspector = inspector();
+    consumer.accept(inspector);
+    return self();
+  }
+
+  public <E extends Throwable> RR inspectFailure(ThrowingConsumer<CodeInspector, E> consumer)
+      throws IOException, ExecutionException, E {
+    assertFailure();
+    assertNotNull(app);
+    CodeInspector inspector = new CodeInspector(app);
+    consumer.accept(inspector);
+    return self();
+  }
+
+  public <E extends Throwable> RR inspectStackTrace(ThrowingConsumer<StackTrace, E> consumer)
+      throws E {
+    consumer.accept(getStackTrace());
     return self();
   }
 

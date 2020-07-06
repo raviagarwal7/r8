@@ -3,20 +3,31 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+
 import com.android.tools.r8.TestBase.Backend;
 import com.android.tools.r8.debug.DebugTestConfig;
+import com.android.tools.r8.desugar.desugaredlibrary.DesugaredLibraryTestBase.KeepRuleConsumer;
+import com.android.tools.r8.testing.AndroidBuildVersion;
 import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.AndroidAppConsumers;
+import com.android.tools.r8.utils.ForwardingOutputStream;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.ThrowingOutputStream;
 import com.google.common.base.Suppliers;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.file.Path;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 public abstract class TestCompilerBuilder<
@@ -28,29 +39,46 @@ public abstract class TestCompilerBuilder<
     extends TestBaseBuilder<C, B, CR, RR, T> {
 
   public static final Consumer<InternalOptions> DEFAULT_OPTIONS =
-      new Consumer<InternalOptions>() {
-        @Override
-        public void accept(InternalOptions options) {}
+      options -> {
+        options.testing.allowClassInlinerGracefulExit = false;
+        options.testing.reportUnusedProguardConfigurationRules = true;
       };
 
   final Backend backend;
 
   // Default initialized setup. Can be overwritten if needed.
-  private Path defaultLibrary;
+  private boolean allowStdoutMessages = false;
+  private boolean allowStderrMessages = false;
+  private boolean useDefaultRuntimeLibrary = true;
+  private final List<Path> additionalRunClassPath = new ArrayList<>();
   private ProgramConsumer programConsumer;
   private StringConsumer mainDexListConsumer;
   private AndroidApiLevel defaultMinApiLevel = ToolHelper.getMinApiLevelForDexVm();
   private Consumer<InternalOptions> optionsConsumer = DEFAULT_OPTIONS;
-  private PrintStream stdout = null;
+  private ByteArrayOutputStream stdout = null;
+  private PrintStream oldStdout = null;
+  private ByteArrayOutputStream stderr = null;
+  private PrintStream oldStderr = null;
+  protected OutputMode outputMode = OutputMode.DexIndexed;
+
+  private boolean isAndroidBuildVersionAdded = false;
+
+  public T addAndroidBuildVersion() {
+    addProgramClasses(AndroidBuildVersion.class);
+    isAndroidBuildVersionAdded = true;
+    return self();
+  }
 
   TestCompilerBuilder(TestState state, B builder, Backend backend) {
     super(state, builder);
     this.backend = backend;
-    defaultLibrary = TestBase.runtimeJar(backend);
-    programConsumer = TestBase.emptyConsumer(backend);
+    if (backend == Backend.DEX) {
+      setOutputMode(OutputMode.DexIndexed);
+    } else {
+      assert backend == Backend.CF;
+      setOutputMode(OutputMode.ClassFile);
+    }
   }
-
-  abstract T self();
 
   abstract CR internalCompile(
       B builder, Consumer<InternalOptions> optionsConsumer, Supplier<AndroidApp> app)
@@ -63,39 +91,104 @@ public abstract class TestCompilerBuilder<
     return self();
   }
 
+  public T allowCheckDiscardedErrors(boolean skipReporting) {
+    return addOptionsModification(
+        options -> {
+          options.testing.allowCheckDiscardedErrors = true;
+          options.testing.dontReportFailingCheckDiscarded = skipReporting;
+        });
+  }
+
   public CR compile() throws CompilationFailedException {
     AndroidAppConsumers sink = new AndroidAppConsumers();
     builder.setProgramConsumer(sink.wrapProgramConsumer(programConsumer));
     builder.setMainDexListConsumer(mainDexListConsumer);
-    if (defaultLibrary != null) {
-      builder.addLibraryFiles(defaultLibrary);
-    }
     if (backend == Backend.DEX && defaultMinApiLevel != null) {
+      assert !builder.isMinApiLevelSet()
+          : "Don't set the API level directly through BaseCompilerCommand.Builder in tests";
       builder.setMinApiLevel(defaultMinApiLevel.getLevel());
     }
-    PrintStream oldOut = System.out;
+    if (useDefaultRuntimeLibrary) {
+      if (backend == Backend.DEX && builder.isMinApiLevelSet()) {
+        builder.addLibraryFiles(
+            ToolHelper.getFirstSupportedAndroidJar(
+                AndroidApiLevel.getAndroidApiLevel(builder.getMinApiLevel())));
+      } else {
+        builder.addLibraryFiles(TestBase.runtimeJar(backend));
+      }
+    }
+    assertNull(oldStdout);
+    oldStdout = System.out;
+    assertNull(oldStderr);
+    oldStderr = System.err;
+    CR cr;
     try {
       if (stdout != null) {
-        System.setOut(stdout);
+        assertTrue(allowStdoutMessages);
+        System.setOut(new PrintStream(new ForwardingOutputStream(stdout, System.out)));
+      } else if (!allowStdoutMessages) {
+        System.setOut(
+            new PrintStream(
+                new ThrowingOutputStream<>(
+                    () -> new AssertionError("Unexpected print to stdout"))));
       }
-      return internalCompile(builder, optionsConsumer, Suppliers.memoize(sink::build));
+      if (stderr != null) {
+        assertTrue(allowStderrMessages);
+        System.setErr(new PrintStream(new ForwardingOutputStream(stderr, System.err)));
+      } else if (!allowStderrMessages) {
+        System.setErr(
+            new PrintStream(
+                new ThrowingOutputStream<>(
+                    () -> new AssertionError("Unexpected print to stderr"))));
+      }
+      cr =
+          internalCompile(builder, optionsConsumer, Suppliers.memoize(sink::build))
+              .addRunClasspathFiles(additionalRunClassPath);
+      if (isAndroidBuildVersionAdded) {
+        cr.setSystemProperty(AndroidBuildVersion.PROPERTY, "" + builder.getMinApiLevel());
+      }
+      return cr;
     } finally {
       if (stdout != null) {
-        System.setOut(oldOut);
+        getState().setStdout(stdout.toString());
       }
+      System.setOut(oldStdout);
+      if (stderr != null) {
+        getState().setStderr(stderr.toString());
+      }
+      System.setErr(oldStderr);
+    }
+  }
+
+  @FunctionalInterface
+  public interface DiagnosticsConsumer {
+    void accept(TestDiagnosticMessages diagnostics);
+  }
+
+  public CR compileWithExpectedDiagnostics(DiagnosticsConsumer diagnosticsConsumer)
+      throws CompilationFailedException {
+    TestDiagnosticMessages diagnosticsHandler = getState().getDiagnosticsMessages();
+    try {
+      CR result = compile();
+      diagnosticsConsumer.accept(diagnosticsHandler);
+      return result;
+    } catch (CompilationFailedException e) {
+      diagnosticsConsumer.accept(diagnosticsHandler);
+      throw e;
     }
   }
 
   @Override
+  @Deprecated
   public RR run(String mainClass)
       throws CompilationFailedException, ExecutionException, IOException {
     return compile().run(mainClass);
   }
 
   @Override
-  public RR run(TestRuntime runtime, String mainClass)
+  public RR run(TestRuntime runtime, String mainClass, String... args)
       throws CompilationFailedException, ExecutionException, IOException {
-    return compile().run(runtime, mainClass);
+    return compile().run(runtime, mainClass, args);
   }
 
   @Override
@@ -137,15 +230,75 @@ public abstract class TestCompilerBuilder<
 
   public T setMinApi(AndroidApiLevel minApiLevel) {
     if (backend == Backend.DEX) {
-      this.defaultMinApiLevel = null;
-      builder.setMinApiLevel(minApiLevel.getLevel());
+      return setMinApi(minApiLevel.getLevel());
     }
     return self();
   }
 
+  public T setMinApi(int minApiLevel) {
+    assert builder.getMinApiLevel() > 0 || this.defaultMinApiLevel != null
+        : "Tests must use this method to set min API level, and not"
+            + " BaseCompilerCommand.Builder.setMinApiLevel()";
+    if (backend == Backend.DEX) {
+      this.defaultMinApiLevel = null;
+      builder.setMinApiLevel(minApiLevel);
+    }
+    return self();
+  }
+
+  /** @deprecated use {@link #setMinApi(AndroidApiLevel)} instead. */
+  @Deprecated
   public T setMinApi(TestRuntime runtime) {
     if (runtime.isDex()) {
       setMinApi(runtime.asDex().getMinApiLevel());
+    }
+    return self();
+  }
+
+  public T disableDesugaring() {
+    return setDisableDesugaring(true);
+  }
+
+  public T setDisableDesugaring(boolean disableDesugaring) {
+    builder.setDisableDesugaring(disableDesugaring);
+    return self();
+  }
+
+  public OutputMode getOutputMode() {
+    if (programConsumer instanceof DexIndexedConsumer) {
+      return OutputMode.DexIndexed;
+    }
+    if (programConsumer instanceof DexFilePerClassFileConsumer) {
+      return ((DexFilePerClassFileConsumer) programConsumer)
+              .combineSyntheticClassesWithPrimaryClass()
+          ? OutputMode.DexFilePerClassFile
+          : OutputMode.DexFilePerClass;
+    }
+    assert programConsumer instanceof ClassFileConsumer;
+    return OutputMode.ClassFile;
+  }
+
+  public T setOutputMode(OutputMode outputMode) {
+    assert ToolHelper.verifyValidOutputMode(backend, outputMode);
+    switch (outputMode) {
+      case DexIndexed:
+        programConsumer = DexIndexedConsumer.emptyConsumer();
+        break;
+      case DexFilePerClassFile:
+        programConsumer = DexFilePerClassFileConsumer.emptyConsumer();
+        break;
+      case DexFilePerClass:
+        programConsumer =
+            new DexFilePerClassFileConsumer.ForwardingConsumer(null) {
+              @Override
+              public boolean combineSyntheticClassesWithPrimaryClass() {
+                return false;
+              }
+            };
+        break;
+      case ClassFile:
+        programConsumer = ClassFileConsumer.emptyConsumer();
+        break;
     }
     return self();
   }
@@ -162,44 +315,93 @@ public abstract class TestCompilerBuilder<
     return self();
   }
 
+  public T setIncludeClassesChecksum(boolean include) {
+    builder.setIncludeClassesChecksum(include);
+    return self();
+  }
+
   @Override
   public T addLibraryFiles(Collection<Path> files) {
-    defaultLibrary = null;
+    useDefaultRuntimeLibrary = false;
     return super.addLibraryFiles(files);
   }
 
   @Override
   public T addLibraryClasses(Collection<Class<?>> classes) {
-    defaultLibrary = null;
+    useDefaultRuntimeLibrary = false;
     return super.addLibraryClasses(classes);
   }
 
   @Override
   public T addLibraryProvider(ClassFileResourceProvider provider) {
-    defaultLibrary = null;
+    useDefaultRuntimeLibrary = false;
     return super.addLibraryProvider(provider);
   }
-
-  public T addClasspathClasses(Class<?>... classes) {
-    return addClasspathClasses(Arrays.asList(classes));
-  }
-
-  public abstract T addClasspathClasses(Collection<Class<?>> classes);
-
-  public T addClasspathFiles(Path... files) {
-    return addClasspathFiles(Arrays.asList(files));
-  }
-
-  public abstract T addClasspathFiles(Collection<Path> files);
 
   public T noDesugaring() {
     builder.setDisableDesugaring(true);
     return self();
   }
 
-  public T redirectStdOut(PrintStream printStream) {
+  public T allowStdoutMessages() {
+    allowStdoutMessages = true;
+    return self();
+  }
+
+  public T collectStdout() {
     assert stdout == null;
-    stdout = printStream;
+    stdout = new ByteArrayOutputStream();
+    return allowStdoutMessages();
+  }
+
+  /**
+   * If {@link #allowStdoutMessages} is false, then {@link System#out} will be replaced temporarily
+   * by a {@link ThrowingOutputStream}. To allow the testing infrastructure to print messages to the
+   * terminal, this method provides a reference to the original {@link System#out}.
+   */
+  public PrintStream getStdoutForTesting() {
+    assertNotNull(oldStdout);
+    return oldStdout;
+  }
+
+  public T allowStderrMessages() {
+    allowStderrMessages = true;
+    return self();
+  }
+
+  public T collectStderr() {
+    assert stderr == null;
+    stderr = new ByteArrayOutputStream();
+    return allowStderrMessages();
+  }
+
+  public T enableCoreLibraryDesugaring(AndroidApiLevel minAPILevel) {
+    return enableCoreLibraryDesugaring(minAPILevel, null);
+  }
+
+  public T enableCoreLibraryDesugaring(
+      AndroidApiLevel minApiLevel, KeepRuleConsumer keepRuleConsumer) {
+    assert minApiLevel.getLevel() < AndroidApiLevel.O.getLevel();
+    builder.addDesugaredLibraryConfiguration(
+        StringResource.fromFile(ToolHelper.DESUGAR_LIB_JSON_FOR_TESTING));
+    // TODO(b/158543446): This should not be setting an implicit library file. Doing so causes
+    //  inconsistent library setup depending on the api level and makes tests hard to read and
+    //  reason about.
+    // Use P to mimic current Android Studio.
+    builder.addLibraryFiles(ToolHelper.getAndroidJar(AndroidApiLevel.P));
+    return self();
+  }
+
+  @Override
+  public T addRunClasspathFiles(Collection<Path> files) {
+    additionalRunClassPath.addAll(files);
+    return self();
+  }
+
+  public T addAssertionsConfiguration(
+      Function<AssertionsConfiguration.Builder, AssertionsConfiguration>
+          assertionsConfigurationGenerator) {
+    builder.addAssertionsConfiguration(assertionsConfigurationGenerator);
     return self();
   }
 }

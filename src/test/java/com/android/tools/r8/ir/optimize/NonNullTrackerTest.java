@@ -7,7 +7,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.InstancePut;
@@ -20,12 +22,26 @@ import com.android.tools.r8.ir.optimize.nonnull.NonNullAfterFieldAccess;
 import com.android.tools.r8.ir.optimize.nonnull.NonNullAfterInvoke;
 import com.android.tools.r8.ir.optimize.nonnull.NonNullAfterNullCheck;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
+import com.android.tools.r8.utils.Timing;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import java.util.function.Consumer;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
+@RunWith(Parameterized.class)
 public class NonNullTrackerTest extends NonNullTrackerTestBase {
+
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withNoneRuntime().build();
+  }
+
+  public NonNullTrackerTest(TestParameters parameters) {
+    parameters.assertNoneRuntime();
+  }
 
   private void buildAndTest(
       Class<?> testClass,
@@ -33,25 +49,25 @@ public class NonNullTrackerTest extends NonNullTrackerTestBase {
       int expectedNumberOfNonNull,
       Consumer<IRCode> testAugmentedIRCode)
       throws Exception {
-    AppView<? extends AppInfo> appView = build(testClass);
+    AppView<? extends AppInfoWithClassHierarchy> appView = build(testClass);
     CodeInspector codeInspector = new CodeInspector(appView.appInfo().app());
     MethodSubject fooSubject = codeInspector.clazz(testClass.getName()).method(signature);
-    IRCode irCode = fooSubject.buildIR();
-    checkCountOfNonNull(irCode, 0);
+    IRCode code = fooSubject.buildIR();
+    checkCountOfNonNull(code, 0);
 
-    NonNullTracker nonNullTracker = new NonNullTracker(appView);
+    AssumeInserter assumeInserter = new AssumeInserter(appView);
 
-    nonNullTracker.addNonNull(irCode);
-    assertTrue(irCode.isConsistentSSA());
-    checkCountOfNonNull(irCode, expectedNumberOfNonNull);
+    assumeInserter.insertAssumeInstructions(code, Timing.empty());
+    assertTrue(code.isConsistentSSA());
+    checkCountOfNonNull(code, expectedNumberOfNonNull);
 
     if (testAugmentedIRCode != null) {
-      testAugmentedIRCode.accept(irCode);
+      testAugmentedIRCode.accept(code);
     }
 
-    nonNullTracker.cleanupNonNull(irCode);
-    assertTrue(irCode.isConsistentSSA());
-    checkCountOfNonNull(irCode, 0);
+    CodeRewriter.removeAssumeInstructions(appView, code);
+    assertTrue(code.isConsistentSSA());
+    checkCountOfNonNull(code, 0);
   }
 
   private static void checkCountOfNonNull(IRCode code, int expectedOccurrences) {
@@ -61,31 +77,30 @@ public class NonNullTrackerTest extends NonNullTrackerTestBase {
     while (it.hasNext()) {
       prev = curr != null && !curr.isGoto() ? curr : prev;
       curr = it.next();
-      if (curr.isAssumeNonNull()) {
+      if (curr.isAssumeWithNonNullAssumption()) {
         // Make sure non-null is added to the right place.
         assertTrue(prev == null
             || prev.throwsOnNullInput()
             || (prev.isIf() && prev.asIf().isZeroTest())
             || !curr.getBlock().getPredecessors().contains(prev.getBlock()));
         // Make sure non-null is used or inserted for arguments.
-        assertTrue(
-            curr.outValue().numberOfAllUsers() > 0 || curr.asAssumeNonNull().src().isArgument());
+        assertTrue(curr.outValue().numberOfAllUsers() > 0 || curr.asAssume().src().isArgument());
         count++;
       }
     }
     assertEquals(expectedOccurrences, count);
   }
 
-  private void checkInvokeGetsNonNullReceiver(IRCode irCode) {
-    checkInvokeReceiver(irCode, true);
+  private void checkInvokeGetsNonNullReceiver(IRCode code) {
+    checkInvokeReceiver(code, true);
   }
 
-  private void checkInvokeGetsNullReceiver(IRCode irCode) {
-    checkInvokeReceiver(irCode, false);
+  private void checkInvokeGetsNullReceiver(IRCode code) {
+    checkInvokeReceiver(code, false);
   }
 
-  private void checkInvokeReceiver(IRCode irCode, boolean isNotNull) {
-    InstructionIterator it = irCode.instructionIterator();
+  private void checkInvokeReceiver(IRCode code, boolean isNotNull) {
+    InstructionIterator it = code.instructionIterator();
     boolean metInvokeWithReceiver = false;
     while (it.hasNext()) {
       Instruction instruction = it.nextUntil(Instruction::isInvokeMethodWithReceiver);
@@ -147,10 +162,10 @@ public class NonNullTrackerTest extends NonNullTrackerTestBase {
         NonNullAfterFieldAccess.class,
         signature,
         1,
-        ircode -> {
+        code -> {
           // There are two InstancePut instructions of interest.
           int count = 0;
-          InstructionIterator it = ircode.instructionIterator();
+          InstructionIterator it = code.instructionIterator();
           while (it.hasNext()) {
             Instruction instruction = it.nextUntil(Instruction::isInstancePut);
             if (instruction == null) {
@@ -160,11 +175,11 @@ public class NonNullTrackerTest extends NonNullTrackerTestBase {
             if (count == 0) {
               // First one in the very first line: its value should not be replaced by NonNullMarker
               // because this instruction will happen _before_ non-null.
-              assertFalse(iput.value().definition.isAssumeNonNull());
+              assertFalse(iput.value().definition.isAssumeWithNonNullAssumption());
             } else if (count == 1) {
               // Second one after a safe invocation, which should use the value added by
               // NonNullMarker.
-              assertTrue(iput.object().definition.isAssumeNonNull());
+              assertTrue(iput.object().definition.isAssumeWithNonNullAssumption());
             }
             count++;
           }

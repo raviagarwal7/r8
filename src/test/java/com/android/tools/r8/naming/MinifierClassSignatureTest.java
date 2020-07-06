@@ -5,12 +5,12 @@
 package com.android.tools.r8.naming;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
 import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
-import static org.junit.Assert.assertThat;
 import static org.objectweb.asm.Opcodes.ACC_FINAL;
 import static org.objectweb.asm.Opcodes.ACC_SUPER;
 import static org.objectweb.asm.Opcodes.ACC_SYNTHETIC;
@@ -25,12 +25,12 @@ import com.android.tools.r8.R8Command;
 import com.android.tools.r8.StringConsumer;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.ToolHelper;
-import com.android.tools.r8.graph.invokesuper.Consumer;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import java.util.function.Consumer;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -327,13 +327,13 @@ public class MinifierClassSignatureTest extends TestBase {
                     .setProguardMapConsumer(StringConsumer.emptyConsumer())
                     .build()));
     // All classes are kept, and renamed.
-    assertThat(inspector.clazz("Simple"), isRenamed());
-    assertThat(inspector.clazz("Base"), isRenamed());
-    assertThat(inspector.clazz("Outer"), isRenamed());
-    assertThat(inspector.clazz("Outer$Inner"), isRenamed());
-    assertThat(inspector.clazz("Outer$ExtendsInner"), isRenamed());
-    assertThat(inspector.clazz("Outer$Inner$InnerInner"), isRenamed());
-    assertThat(inspector.clazz("Outer$Inner$ExtendsInnerInner"), isRenamed());
+    assertThat(inspector.clazz("Simple"), isPresentAndRenamed());
+    assertThat(inspector.clazz("Base"), isPresentAndRenamed());
+    assertThat(inspector.clazz("Outer"), isPresentAndRenamed());
+    assertThat(inspector.clazz("Outer$Inner"), isPresentAndRenamed());
+    assertThat(inspector.clazz("Outer$ExtendsInner"), isPresentAndRenamed());
+    assertThat(inspector.clazz("Outer$Inner$InnerInner"), isPresentAndRenamed());
+    assertThat(inspector.clazz("Outer$Inner$ExtendsInnerInner"), isPresentAndRenamed());
 
     // Test that classes with have their original signature if the default was provided.
     if (!signatures.containsKey("Simple")) {

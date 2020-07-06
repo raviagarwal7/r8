@@ -10,6 +10,7 @@ import com.android.tools.r8.dex.ApplicationReader;
 import com.android.tools.r8.dex.ApplicationWriter;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.origin.Origin;
 import com.google.common.collect.ImmutableList;
@@ -109,18 +110,16 @@ public class Smali {
     options.programConsumer = consumer;
     ExecutorService executor = ThreadUtils.getExecutorService(1);
     try {
-      DexApplication dexApp = new ApplicationReader(
-          app, options, new Timing("smali")).read(executor);
+      DexApplication dexApp = new ApplicationReader(app, options, Timing.empty()).read(executor);
       ApplicationWriter writer =
           new ApplicationWriter(
               dexApp,
               null,
               options,
               null,
-              null,
               GraphLense.getIdentityLense(),
+              InitClassLens.getDefault(),
               NamingLens.getIdentityLens(),
-              null,
               null);
       writer.write(executor);
       return consumer.contents;

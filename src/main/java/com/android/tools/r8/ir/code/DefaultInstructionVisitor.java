@@ -35,7 +35,7 @@ public abstract class DefaultInstructionVisitor<T> implements InstructionVisitor
   }
 
   @Override
-  public T visit(Assume<?> instruction) {
+  public T visit(Assume instruction) {
     return null;
   }
 
@@ -156,6 +156,11 @@ public abstract class DefaultInstructionVisitor<T> implements InstructionVisitor
 
   @Override
   public T visit(Inc instruction) {
+    return null;
+  }
+
+  @Override
+  public T visit(InitClass instruction) {
     return null;
   }
 
@@ -330,7 +335,12 @@ public abstract class DefaultInstructionVisitor<T> implements InstructionVisitor
   }
 
   @Override
-  public T visit(Switch instruction) {
+  public T visit(IntSwitch instruction) {
+    return null;
+  }
+
+  @Override
+  public T visit(StringSwitch instruction) {
     return null;
   }
 

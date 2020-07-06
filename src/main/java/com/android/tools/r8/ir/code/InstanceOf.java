@@ -7,14 +7,15 @@ package com.android.tools.r8.ir.code;
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.code.CfInstanceOf;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
+import java.util.Set;
 
 public class InstanceOf extends Instruction {
 
@@ -23,6 +24,11 @@ public class InstanceOf extends Instruction {
   public InstanceOf(Value dest, Value value, DexType type) {
     super(dest, value);
     this.type = type;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INSTANCE_OF;
   }
 
   @Override
@@ -81,13 +87,13 @@ public class InstanceOf extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInstanceOf(type, invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInstanceOf(type, context.getHolder());
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.INT;
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.getInt();
   }
 
   @Override
@@ -104,5 +110,15 @@ public class InstanceOf extends Instruction {
   @Override
   public void buildCf(CfBuilder builder) {
     builder.add(new CfInstanceOf(type));
+  }
+
+  @Override
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return true;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

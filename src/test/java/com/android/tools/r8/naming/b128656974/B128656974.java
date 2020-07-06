@@ -4,9 +4,9 @@
 package com.android.tools.r8.naming.b128656974;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.NeverClassInline;
 import com.android.tools.r8.NeverInline;
@@ -25,10 +25,8 @@ public class B128656974 extends TestBase {
   public void testField() throws Exception {
     Class<?> main = TestClassMainForField.class;
     testForR8(Backend.DEX)
-        .addProgramClasses(
-            Greeting.class, Greeting.getGreetingBase(), TestClassSub.class, main)
-        .enableClassInliningAnnotations()
-        .enableInliningAnnotations()
+        .addProgramClasses(Greeting.class, Greeting.getGreetingBase(), TestClassSub.class, main)
+        .enableNeverClassInliningAnnotations()
         .enableMergeAnnotations()
         .addKeepMainRule(main)
         .addKeepRules(
@@ -37,14 +35,14 @@ public class B128656974 extends TestBase {
                 + "{ static java.lang.String a; }")
         .run(main)
         .assertSuccessWithOutput(StringUtils.lines("TestClassSub.greeting", "TestClassSub.a"))
-        .inspect(inspector -> {
-          ClassSubject greetingBase = inspector.clazz(Greeting.getGreetingBase());
-          assertThat(greetingBase, isPresent());
-          FieldSubject greeting = greetingBase.uniqueFieldWithName("greeting");
-          assertThat(greeting, isPresent());
-          assertThat(greeting, isRenamed());
-          assertNotEquals("a", greeting.getFinalName());
-        });
+        .inspect(
+            inspector -> {
+              ClassSubject greetingBase = inspector.clazz(Greeting.getGreetingBase());
+              assertThat(greetingBase, isPresent());
+              FieldSubject greeting = greetingBase.uniqueFieldWithName("greeting");
+              assertThat(greeting, isPresentAndRenamed());
+              assertNotEquals("a", greeting.getFinalName());
+            });
   }
 
   @NeverClassInline
@@ -75,26 +73,23 @@ public class B128656974 extends TestBase {
   public void testMethod() throws Exception {
     Class<?> main = TestClassMainForMethod.class;
     testForR8(Backend.DEX)
-        .addProgramClasses(
-            TestClassBase.class, TestClassSub2.class, main)
+        .addProgramClasses(TestClassBase.class, TestClassSub2.class, main)
         .enableMergeAnnotations()
-        .enableClassInliningAnnotations()
+        .enableNeverClassInliningAnnotations()
         .enableInliningAnnotations()
         .addKeepMainRule(main)
         .addKeepRules(
-            "-keepclassmembernames class "
-                + TestClassSub2.class.getTypeName()
-                + "{ void a(...); }")
+            "-keepclassmembernames class " + TestClassSub2.class.getTypeName() + "{ void a(...); }")
         .run(main)
         .assertSuccessWithOutput(StringUtils.lines("TestClassSub2::a", "TestClassBase::foo"))
-        .inspect(inspector -> {
-          ClassSubject base = inspector.clazz(TestClassBase.class);
-          assertThat(base, isPresent());
-          MethodSubject foo = base.uniqueMethodWithName("foo");
-          assertThat(foo, isPresent());
-          assertThat(foo, isRenamed());
-          assertNotEquals("a", foo.getFinalName());
-        });
+        .inspect(
+            inspector -> {
+              ClassSubject base = inspector.clazz(TestClassBase.class);
+              assertThat(base, isPresent());
+              MethodSubject foo = base.uniqueMethodWithName("foo");
+              assertThat(foo, isPresentAndRenamed());
+              assertNotEquals("a", foo.getFinalName());
+            });
   }
 
   @NeverMerge

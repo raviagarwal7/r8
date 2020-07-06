@@ -11,20 +11,22 @@ import com.android.tools.r8.code.InvokeSuper;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.errors.Unimplemented;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.ClassAccessFlags;
 import com.android.tools.r8.graph.Code;
 import com.android.tools.r8.graph.DexAnnotationSet;
 import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.graph.DexCode;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexLibraryClass;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DexProgramClass.ChecksumSupplier;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexTypeList;
+import com.android.tools.r8.graph.GraphLense;
 import com.android.tools.r8.graph.GraphLense.NestedGraphLense;
 import com.android.tools.r8.graph.MethodAccessFlags;
 import com.android.tools.r8.graph.ParameterAnnotationsList;
@@ -32,6 +34,8 @@ import com.android.tools.r8.ir.code.Invoke.Type;
 import com.android.tools.r8.ir.synthetic.ForwardMethodSourceCode;
 import com.android.tools.r8.ir.synthetic.SynthesizedCode;
 import com.android.tools.r8.origin.SynthesizedOrigin;
+import com.android.tools.r8.utils.Pair;
+import com.google.common.collect.BiMap;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -50,20 +54,20 @@ import java.util.Set;
 // Also moves static interface methods into a companion class.
 final class InterfaceProcessor {
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   private final InterfaceMethodRewriter rewriter;
 
   // All created companion and dispatch classes indexed by interface type.
   final Map<DexType, DexProgramClass> syntheticClasses = new IdentityHashMap<>();
 
-  InterfaceProcessor(AppView<? extends AppInfo> appView, InterfaceMethodRewriter rewriter) {
+  InterfaceProcessor(
+      AppView<?> appView, InterfaceMethodRewriter rewriter) {
     this.appView = appView;
     this.rewriter = rewriter;
   }
 
   void process(DexProgramClass iface, NestedGraphLense.Builder graphLensBuilder) {
     assert iface.isInterface();
-
     // The list of methods to be created in companion class.
     List<DexEncodedMethod> companionMethods = new ArrayList<>();
 
@@ -88,13 +92,17 @@ final class InterfaceProcessor {
         MethodAccessFlags newFlags = virtual.accessFlags.copy();
         newFlags.unsetBridge();
         newFlags.promoteToStatic();
-        DexCode dexCode = code.asDexCode();
-        dexCode.setDebugInfo(dexCode.debugInfoWithFakeThisParameter(rewriter.factory));
-        assert (dexCode.getDebugInfo() == null)
-            || (companionMethod.getArity() == dexCode.getDebugInfo().parameters.length);
-
-        DexEncodedMethod implMethod = new DexEncodedMethod(
-            companionMethod, newFlags, virtual.annotations, virtual.parameterAnnotationsList, code);
+        DexEncodedMethod.setDebugInfoWithFakeThisParameter(
+            code, companionMethod.getArity(), appView);
+        DexEncodedMethod implMethod =
+            new DexEncodedMethod(
+                companionMethod,
+                newFlags,
+                virtual.annotations(),
+                virtual.parameterAnnotationsList,
+                code,
+                true);
+        implMethod.copyMetadata(virtual);
         virtual.setDefaultInterfaceMethodImplementation(implMethod);
         companionMethods.add(implMethod);
         graphLensBuilder.move(virtual.method, implMethod.method);
@@ -107,7 +115,7 @@ final class InterfaceProcessor {
     }
 
     // If at least one bridge method was removed then update the table.
-    if (remainingMethods.size() < iface.virtualMethods().size()) {
+    if (remainingMethods.size() < iface.getMethodCollection().numberOfVirtualMethods()) {
       iface.setVirtualMethods(remainingMethods.toArray(DexEncodedMethod.EMPTY_ARRAY));
     }
     remainingMethods.clear();
@@ -127,8 +135,16 @@ final class InterfaceProcessor {
             : "Static interface method " + direct.toSourceString() + " is expected to "
             + "either be public or private in " + iface.origin;
         DexMethod companionMethod = rewriter.staticAsMethodOfCompanionClass(oldMethod);
-        companionMethods.add(new DexEncodedMethod(companionMethod, newFlags,
-            direct.annotations, direct.parameterAnnotationsList, direct.getCode()));
+        DexEncodedMethod implMethod =
+            new DexEncodedMethod(
+                companionMethod,
+                newFlags,
+                direct.annotations(),
+                direct.parameterAnnotationsList,
+                direct.getCode(),
+                true);
+        implMethod.copyMetadata(direct);
+        companionMethods.add(implMethod);
         graphLensBuilder.move(oldMethod, companionMethod);
       } else {
         if (originalFlags.isPrivate()) {
@@ -144,13 +160,18 @@ final class InterfaceProcessor {
             throw new CompilationError("Code is missing for private instance "
                 + "interface method: " + oldMethod.toSourceString(), iface.origin);
           }
-          DexCode dexCode = code.asDexCode();
-          dexCode.setDebugInfo(dexCode.debugInfoWithFakeThisParameter(rewriter.factory));
-          assert (dexCode.getDebugInfo() == null)
-              || (companionMethod.getArity() == dexCode.getDebugInfo().parameters.length);
-
-          companionMethods.add(new DexEncodedMethod(companionMethod,
-              newFlags, direct.annotations, direct.parameterAnnotationsList, code));
+          DexEncodedMethod.setDebugInfoWithFakeThisParameter(
+              code, companionMethod.getArity(), appView);
+          DexEncodedMethod implMethod =
+              new DexEncodedMethod(
+                  companionMethod,
+                  newFlags,
+                  direct.annotations(),
+                  direct.parameterAnnotationsList,
+                  code,
+                  true);
+          implMethod.copyMetadata(direct);
+          companionMethods.add(implMethod);
           graphLensBuilder.move(oldMethod, companionMethod);
         } else {
           // Since there are no interface constructors at this point,
@@ -160,7 +181,7 @@ final class InterfaceProcessor {
         }
       }
     }
-    if (remainingMethods.size() < iface.directMethods().size()) {
+    if (remainingMethods.size() < iface.getMethodCollection().numberOfDirectMethods()) {
       iface.setDirectMethods(remainingMethods.toArray(DexEncodedMethod.EMPTY_ARRAY));
     }
 
@@ -198,11 +219,20 @@ final class InterfaceProcessor {
             companionMethods.toArray(DexEncodedMethod.EMPTY_ARRAY),
             DexEncodedMethod.EMPTY_ARRAY,
             rewriter.factory.getSkipNameValidationForTesting(),
+            getChecksumSupplier(iface),
             Collections.singletonList(iface));
     syntheticClasses.put(iface.type, companionClass);
   }
 
-  List<DexEncodedMethod> process(DexLibraryClass iface, Set<DexProgramClass> callers) {
+  private ChecksumSupplier getChecksumSupplier(DexProgramClass iface) {
+    if (!appView.options().encodeChecksums) {
+      return DexProgramClass::invalidChecksumRequest;
+    }
+    long checksum = iface.getChecksum();
+    return c -> 7 * checksum;
+  }
+
+  DexProgramClass process(DexLibraryClass iface, Set<DexProgramClass> callers) {
     assert iface.isInterface();
 
     // The list of methods to be created in dispatch class.
@@ -228,6 +258,12 @@ final class InterfaceProcessor {
 
       DexMethod origMethod = direct.method;
       DexMethod newMethod = rewriter.staticAsMethodOfDispatchClass(origMethod);
+      ForwardMethodSourceCode.Builder forwardSourceCodeBuilder =
+          ForwardMethodSourceCode.builder(newMethod);
+      forwardSourceCodeBuilder
+          .setTarget(origMethod)
+          .setInvokeType(Type.STATIC)
+          .setIsInterface(false); // We forward to the Companion class, not an interface.
       DexEncodedMethod newEncodedMethod =
           new DexEncodedMethod(
               newMethod,
@@ -235,17 +271,8 @@ final class InterfaceProcessor {
                   Constants.ACC_PUBLIC | Constants.ACC_STATIC | Constants.ACC_SYNTHETIC, false),
               DexAnnotationSet.empty(),
               ParameterAnnotationsList.empty(),
-              new SynthesizedCode(
-                  callerPosition ->
-                      new ForwardMethodSourceCode(
-                          null,
-                          newMethod,
-                          newMethod,
-                          null,
-                          origMethod,
-                          Type.STATIC,
-                          callerPosition,
-                          true /* isInterface */)));
+              new SynthesizedCode(forwardSourceCodeBuilder::build),
+              true);
       newEncodedMethod.getMutableOptimizationInfo().markNeverInline();
       dispatchMethods.add(newEncodedMethod);
     }
@@ -275,9 +302,10 @@ final class InterfaceProcessor {
             dispatchMethods.toArray(DexEncodedMethod.EMPTY_ARRAY),
             DexEncodedMethod.EMPTY_ARRAY,
             rewriter.factory.getSkipNameValidationForTesting(),
+            DexProgramClass::checksumFromType,
             callers);
     syntheticClasses.put(iface.type, dispatchClass);
-    return dispatchMethods;
+    return dispatchClass;
   }
 
   private boolean canMoveToCompanionClass(DexEncodedMethod method) {
@@ -292,12 +320,18 @@ final class InterfaceProcessor {
     } else {
       assert code.isCfCode();
       for (CfInstruction insn : code.asCfCode().getInstructions()) {
-        if (insn instanceof CfInvoke && ((CfInvoke) insn).isInvokeSuper(method.method.holder)) {
+        if (insn instanceof CfInvoke && ((CfInvoke) insn).isInvokeSuper(method.holder())) {
           return false;
         }
       }
     }
     return true;
+  }
+
+  private DexClass definitionForDependency(DexType dependency, DexClass dependent) {
+    return dependent.isProgramClass()
+        ? appView.appInfo().definitionForDesugarDependency(dependent.asProgramClass(), dependency)
+        : appView.definitionFor(dependency);
   }
 
   // Returns true if the given interface method must be kept on [iface] after moving its
@@ -311,30 +345,31 @@ final class InterfaceProcessor {
       }
     }
     if (method.accessFlags.isBridge()) {
-      Deque<DexType> worklist = new ArrayDeque<>();
+      Deque<Pair<DexClass, DexType>> worklist = new ArrayDeque<>();
       Set<DexType> seenBefore = new HashSet<>();
-      if (iface.superType != null) {
-        worklist.add(iface.superType);
-      }
-      Collections.addAll(worklist, iface.interfaces.values);
+      addSuperTypes(iface, worklist);
       while (!worklist.isEmpty()) {
-        DexType superType = worklist.pop();
-        if (!seenBefore.add(superType)) {
+        Pair<DexClass, DexType> item = worklist.pop();
+        DexClass clazz = definitionForDependency(item.getSecond(), item.getFirst());
+        if (clazz == null || !seenBefore.add(clazz.type)) {
           continue;
         }
-        DexClass clazz = appView.definitionFor(superType);
-        if (clazz != null) {
-          if (clazz.lookupVirtualMethod(method.method) != null) {
-            return false;
-          }
-          if (clazz.superType != null) {
-            worklist.add(clazz.superType);
-          }
-          Collections.addAll(worklist, clazz.interfaces.values);
+        if (clazz.lookupVirtualMethod(method.method) != null) {
+          return false;
         }
+        addSuperTypes(clazz, worklist);
       }
     }
     return true;
+  }
+
+  private static void addSuperTypes(DexClass clazz, Deque<Pair<DexClass, DexType>> worklist) {
+    if (clazz.superType != null) {
+      worklist.add(new Pair<>(clazz, clazz.superType));
+    }
+    for (DexType iface : clazz.interfaces.values) {
+      worklist.add(new Pair<>(clazz, iface));
+    }
   }
 
   private boolean isStaticMethod(DexEncodedMethod method) {
@@ -342,5 +377,54 @@ final class InterfaceProcessor {
       throw new Unimplemented("Native interface methods are not yet supported.");
     }
     return method.accessFlags.isStatic() && !rewriter.factory.isClassConstructor(method.method);
+  }
+
+  // Specific lens which remaps invocation types to static since all rewrites performed here
+  // are to static companion methods.
+  public static class InterfaceProcessorNestedGraphLense extends NestedGraphLense {
+
+    public InterfaceProcessorNestedGraphLense(
+        Map<DexType, DexType> typeMap,
+        Map<DexMethod, DexMethod> methodMap,
+        Map<DexField, DexField> fieldMap,
+        BiMap<DexField, DexField> originalFieldSignatures,
+        BiMap<DexMethod, DexMethod> originalMethodSignatures,
+        GraphLense previousLense,
+        DexItemFactory dexItemFactory) {
+      super(
+          typeMap,
+          methodMap,
+          fieldMap,
+          originalFieldSignatures,
+          originalMethodSignatures,
+          previousLense,
+          dexItemFactory);
+    }
+
+    @Override
+    protected Type mapInvocationType(DexMethod newMethod, DexMethod originalMethod, Type type) {
+      return Type.STATIC;
+    }
+
+    public static GraphLense.Builder builder() {
+      return new Builder();
+    }
+
+    public static class Builder extends NestedGraphLense.Builder {
+      @Override
+      public GraphLense build(DexItemFactory dexItemFactory, GraphLense previousLense) {
+        if (originalFieldSignatures.isEmpty() && originalMethodSignatures.isEmpty()) {
+          return previousLense;
+        }
+        return new InterfaceProcessorNestedGraphLense(
+            typeMap,
+            methodMap,
+            fieldMap,
+            originalFieldSignatures,
+            originalMethodSignatures,
+            previousLense,
+            dexItemFactory);
+      }
+    }
   }
 }

@@ -3,101 +3,190 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.optimize;
 
+import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
+import static com.google.common.base.Predicates.not;
+
+import com.android.tools.r8.androidapi.AvailableApiExceptions;
+import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.AccessControl;
 import com.android.tools.r8.graph.AccessFlags;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.ClassHierarchy;
 import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
-import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.NestMemberClassAttribute;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult.SingleResolutionResult;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
+import com.android.tools.r8.ir.analysis.proto.ProtoInliningReasonStrategy;
+import com.android.tools.r8.ir.analysis.type.Nullability;
+import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.BasicBlock;
+import com.android.tools.r8.ir.code.BasicBlockIterator;
+import com.android.tools.r8.ir.code.CatchHandlers.CatchHandler;
+import com.android.tools.r8.ir.code.ConstClass;
 import com.android.tools.r8.ir.code.IRCode;
-import com.android.tools.r8.ir.code.If;
+import com.android.tools.r8.ir.code.InitClass;
 import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.InstructionIterator;
 import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.Invoke;
 import com.android.tools.r8.ir.code.InvokeMethod;
+import com.android.tools.r8.ir.code.InvokeStatic;
+import com.android.tools.r8.ir.code.InvokeVirtual;
+import com.android.tools.r8.ir.code.Monitor;
+import com.android.tools.r8.ir.code.MoveException;
+import com.android.tools.r8.ir.code.Phi;
 import com.android.tools.r8.ir.code.Position;
 import com.android.tools.r8.ir.code.Throw;
 import com.android.tools.r8.ir.code.Value;
-import com.android.tools.r8.ir.code.ValueNumberGenerator;
-import com.android.tools.r8.ir.conversion.CallSiteInformation;
-import com.android.tools.r8.ir.conversion.IRConverter;
+import com.android.tools.r8.ir.conversion.CodeOptimization;
 import com.android.tools.r8.ir.conversion.LensCodeRewriter;
-import com.android.tools.r8.ir.conversion.OptimizationFeedback;
+import com.android.tools.r8.ir.conversion.MethodProcessor;
+import com.android.tools.r8.ir.conversion.PostOptimization;
 import com.android.tools.r8.ir.desugar.TwrCloseResourceRewriter;
-import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedbackIgnore;
+import com.android.tools.r8.ir.optimize.inliner.DefaultInliningReasonStrategy;
+import com.android.tools.r8.ir.optimize.inliner.InliningIRProvider;
+import com.android.tools.r8.ir.optimize.inliner.InliningReasonStrategy;
+import com.android.tools.r8.ir.optimize.inliner.NopWhyAreYouNotInliningReporter;
+import com.android.tools.r8.ir.optimize.inliner.WhyAreYouNotInliningReporter;
+import com.android.tools.r8.ir.optimize.lambda.LambdaMerger;
+import com.android.tools.r8.kotlin.Kotlin;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.shaking.MainDexClasses;
 import com.android.tools.r8.utils.InternalOptions;
-import com.android.tools.r8.utils.ThreadUtils;
+import com.android.tools.r8.utils.IteratorUtils;
+import com.android.tools.r8.utils.ListUtils;
+import com.android.tools.r8.utils.OptionalBool;
+import com.android.tools.r8.utils.SetUtils;
+import com.android.tools.r8.utils.Timing;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collection;
+import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.function.Predicate;
 
-public class Inliner {
+public class Inliner implements PostOptimization {
 
   protected final AppView<AppInfoWithLiveness> appView;
+  private final Set<DexMethod> blacklist;
+  private final LambdaMerger lambdaMerger;
+  private final LensCodeRewriter lensCodeRewriter;
   final MainDexClasses mainDexClasses;
 
   // State for inlining methods which are known to be called twice.
   private boolean applyDoubleInlining = false;
-  private final Set<DexEncodedMethod> doubleInlineCallers = Sets.newIdentityHashSet();
-  private final Set<DexEncodedMethod> doubleInlineSelectedTargets = Sets.newIdentityHashSet();
-  private final Map<DexEncodedMethod, DexEncodedMethod> doubleInlineeCandidates = new HashMap<>();
+  private final ProgramMethodSet doubleInlineCallers = ProgramMethodSet.create();
+  private final ProgramMethodSet doubleInlineSelectedTargets = ProgramMethodSet.create();
+  private final Map<DexEncodedMethod, ProgramMethod> doubleInlineeCandidates =
+      new IdentityHashMap<>();
 
-  private final Set<DexMethod> blackList = Sets.newIdentityHashSet();
+  private final AvailableApiExceptions availableApiExceptions;
 
-  public Inliner(AppView<AppInfoWithLiveness> appView, MainDexClasses mainDexClasses) {
+  public Inliner(
+      AppView<AppInfoWithLiveness> appView,
+      MainDexClasses mainDexClasses,
+      LambdaMerger lambdaMerger,
+      LensCodeRewriter lensCodeRewriter) {
+    Kotlin.Intrinsics intrinsics = appView.dexItemFactory().kotlin.intrinsics;
     this.appView = appView;
+    this.blacklist =
+        appView.options().kotlinOptimizationOptions().disableKotlinSpecificOptimizations
+            ? ImmutableSet.of()
+            : ImmutableSet.of(intrinsics.throwNpe, intrinsics.throwParameterIsNullException);
+    this.lambdaMerger = lambdaMerger;
+    this.lensCodeRewriter = lensCodeRewriter;
     this.mainDexClasses = mainDexClasses;
-    fillInBlackList();
+    availableApiExceptions =
+        appView.options().canHaveDalvikCatchHandlerVerificationBug()
+            ? new AvailableApiExceptions(appView.options())
+            : null;
   }
 
-  private void fillInBlackList() {
-    blackList.add(appView.dexItemFactory().kotlin.intrinsics.throwParameterIsNullException);
-    blackList.add(appView.dexItemFactory().kotlin.intrinsics.throwNpe);
+  boolean isBlacklisted(
+      InvokeMethod invoke,
+      SingleResolutionResult resolutionResult,
+      ProgramMethod singleTarget,
+      WhyAreYouNotInliningReporter whyAreYouNotInliningReporter) {
+    AppInfoWithLiveness appInfo = appView.appInfo();
+    DexMethod singleTargetReference = singleTarget.getReference();
+    if (singleTarget.getDefinition().getOptimizationInfo().forceInline()
+        && appInfo.neverInline.contains(singleTargetReference)) {
+      throw new Unreachable();
+    }
+
+    if (appInfo.isPinned(singleTargetReference)) {
+      whyAreYouNotInliningReporter.reportPinned();
+      return true;
+    }
+
+    if (blacklist.contains(appView.graphLense().getOriginalMethodSignature(singleTargetReference))
+        || TwrCloseResourceRewriter.isSynthesizedCloseResourceMethod(
+            singleTargetReference, appView)) {
+      whyAreYouNotInliningReporter.reportBlacklisted();
+      return true;
+    }
+
+    if (appInfo.neverInline.contains(singleTargetReference)) {
+      whyAreYouNotInliningReporter.reportMarkedAsNeverInline();
+      return true;
+    }
+
+    if (appInfo.noSideEffects.containsKey(invoke.getInvokedMethod())
+        || appInfo.noSideEffects.containsKey(resolutionResult.getResolvedMethod().getReference())
+        || appInfo.noSideEffects.containsKey(singleTargetReference)) {
+      return true;
+    }
+
+    return false;
   }
 
-  public boolean isBlackListed(DexMethod method) {
-    return blackList.contains(appView.graphLense().getOriginalMethodSignature(method))
-        || appView.appInfo().neverInline.contains(method)
-        || TwrCloseResourceRewriter.isSynthesizedCloseResourceMethod(method, appView);
+  boolean isDoubleInliningEnabled() {
+    return applyDoubleInlining;
   }
 
   private ConstraintWithTarget instructionAllowedForInlining(
-      Instruction instruction, InliningConstraints inliningConstraints, DexType invocationContext) {
-    ConstraintWithTarget result =
-        instruction.inliningConstraint(inliningConstraints, invocationContext);
+      Instruction instruction, InliningConstraints inliningConstraints, ProgramMethod context) {
+    ConstraintWithTarget result = instruction.inliningConstraint(inliningConstraints, context);
     if (result == ConstraintWithTarget.NEVER && instruction.isDebugInstruction()) {
       return ConstraintWithTarget.ALWAYS;
     }
     return result;
   }
 
-  public ConstraintWithTarget computeInliningConstraint(IRCode code, DexEncodedMethod method) {
+  public ConstraintWithTarget computeInliningConstraint(IRCode code) {
+    if (containsPotentialCatchHandlerVerificationError(code)) {
+      return ConstraintWithTarget.NEVER;
+    }
+
+    ProgramMethod context = code.context();
+    if (appView.options().canHaveDalvikIntUsedAsNonIntPrimitiveTypeBug()
+        && returnsIntAsBoolean(code, context)) {
+      return ConstraintWithTarget.NEVER;
+    }
+
     ConstraintWithTarget result = ConstraintWithTarget.ALWAYS;
     InliningConstraints inliningConstraints =
         new InliningConstraints(appView, GraphLense.getIdentityLense());
-    InstructionIterator it = code.instructionIterator();
-    while (it.hasNext()) {
-      Instruction instruction = it.next();
+    for (Instruction instruction : code.instructions()) {
       ConstraintWithTarget state =
-          instructionAllowedForInlining(instruction, inliningConstraints, method.method.holder);
+          instructionAllowedForInlining(instruction, inliningConstraints, context);
       if (state == ConstraintWithTarget.NEVER) {
         result = state;
         break;
@@ -108,81 +197,65 @@ public class Inliner {
     return result;
   }
 
-  boolean hasInliningAccess(DexEncodedMethod method, DexEncodedMethod target) {
-    if (!isVisibleWithFlags(target.method.holder, method.method.holder, target.accessFlags)) {
-      return false;
-    }
-    // The class needs also to be visible for us to have access.
-    DexClass targetClass = appView.definitionFor(target.method.holder);
-    return isVisibleWithFlags(target.method.holder, method.method.holder, targetClass.accessFlags);
-  }
-
-  private boolean isVisibleWithFlags(DexType target, DexType context, AccessFlags flags) {
-    if (flags.isPublic()) {
-      return true;
-    }
-    if (flags.isPrivate()) {
-      return target == context;
-    }
-    if (flags.isProtected()) {
-      return appView.appInfo().isSubtype(context, target) || target.isSamePackage(context);
-    }
-    // package-private
-    return target.isSamePackage(context);
-  }
-
-  synchronized boolean isDoubleInliningTarget(
-      CallSiteInformation callSiteInformation, DexEncodedMethod candidate) {
-    return callSiteInformation.hasDoubleCallSite(candidate.method)
-        || doubleInlineSelectedTargets.contains(candidate);
-  }
-
-  synchronized DexEncodedMethod doubleInlining(DexEncodedMethod method,
-      DexEncodedMethod target) {
-    if (!applyDoubleInlining) {
-      if (doubleInlineeCandidates.containsKey(target)) {
-        // Both calls can be inlined.
-        doubleInlineCallers.add(doubleInlineeCandidates.get(target));
-        doubleInlineCallers.add(method);
-        doubleInlineSelectedTargets.add(target);
-      } else {
-        // First call can be inlined.
-        doubleInlineeCandidates.put(target, method);
+  private boolean returnsIntAsBoolean(IRCode code, ProgramMethod method) {
+    DexType returnType = method.getDefinition().returnType();
+    for (BasicBlock basicBlock : code.blocks) {
+      InstructionIterator instructionIterator = basicBlock.iterator();
+      while (instructionIterator.hasNext()) {
+        Instruction instruction = instructionIterator.nextUntil(Instruction::isReturn);
+        if (instruction != null) {
+          if (returnType.isBooleanType() && !instruction.inValues().get(0).knownToBeBoolean()) {
+            return true;
+          }
+        }
       }
-      // Just preparing for double inlining.
-      return null;
-    } else {
+    }
+    return false;
+  }
+
+  public synchronized boolean isDoubleInlineSelectedTarget(ProgramMethod method) {
+    return doubleInlineSelectedTargets.contains(method);
+  }
+
+  synchronized boolean satisfiesRequirementsForDoubleInlining(
+      ProgramMethod method, ProgramMethod target) {
+    if (applyDoubleInlining) {
       // Don't perform the actual inlining if this was not selected.
-      if (!doubleInlineSelectedTargets.contains(target)) {
-        return null;
-      }
+      return doubleInlineSelectedTargets.contains(target);
     }
-    return target;
+
+    // Just preparing for double inlining.
+    recordDoubleInliningCandidate(method, target);
+    return false;
   }
 
-  public void processDoubleInlineCallers(
-      IRConverter converter, ExecutorService executorService, OptimizationFeedback feedback)
-      throws ExecutionException {
-    if (doubleInlineCallers.isEmpty()) {
+  synchronized void recordDoubleInliningCandidate(ProgramMethod method, ProgramMethod target) {
+    if (applyDoubleInlining) {
       return;
     }
-    applyDoubleInlining = true;
-    List<Future<?>> futures = new ArrayList<>();
-    for (DexEncodedMethod method : doubleInlineCallers) {
-      futures.add(
-          executorService.submit(
-              () -> {
-                converter.processMethod(
-                    method,
-                    feedback,
-                    doubleInlineCallers::contains,
-                    CallSiteInformation.empty(),
-                    Outliner::noProcessing);
-                assert method.isProcessed();
-                return null;
-              }));
+
+    if (doubleInlineeCandidates.containsKey(target.getDefinition())) {
+      // Both calls can be inlined.
+      ProgramMethod doubleInlineeCandidate = doubleInlineeCandidates.get(target.getDefinition());
+      doubleInlineCallers.add(doubleInlineeCandidate);
+      doubleInlineCallers.add(method);
+      doubleInlineSelectedTargets.add(target);
+    } else {
+      // First call can be inlined.
+      doubleInlineeCandidates.put(target.getDefinition(), method);
     }
-    ThreadUtils.awaitFutures(futures);
+  }
+
+  @Override
+  public ProgramMethodSet methodsToRevisit() {
+    applyDoubleInlining = true;
+    return doubleInlineCallers;
+  }
+
+  @Override
+  public Collection<CodeOptimization> codeOptimizationsForPostProcessing() {
+    // Run IRConverter#optimize.
+    return null;  // Technically same as return converter.getOptimizationForPostIRProcessing();
   }
 
   /**
@@ -194,11 +267,21 @@ public class Inliner {
    */
   public enum Constraint {
     // The ordinal values are important so please do not reorder.
-    NEVER(1),     // Never inline this.
-    SAMECLASS(2), // Inlineable into methods with same holder.
-    PACKAGE(4),   // Inlineable into methods with holders from the same package.
-    SUBCLASS(8),  // Inlineable into methods with holders from a subclass in a different package.
-    ALWAYS(16);   // No restrictions for inlining this.
+    // Each constraint includes all constraints <= to it.
+    // For example, SAMENEST with class X means:
+    // - the target is in the same nest as X, or
+    // - the target has the same class as X (SAMECLASS <= SAMENEST).
+    // SUBCLASS with class X means:
+    // - the target is a subclass of X in different package, or
+    // - the target is in the same package (PACKAGE <= SUBCLASS), or
+    // ...
+    // - the target is the same class as X (SAMECLASS <= SUBCLASS).
+    NEVER(1), // Never inline this.
+    SAMECLASS(2), // Inlineable into methods in the same holder.
+    SAMENEST(4), // Inlineable into methods with same nest.
+    PACKAGE(8), // Inlineable into methods with holders from the same package.
+    SUBCLASS(16), // Inlineable into methods with holders from a subclass in a different package.
+    ALWAYS(32); // No restrictions for inlining this.
 
     int value;
 
@@ -208,7 +291,8 @@ public class Inliner {
 
     static {
       assert NEVER.ordinal() < SAMECLASS.ordinal();
-      assert SAMECLASS.ordinal() < PACKAGE.ordinal();
+      assert SAMECLASS.ordinal() < SAMENEST.ordinal();
+      assert SAMENEST.ordinal() < PACKAGE.ordinal();
       assert PACKAGE.ordinal() < SUBCLASS.ordinal();
       assert SUBCLASS.ordinal() < ALWAYS.ordinal();
     }
@@ -274,29 +358,36 @@ public class Inliner {
     }
 
     public static ConstraintWithTarget deriveConstraint(
-        DexType contextHolder, DexType targetHolder, AccessFlags flags, AppView<?> appView) {
+        DexProgramClass context, DexType targetHolder, AccessFlags<?> flags, AppView<?> appView) {
       if (flags.isPublic()) {
         return ALWAYS;
       } else if (flags.isPrivate()) {
-        return targetHolder == contextHolder
-            ? new ConstraintWithTarget(Constraint.SAMECLASS, targetHolder) : NEVER;
+        if (context.isInANest()) {
+          return NestUtils.sameNest(context.getType(), targetHolder, appView)
+              ? new ConstraintWithTarget(Constraint.SAMENEST, targetHolder)
+              : NEVER;
+        }
+        return targetHolder == context.type
+            ? new ConstraintWithTarget(Constraint.SAMECLASS, targetHolder)
+            : NEVER;
       } else if (flags.isProtected()) {
-        if (targetHolder.isSamePackage(contextHolder)) {
+        if (targetHolder.isSamePackage(context.type)) {
           // Even though protected, this is visible via the same package from the context.
           return new ConstraintWithTarget(Constraint.PACKAGE, targetHolder);
-        } else if (appView.isSubtype(contextHolder, targetHolder).isTrue()) {
+        } else if (appView.isSubtype(context.type, targetHolder).isTrue()) {
           return new ConstraintWithTarget(Constraint.SUBCLASS, targetHolder);
         }
         return NEVER;
       } else {
         /* package-private */
-        return targetHolder.isSamePackage(contextHolder)
-            ? new ConstraintWithTarget(Constraint.PACKAGE, targetHolder) : NEVER;
+        return targetHolder.isSamePackage(context.type)
+            ? new ConstraintWithTarget(Constraint.PACKAGE, targetHolder)
+            : NEVER;
       }
     }
 
     public static ConstraintWithTarget classIsVisible(
-        DexType context, DexType clazz, AppView<?> appView) {
+        DexProgramClass context, DexType clazz, AppView<?> appView) {
       if (clazz.isArrayType()) {
         return classIsVisible(context, clazz.toArrayElementType(appView.dexItemFactory()), appView);
       }
@@ -329,11 +420,17 @@ public class Inliner {
       int constraint = one.constraint.value | other.constraint.value;
       assert !Constraint.NEVER.isSet(constraint);
       assert !Constraint.ALWAYS.isSet(constraint);
-      // SAMECLASS <= SAMECLASS, PACKAGE, SUBCLASS
+      // SAMECLASS <= SAMECLASS, SAMENEST, PACKAGE, SUBCLASS
       if (Constraint.SAMECLASS.isSet(constraint)) {
         assert one.constraint == Constraint.SAMECLASS;
         if (other.constraint == Constraint.SAMECLASS) {
           assert one.targetHolder != other.targetHolder;
+          return NEVER;
+        }
+        if (other.constraint == Constraint.SAMENEST) {
+          if (NestUtils.sameNest(one.targetHolder, other.targetHolder, appView)) {
+            return one;
+          }
           return NEVER;
         }
         if (other.constraint == Constraint.PACKAGE) {
@@ -344,6 +441,29 @@ public class Inliner {
         }
         assert other.constraint == Constraint.SUBCLASS;
         if (appView.isSubtype(one.targetHolder, other.targetHolder).isTrue()) {
+          return one;
+        }
+        return NEVER;
+      }
+      // SAMENEST <= SAMENEST, PACKAGE, SUBCLASS
+      if (Constraint.SAMENEST.isSet(constraint)) {
+        assert one.constraint == Constraint.SAMENEST;
+        if (other.constraint == Constraint.SAMENEST) {
+          if (NestUtils.sameNest(one.targetHolder, other.targetHolder, appView)) {
+            return one;
+          }
+          return NEVER;
+        }
+        assert verifyAllNestInSamePackage(one.targetHolder, appView);
+        if (other.constraint == Constraint.PACKAGE) {
+          if (one.targetHolder.isSamePackage(other.targetHolder)) {
+            return one;
+          }
+          return NEVER;
+        }
+        assert other.constraint == Constraint.SUBCLASS;
+        if (allNestMembersSubtypeOf(one.targetHolder, other.targetHolder, appView)) {
+          // Then, SAMENEST is a more restrictive constraint.
           return one;
         }
         return NEVER;
@@ -364,6 +484,9 @@ public class Inliner {
           // Then, PACKAGE is more restrictive constraint.
           return one;
         }
+        if (appView.isSubtype(one.targetHolder, other.targetHolder).isTrue()) {
+          return new ConstraintWithTarget(Constraint.SAMECLASS, one.targetHolder);
+        }
         // TODO(b/128967328): towards finer-grained constraints, we need both.
         // The target method is still inlineable to methods with a holder from the same package of
         // one's holder and a subtype of other's holder.
@@ -382,6 +505,46 @@ public class Inliner {
       // SUBCLASS of x and SUBCLASS of y while x and y are not a subtype of each other.
       return NEVER;
     }
+
+    private static boolean allNestMembersSubtypeOf(
+        DexType nestType, DexType superType, AppView<?> appView) {
+      DexClass dexClass = appView.definitionFor(nestType);
+      if (dexClass == null) {
+        assert false;
+        return false;
+      }
+      if (!dexClass.isInANest()) {
+        return appView.isSubtype(dexClass.type, superType).isTrue();
+      }
+      DexClass nestHost =
+          dexClass.isNestHost() ? dexClass : appView.definitionFor(dexClass.getNestHost());
+      if (nestHost == null) {
+        assert false;
+        return false;
+      }
+      for (NestMemberClassAttribute member : nestHost.getNestMembersClassAttributes()) {
+        if (!appView.isSubtype(member.getNestMember(), superType).isTrue()) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    private static boolean verifyAllNestInSamePackage(DexType type, AppView<?> appView) {
+      String descr = type.getPackageDescriptor();
+      DexClass dexClass = appView.definitionFor(type);
+      assert dexClass != null;
+      if (!dexClass.isInANest()) {
+        return true;
+      }
+      DexClass nestHost =
+          dexClass.isNestHost() ? dexClass : appView.definitionFor(dexClass.getNestHost());
+      assert nestHost != null;
+      for (NestMemberClassAttribute member : nestHost.getNestMembersClassAttributes()) {
+        assert member.getNestMember().getPackageDescriptor().equals(descr);
+      }
+      return true;
+    }
   }
 
   /**
@@ -395,7 +558,8 @@ public class Inliner {
     ALWAYS,        // Inlinee is marked for inlining due to alwaysinline directive.
     SINGLE_CALLER, // Inlinee has precisely one caller.
     DUAL_CALLER,   // Inlinee has precisely two callers.
-    SIMPLE;        // Inlinee has simple code suitable for inlining.
+    SIMPLE,        // Inlinee has simple code suitable for inlining.
+    NEVER;         // Inlinee must not be inlined.
 
     public boolean mustBeInlined() {
       // TODO(118734615): Include SINGLE_CALLER and DUAL_CALLER here as well?
@@ -403,88 +567,229 @@ public class Inliner {
     }
   }
 
-  static public class InlineAction {
+  public static class InlineAction {
 
-    public final DexEncodedMethod target;
+    public final ProgramMethod target;
     public final Invoke invoke;
     final Reason reason;
 
-    private boolean shouldReturnEmptyThrowingCode;
+    private boolean shouldSynthesizeInitClass;
     private boolean shouldSynthesizeNullCheckForReceiver;
 
-    InlineAction(DexEncodedMethod target, Invoke invoke, Reason reason) {
+    InlineAction(ProgramMethod target, Invoke invoke, Reason reason) {
       this.target = target;
       this.invoke = invoke;
       this.reason = reason;
     }
 
-    void setShouldReturnEmptyThrowingCode() {
-      shouldReturnEmptyThrowingCode = true;
+    void setShouldSynthesizeInitClass() {
+      assert !shouldSynthesizeNullCheckForReceiver;
+      shouldSynthesizeInitClass = true;
     }
 
     void setShouldSynthesizeNullCheckForReceiver() {
+      assert !shouldSynthesizeInitClass;
       shouldSynthesizeNullCheckForReceiver = true;
     }
 
-    public InlineeWithReason buildInliningIR(
-        DexEncodedMethod context,
-        ValueNumberGenerator generator,
-        AppView<? extends AppInfoWithSubtyping> appView,
-        Position callerPosition) {
-      Origin origin = appView.appInfo().originFor(target.method.holder);
+    InlineeWithReason buildInliningIR(
+        AppView<? extends AppInfoWithClassHierarchy> appView,
+        InvokeMethod invoke,
+        ProgramMethod context,
+        InliningIRProvider inliningIRProvider,
+        LambdaMerger lambdaMerger,
+        LensCodeRewriter lensCodeRewriter) {
+      DexItemFactory dexItemFactory = appView.dexItemFactory();
+      InternalOptions options = appView.options();
 
-      IRCode code;
-      if (shouldReturnEmptyThrowingCode) {
-        code = target.buildEmptyThrowingIRCode(appView, origin);
-      } else {
-        // Build the IR for a yet not processed method, and perform minimal IR processing.
-        code = target.buildInliningIR(context, appView, generator, callerPosition, origin);
+      // Build the IR for a yet not processed method, and perform minimal IR processing.
+      IRCode code = inliningIRProvider.getInliningIR(invoke, target);
 
-        // Insert a null check if this is needed to preserve the implicit null check for the
-        // receiver.
-        if (shouldSynthesizeNullCheckForReceiver) {
-          List<Value> arguments = code.collectArguments();
-          if (!arguments.isEmpty()) {
-            Value receiver = arguments.get(0);
-            assert receiver.isThis();
+      // Insert a init class instruction if this is needed to preserve class initialization
+      // semantics.
+      if (shouldSynthesizeInitClass) {
+        synthesizeInitClass(code);
+      }
 
-            BasicBlock entryBlock = code.entryBlock();
+      // Insert a null check if this is needed to preserve the implicit null check for the receiver.
+      // This is only needed if we do not also insert a monitor-enter instruction, since that will
+      // throw a NPE if the receiver is null.
+      //
+      // Note: When generating DEX, we synthesize monitor-enter/exit instructions during IR
+      // building, and therefore, we do not need to do anything here. Upon writing, we will use the
+      // flag "declared synchronized" instead of "synchronized".
+      boolean shouldSynthesizeMonitorEnterExit =
+          target.getDefinition().isSynchronized() && options.isGeneratingClassFiles();
+      boolean isSynthesizingNullCheckForReceiverUsingMonitorEnter =
+          shouldSynthesizeMonitorEnterExit && !target.getDefinition().isStatic();
+      if (shouldSynthesizeNullCheckForReceiver
+          && !isSynthesizingNullCheckForReceiverUsingMonitorEnter) {
+        synthesizeNullCheckForReceiver(appView, code);
+      }
 
-            // Insert a new block between the last argument instruction and the first actual
-            // instruction of the method.
-            BasicBlock throwBlock = entryBlock.listIterator(arguments.size()).split(code, 0, null);
-            assert !throwBlock.hasCatchHandlers();
+      // Insert monitor-enter and monitor-exit instructions if the method is synchronized.
+      if (shouldSynthesizeMonitorEnterExit) {
+        TypeElement throwableType =
+            TypeElement.fromDexType(
+                dexItemFactory.throwableType, Nullability.definitelyNotNull(), appView);
 
-            // Link the entry block to the successor of the newly inserted block.
-            BasicBlock continuationBlock = throwBlock.unlinkSingleSuccessor();
-            entryBlock.link(continuationBlock);
+        code.prepareBlocksForCatchHandlers();
 
-            // Replace the last instruction of the entry block, which is now a goto instruction,
-            // with an `if-eqz` instruction that jumps to the newly inserted block if the receiver
-            // is null.
-            If ifInstruction = new If(If.Type.EQ, receiver);
-            entryBlock.replaceLastInstruction(ifInstruction);
-            assert ifInstruction.getTrueTarget() == throwBlock;
-            assert ifInstruction.fallthroughBlock() == continuationBlock;
+        int nextBlockNumber = code.getHighestBlockNumber() + 1;
 
-            // Replace the single goto instruction in the newly inserted block by `throw null`.
-            InstructionListIterator iterator = throwBlock.listIterator();
-            Value nullValue = iterator.insertConstNullInstruction(code, appView.options());
-            iterator.next();
-            iterator.replaceCurrentInstruction(new Throw(nullValue));
-          } else {
-            assert false : "Unable to synthesize a null check for the receiver";
+        // Create a block for holding the monitor-exit instruction.
+        BasicBlock monitorExitBlock = new BasicBlock();
+        monitorExitBlock.setNumber(nextBlockNumber++);
+
+        // For each block in the code that may throw, add a catch-all handler targeting the
+        // monitor-exit block.
+        List<BasicBlock> moveExceptionBlocks = new ArrayList<>();
+        for (BasicBlock block : code.blocks) {
+          if (!block.canThrow()) {
+            continue;
+          }
+          if (block.hasCatchHandlers()
+              && block.getCatchHandlersWithSuccessorIndexes().hasCatchAll(dexItemFactory)) {
+            continue;
+          }
+          BasicBlock moveExceptionBlock =
+              BasicBlock.createGotoBlock(
+                  nextBlockNumber++, Position.none(), code.metadata(), monitorExitBlock);
+          InstructionListIterator moveExceptionBlockIterator =
+              moveExceptionBlock.listIterator(code);
+          moveExceptionBlockIterator.setInsertionPosition(Position.syntheticNone());
+          moveExceptionBlockIterator.add(
+              new MoveException(
+                  code.createValue(throwableType), dexItemFactory.throwableType, options));
+          block.appendCatchHandler(moveExceptionBlock, dexItemFactory.throwableType);
+          moveExceptionBlocks.add(moveExceptionBlock);
+        }
+
+        // Create a phi for the exception values such that we can rethrow the exception if needed.
+        Value exceptionValue;
+        if (moveExceptionBlocks.size() == 1) {
+          exceptionValue =
+              ListUtils.first(moveExceptionBlocks).getInstructions().getFirst().outValue();
+        } else {
+          Phi phi = code.createPhi(monitorExitBlock, throwableType);
+          List<Value> operands =
+              ListUtils.map(
+                  moveExceptionBlocks, block -> block.getInstructions().getFirst().outValue());
+          phi.addOperands(operands);
+          exceptionValue = phi;
+        }
+
+        InstructionListIterator monitorExitBlockIterator = monitorExitBlock.listIterator(code);
+        monitorExitBlockIterator.setInsertionPosition(Position.syntheticNone());
+        monitorExitBlockIterator.add(new Throw(exceptionValue));
+        monitorExitBlock.getMutablePredecessors().addAll(moveExceptionBlocks);
+
+        // Insert the newly created blocks.
+        code.blocks.addAll(moveExceptionBlocks);
+        code.blocks.add(monitorExitBlock);
+
+        // Create a block for holding the monitor-enter instruction. Note that, since this block
+        // is created after we attach catch-all handlers to the code, this block will not have any
+        // catch handlers.
+        BasicBlock entryBlock = code.entryBlock();
+        InstructionListIterator entryBlockIterator = entryBlock.listIterator(code);
+        entryBlockIterator.nextUntil(not(Instruction::isArgument));
+        entryBlockIterator.previous();
+        BasicBlock monitorEnterBlock = entryBlockIterator.split(code, 0, null);
+        assert !monitorEnterBlock.hasCatchHandlers();
+
+        InstructionListIterator monitorEnterBlockIterator = monitorEnterBlock.listIterator(code);
+        monitorEnterBlockIterator.setInsertionPosition(Position.syntheticNone());
+
+        // If this is a static method, then the class object will act as the lock, so we load it
+        // using a const-class instruction.
+        Value lockValue;
+        if (target.getDefinition().isStatic()) {
+          lockValue =
+              code.createValue(
+                  TypeElement.fromDexType(dexItemFactory.objectType, definitelyNotNull(), appView));
+          monitorEnterBlockIterator.add(new ConstClass(lockValue, target.getHolderType()));
+        } else {
+          lockValue = entryBlock.getInstructions().getFirst().asArgument().outValue();
+        }
+
+        // Insert the monitor-enter and monitor-exit instructions.
+        monitorEnterBlockIterator.add(new Monitor(Monitor.Type.ENTER, lockValue));
+        monitorExitBlockIterator.previous();
+        monitorExitBlockIterator.add(new Monitor(Monitor.Type.EXIT, lockValue));
+        monitorExitBlock.close(null);
+
+        for (BasicBlock block : code.blocks) {
+          if (block.exit().isReturn()) {
+            // Since return instructions are not allowed after a throwing instruction in a block
+            // with catch handlers, the call to prepareBlocksForCatchHandlers() has already taken
+            // care of ensuring that all return blocks have no throwing instructions.
+            assert !block.canThrow();
+
+            InstructionListIterator instructionIterator =
+                block.listIterator(code, block.getInstructions().size() - 1);
+            instructionIterator.setInsertionPosition(Position.syntheticNone());
+            instructionIterator.add(new Monitor(Monitor.Type.EXIT, lockValue));
           }
         }
-        if (!target.isProcessed()) {
-          new LensCodeRewriter(appView).rewrite(code, target);
-        }
       }
+
+      if (inliningIRProvider.shouldApplyCodeRewritings(target)) {
+        assert lensCodeRewriter != null;
+        lensCodeRewriter.rewrite(code, target);
+      }
+      if (lambdaMerger != null) {
+        lambdaMerger.rewriteCodeForInlining(target, code, context, inliningIRProvider);
+      }
+      assert code.isConsistentSSA();
       return new InlineeWithReason(code, reason);
+    }
+
+    private void synthesizeInitClass(IRCode code) {
+      List<Value> arguments = code.collectArguments();
+      BasicBlock entryBlock = code.entryBlock();
+
+      // Insert a new block between the last argument instruction and the first actual instruction
+      // of the method.
+      BasicBlock initClassBlock =
+          entryBlock.listIterator(code, arguments.size()).split(code, 0, null);
+      assert !initClassBlock.hasCatchHandlers();
+
+      InstructionListIterator iterator = initClassBlock.listIterator(code);
+      iterator.setInsertionPosition(entryBlock.exit().getPosition());
+      iterator.add(new InitClass(code.createValue(TypeElement.getInt()), target.getHolderType()));
+    }
+
+    private void synthesizeNullCheckForReceiver(AppView<?> appView, IRCode code) {
+      List<Value> arguments = code.collectArguments();
+      if (!arguments.isEmpty()) {
+        Value receiver = arguments.get(0);
+        assert receiver.isThis();
+
+        BasicBlock entryBlock = code.entryBlock();
+
+        // Insert a new block between the last argument instruction and the first actual
+        // instruction of the method.
+        BasicBlock throwBlock =
+            entryBlock.listIterator(code, arguments.size()).split(code, 0, null);
+        assert !throwBlock.hasCatchHandlers();
+
+        InstructionListIterator iterator = throwBlock.listIterator(code);
+        iterator.setInsertionPosition(entryBlock.exit().getPosition());
+        if (appView.options().canUseRequireNonNull()) {
+          DexMethod requireNonNullMethod = appView.dexItemFactory().objectsMethods.requireNonNull;
+          iterator.add(new InvokeStatic(requireNonNullMethod, null, ImmutableList.of(receiver)));
+        } else {
+          DexMethod getClassMethod = appView.dexItemFactory().objectMembers.getClass;
+          iterator.add(new InvokeVirtual(getClassMethod, null, ImmutableList.of(receiver)));
+        }
+      } else {
+        assert false : "Unable to synthesize a null check for the receiver";
+      }
     }
   }
 
-  public static class InlineeWithReason {
+  static class InlineeWithReason {
 
     final Reason reason;
     final IRCode code;
@@ -495,240 +800,418 @@ public class Inliner {
     }
   }
 
-  static final int numberOfInstructions(IRCode code) {
-    int numOfInstructions = 0;
+  static int numberOfInstructions(IRCode code) {
+    int numberOfInstructions = 0;
     for (BasicBlock block : code.blocks) {
-      numOfInstructions += block.getInstructions().size();
-    }
-    return numOfInstructions;
-  }
+      for (Instruction instruction : block.getInstructions()) {
+        assert !instruction.isDebugInstruction();
 
-  boolean legalConstructorInline(
-      DexEncodedMethod method, InvokeMethod invoke, IRCode code, ClassHierarchy hierarchy) {
+        // Do not include argument instructions since they do not materialize in the output.
+        if (instruction.isArgument()) {
+          continue;
+        }
 
-    // In the Java VM Specification section "4.10.2.4. Instance Initialization Methods and
-    // Newly Created Objects" it says:
-    //
-    // Before that method invokes another instance initialization method of myClass or its direct
-    // superclass on this, the only operation the method can perform on this is assigning fields
-    // declared within myClass.
+        // Do not include assume instructions in the calculation of the inlining budget, since they
+        // do not materialize in the output.
+        if (instruction.isAssume()) {
+          continue;
+        }
 
-    // Allow inlining a constructor into a constructor of the same class, as the constructor code
-    // is expected to adhere to the VM specification.
-    DexType callerMethodHolder = method.method.holder;
-    boolean callerMethodIsConstructor = method.isInstanceInitializer();
-    DexType calleeMethodHolder = invoke.asInvokeMethod().getInvokedMethod().holder;
-    // Calling a constructor on the same class from a constructor can always be inlined.
-    if (callerMethodIsConstructor && callerMethodHolder == calleeMethodHolder) {
-      return true;
-    }
-
-    // We cannot invoke <init> on other values than |this| on Dalvik 4.4.4. Compute whether
-    // the receiver to the call was the this value at the call-site.
-    boolean receiverOfInnerCallIsThisOfOuter = invoke.asInvokeDirect().getReceiver().isThis();
-
-    // Don't allow inlining a constructor into a non-constructor if the first use of the
-    // un-initialized object is not an argument of an invoke of <init>.
-    // Also, we cannot inline a constructor if it initializes final fields, as such is only allowed
-    // from within a constructor of the corresponding class.
-    // Lastly, we can only inline a constructor, if its own <init> call is on the method's class. If
-    // we inline into a constructor, calls to super.<init> are also OK if the receiver of the
-    // super.<init> call is the this argument.
-    InstructionIterator iterator = code.instructionIterator();
-    Instruction instruction = iterator.next();
-    // A constructor always has the un-initialized object as the first argument.
-    assert instruction.isArgument();
-    Value unInitializedObject = instruction.outValue();
-    boolean seenSuperInvoke = false;
-    while (iterator.hasNext()) {
-      instruction = iterator.next();
-      if (instruction.inValues().contains(unInitializedObject)) {
-        if (instruction.isInvokeDirect() && !seenSuperInvoke) {
-          DexMethod target = instruction.asInvokeDirect().getInvokedMethod();
-          seenSuperInvoke = appView.dexItemFactory().isConstructor(target);
-          boolean callOnConstructorThatCallsConstructorSameClass =
-              calleeMethodHolder == target.holder;
-          boolean callOnSupertypeOfThisInConstructor =
-              hierarchy.isDirectSubtype(callerMethodHolder, target.holder)
-                  && instruction.asInvokeDirect().getReceiver() == unInitializedObject
-                  && receiverOfInnerCallIsThisOfOuter
-                  && callerMethodIsConstructor;
-          if (seenSuperInvoke
-              // Calls to init on same class than the called constructor are OK.
-              && !callOnConstructorThatCallsConstructorSameClass
-              // If we are inlining into a constructor, calls to superclass init are only OK on the
-              // |this| value in the outer context.
-              && !callOnSupertypeOfThisInConstructor) {
-            return false;
+        // Do not include goto instructions that target a basic block with exactly one predecessor,
+        // since these goto instructions will generally not materialize.
+        if (instruction.isGoto()) {
+          if (instruction.asGoto().getTarget().getPredecessors().size() == 1) {
+            continue;
           }
         }
-        if (!seenSuperInvoke) {
-          return false;
+
+        // Do not include return instructions since they do not materialize once inlined.
+        if (instruction.isReturn()) {
+          continue;
         }
-      }
-      if (instruction.isInstancePut()) {
-        // Fields may not be initialized outside of a constructor.
-        if (!callerMethodIsConstructor) {
-          return false;
-        }
-        DexField field = instruction.asInstancePut().getField();
-        DexEncodedField target = appView.appInfo().lookupInstanceTarget(field.holder, field);
-        if (target != null && target.accessFlags.isFinal()) {
-          return false;
-        }
+
+        ++numberOfInstructions;
       }
     }
-    return true;
+    return numberOfInstructions;
   }
 
   public static class InliningInfo {
-    public final DexEncodedMethod target;
+    public final ProgramMethod target;
     public final DexType receiverType; // null, if unknown
 
-    public InliningInfo(DexEncodedMethod target, DexType receiverType) {
+    public InliningInfo(ProgramMethod target, DexType receiverType) {
       this.target = target;
       this.receiverType = receiverType;
     }
   }
 
   public void performForcedInlining(
-      DexEncodedMethod method,
+      ProgramMethod method,
       IRCode code,
-      Map<InvokeMethod, InliningInfo> invokesToInline) {
-
-    ForcedInliningOracle oracle = new ForcedInliningOracle(method, invokesToInline);
-    performInliningImpl(oracle, oracle, method, code);
+      Map<? extends InvokeMethod, InliningInfo> invokesToInline,
+      InliningIRProvider inliningIRProvider,
+      Timing timing) {
+    ForcedInliningOracle oracle = new ForcedInliningOracle(appView, method, invokesToInline);
+    performInliningImpl(
+        oracle,
+        oracle,
+        method,
+        code,
+        OptimizationFeedbackIgnore.getInstance(),
+        inliningIRProvider,
+        timing);
   }
 
   public void performInlining(
-      DexEncodedMethod method,
+      ProgramMethod method,
       IRCode code,
-      Predicate<DexEncodedMethod> isProcessedConcurrently,
-      CallSiteInformation callSiteInformation) {
+      OptimizationFeedback feedback,
+      MethodProcessor methodProcessor,
+      Timing timing) {
+    performInlining(
+        method,
+        code,
+        feedback,
+        methodProcessor,
+        timing,
+        createDefaultInliningReasonStrategy(methodProcessor));
+  }
+
+  public void performInlining(
+      ProgramMethod method,
+      IRCode code,
+      OptimizationFeedback feedback,
+      MethodProcessor methodProcessor,
+      Timing timing,
+      InliningReasonStrategy inliningReasonStrategy) {
     InternalOptions options = appView.options();
     DefaultInliningOracle oracle =
         createDefaultOracle(
             method,
-            code,
-            isProcessedConcurrently,
-            callSiteInformation,
+            methodProcessor,
             options.inliningInstructionLimit,
-            options.inliningInstructionAllowance - numberOfInstructions(code));
-    performInliningImpl(oracle, oracle, method, code);
+            options.inliningInstructionAllowance - numberOfInstructions(code),
+            inliningReasonStrategy);
+    InliningIRProvider inliningIRProvider =
+        new InliningIRProvider(appView, method, code, methodProcessor);
+    assert inliningIRProvider.verifyIRCacheIsEmpty();
+    performInliningImpl(oracle, oracle, method, code, feedback, inliningIRProvider, timing);
+  }
+
+  public InliningReasonStrategy createDefaultInliningReasonStrategy(
+      MethodProcessor methodProcessor) {
+    DefaultInliningReasonStrategy defaultInliningReasonStrategy =
+        new DefaultInliningReasonStrategy(appView, methodProcessor.getCallSiteInformation(), this);
+    return appView.withGeneratedMessageLiteShrinker(
+        ignore -> new ProtoInliningReasonStrategy(appView, defaultInliningReasonStrategy),
+        defaultInliningReasonStrategy);
   }
 
   public DefaultInliningOracle createDefaultOracle(
-      DexEncodedMethod method,
-      IRCode code,
-      Predicate<DexEncodedMethod> isProcessedConcurrently,
-      CallSiteInformation callSiteInformation,
+      ProgramMethod method,
+      MethodProcessor methodProcessor,
       int inliningInstructionLimit,
       int inliningInstructionAllowance) {
+    return createDefaultOracle(
+        method,
+        methodProcessor,
+        inliningInstructionLimit,
+        inliningInstructionAllowance,
+        createDefaultInliningReasonStrategy(methodProcessor));
+  }
+
+  public DefaultInliningOracle createDefaultOracle(
+      ProgramMethod method,
+      MethodProcessor methodProcessor,
+      int inliningInstructionLimit,
+      int inliningInstructionAllowance,
+      InliningReasonStrategy inliningReasonStrategy) {
     return new DefaultInliningOracle(
         appView,
         this,
+        inliningReasonStrategy,
         method,
-        code,
-        callSiteInformation,
-        isProcessedConcurrently,
+        methodProcessor,
         inliningInstructionLimit,
         inliningInstructionAllowance);
   }
 
   private void performInliningImpl(
-      InliningStrategy strategy, InliningOracle oracle, DexEncodedMethod context, IRCode code) {
-    List<BasicBlock> blocksToRemove = new ArrayList<>();
-    ListIterator<BasicBlock> blockIterator = code.listIterator();
+      InliningStrategy strategy,
+      InliningOracle oracle,
+      ProgramMethod context,
+      IRCode code,
+      OptimizationFeedback feedback,
+      InliningIRProvider inliningIRProvider,
+      Timing timing) {
+    AssumeRemover assumeRemover = new AssumeRemover(appView, code);
+    Set<BasicBlock> blocksToRemove = Sets.newIdentityHashSet();
+    BasicBlockIterator blockIterator = code.listIterator();
     ClassInitializationAnalysis classInitializationAnalysis =
         new ClassInitializationAnalysis(appView, code);
+    Deque<BasicBlock> inlineeStack = new ArrayDeque<>();
+    InternalOptions options = appView.options();
     while (blockIterator.hasNext()) {
       BasicBlock block = blockIterator.next();
+      if (!inlineeStack.isEmpty() && inlineeStack.peekFirst() == block) {
+        inlineeStack.pop();
+      }
       if (blocksToRemove.contains(block)) {
         continue;
       }
-      InstructionListIterator iterator = block.listIterator();
+      InstructionListIterator iterator = block.listIterator(code);
       while (iterator.hasNext()) {
         Instruction current = iterator.next();
         if (current.isInvokeMethod()) {
           InvokeMethod invoke = current.asInvokeMethod();
-          InlineAction result =
-              invoke.computeInlining(oracle, context.method.holder, classInitializationAnalysis);
-          if (result != null) {
-            if (!(strategy.stillHasBudget() || result.reason.mustBeInlined())) {
+          // TODO(b/142116551): This should be equivalent to invoke.lookupSingleTarget()!
+
+          SingleResolutionResult resolutionResult =
+              appView
+                  .appInfo()
+                  .resolveMethod(invoke.getInvokedMethod(), invoke.getInterfaceBit())
+                  .asSingleResolution();
+          if (resolutionResult == null) {
+            continue;
+          }
+
+          // TODO(b/156853206): Should not duplicate resolution.
+          ProgramMethod singleTarget = oracle.lookupSingleTarget(invoke, context);
+          if (singleTarget == null) {
+            WhyAreYouNotInliningReporter.handleInvokeWithUnknownTarget(invoke, appView, context);
+            continue;
+          }
+
+          OptionalBool methodAccessible =
+              AccessControl.isMethodAccessible(
+                  singleTarget.getDefinition(),
+                  singleTarget.getHolder().asDexClass(),
+                  context.getHolder(),
+                  appView.withClassHierarchy().appInfo());
+          if (!methodAccessible.isTrue()) {
+            continue;
+          }
+
+          DexEncodedMethod singleTargetMethod = singleTarget.getDefinition();
+          WhyAreYouNotInliningReporter whyAreYouNotInliningReporter =
+              oracle.isForcedInliningOracle()
+                  ? NopWhyAreYouNotInliningReporter.getInstance()
+                  : WhyAreYouNotInliningReporter.createFor(singleTarget, appView, context);
+          InlineAction action =
+              oracle.computeInlining(
+                  invoke,
+                  resolutionResult,
+                  singleTarget,
+                  context,
+                  classInitializationAnalysis,
+                  whyAreYouNotInliningReporter);
+          if (action == null) {
+            assert whyAreYouNotInliningReporter.unsetReasonHasBeenReportedFlag();
+            continue;
+          }
+
+          if (!inlineeStack.isEmpty()
+              && !strategy.allowInliningOfInvokeInInlinee(
+                  action, inlineeStack.size(), whyAreYouNotInliningReporter)) {
+            assert whyAreYouNotInliningReporter.unsetReasonHasBeenReportedFlag();
+            continue;
+          }
+
+          if (!strategy.stillHasBudget(action, whyAreYouNotInliningReporter)) {
+            assert whyAreYouNotInliningReporter.unsetReasonHasBeenReportedFlag();
+            continue;
+          }
+
+          InlineeWithReason inlinee =
+              action.buildInliningIR(
+                  appView, invoke, context, inliningIRProvider, lambdaMerger, lensCodeRewriter);
+          if (strategy.willExceedBudget(
+              code, invoke, inlinee, block, whyAreYouNotInliningReporter)) {
+            assert whyAreYouNotInliningReporter.unsetReasonHasBeenReportedFlag();
+            continue;
+          }
+
+          // If this code did not go through the full pipeline, apply inlining to make sure
+          // that force inline targets get processed.
+          strategy.ensureMethodProcessed(singleTarget, inlinee.code, feedback);
+
+          // Make sure constructor inlining is legal.
+          assert !singleTargetMethod.isClassInitializer();
+          if (singleTargetMethod.isInstanceInitializer()
+              && !strategy.canInlineInstanceInitializer(
+                  inlinee.code, whyAreYouNotInliningReporter)) {
+            assert whyAreYouNotInliningReporter.unsetReasonHasBeenReportedFlag();
+            continue;
+          }
+
+          // Mark AssumeDynamicType instruction for the out-value for removal, if any.
+          Value outValue = invoke.outValue();
+          if (outValue != null) {
+            assumeRemover.markAssumeDynamicTypeUsersForRemoval(outValue);
+          }
+
+          boolean inlineeMayHaveInvokeMethod = inlinee.code.metadata().mayHaveInvokeMethod();
+
+          // Inline the inlinee code in place of the invoke instruction
+          // Back up before the invoke instruction.
+          iterator.previous();
+          strategy.markInlined(inlinee);
+          iterator.inlineInvoke(
+              appView,
+              code,
+              inlinee.code,
+              blockIterator,
+              blocksToRemove,
+              getDowncastTypeIfNeeded(strategy, invoke, singleTarget));
+
+          if (inlinee.reason == Reason.SINGLE_CALLER) {
+            feedback.markInlinedIntoSingleCallSite(singleTargetMethod);
+          }
+
+          classInitializationAnalysis.notifyCodeHasChanged();
+          postProcessInlineeBlocks(code, inlinee.code, blockIterator, block, timing);
+
+          // The synthetic and bridge flags are maintained only if the inlinee has also these flags.
+          if (context.getDefinition().isBridge() && !inlinee.code.method().isBridge()) {
+            context.getDefinition().accessFlags.demoteFromBridge();
+          }
+          if (context.getDefinition().accessFlags.isSynthetic()
+              && !inlinee.code.method().accessFlags.isSynthetic()) {
+            context.getDefinition().accessFlags.demoteFromSynthetic();
+          }
+
+          context.getDefinition().copyMetadata(singleTargetMethod);
+
+          if (inlineeMayHaveInvokeMethod && options.applyInliningToInlinee) {
+            if (inlineeStack.size() + 1 > options.applyInliningToInlineeMaxDepth
+                && appView.appInfo().alwaysInline.isEmpty()
+                && appView.appInfo().forceInline.isEmpty()) {
               continue;
             }
-            DexEncodedMethod target = result.target;
-            Position invokePosition = invoke.getPosition();
-            if (invokePosition.method == null) {
-              assert invokePosition.isNone();
-              invokePosition = Position.noneWithMethod(context.method, null);
-            }
-            assert invokePosition.callerPosition == null
-                || invokePosition.getOutermostCaller().method
-                    == appView.graphLense().getOriginalMethodSignature(context.method);
-
-            InlineeWithReason inlinee =
-                result.buildInliningIR(context, code.valueNumberGenerator, appView, invokePosition);
-            if (inlinee != null) {
-              if (strategy.willExceedBudget(inlinee, block)) {
-                continue;
-              }
-
-              // If this code did not go through the full pipeline, apply inlining to make sure
-              // that force inline targets get processed.
-              strategy.ensureMethodProcessed(target, inlinee.code);
-
-              // Make sure constructor inlining is legal.
-              assert !target.isClassInitializer();
-              if (!strategy.isValidTarget(invoke, target, inlinee.code, appView.appInfo())) {
-                continue;
-              }
-              DexType downcast = getDowncastTypeIfNeeded(strategy, invoke, target);
-              // Inline the inlinee code in place of the invoke instruction
-              // Back up before the invoke instruction.
-              iterator.previous();
-              strategy.markInlined(inlinee);
-              iterator.inlineInvoke(
-                  appView, code, inlinee.code, blockIterator, blocksToRemove, downcast);
-
-              classInitializationAnalysis.notifyCodeHasChanged();
-              strategy.updateTypeInformationIfNeeded(inlinee.code, blockIterator, block);
-
-              // If we inlined the invoke from a bridge method, it is no longer a bridge method.
-              if (context.accessFlags.isBridge()) {
-                context.accessFlags.unsetSynthetic();
-                context.accessFlags.unsetBridge();
-              }
-
-              context.copyMetadata(target);
-              code.copyMetadataFromInlinee(inlinee.code);
-            }
+            // Record that we will be inside the inlinee until the next block.
+            BasicBlock inlineeEnd = IteratorUtils.peekNext(blockIterator);
+            inlineeStack.push(inlineeEnd);
+            // Move the cursor back to where the first inlinee block was added.
+            IteratorUtils.previousUntil(blockIterator, previous -> previous == block);
+            blockIterator.next();
           }
+        } else if (current.isAssume()) {
+          assumeRemover.removeIfMarked(current.asAssume(), iterator);
         }
       }
     }
+    assert inlineeStack.isEmpty();
+    assumeRemover.removeMarkedInstructions(blocksToRemove);
+    assumeRemover.finish();
     classInitializationAnalysis.finish();
-    oracle.finish();
     code.removeBlocks(blocksToRemove);
-    code.removeAllTrivialPhis();
+    code.removeAllDeadAndTrivialPhis();
     assert code.isConsistentSSA();
   }
 
-  private static DexType getDowncastTypeIfNeeded(
-      InliningStrategy strategy, InvokeMethod invoke, DexEncodedMethod target) {
+  private boolean containsPotentialCatchHandlerVerificationError(IRCode code) {
+    if (availableApiExceptions == null) {
+      assert !appView.options().canHaveDalvikCatchHandlerVerificationBug();
+      return false;
+    }
+    for (BasicBlock block : code.blocks) {
+      for (CatchHandler<BasicBlock> catchHandler : block.getCatchHandlers()) {
+        DexClass clazz = appView.definitionFor(catchHandler.guard);
+        if ((clazz == null || clazz.isLibraryClass())
+            && availableApiExceptions.canCauseVerificationError(catchHandler.guard)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private DexType getDowncastTypeIfNeeded(
+      InliningStrategy strategy, InvokeMethod invoke, ProgramMethod target) {
     if (invoke.isInvokeMethodWithReceiver()) {
       // If the invoke has a receiver but the actual type of the receiver is different
       // from the computed target holder, inlining requires a downcast of the receiver.
-      DexType assumedReceiverType = strategy.getReceiverTypeIfKnown(invoke);
-      if (assumedReceiverType == null) {
+      DexType receiverType = strategy.getReceiverTypeIfKnown(invoke);
+      if (receiverType == null) {
         // In case we don't know exact type of the receiver we use declared
         // method holder as a fallback.
-        assumedReceiverType = invoke.getInvokedMethod().holder;
+        receiverType = invoke.getInvokedMethod().holder;
       }
-      if (assumedReceiverType != target.method.holder) {
-        return target.method.holder;
+      if (!appView.appInfo().isSubtype(receiverType, target.getHolderType())) {
+        return target.getHolderType();
       }
     }
     return null;
+  }
+
+  /** Applies member rebinding to the inlinee and inserts assume instructions. */
+  private void postProcessInlineeBlocks(
+      IRCode code,
+      IRCode inlinee,
+      BasicBlockIterator blockIterator,
+      BasicBlock block,
+      Timing timing) {
+    BasicBlock state = IteratorUtils.peekNext(blockIterator);
+
+    Set<BasicBlock> inlineeBlocks = SetUtils.newIdentityHashSet(inlinee.blocks);
+
+    // Run member value propagation on the inlinee blocks.
+    if (appView.options().enableValuePropagation) {
+      rewindBlockIteratorToFirstInlineeBlock(blockIterator, block);
+      applyMemberValuePropagationToInlinee(code, blockIterator, block, inlineeBlocks);
+    }
+
+    // Add non-null IRs only to the inlinee blocks.
+    insertAssumeInstructions(code, blockIterator, block, inlineeBlocks, timing);
+
+    // Restore the old state of the iterator.
+    rewindBlockIteratorToFirstInlineeBlock(blockIterator, state);
+    // TODO(b/72693244): need a test where refined env in inlinee affects the caller.
+  }
+
+  private void insertAssumeInstructions(
+      IRCode code,
+      BasicBlockIterator blockIterator,
+      BasicBlock block,
+      Set<BasicBlock> inlineeBlocks,
+      Timing timing) {
+    rewindBlockIteratorToFirstInlineeBlock(blockIterator, block);
+    new AssumeInserter(appView)
+        .insertAssumeInstructionsInBlocks(code, blockIterator, inlineeBlocks::contains, timing);
+    assert !blockIterator.hasNext();
+  }
+
+  private void applyMemberValuePropagationToInlinee(
+      IRCode code,
+      ListIterator<BasicBlock> blockIterator,
+      BasicBlock block,
+      Set<BasicBlock> inlineeBlocks) {
+    assert IteratorUtils.peekNext(blockIterator) == block;
+    Set<Value> affectedValues = Sets.newIdentityHashSet();
+    new MemberValuePropagation(appView)
+        .run(code, blockIterator, affectedValues, inlineeBlocks::contains);
+    if (!affectedValues.isEmpty()) {
+      new TypeAnalysis(appView).narrowing(affectedValues);
+    }
+    assert !blockIterator.hasNext();
+  }
+
+  private void rewindBlockIteratorToFirstInlineeBlock(
+      ListIterator<BasicBlock> blockIterator, BasicBlock firstInlineeBlock) {
+    // Move the cursor back to where the first inlinee block was added.
+    while (blockIterator.hasPrevious() && blockIterator.previous() != firstInlineeBlock) {
+      // Do nothing.
+    }
+    assert IteratorUtils.peekNext(blockIterator) == firstInlineeBlock;
+  }
+
+  public static boolean verifyNoMethodsInlinedDueToSingleCallSite(AppView<?> appView) {
+    for (DexProgramClass clazz : appView.appInfo().classes()) {
+      for (DexEncodedMethod method : clazz.methods()) {
+        assert !method.getOptimizationInfo().hasBeenInlinedIntoSingleCallSite();
+      }
+    }
+    return true;
   }
 }

@@ -7,7 +7,6 @@ import static com.android.tools.r8.ir.regalloc.LiveIntervals.NO_REGISTER;
 
 import com.android.tools.r8.cf.TypeVerificationHelper.TypeInfo;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.DebugLocalWrite;
@@ -58,7 +57,7 @@ import java.util.TreeSet;
  */
 public class CfRegisterAllocator implements RegisterAllocator {
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   private final IRCode code;
   private final TypeVerificationHelper typeHelper;
 
@@ -113,8 +112,7 @@ public class CfRegisterAllocator implements RegisterAllocator {
 
   private int maxArgumentRegisterNumber = -1;
 
-  public CfRegisterAllocator(
-      AppView<? extends AppInfo> appView, IRCode code, TypeVerificationHelper typeHelper) {
+  public CfRegisterAllocator(AppView<?> appView, IRCode code, TypeVerificationHelper typeHelper) {
     this.appView = appView;
     this.code = code;
     this.typeHelper = typeHelper;
@@ -158,15 +156,14 @@ public class CfRegisterAllocator implements RegisterAllocator {
     // locals alive for their entire live range. In release mode the liveness is all that matters
     // and we do not actually want locals information in the output.
     if (appView.options().debug) {
-      LinearScanRegisterAllocator.computeDebugInfo(blocks, liveIntervals, this, liveAtEntrySets);
+      LinearScanRegisterAllocator.computeDebugInfo(
+          code, blocks, liveIntervals, this, liveAtEntrySets);
     }
   }
 
   private void computeNeedsRegister() {
-    InstructionIterator it = code.instructionIterator();
-    while (it.hasNext()) {
-      Instruction next = it.next();
-      Value outValue = next.outValue();
+    for (Instruction instruction : code.instructions()) {
+      Value outValue = instruction.outValue();
       if (outValue != null) {
         boolean isStackValue =
             (outValue instanceof StackValue) || (outValue instanceof StackValues);
@@ -232,8 +229,7 @@ public class CfRegisterAllocator implements RegisterAllocator {
       // Find a free register that is not used by an inactive interval that overlaps with
       // unhandledInterval.
       if (tryHint(unhandledInterval)) {
-        assignRegisterToUnhandledInterval(
-            unhandledInterval, unhandledInterval.getHint().getRegister());
+        assignRegisterToUnhandledInterval(unhandledInterval, unhandledInterval.getHint());
       } else {
         boolean wide = unhandledInterval.getType().isWide();
         int register;
@@ -307,9 +303,9 @@ public class CfRegisterAllocator implements RegisterAllocator {
   private void updateHints(LiveIntervals intervals) {
     for (Phi phi : intervals.getValue().uniquePhiUsers()) {
       if (!phi.isValueOnStack()) {
-        phi.getLiveIntervals().setHint(intervals);
+        phi.getLiveIntervals().setHint(intervals, unhandled);
         for (Value value : phi.getOperands()) {
-          value.getLiveIntervals().setHint(intervals);
+          value.getLiveIntervals().setHint(intervals, unhandled);
         }
       }
     }
@@ -320,7 +316,7 @@ public class CfRegisterAllocator implements RegisterAllocator {
       return false;
     }
     boolean isWide = unhandled.getType().isWide();
-    int hintRegister = unhandled.getHint().getRegister();
+    int hintRegister = unhandled.getHint();
     if (freeRegisters.contains(hintRegister)
         && (!isWide || freeRegisters.contains(hintRegister + 1))) {
       for (LiveIntervals inactive : inactive) {
@@ -507,10 +503,10 @@ public class CfRegisterAllocator implements RegisterAllocator {
 
   private void applyInstructionsBackwardsToRegisterLiveness(
       BasicBlock block, IntSet liveRegisters, int suffixSize) {
-    Iterator<Instruction> iterator = block.getInstructions().descendingIterator();
+    InstructionIterator iterator = block.iterator(block.getInstructions().size());
     int instructionsLeft = suffixSize;
-    while (--instructionsLeft >= 0 && iterator.hasNext()) {
-      Instruction current = iterator.next();
+    while (--instructionsLeft >= 0 && iterator.hasPrevious()) {
+      Instruction current = iterator.previous();
       Value outValue = current.outValue();
       if (outValue != null && outValue.needsRegister()) {
         int register = getRegisterForValue(outValue);

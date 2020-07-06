@@ -3,57 +3,273 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.graph;
 
+import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
+
 import com.android.tools.r8.dex.DexOutputBuffer;
 import com.android.tools.r8.dex.FileWriter;
 import com.android.tools.r8.dex.IndexedItemCollection;
 import com.android.tools.r8.dex.MixedSectionCollection;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
+import com.android.tools.r8.ir.analysis.value.AbstractValue;
+import com.android.tools.r8.ir.analysis.value.AbstractValueFactory;
+import com.android.tools.r8.ir.analysis.value.UnknownValue;
 import com.android.tools.r8.ir.code.BasicBlock.ThrowingInfo;
-import com.android.tools.r8.ir.code.ConstNumber;
+import com.android.tools.r8.ir.code.ConstInstruction;
 import com.android.tools.r8.ir.code.ConstString;
 import com.android.tools.r8.ir.code.DexItemBasedConstString;
-import com.android.tools.r8.ir.code.Instruction;
+import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Value;
-import com.android.tools.r8.ir.optimize.ReflectionOptimizer.ClassNameComputationInfo;
+import com.android.tools.r8.naming.dexitembasedstring.NameComputationInfo;
+import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.EncodedValueUtils;
-import com.android.tools.r8.utils.InternalOptions;
 import java.util.Arrays;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Type;
 
 public abstract class DexValue extends DexItem {
+
+  public enum DexValueKind {
+    BYTE(0x00),
+    SHORT(0x02),
+    CHAR(0x03),
+    INT(0x04),
+    LONG(0x06),
+    FLOAT(0x10),
+    DOUBLE(0x11),
+    METHOD_TYPE(0x15),
+    METHOD_HANDLE(0x16),
+    STRING(0x17),
+    TYPE(0x18),
+    FIELD(0x19),
+    METHOD(0x1a),
+    ENUM(0x1b),
+    ARRAY(0x1c),
+    ANNOTATION(0x1d),
+    NULL(0x1e),
+    BOOLEAN(0x1f);
+
+    public static DexValueKind fromId(int id) {
+      switch (id) {
+        case 0x00:
+          return BYTE;
+        case 0x02:
+          return SHORT;
+        case 0x03:
+          return CHAR;
+        case 0x04:
+          return INT;
+        case 0x06:
+          return LONG;
+        case 0x10:
+          return FLOAT;
+        case 0x11:
+          return DOUBLE;
+        case 0x15:
+          return METHOD_TYPE;
+        case 0x16:
+          return METHOD_HANDLE;
+        case 0x17:
+          return STRING;
+        case 0x18:
+          return TYPE;
+        case 0x19:
+          return FIELD;
+        case 0x1a:
+          return METHOD;
+        case 0x1b:
+          return ENUM;
+        case 0x1c:
+          return ARRAY;
+        case 0x1d:
+          return ANNOTATION;
+        case 0x1e:
+          return NULL;
+        case 0x1f:
+          return BOOLEAN;
+        default:
+          throw new Unreachable();
+      }
+    }
+
+    private final byte b;
+
+    DexValueKind(int b) {
+      this.b = (byte) b;
+    }
+
+    byte toByte() {
+      return b;
+    }
+  }
+
   public static final DexValue[] EMPTY_ARRAY = {};
 
-  public static final UnknownDexValue UNKNOWN = UnknownDexValue.UNKNOWN;
+  public abstract DexValueKind getValueKind();
 
-  public static final byte VALUE_BYTE = 0x00;
-  public static final byte VALUE_SHORT = 0x02;
-  public static final byte VALUE_CHAR = 0x03;
-  public static final byte VALUE_INT = 0x04;
-  public static final byte VALUE_LONG = 0x06;
-  public static final byte VALUE_FLOAT = 0x10;
-  public static final byte VALUE_DOUBLE = 0x11;
-  public static final byte VALUE_METHOD_TYPE = 0x15;
-  public static final byte VALUE_METHOD_HANDLE = 0x16;
-  public static final byte VALUE_STRING = 0x17;
-  public static final byte VALUE_TYPE = 0x18;
-  public static final byte VALUE_FIELD = 0x19;
-  public static final byte VALUE_METHOD = 0x1a;
-  public static final byte VALUE_ENUM = 0x1b;
-  public static final byte VALUE_ARRAY = 0x1c;
-  public static final byte VALUE_ANNOTATION = 0x1d;
-  public static final byte VALUE_NULL = 0x1e;
-  public static final byte VALUE_BOOLEAN = 0x1f;
+  public boolean isDexItemBasedValueString() {
+    return false;
+  }
+
+  public DexItemBasedValueString asDexItemBasedValueString() {
+    return null;
+  }
+
+  public boolean isDexValueMethodHandle() {
+    return false;
+  }
 
   public DexValueMethodHandle asDexValueMethodHandle() {
     return null;
+  }
+
+  public boolean isDexValueMethodType() {
+    return false;
   }
 
   public DexValueMethodType asDexValueMethodType() {
     return null;
   }
 
-  public static DexValue fromAsmBootstrapArgument(
+  public boolean isDexValueAnnotation() {
+    return false;
+  }
+
+  public DexValueAnnotation asDexValueAnnotation() {
+    return null;
+  }
+
+  public boolean isDexValueArray() {
+    return false;
+  }
+
+  public DexValueArray asDexValueArray() {
+    return null;
+  }
+
+  public boolean isDexValueBoolean() {
+    return false;
+  }
+
+  public DexValueBoolean asDexValueBoolean() {
+    return null;
+  }
+
+  public boolean isDexValueByte() {
+    return false;
+  }
+
+  public DexValueByte asDexValueByte() {
+    return null;
+  }
+
+  public boolean isDexValueDouble() {
+    return false;
+  }
+
+  public DexValueDouble asDexValueDouble() {
+    return null;
+  }
+
+  public boolean isDexValueChar() {
+    return false;
+  }
+
+  public DexValueChar asDexValueChar() {
+    return null;
+  }
+
+  public boolean isDexValueEnum() {
+    return false;
+  }
+
+  public DexValueEnum asDexValueEnum() {
+    return null;
+  }
+
+  public boolean isDexValueField() {
+    return false;
+  }
+
+  public DexValueField asDexValueField() {
+    return null;
+  }
+
+  public boolean isDexValueFloat() {
+    return false;
+  }
+
+  public DexValueFloat asDexValueFloat() {
+    return null;
+  }
+
+  public boolean isDexValueInt() {
+    return false;
+  }
+
+  public DexValueInt asDexValueInt() {
+    return null;
+  }
+
+  public boolean isDexValueLong() {
+    return false;
+  }
+
+  public DexValueLong asDexValueLong() {
+    return null;
+  }
+
+  public boolean isDexValueMethod() {
+    return false;
+  }
+
+  public DexValueMethod asDexValueMethod() {
+    return null;
+  }
+
+  public boolean isDexValueNull() {
+    return false;
+  }
+
+  public DexValueNull asDexValueNull() {
+    return null;
+  }
+
+  public boolean isDexValueNumber() {
+    return false;
+  }
+
+  public DexValueNumber asDexValueNumber() {
+    return null;
+  }
+
+  public boolean isDexValueShort() {
+    return false;
+  }
+
+  public DexValueShort asDexValueShort() {
+    return null;
+  }
+
+  public boolean isDexValueString() {
+    return false;
+  }
+
+  public DexValueString asDexValueString() {
+    return null;
+  }
+
+  public boolean isDexValueType() {
+    return false;
+  }
+
+  public DexValueType asDexValueType() {
+    return null;
+  }
+
+  public abstract AbstractValue toAbstractValue(AbstractValueFactory factory);
+
+  static DexValue fromAsmBootstrapArgument(
       Object value, JarApplicationReader application, DexType clazz) {
     if (value instanceof Integer) {
       return DexValue.DexValueInt.create((Integer) value);
@@ -87,8 +303,8 @@ public abstract class DexValue extends DexItem {
     }
   }
 
-  private static void writeHeader(byte type, int arg, DexOutputBuffer dest) {
-    dest.putByte((byte) ((arg << 5) | type));
+  private static void writeHeader(DexValueKind kind, int arg, DexOutputBuffer dest) {
+    dest.putByte((byte) ((arg << 5) | kind.toByte()));
   }
 
   @Override
@@ -135,11 +351,13 @@ public abstract class DexValue extends DexItem {
     }
   }
 
+  public abstract DexType getType(DexItemFactory factory);
+
   public abstract Object getBoxedValue();
 
-  // Returns a const instruction for the non default value.
-  public Instruction asConstInstruction(
-      boolean hasClassInitializer, Value dest, InternalOptions options) {
+  /** Returns an instruction that can be used to materialize this {@link DexValue} (or null). */
+  public ConstInstruction asConstInstruction(
+      AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
     return null;
   }
 
@@ -159,72 +377,11 @@ public abstract class DexValue extends DexItem {
 
   public abstract Object asAsmEncodedObject();
 
-  static public class UnknownDexValue extends DexValue {
-
-    // Singleton instance.
-    public static final UnknownDexValue UNKNOWN = new UnknownDexValue();
-
-    private UnknownDexValue() {
-    }
+  private abstract static class SimpleDexValue extends DexValue {
 
     @Override
-    public void collectIndexedItems(IndexedItemCollection indexedItems,
-        DexMethod method, int instructionOffset) {
-      throw new Unreachable();
-    }
-
-    @Override
-    public void sort() {
-      throw new Unreachable();
-    }
-
-    @Override
-    public boolean mayHaveSideEffects() {
-      return true;
-    }
-
-    @Override
-    public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      throw new Unreachable();
-    }
-
-    @Override
-    public Object getBoxedValue() {
-      throw new Unreachable();
-    }
-
-    @Override
-    public Object asAsmEncodedObject() {
-      throw new Unreachable();
-    }
-
-    @Override
-    public int hashCode() {
-      return System.identityHashCode(this);
-    }
-
-    @Override
-    public boolean equals(Object other) {
-      return other == this;
-    }
-
-    @Override
-    public String toString() {
-      return "UNKNOWN";
-    }
-
-    @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
-      return null;
-    }
-  }
-
-  static private abstract class SimpleDexValue extends DexValue {
-
-    @Override
-    public void collectIndexedItems(IndexedItemCollection indexedItems,
-        DexMethod method, int instructionOffset) {
+    public void collectIndexedItems(
+        IndexedItemCollection indexedItems, DexMethod method, int instructionOffset) {
       // Intentionally left empty
     }
 
@@ -238,18 +395,37 @@ public abstract class DexValue extends DexItem {
       return false;
     }
 
-    protected static void writeIntegerTo(byte type, long value, int expected,
-        DexOutputBuffer dest) {
+    static void writeIntegerTo(DexValueKind kind, long value, int expected, DexOutputBuffer dest) {
       // Leave space for header.
       dest.forward(1);
       int length = dest.putSignedEncodedValue(value, expected);
       dest.rewind(length + 1);
-      writeHeader(type, length - 1, dest);
+      writeHeader(kind, length - 1, dest);
       dest.forward(length);
     }
   }
 
-  static public class DexValueByte extends SimpleDexValue {
+  public abstract static class DexValueNumber extends SimpleDexValue {
+
+    public abstract long getRawValue();
+
+    @Override
+    public boolean isDexValueNumber() {
+      return true;
+    }
+
+    @Override
+    public DexValueNumber asDexValueNumber() {
+      return this;
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return factory.createSingleNumberValue(getRawValue());
+    }
+  }
+
+  public static class DexValueByte extends DexValueNumber {
 
     public static final DexValueByte DEFAULT = new DexValueByte((byte) 0);
 
@@ -268,13 +444,38 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.BYTE;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      return factory.byteType;
+    }
+
+    @Override
+    public long getRawValue() {
+      return value;
+    }
+
+    @Override
+    public boolean isDexValueByte() {
+      return true;
+    }
+
+    @Override
+    public DexValueByte asDexValueByte() {
+      return this;
+    }
+
+    @Override
     public Object getBoxedValue() {
       return getValue();
     }
 
     @Override
     public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      writeHeader(VALUE_BYTE, 0, dest);
+      writeHeader(DexValueKind.BYTE, 0, dest);
       dest.putSignedEncodedValue(value, 1);
     }
 
@@ -302,13 +503,13 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
-      return (this == DEFAULT && hasClassInitializer) ? null : new ConstNumber(dest, value);
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createIntConstant(value, local);
     }
   }
 
-  static public class DexValueShort extends SimpleDexValue {
+  public static class DexValueShort extends DexValueNumber {
 
     public static final DexValueShort DEFAULT = new DexValueShort((short) 0);
     final short value;
@@ -326,13 +527,38 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.SHORT;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      return factory.shortType;
+    }
+
+    @Override
+    public long getRawValue() {
+      return value;
+    }
+
+    @Override
+    public boolean isDexValueShort() {
+      return true;
+    }
+
+    @Override
+    public DexValueShort asDexValueShort() {
+      return this;
+    }
+
+    @Override
     public Object getBoxedValue() {
       return getValue();
     }
 
     @Override
     public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      writeIntegerTo(VALUE_SHORT, value, Short.BYTES, dest);
+      writeIntegerTo(DexValueKind.SHORT, value, Short.BYTES, dest);
     }
 
     @Override
@@ -359,13 +585,13 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
-      return (this == DEFAULT && hasClassInitializer) ? null : new ConstNumber(dest, value);
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createIntConstant(value, local);
     }
   }
 
-  static public class DexValueChar extends SimpleDexValue {
+  public static class DexValueChar extends DexValueNumber {
 
     public static final DexValueChar DEFAULT = new DexValueChar((char) 0);
     final char value;
@@ -383,6 +609,31 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.CHAR;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      return factory.charType;
+    }
+
+    @Override
+    public long getRawValue() {
+      return value;
+    }
+
+    @Override
+    public boolean isDexValueChar() {
+      return true;
+    }
+
+    @Override
+    public DexValueChar asDexValueChar() {
+      return this;
+    }
+
+    @Override
     public Object getBoxedValue() {
       return getValue();
     }
@@ -392,7 +643,7 @@ public abstract class DexValue extends DexItem {
       dest.forward(1);
       int length = dest.putUnsignedEncodedValue(value, 2);
       dest.rewind(length + 1);
-      writeHeader(VALUE_CHAR, length - 1, dest);
+      writeHeader(DexValueKind.CHAR, length - 1, dest);
       dest.forward(length);
     }
 
@@ -420,13 +671,13 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
-      return (this == DEFAULT && hasClassInitializer) ? null : new ConstNumber(dest, value);
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createIntConstant(value, local);
     }
   }
 
-  static public class DexValueInt extends SimpleDexValue {
+  public static class DexValueInt extends DexValueNumber {
 
     public static final DexValueInt DEFAULT = new DexValueInt(0);
     public final int value;
@@ -444,13 +695,38 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.INT;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      return factory.intType;
+    }
+
+    @Override
+    public long getRawValue() {
+      return value;
+    }
+
+    @Override
     public Object getBoxedValue() {
       return getValue();
     }
 
     @Override
     public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      writeIntegerTo(VALUE_INT, value, Integer.BYTES, dest);
+      writeIntegerTo(DexValueKind.INT, value, Integer.BYTES, dest);
+    }
+
+    @Override
+    public boolean isDexValueInt() {
+      return true;
+    }
+
+    @Override
+    public DexValueInt asDexValueInt() {
+      return this;
     }
 
     @Override
@@ -477,13 +753,13 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
-      return (this == DEFAULT && hasClassInitializer) ? null : new ConstNumber(dest, value);
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createIntConstant(value, local);
     }
   }
 
-  static public class DexValueLong extends SimpleDexValue {
+  public static class DexValueLong extends DexValueNumber {
 
     public static final DexValueLong DEFAULT = new DexValueLong(0);
     final long value;
@@ -501,13 +777,38 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.LONG;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      return factory.longType;
+    }
+
+    @Override
+    public long getRawValue() {
+      return value;
+    }
+
+    @Override
+    public boolean isDexValueLong() {
+      return true;
+    }
+
+    @Override
+    public DexValueLong asDexValueLong() {
+      return this;
+    }
+
+    @Override
     public Object getBoxedValue() {
       return getValue();
     }
 
     @Override
     public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      writeIntegerTo(VALUE_LONG, value, Long.BYTES, dest);
+      writeIntegerTo(DexValueKind.LONG, value, Long.BYTES, dest);
     }
 
     @Override
@@ -534,13 +835,13 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
-      return (this == DEFAULT && hasClassInitializer) ? null : new ConstNumber(dest, value);
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createLongConstant(value, local);
     }
   }
 
-  static public class DexValueFloat extends SimpleDexValue {
+  public static class DexValueFloat extends DexValueNumber {
 
     public static final DexValueFloat DEFAULT = new DexValueFloat(0);
     final float value;
@@ -558,6 +859,31 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.FLOAT;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      return factory.floatType;
+    }
+
+    @Override
+    public long getRawValue() {
+      return Float.floatToIntBits(value);
+    }
+
+    @Override
+    public boolean isDexValueFloat() {
+      return true;
+    }
+
+    @Override
+    public DexValueFloat asDexValueFloat() {
+      return this;
+    }
+
+    @Override
     public Object getBoxedValue() {
       return getValue();
     }
@@ -567,13 +893,19 @@ public abstract class DexValue extends DexItem {
       dest.forward(1);
       int length = EncodedValueUtils.putFloat(dest, value);
       dest.rewind(length + 1);
-      writeHeader(VALUE_FLOAT, length - 1, dest);
+      writeHeader(DexValueKind.FLOAT, length - 1, dest);
       dest.forward(length);
     }
 
     @Override
     public Object asAsmEncodedObject() {
       return Float.valueOf(value);
+    }
+
+    @Override
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createFloatConstant(value, local);
     }
 
     @Override
@@ -586,18 +918,17 @@ public abstract class DexValue extends DexItem {
       if (other == this) {
         return true;
       }
-      return (other instanceof DexValueFloat) &&
-          (Float.compare(value, ((DexValueFloat) other).value) == 0);
+      return other instanceof DexValueFloat
+          && Float.compare(value, ((DexValueFloat) other).value) == 0;
     }
 
     @Override
     public String toString() {
       return "Float " + value;
     }
-
   }
 
-  static public class DexValueDouble extends SimpleDexValue {
+  public static class DexValueDouble extends DexValueNumber {
 
     public static final DexValueDouble DEFAULT = new DexValueDouble(0);
 
@@ -616,6 +947,31 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.DOUBLE;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      return factory.doubleType;
+    }
+
+    @Override
+    public long getRawValue() {
+      return Double.doubleToRawLongBits(value);
+    }
+
+    @Override
+    public boolean isDexValueDouble() {
+      return true;
+    }
+
+    @Override
+    public DexValueDouble asDexValueDouble() {
+      return this;
+    }
+
+    @Override
     public Object getBoxedValue() {
       return getValue();
     }
@@ -625,13 +981,19 @@ public abstract class DexValue extends DexItem {
       dest.forward(1);
       int length = EncodedValueUtils.putDouble(dest, value);
       dest.rewind(length + 1);
-      writeHeader(VALUE_DOUBLE, length - 1, dest);
+      writeHeader(DexValueKind.DOUBLE, length - 1, dest);
       dest.forward(length);
     }
 
     @Override
     public Object asAsmEncodedObject() {
       return Double.valueOf(value);
+    }
+
+    @Override
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createDoubleConstant(value, local);
     }
 
     @Override
@@ -662,7 +1024,10 @@ public abstract class DexValue extends DexItem {
       this.value = value;
     }
 
-    protected abstract byte getValueKind();
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      throw new Unreachable();
+    }
 
     public T getValue() {
       return value;
@@ -701,7 +1066,7 @@ public abstract class DexValue extends DexItem {
 
     @Override
     public int hashCode() {
-      return value.hashCode() * 7 + getValueKind();
+      return value.hashCode() * 7 + getValueKind().toByte();
     }
 
     @Override
@@ -729,20 +1094,37 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueString asDexValueString() {
+      return this;
+    }
+
+    @Override
+    public boolean isDexValueString() {
+      return true;
+    }
+
+    @Override
     public Object asAsmEncodedObject() {
       return value.toString();
     }
 
     @Override
-    protected byte getValueKind() {
-      return VALUE_STRING;
+    public DexValueKind getValueKind() {
+      return DexValueKind.STRING;
     }
 
     @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
+    public DexType getType(DexItemFactory factory) {
+      return factory.stringType;
+    }
+
+    @Override
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      TypeElement type = TypeElement.stringClassType(appView, definitelyNotNull());
+      Value outValue = code.createValue(type, local);
       ConstString instruction =
-          new ConstString(dest, value, ThrowingInfo.defaultForConstString(options));
+          new ConstString(outValue, value, ThrowingInfo.defaultForConstString(appView.options()));
       if (!instruction.instructionInstanceCanThrow()) {
         return instruction;
       }
@@ -754,23 +1136,34 @@ public abstract class DexValue extends DexItem {
       // Assuming that strings do not have side-effects.
       return false;
     }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return factory.createSingleStringValue(value);
+    }
   }
 
   public static class DexItemBasedValueString extends NestedDexValue<DexReference> {
-    private final ClassNameComputationInfo classNameComputationInfo;
 
-    public DexItemBasedValueString(DexReference value) {
-      this(value, ClassNameComputationInfo.none());
-    }
+    private final NameComputationInfo<?> nameComputationInfo;
 
-    public DexItemBasedValueString(
-        DexReference value, ClassNameComputationInfo classNameComputationInfo) {
+    public DexItemBasedValueString(DexReference value, NameComputationInfo<?> nameComputationInfo) {
       super(value);
-      this.classNameComputationInfo = classNameComputationInfo;
+      this.nameComputationInfo = nameComputationInfo;
     }
 
-    public ClassNameComputationInfo getClassNameComputationInfo() {
-      return classNameComputationInfo;
+    public NameComputationInfo<?> getNameComputationInfo() {
+      return nameComputationInfo;
+    }
+
+    @Override
+    public boolean isDexItemBasedValueString() {
+      return true;
+    }
+
+    @Override
+    public DexItemBasedValueString asDexItemBasedValueString() {
+      return this;
     }
 
     @Override
@@ -779,19 +1172,36 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    protected byte getValueKind() {
-      return VALUE_STRING;
+    public DexValueKind getValueKind() {
+      return DexValueKind.STRING;
     }
 
     @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
+    public DexType getType(DexItemFactory factory) {
+      return factory.stringType;
+    }
+
+    @Override
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      TypeElement type = TypeElement.stringClassType(appView, definitelyNotNull());
+      Value outValue = code.createValue(type, local);
       DexItemBasedConstString instruction =
           new DexItemBasedConstString(
-              dest, value, ThrowingInfo.defaultForConstString(options), classNameComputationInfo);
+              outValue,
+              value,
+              nameComputationInfo,
+              ThrowingInfo.defaultForConstString(appView.options()));
       // DexItemBasedConstString cannot throw.
       assert !instruction.instructionInstanceCanThrow();
       return instruction;
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      // TODO(b/150835624): Update once there is an abstract value to represent dex item based
+      //  strings.
+      return UnknownValue.getInstance();
     }
 
     @Override
@@ -808,14 +1218,29 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    protected byte getValueKind() {
-      return VALUE_TYPE;
+    public DexValueKind getValueKind() {
+      return DexValueKind.TYPE;
     }
 
     @Override
-    public void collectIndexedItems(IndexedItemCollection indexedItems,
-        DexMethod method, int instructionOffset) {
+    public void collectIndexedItems(
+        IndexedItemCollection indexedItems, DexMethod method, int instructionOffset) {
       value.collectIndexedItems(indexedItems, method, instructionOffset);
+    }
+
+    @Override
+    public DexValueType asDexValueType() {
+      return this;
+    }
+
+    @Override
+    public boolean isDexValueType() {
+      return true;
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return UnknownValue.getInstance();
     }
   }
 
@@ -826,14 +1251,29 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    protected byte getValueKind() {
-      return VALUE_FIELD;
+    public DexValueKind getValueKind() {
+      return DexValueKind.FIELD;
     }
 
     @Override
-    public void collectIndexedItems(IndexedItemCollection indexedItems,
-        DexMethod method, int instructionOffset) {
+    public void collectIndexedItems(
+        IndexedItemCollection indexedItems, DexMethod method, int instructionOffset) {
       value.collectIndexedItems(indexedItems, method, instructionOffset);
+    }
+
+    @Override
+    public boolean isDexValueField() {
+      return true;
+    }
+
+    @Override
+    public DexValueField asDexValueField() {
+      return this;
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return UnknownValue.getInstance();
     }
   }
 
@@ -844,14 +1284,29 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    protected byte getValueKind() {
-      return VALUE_METHOD;
+    public DexValueKind getValueKind() {
+      return DexValueKind.METHOD;
     }
 
     @Override
-    public void collectIndexedItems(IndexedItemCollection indexedItems,
-        DexMethod method, int instructionOffset) {
+    public void collectIndexedItems(
+        IndexedItemCollection indexedItems, DexMethod method, int instructionOffset) {
       value.collectIndexedItems(indexedItems, method, instructionOffset);
+    }
+
+    @Override
+    public boolean isDexValueMethod() {
+      return true;
+    }
+
+    @Override
+    public DexValueMethod asDexValueMethod() {
+      return this;
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return UnknownValue.getInstance();
     }
   }
 
@@ -862,14 +1317,29 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    protected byte getValueKind() {
-      return VALUE_ENUM;
+    public DexValueKind getValueKind() {
+      return DexValueKind.ENUM;
     }
 
     @Override
-    public void collectIndexedItems(IndexedItemCollection indexedItems,
-        DexMethod method, int instructionOffset) {
+    public void collectIndexedItems(
+        IndexedItemCollection indexedItems, DexMethod method, int instructionOffset) {
       value.collectIndexedItems(indexedItems, method, instructionOffset);
+    }
+
+    @Override
+    public boolean isDexValueEnum() {
+      return true;
+    }
+
+    @Override
+    public DexValueEnum asDexValueEnum() {
+      return this;
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return UnknownValue.getInstance();
     }
   }
 
@@ -880,19 +1350,29 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public boolean isDexValueMethodType() {
+      return true;
+    }
+
+    @Override
     public DexValueMethodType asDexValueMethodType() {
       return this;
     }
 
     @Override
-    protected byte getValueKind() {
-      return VALUE_METHOD_TYPE;
+    public DexValueKind getValueKind() {
+      return DexValueKind.METHOD_TYPE;
     }
 
     @Override
-    public void collectIndexedItems(IndexedItemCollection indexedItems,
-        DexMethod method, int instructionOffset) {
+    public void collectIndexedItems(
+        IndexedItemCollection indexedItems, DexMethod method, int instructionOffset) {
       value.collectIndexedItems(indexedItems, method, instructionOffset);
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return UnknownValue.getInstance();
     }
   }
 
@@ -909,6 +1389,11 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.ARRAY;
+    }
+
+    @Override
     public void collectIndexedItems(IndexedItemCollection indexedItems,
         DexMethod method, int instructionOffset) {
       collectAll(indexedItems, values);
@@ -916,7 +1401,7 @@ public abstract class DexValue extends DexItem {
 
     @Override
     public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      writeHeader(VALUE_ARRAY, 0, dest);
+      writeHeader(DexValueKind.ARRAY, 0, dest);
       dest.putUleb128(values.length);
       for (DexValue value : values) {
         value.writeTo(dest, mapping);
@@ -924,8 +1409,18 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexType getType(DexItemFactory factory) {
+      throw new Unreachable();
+    }
+
+    @Override
     public Object getBoxedValue() {
       throw new Unreachable("No boxed value for DexValueArray");
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return UnknownValue.getInstance();
     }
 
     @Override
@@ -961,6 +1456,16 @@ public abstract class DexValue extends DexItem {
     public String toString() {
       return "Array " + Arrays.toString(values);
     }
+
+    @Override
+    public boolean isDexValueArray() {
+      return true;
+    }
+
+    @Override
+    public DexValueArray asDexValueArray() {
+      return this;
+    }
   }
 
   static public class DexValueAnnotation extends DexValue {
@@ -972,15 +1477,40 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.ANNOTATION;
+    }
+
+    @Override
+    public boolean isDexValueAnnotation() {
+      return true;
+    }
+
+    @Override
+    public DexValueAnnotation asDexValueAnnotation() {
+      return this;
+    }
+
+    @Override
     public void collectIndexedItems(IndexedItemCollection indexedItems,
         DexMethod method, int instructionOffset) {
       value.collectIndexedItems(indexedItems, method, instructionOffset);
     }
 
     @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return UnknownValue.getInstance();
+    }
+
+    @Override
     public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      writeHeader(VALUE_ANNOTATION, 0, dest);
+      writeHeader(DexValueKind.ANNOTATION, 0, dest);
       FileWriter.writeEncodedAnnotation(value, dest, mapping);
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      throw new Unreachable();
     }
 
     @Override
@@ -1021,7 +1551,7 @@ public abstract class DexValue extends DexItem {
     }
   }
 
-  static public class DexValueNull extends SimpleDexValue {
+  public static class DexValueNull extends DexValueNumber {
 
     public static final DexValue NULL = new DexValueNull();
 
@@ -1034,8 +1564,33 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.NULL;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      throw new Unreachable();
+    }
+
+    @Override
+    public long getRawValue() {
+      return 0;
+    }
+
+    @Override
     public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      writeHeader(VALUE_NULL, 0, dest);
+      writeHeader(DexValueKind.NULL, 0, dest);
+    }
+
+    @Override
+    public boolean isDexValueNull() {
+      return true;
+    }
+
+    @Override
+    public DexValueNull asDexValueNull() {
+      return this;
     }
 
     @Override
@@ -1058,16 +1613,22 @@ public abstract class DexValue extends DexItem {
       if (other == this) {
         return true;
       }
-      return (other instanceof DexValueNull);
+      return other instanceof DexValueNull;
     }
 
     @Override
     public String toString() {
       return "Null";
     }
+
+    @Override
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createConstNull(local);
+    }
   }
 
-  static public class DexValueBoolean extends SimpleDexValue {
+  public static class DexValueBoolean extends DexValueNumber {
 
     private static final DexValueBoolean TRUE = new DexValueBoolean(true);
     private static final DexValueBoolean FALSE = new DexValueBoolean(false);
@@ -1089,13 +1650,38 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public DexValueKind getValueKind() {
+      return DexValueKind.BOOLEAN;
+    }
+
+    @Override
+    public DexType getType(DexItemFactory factory) {
+      return factory.booleanType;
+    }
+
+    @Override
+    public long getRawValue() {
+      return BooleanUtils.longValue(value);
+    }
+
+    @Override
+    public boolean isDexValueBoolean() {
+      return true;
+    }
+
+    @Override
+    public DexValueBoolean asDexValueBoolean() {
+      return this;
+    }
+
+    @Override
     public Object getBoxedValue() {
       return getValue();
     }
 
     @Override
     public void writeTo(DexOutputBuffer dest, ObjectToOffsetMapping mapping) {
-      writeHeader(VALUE_BOOLEAN, value ? 1 : 0, dest);
+      writeHeader(DexValueKind.BOOLEAN, value ? 1 : 0, dest);
     }
 
     @Override
@@ -1113,7 +1699,7 @@ public abstract class DexValue extends DexItem {
       if (other == this) {
         return true;
       }
-      return (other instanceof DexValueBoolean) && ((DexValueBoolean) other).value == value;
+      return other instanceof DexValueBoolean && ((DexValueBoolean) other).value == value;
     }
 
     @Override
@@ -1122,9 +1708,9 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
-    public Instruction asConstInstruction(
-        boolean hasClassInitializer, Value dest, InternalOptions options) {
-      return (this == DEFAULT && hasClassInitializer) ? null : new ConstNumber(dest, value ? 1 : 0);
+    public ConstInstruction asConstInstruction(
+        AppView<? extends AppInfoWithClassHierarchy> appView, IRCode code, DebugLocalInfo local) {
+      return code.createIntConstant(BooleanUtils.intValue(value), local);
     }
   }
 
@@ -1135,19 +1721,29 @@ public abstract class DexValue extends DexItem {
     }
 
     @Override
+    public boolean isDexValueMethodHandle() {
+      return true;
+    }
+
+    @Override
     public DexValueMethodHandle asDexValueMethodHandle() {
       return this;
     }
 
     @Override
-    protected byte getValueKind() {
-      return VALUE_METHOD_HANDLE;
+    public DexValueKind getValueKind() {
+      return DexValueKind.METHOD_HANDLE;
     }
 
     @Override
-    public void collectIndexedItems(IndexedItemCollection indexedItems,
-        DexMethod method, int instructionOffset) {
+    public void collectIndexedItems(
+        IndexedItemCollection indexedItems, DexMethod method, int instructionOffset) {
       value.collectIndexedItems(indexedItems, method, instructionOffset);
+    }
+
+    @Override
+    public AbstractValue toAbstractValue(AbstractValueFactory factory) {
+      return UnknownValue.getInstance();
     }
   }
 }

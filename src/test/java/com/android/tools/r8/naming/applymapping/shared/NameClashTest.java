@@ -4,7 +4,7 @@
 package com.android.tools.r8.naming.applymapping.shared;
 
 import static org.hamcrest.CoreMatchers.containsString;
-import static org.junit.Assert.assertThat;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.fail;
 
 import com.android.tools.r8.CompilationFailedException;
@@ -43,17 +43,16 @@ public class NameClashTest extends TestBase {
   public static void setUpJars() throws Exception {
     prgJarThatUsesOriginalLib =
         temporaryFolder.newFile("prgOrginalLib.jar").toPath().toAbsolutePath();
-    writeToJar(prgJarThatUsesOriginalLib, ImmutableList.of(ToolHelper.getClassAsBytes(MAIN)));
+    writeClassFileDataToJar(
+        prgJarThatUsesOriginalLib, ImmutableList.of(ToolHelper.getClassAsBytes(MAIN)));
     prgJarThatUsesMinifiedLib =
         temporaryFolder.newFile("prgMinifiedLib.jar").toPath().toAbsolutePath();
-    writeToJar(prgJarThatUsesMinifiedLib, ImmutableList.of(ProgramClassDump.dump()));
+    writeClassFileDataToJar(prgJarThatUsesMinifiedLib, ImmutableList.of(ProgramClassDump.dump()));
     libJar = temporaryFolder.newFile("lib.jar").toPath().toAbsolutePath();
-    writeToJar(
+    writeClassesToJar(
         libJar,
         ImmutableList.of(
-            ToolHelper.getClassAsBytes(ProgramWithLibraryClasses.class),
-            ToolHelper.getClassAsBytes(LibraryClass.class),
-            ToolHelper.getClassAsBytes(AnotherLibraryClass.class)));
+            ProgramWithLibraryClasses.class, LibraryClass.class, AnotherLibraryClass.class));
   }
 
   @Before
@@ -140,6 +139,7 @@ public class NameClashTest extends TestBase {
         .addKeepMainRule(MAIN)
         .addKeepRules("-applymapping " + mappingFile)
         .noTreeShaking()
+        .noMinification()
         .compile()
         .run(MAIN)
         .assertSuccessWithOutput(EXPECTED_OUTPUT);
@@ -172,18 +172,6 @@ public class NameClashTest extends TestBase {
   private void testProguard_minifiedLibraryJar(Path mappingFile) throws Exception {
     testForProguard()
         .addLibraryFiles(ToolHelper.getJava8RuntimeJar(), libJar)
-        .addProgramFiles(prgJarThatUsesMinifiedLib)
-        .addKeepMainRule(MAIN)
-        .addKeepRules("-applymapping " + mappingFile)
-        .noTreeShaking()
-        .compile()
-        .run(MAIN)
-        .assertSuccessWithOutput(EXPECTED_OUTPUT);
-  }
-
-  private void testR8_minifiedLibraryJar(Path mappingFile) throws Exception {
-    testForR8(Backend.DEX)
-        .addLibraryFiles(ToolHelper.getDefaultAndroidJar(), libJar)
         .addProgramFiles(prgJarThatUsesMinifiedLib)
         .addKeepMainRule(MAIN)
         .addKeepRules("-applymapping " + mappingFile)
@@ -304,6 +292,7 @@ public class NameClashTest extends TestBase {
   }
 
   @Test
+  @Ignore("b/136697829")
   public void testR8_prgMethodRenamedToExistingName() throws Exception {
     FileUtils.writeTextFile(mappingFile, mappingToExistingMethodName());
     try {
@@ -333,6 +322,7 @@ public class NameClashTest extends TestBase {
   }
 
   @Test
+  @Ignore("b/136697829")
   public void testR8_originalLibMethodRenamedToExistingName() throws Exception {
     FileUtils.writeTextFile(mappingFile, mappingToExistingMethodName());
     try {
@@ -363,6 +353,7 @@ public class NameClashTest extends TestBase {
   }
 
   @Test
+  @Ignore("b/136697829")
   public void testR8_prgMethodRenamedToSameName() throws Exception {
     FileUtils.writeTextFile(mappingFile, mappingToTheSameMethodName());
     try {
@@ -392,6 +383,7 @@ public class NameClashTest extends TestBase {
   }
 
   @Test
+  @Ignore("b/136697829")
   public void testR8_originalLibMethodRenamedToSameName() throws Exception {
     FileUtils.writeTextFile(mappingFile, mappingToTheSameMethodName());
     try {
@@ -409,21 +401,6 @@ public class NameClashTest extends TestBase {
   }
 
   @Test
-  public void testR8_originalLibClassRenamedToExistingName() throws Exception {
-    FileUtils.writeTextFile(mappingFile, mappingToExistingClassName());
-    try {
-      testR8_originalLibraryJar(mappingFile);
-      fail("Expect compilation failure.");
-    } catch (CompilationFailedException e) {
-      assertThat(e.getCause().getMessage(), containsString("cannot be mapped to"));
-      assertThat(
-          e.getCause().getMessage(),
-          containsString("because it is in conflict with an existing class with the same name."));
-      assertThat(e.getCause().getMessage(), containsString(ProgramClass.class.getTypeName()));
-    }
-  }
-
-  @Test
   public void testProguard_minifiedLib() throws Exception {
     FileUtils.writeTextFile(mappingFile, invertedMapping());
     try {
@@ -431,12 +408,5 @@ public class NameClashTest extends TestBase {
     } catch (CompilationFailedException e) {
       assertThat(e.getMessage(), containsString("can't find superclass or interface A"));
     }
-  }
-
-  @Ignore("b/121305642")
-  @Test
-  public void testR8_minifiedLib() throws Exception {
-    FileUtils.writeTextFile(mappingFile, invertedMapping());
-    testR8_minifiedLibraryJar(mappingFile);
   }
 }

@@ -8,7 +8,6 @@ import com.android.tools.r8.ir.code.Invoke;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
 import java.util.IdentityHashMap;
-import java.util.List;
 import java.util.Map;
 
 /**
@@ -20,7 +19,7 @@ import java.util.Map;
  */
 public class AppliedGraphLens extends GraphLense {
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
 
   private final BiMap<DexType, DexType> originalTypeNames = HashBiMap.create();
   private final BiMap<DexField, DexField> originalFieldSignatures = HashBiMap.create();
@@ -29,7 +28,7 @@ public class AppliedGraphLens extends GraphLense {
       new IdentityHashMap<>();
 
   public AppliedGraphLens(
-      AppView<? extends AppInfoWithSubtyping> appView, List<DexProgramClass> classes) {
+      AppView<? extends AppInfoWithClassHierarchy> appView, Iterable<DexProgramClass> classes) {
     this.appView = appView;
 
     for (DexProgramClass clazz : classes) {
@@ -102,8 +101,10 @@ public class AppliedGraphLens extends GraphLense {
   }
 
   @Override
-  public DexMethod getRenamedMethodSignature(DexMethod originalMethod) {
-    return originalMethodSignatures.inverse().getOrDefault(originalMethod, originalMethod);
+  public DexMethod getRenamedMethodSignature(DexMethod originalMethod, GraphLense applied) {
+    return this != applied
+        ? originalMethodSignatures.inverse().getOrDefault(originalMethod, originalMethod)
+        : originalMethod;
   }
 
   @Override
@@ -134,5 +135,10 @@ public class AppliedGraphLens extends GraphLense {
   @Override
   public boolean isContextFreeForMethods() {
     return true;
+  }
+
+  @Override
+  public boolean hasCodeRewritings() {
+    return false;
   }
 }

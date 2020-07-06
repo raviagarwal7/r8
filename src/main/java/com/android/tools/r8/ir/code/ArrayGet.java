@@ -16,12 +16,12 @@ import com.android.tools.r8.code.AgetWide;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.ArrayTypeLatticeElement;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.ArrayTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.conversion.TypeConstraintResolver;
@@ -29,14 +29,20 @@ import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.ir.regalloc.RegisterAllocator;
 import java.util.Arrays;
+import java.util.Set;
 
-public class ArrayGet extends Instruction implements ImpreciseMemberTypeInstruction {
+public class ArrayGet extends ArrayAccess {
 
   private MemberType type;
 
   public ArrayGet(MemberType type, Value dest, Value array, Value index) {
     super(dest, Arrays.asList(array, index));
     this.type = type;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.ARRAY_GET;
   }
 
   @Override
@@ -48,17 +54,16 @@ public class ArrayGet extends Instruction implements ImpreciseMemberTypeInstruct
     return outValue;
   }
 
-  public Value array() {
-    return inValues.get(0);
-  }
-
-  public Value index() {
-    return inValues.get(1);
-  }
-
   @Override
   public MemberType getMemberType() {
     return type;
+  }
+
+  @Override
+  public boolean couldIntroduceAnAlias(AppView<?> appView, Value root) {
+    assert root != null && root.getType().isReferenceType();
+    assert outValue != null;
+    return outValue.getType().isReferenceType();
   }
 
   @Override
@@ -81,11 +86,15 @@ public class ArrayGet extends Instruction implements ImpreciseMemberTypeInstruct
       case OBJECT:
         instruction = new AgetObject(dest, array, index);
         break;
-      case BOOLEAN:
-        instruction = new AgetBoolean(dest, array, index);
-        break;
-      case BYTE:
-        instruction = new AgetByte(dest, array, index);
+      case BOOLEAN_OR_BYTE:
+        ArrayTypeElement arrayType = array().getType().asArrayType();
+        if (arrayType != null && arrayType.getMemberType() == TypeElement.getBoolean()) {
+          instruction = new AgetBoolean(dest, array, index);
+        } else {
+          assert array().getType().isDefinitelyNull()
+              || arrayType.getMemberType() == TypeElement.getByte();
+          instruction = new AgetByte(dest, array, index);
+        }
         break;
       case CHAR:
         instruction = new AgetChar(dest, array, index);
@@ -143,7 +152,7 @@ public class ArrayGet extends Instruction implements ImpreciseMemberTypeInstruct
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forArrayGet();
   }
 
@@ -153,10 +162,9 @@ public class ArrayGet extends Instruction implements ImpreciseMemberTypeInstruct
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     // This method is not called for ArrayGet on primitive array.
-    assert this.outValue.getTypeLattice().isReference();
+    assert this.outValue.getType().isReferenceType();
     DexType arrayType = helper.getDexType(array());
     if (arrayType == DexItemFactory.nullValueType) {
       // JVM 8 §4.10.1.9.aaload: Array component type of null is null.
@@ -177,56 +185,51 @@ public class ArrayGet extends Instruction implements ImpreciseMemberTypeInstruct
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    ArrayTypeLatticeElement arrayTypeLattice = array().getTypeLattice().isArrayType()
-        ? array().getTypeLattice().asArrayTypeLatticeElement()
-        : null;
+  public TypeElement evaluate(AppView<?> appView) {
+    ArrayTypeElement arrayTypeLattice =
+        array().getType().isArrayType() ? array().getType().asArrayType() : null;
     switch (getMemberType()) {
       case OBJECT:
         // If the out-type of the array is bottom (the input array must be definitely null), then
         // the instruction cannot return. For now we return NULL as the type to ensure we have a
         // type consistent witness for the out-value type. We could consider returning bottom in
         // this case as the value is indeed empty, i.e., the instruction will always fail.
-        TypeLatticeElement valueType = arrayTypeLattice == null
-            ? TypeLatticeElement.NULL
-            : arrayTypeLattice.getArrayMemberTypeAsValueType();
-        assert valueType.isReference();
+        TypeElement valueType =
+            arrayTypeLattice == null
+                ? TypeElement.getNull()
+                : arrayTypeLattice.getMemberTypeAsValueType();
+        assert valueType.isReferenceType();
         return valueType;
-      case BOOLEAN:
-      case BYTE:
+      case BOOLEAN_OR_BYTE:
       case CHAR:
       case SHORT:
       case INT:
-        assert arrayTypeLattice == null
-            || arrayTypeLattice.getArrayMemberTypeAsValueType().isInt();
-        return TypeLatticeElement.INT;
+        assert arrayTypeLattice == null || arrayTypeLattice.getMemberTypeAsValueType().isInt();
+        return TypeElement.getInt();
       case FLOAT:
-        assert arrayTypeLattice == null
-            || arrayTypeLattice.getArrayMemberTypeAsValueType().isFloat();
-        return TypeLatticeElement.FLOAT;
+        assert arrayTypeLattice == null || arrayTypeLattice.getMemberTypeAsValueType().isFloat();
+        return TypeElement.getFloat();
       case LONG:
-        assert arrayTypeLattice == null
-            || arrayTypeLattice.getArrayMemberTypeAsValueType().isLong();
-        return TypeLatticeElement.LONG;
+        assert arrayTypeLattice == null || arrayTypeLattice.getMemberTypeAsValueType().isLong();
+        return TypeElement.getLong();
       case DOUBLE:
-        assert arrayTypeLattice == null
-            || arrayTypeLattice.getArrayMemberTypeAsValueType().isDouble();
-        return TypeLatticeElement.DOUBLE;
+        assert arrayTypeLattice == null || arrayTypeLattice.getMemberTypeAsValueType().isDouble();
+        return TypeElement.getDouble();
       case INT_OR_FLOAT:
         assert arrayTypeLattice == null
-            || arrayTypeLattice.getArrayMemberTypeAsValueType().isSingle();
+            || arrayTypeLattice.getMemberTypeAsValueType().isSinglePrimitive();
         return checkConstraint(dest(), ValueTypeConstraint.INT_OR_FLOAT);
       case LONG_OR_DOUBLE:
         assert arrayTypeLattice == null
-            || arrayTypeLattice.getArrayMemberTypeAsValueType().isWide();
+            || arrayTypeLattice.getMemberTypeAsValueType().isWidePrimitive();
         return checkConstraint(dest(), ValueTypeConstraint.LONG_OR_DOUBLE);
       default:
         throw new Unreachable("Unexpected member type: " + getMemberType());
     }
   }
 
-  private static TypeLatticeElement checkConstraint(Value value, ValueTypeConstraint constraint) {
-    TypeLatticeElement latticeElement = value.constrainedType(constraint);
+  private static TypeElement checkConstraint(Value value, ValueTypeConstraint constraint) {
+    TypeElement latticeElement = value.constrainedType(constraint);
     if (latticeElement != null) {
       return latticeElement;
     }
@@ -235,7 +238,7 @@ public class ArrayGet extends Instruction implements ImpreciseMemberTypeInstruct
   }
 
   @Override
-  public boolean throwsNpeIfValueIsNull(Value value, DexItemFactory dexItemFactory) {
+  public boolean throwsNpeIfValueIsNull(Value value, AppView<?> appView, ProgramMethod context) {
     return array() == value;
   }
 
@@ -250,7 +253,23 @@ public class ArrayGet extends Instruction implements ImpreciseMemberTypeInstruct
   }
 
   @Override
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return array().getType().isArrayType()
+        && array().getType().asArrayType().getMemberType() == TypeElement.getBoolean();
+  }
+
+  @Override
   public void constrainType(TypeConstraintResolver constraintResolver) {
     constraintResolver.constrainArrayMemberType(type, dest(), array(), t -> type = t);
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
+  }
+
+  @Override
+  public ArrayAccess withMemberType(MemberType newMemberType) {
+    return new ArrayGet(newMemberType, outValue(), array(), index());
   }
 }

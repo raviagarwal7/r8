@@ -42,6 +42,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.function.Consumer;
 import org.junit.Assert;
@@ -64,6 +65,8 @@ public class OutlineTest extends SmaliTestBase {
     return options -> {
       // Disable inlining to make sure that code looks as expected.
       options.enableInlining = false;
+      // Disable string concatenation optimization to not bother outlining of StringBuilder usage.
+      options.enableStringConcatenationOptimization = false;
       // Also apply outline options.
       optionsConsumer.accept(options);
     };
@@ -74,6 +77,8 @@ public class OutlineTest extends SmaliTestBase {
     return options -> {
       // Disable inlining to make sure that code looks as expected.
       options.enableInlining = false;
+      // Disable string concatenation optimization to not bother outlining of StringBuilder usage.
+      options.enableStringConcatenationOptimization = false;
       // Also apply outline options.
       optionsConsumer.accept(options.outline);
     };
@@ -860,13 +865,12 @@ public class OutlineTest extends SmaliTestBase {
     CodeInspector inspector = new CodeInspector(processedApplication);
     ClassSubject clazz = inspector.clazz(OutlineOptions.CLASS_NAME);
     assertTrue(clazz.isPresent());
-    assertEquals(3, clazz.getDexClass().directMethods().size());
+    assertEquals(3, clazz.getDexProgramClass().getMethodCollection().numberOfDirectMethods());
     // Collect the return types of the putlines for the body of method1 and method2.
     List<DexType> r = new ArrayList<>();
-    for (int i = 0; i < clazz.getDexClass().directMethods().size(); i++) {
-      if (clazz.getDexClass().directMethods().get(i).getCode().asDexCode().instructions[0]
-          instanceof InvokeVirtual) {
-        r.add(clazz.getDexClass().directMethods().get(i).method.proto.returnType);
+    for (DexEncodedMethod directMethod : clazz.getDexProgramClass().directMethods()) {
+      if (directMethod.getCode().asDexCode().instructions[0] instanceof InvokeVirtual) {
+        r.add(directMethod.method.proto.returnType);
       }
     }
     assert r.size() == 2;
@@ -1331,7 +1335,7 @@ public class OutlineTest extends SmaliTestBase {
                   dexItemFactory.stringBuilderType);
               // ... and not assuming that StringBuilder.<init>() cannot have side effects.
               dexItemFactory.libraryMethodsWithoutSideEffects =
-                  new HashSet<>(dexItemFactory.libraryMethodsWithoutSideEffects);
+                  new IdentityHashMap<>(dexItemFactory.libraryMethodsWithoutSideEffects);
               dexItemFactory.libraryMethodsWithoutSideEffects.remove(
                   dexItemFactory.stringBuilderMethods.defaultConstructor);
             });
@@ -1785,7 +1789,7 @@ public class OutlineTest extends SmaliTestBase {
     assertThat(
         new CodeInspector(processedApplication)
             .clazz(OutlineOptions.CLASS_NAME)
-            .method("boolean", "outline0", ImmutableList.of("java.util.Collection")),
+            .method("boolean", "outline0", ImmutableList.of("java.util.List")),
         isPresent());
 
     // Run code and check result.

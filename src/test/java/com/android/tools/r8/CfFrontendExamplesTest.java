@@ -22,7 +22,6 @@ import java.util.List;
 import java.util.function.BiConsumer;
 import org.junit.Test;
 import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.util.ASMifier;
 import org.objectweb.asm.util.TraceClassVisitor;
 
@@ -121,11 +120,6 @@ public class CfFrontendExamplesTest extends TestBase {
   @Test
   public void testUdpServer() throws Exception {
     runTest("loop.UdpServer");
-  }
-
-  @Test
-  public void testNewArray() throws Exception {
-    runTest("newarray.NewArray");
   }
 
   @Test
@@ -320,7 +314,7 @@ public class CfFrontendExamplesTest extends TestBase {
         command,
         options -> {
           options.skipIR = true;
-          options.enableCfFrontend = true;
+          options.testing.readInputStackMaps = true;
         });
     ArchiveClassFileProvider expected = new ArchiveClassFileProvider(inputJar);
     ArchiveClassFileProvider actual = new ArchiveClassFileProvider(outputJar);
@@ -358,18 +352,18 @@ public class CfFrontendExamplesTest extends TestBase {
     return descriptorList;
   }
 
-  private static byte[] getClassAsBytes(ArchiveClassFileProvider inputJar, String descriptor)
+  public static byte[] getClassAsBytes(ClassFileResourceProvider inputJar, String descriptor)
       throws Exception {
     return toByteArray(inputJar.getProgramResource(descriptor).getByteStream());
   }
 
-  private static String asmToString(byte[] clazz) {
+  public static String asmToString(byte[] clazz) {
     StringWriter stringWriter = new StringWriter();
     printAsm(new PrintWriter(stringWriter), clazz);
     return stringWriter.toString();
   }
 
-  private static void printAsm(PrintWriter pw, byte[] clazz) {
+  public static void printAsm(PrintWriter pw, byte[] clazz) {
     new ClassReader(clazz).accept(new TraceClassVisitor(null, new ASMifierSorted(), pw), 0);
   }
 

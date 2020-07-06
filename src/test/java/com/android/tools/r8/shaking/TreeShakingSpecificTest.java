@@ -88,14 +88,18 @@ public class TreeShakingSpecificTest {
     Path out = temp.getRoot().toPath();
     String test = "shaking2";
     Path keepRules = Paths.get(EXAMPLES_DIR, test, "keep-rules.txt");
-    DiagnosticsHandler handler = new DiagnosticsHandler() {
-      @Override
-      public void error(Diagnostic error) {
-        if (!error.getDiagnosticMessage().contains("library classes are missing")) {
-          throw new RuntimeException("Unexpected compilation error");
-        }
-      }
-    };
+    DiagnosticsHandler handler =
+        new DiagnosticsHandler() {
+          @Override
+          public void error(Diagnostic error) {
+            String expectedErrorMessage =
+                "Compilation can't be completed because the class `java.lang.Object` is missing";
+            if (error.getDiagnosticMessage().contains(expectedErrorMessage)) {
+              return;
+            }
+            throw new RuntimeException("Unexpected compilation error");
+          }
+        };
     R8Command.Builder builder = R8Command.builder(handler)
         .addProguardConfigurationFiles(keepRules);
     finishBuild(builder, out, test);
@@ -136,7 +140,11 @@ public class TreeShakingSpecificTest {
             .collect(Collectors.joining("\n"));
     String refMapping =
         new String(
-            Files.readAllBytes(Paths.get(EXAMPLES_DIR, "shaking1", "print-mapping.ref")),
+            Files.readAllBytes(
+                Paths.get(
+                    EXAMPLES_DIR,
+                    "shaking1",
+                    "print-mapping-" + backend.name().toLowerCase() + ".ref")),
             StandardCharsets.UTF_8);
     Assert.assertEquals(sorted(refMapping), sorted(actualMapping));
   }

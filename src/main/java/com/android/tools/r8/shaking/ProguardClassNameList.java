@@ -3,6 +3,7 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.shaking;
 
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
@@ -12,6 +13,7 @@ import it.unimi.dsi.fastutil.objects.Object2BooleanMap.Entry;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -71,6 +73,12 @@ public abstract class ProguardClassNameList {
     return builder.toString();
   }
 
+  @Override
+  public abstract boolean equals(Object o);
+
+  @Override
+  public abstract int hashCode();
+
   public abstract List<DexType> asSpecificDexTypes();
 
   public abstract boolean matches(DexType type);
@@ -79,11 +87,15 @@ public abstract class ProguardClassNameList {
     return Collections::emptyIterator;
   }
 
+  public boolean hasWildcards() {
+    return getWildcards().iterator().hasNext();
+  }
+
   static Iterable<ProguardWildcard> getWildcardsOrEmpty(ProguardClassNameList nameList) {
     return nameList == null ? Collections::emptyIterator : nameList.getWildcards();
   }
 
-  protected ProguardClassNameList materialize() {
+  protected ProguardClassNameList materialize(DexItemFactory dexItemFactory) {
     return this;
   }
 
@@ -104,6 +116,16 @@ public abstract class ProguardClassNameList {
     }
 
     @Override
+    public boolean equals(Object o) {
+      return o instanceof EmptyClassNameList;
+    }
+
+    @Override
+    public int hashCode() {
+      return 7;
+    }
+
+    @Override
     public List<DexType> asSpecificDexTypes() {
       return null;
     }
@@ -118,9 +140,9 @@ public abstract class ProguardClassNameList {
     }
   }
 
-  private static class SingleClassNameList extends ProguardClassNameList {
+  static class SingleClassNameList extends ProguardClassNameList {
 
-    private final ProguardTypeMatcher className;
+    final ProguardTypeMatcher className;
 
     private SingleClassNameList(ProguardTypeMatcher className) {
       this.className = className;
@@ -134,6 +156,23 @@ public abstract class ProguardClassNameList {
     @Override
     public void writeTo(StringBuilder builder) {
       builder.append(className.toString());
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      SingleClassNameList that = (SingleClassNameList) o;
+      return Objects.equals(className, that.className);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(className);
     }
 
     @Override
@@ -153,8 +192,8 @@ public abstract class ProguardClassNameList {
     }
 
     @Override
-    protected SingleClassNameList materialize() {
-      return new SingleClassNameList(className.materialize());
+    protected SingleClassNameList materialize(DexItemFactory dexItemFactory) {
+      return new SingleClassNameList(className.materialize(dexItemFactory));
     }
 
     @Override
@@ -189,6 +228,23 @@ public abstract class ProguardClassNameList {
     }
 
     @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      PositiveClassNameList that = (PositiveClassNameList) o;
+      return Objects.equals(classNames, that.classNames);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(classNames);
+    }
+
+    @Override
     public List<DexType> asSpecificDexTypes() {
       if (classNames.stream().allMatch(k -> k.getSpecificType() != null)) {
         return classNames.stream().map(ProguardTypeMatcher::getSpecificType)
@@ -211,9 +267,11 @@ public abstract class ProguardClassNameList {
     }
 
     @Override
-    protected PositiveClassNameList materialize() {
+    protected PositiveClassNameList materialize(DexItemFactory dexItemFactory) {
       return new PositiveClassNameList(
-          classNames.stream().map(ProguardTypeMatcher::materialize).collect(Collectors.toList()));
+          classNames.stream()
+              .map(className -> className.materialize(dexItemFactory))
+              .collect(Collectors.toList()));
     }
 
     @Override
@@ -251,6 +309,23 @@ public abstract class ProguardClassNameList {
     }
 
     @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      MixedClassNameList that = (MixedClassNameList) o;
+      return Objects.equals(classNames, that.classNames);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(classNames);
+    }
+
+    @Override
     public List<DexType> asSpecificDexTypes() {
       return null;
     }
@@ -275,9 +350,10 @@ public abstract class ProguardClassNameList {
     }
 
     @Override
-    protected ProguardClassNameList materialize() {
+    protected ProguardClassNameList materialize(DexItemFactory dexItemFactory) {
       Builder builder = builder();
-      classNames.forEach((m, negated) -> builder.addClassName(negated, m.materialize()));
+      classNames.forEach(
+          (m, negated) -> builder.addClassName(negated, m.materialize(dexItemFactory)));
       return builder.build();
     }
 

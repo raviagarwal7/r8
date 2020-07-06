@@ -5,12 +5,12 @@
 package com.android.tools.r8.naming;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
 import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
-import static org.junit.Assert.assertThat;
 import static org.objectweb.asm.Opcodes.ACC_FINAL;
 import static org.objectweb.asm.Opcodes.ACC_PUBLIC;
 import static org.objectweb.asm.Opcodes.ACC_SUPER;
@@ -26,7 +26,6 @@ import com.android.tools.r8.R8Command;
 import com.android.tools.r8.StringConsumer;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.ToolHelper;
-import com.android.tools.r8.graph.invokesuper.Consumer;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -34,6 +33,7 @@ import com.android.tools.r8.utils.codeinspector.FieldSubject;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import java.util.Map;
+import java.util.function.Consumer;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -193,8 +193,8 @@ public class MinifierFieldSignatureTest extends TestBase {
                     .build()));
     // All classes are kept, and renamed.
     ClassSubject clazz = inspector.clazz("Fields");
-    assertThat(clazz, isRenamed());
-    assertThat(inspector.clazz("Fields$Inner"), isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
+    assertThat(inspector.clazz("Fields$Inner"), isPresentAndRenamed());
 
     FieldSubject anX = lookupAnX(inspector);
     FieldSubject anArrayOfX = lookupAnArrayOfX(inspector);
@@ -202,10 +202,10 @@ public class MinifierFieldSignatureTest extends TestBase {
     FieldSubject aFieldsOfXInner = clazz.field("Fields$Inner", "aFieldsOfXInner");
 
     // Check that all fields have been renamed
-    assertThat(anX, isRenamed());
-    assertThat(anArrayOfX, isRenamed());
-    assertThat(aFieldsOfX, isRenamed());
-    assertThat(aFieldsOfXInner, isRenamed());
+    assertThat(anX, isPresentAndRenamed());
+    assertThat(anArrayOfX, isPresentAndRenamed());
+    assertThat(aFieldsOfX, isPresentAndRenamed());
+    assertThat(aFieldsOfXInner, isPresentAndRenamed());
 
     //System.out.println(generic.getFinalSignatureAttribute());
     //System.out.println(generic.getOriginalSignatureAttribute());

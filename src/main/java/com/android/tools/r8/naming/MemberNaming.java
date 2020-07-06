@@ -3,6 +3,7 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.naming;
 
+import static com.android.tools.r8.utils.DescriptorUtils.JAVA_PACKAGE_SEPARATOR;
 import static com.android.tools.r8.utils.DescriptorUtils.javaTypeToDescriptor;
 
 import com.android.tools.r8.dex.Constants;
@@ -86,6 +87,10 @@ public class MemberNaming {
     return signature.kind() == SignatureKind.METHOD;
   }
 
+  public boolean isFieldNaming() {
+    return signature.kind() == SignatureKind.FIELD;
+  }
+
   public Position getPosition() {
     return position;
   }
@@ -115,7 +120,35 @@ public class MemberNaming {
 
     abstract void write(Writer builder) throws IOException;
 
-    boolean isQualified() { return name.indexOf(DescriptorUtils.JAVA_PACKAGE_SEPARATOR) != -1; }
+    public boolean isQualified() {
+      return name.indexOf(JAVA_PACKAGE_SEPARATOR) != -1;
+    }
+
+    public String toUnqualifiedName() {
+      assert isQualified();
+      return name.substring(name.lastIndexOf(JAVA_PACKAGE_SEPARATOR) + 1);
+    }
+
+    public String toHolderFromQualified() {
+      assert isQualified();
+      return name.substring(0, name.lastIndexOf(JAVA_PACKAGE_SEPARATOR));
+    }
+
+    public boolean isMethodSignature() {
+      return false;
+    }
+
+    public boolean isFieldSignature() {
+      return false;
+    }
+
+    public MethodSignature asMethodSignature() {
+      return null;
+    }
+
+    public FieldSignature asFieldSignature() {
+      return null;
+    }
 
     @Override
     public String toString() {
@@ -154,7 +187,7 @@ public class MemberNaming {
           field.type.toSourceString());
     }
 
-    DexField toDexField(DexItemFactory factory, DexType clazz) {
+    public DexField toDexField(DexItemFactory factory, DexType clazz) {
       return factory.createField(
           clazz,
           factory.createType(javaTypeToDescriptor(type)),
@@ -198,6 +231,16 @@ public class MemberNaming {
       writer.append(type);
       writer.append(' ');
       writer.append(name);
+    }
+
+    @Override
+    public boolean isFieldSignature() {
+      return true;
+    }
+
+    @Override
+    public FieldSignature asFieldSignature() {
+      return this;
     }
   }
 
@@ -250,10 +293,10 @@ public class MemberNaming {
 
     public MethodSignature toUnqualified() {
       assert isQualified();
-      return new MethodSignature(name.substring(name.lastIndexOf('.') + 1), type, parameters);
+      return new MethodSignature(toUnqualifiedName(), type, parameters);
     }
 
-    DexMethod toDexMethod(DexItemFactory factory, DexType clazz) {
+    public DexMethod toDexMethod(DexItemFactory factory, DexType clazz) {
       DexType[] paramTypes = new DexType[parameters.length];
       for (int i = 0; i < parameters.length; i++) {
         paramTypes[i] = factory.createType(javaTypeToDescriptor(parameters[i]));
@@ -330,6 +373,16 @@ public class MemberNaming {
       sb.append(')');
       sb.append(javaTypeToDescriptor(type));
       return sb.toString();
+    }
+
+    @Override
+    public boolean isMethodSignature() {
+      return true;
+    }
+
+    @Override
+    public MethodSignature asMethodSignature() {
+      return this;
     }
   }
 }

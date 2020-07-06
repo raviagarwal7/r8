@@ -3,16 +3,27 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static com.android.tools.r8.utils.InternalOptions.DETERMINISTIC_DEBUGGING;
+
+import com.android.tools.r8.AssertionsConfiguration.AssertionTransformation;
 import com.android.tools.r8.errors.DexFileOverflowDiagnostic;
 import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.inspector.Inspector;
+import com.android.tools.r8.inspector.internal.InspectorImpl;
+import com.android.tools.r8.ir.desugar.DesugaredLibraryConfiguration;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.AssertionConfigurationWithDefault;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.InternalOptions.DesugarState;
 import com.android.tools.r8.utils.Reporter;
 import com.android.tools.r8.utils.StringDiagnostic;
+import com.android.tools.r8.utils.ThreadUtils;
 import java.nio.file.Path;
 import java.util.Collection;
+import java.util.List;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 
 /**
@@ -31,13 +42,6 @@ import java.util.function.Consumer;
 @Keep
 public final class D8Command extends BaseCompilerCommand {
   private Consumer<InternalOptions> internalOptionsModifier;
-
-  private static class ClasspathInputOrigin extends InputFileOrigin {
-
-    public ClasspathInputOrigin(Path file) {
-      super("classpath input", file);
-    }
-  }
 
   private static class DefaultD8DiagnosticsHandler implements DiagnosticsHandler {
 
@@ -65,6 +69,11 @@ public final class D8Command extends BaseCompilerCommand {
   public static class Builder extends BaseCompilerCommand.Builder<D8Command, Builder> {
 
     private boolean intermediate = false;
+    private DesugarGraphConsumer desugarGraphConsumer = null;
+    private StringConsumer desugaredLibraryKeepRuleConsumer = null;
+    private String synthesizedClassPrefix = "";
+    private boolean enableMainDexListCheck = true;
+    private boolean minimalMainDex = false;
     private Consumer<InternalOptions> internalOptionsModifier;
 
     private Builder() {
@@ -79,26 +88,34 @@ public final class D8Command extends BaseCompilerCommand {
       super(app);
     }
 
-    /** Add dex program-data. */
+    /**
+     * Add dex program-data.
+     */
     @Override
     public Builder addDexProgramData(byte[] data, Origin origin) {
       guard(() -> getAppBuilder().addDexProgramData(data, origin));
       return self();
     }
 
-    /** Add classpath file resources. These have @Override to ensure binary compatibility. */
+    /**
+     * Add classpath file resources. These have @Override to ensure binary compatibility.
+     */
     @Override
     public Builder addClasspathFiles(Path... files) {
       return super.addClasspathFiles(files);
     }
 
-    /** Add classpath file resources. */
+    /**
+     * Add classpath file resources.
+     */
     @Override
     public Builder addClasspathFiles(Collection<Path> files) {
       return super.addClasspathFiles(files);
     }
 
-    /** Add classfile resources provider for class-path resources. */
+    /**
+     * Add classfile resources provider for class-path resources.
+     */
     @Override
     public Builder addClasspathResourceProvider(ClassFileResourceProvider provider) {
       return super.addClasspathResourceProvider(provider);
@@ -125,6 +142,40 @@ public final class D8Command extends BaseCompilerCommand {
       return self();
     }
 
+    /**
+     * Set a consumer for receiving the keep rules to use when compiling the desugared library for
+     * the program being compiled in this compilation.
+     *
+     * @param keepRuleConsumer Consumer to receive the content once produced.
+     */
+    public Builder setDesugaredLibraryKeepRuleConsumer(StringConsumer keepRuleConsumer) {
+      this.desugaredLibraryKeepRuleConsumer = keepRuleConsumer;
+      return self();
+    }
+
+    /**
+     * Get the consumer that will receive dependency information for desugaring.
+     */
+    public DesugarGraphConsumer getDesugarGraphConsumer() {
+      return desugarGraphConsumer;
+    }
+
+    /**
+     * Set the consumer that will receive dependency information for desugaring.
+     *
+     * <p>Setting the consumer will clear any previously set consumer.
+     */
+    public Builder setDesugarGraphConsumer(DesugarGraphConsumer desugarGraphConsumer) {
+      this.desugarGraphConsumer = desugarGraphConsumer;
+      return self();
+    }
+
+    // Internal helper for compat tools to make them only desugar backports.
+    Builder enableDesugarBackportStatics() {
+      this.desugarState = DesugarState.ONLY_BACKPORT_STATICS;
+      return self();
+    }
+
     @Override
     Builder self() {
       return this;
@@ -135,11 +186,30 @@ public final class D8Command extends BaseCompilerCommand {
       return CompilationMode.DEBUG;
     }
 
+    Builder setSynthesizedClassesPrefix(String prefix) {
+      synthesizedClassPrefix = prefix;
+      return self();
+    }
+
+    @Deprecated
+    // Internal helper for supporting bazel integration.
+    Builder setEnableMainDexListCheck(boolean value) {
+      enableMainDexListCheck = value;
+      return self();
+    }
+
+    @Deprecated
+    // Internal helper for supporting bazel integration.
+    Builder setMinimalMainDex(boolean value) {
+      minimalMainDex = value;
+      return self();
+    }
+
     @Override
     void validate() {
       Reporter reporter = getReporter();
       if (getProgramConsumer() instanceof ClassFileConsumer) {
-        reporter.error("D8 does not support compiling to Java class files");
+        reporter.warning("Compiling to Java class files with D8 is not officially supported");
       }
       if (getAppBuilder().hasMainDexList()) {
         if (intermediate) {
@@ -159,6 +229,9 @@ public final class D8Command extends BaseCompilerCommand {
                   + " and above");
         }
       }
+      if (hasDesugaredLibraryConfiguration() && getDisableDesugaring()) {
+        reporter.error("Using desugared library configuration requires desugaring to be enabled");
+      }
       super.validate();
     }
 
@@ -170,6 +243,10 @@ public final class D8Command extends BaseCompilerCommand {
 
       intermediate |= getProgramConsumer() instanceof DexFilePerClassFileConsumer;
 
+      DexItemFactory factory = new DexItemFactory();
+      DesugaredLibraryConfiguration libraryConfiguration =
+          getDesugaredLibraryConfiguration(factory, false);
+
       return new D8Command(
           getAppBuilder().build(),
           getMode(),
@@ -177,20 +254,38 @@ public final class D8Command extends BaseCompilerCommand {
           getMainDexListConsumer(),
           getMinApiLevel(),
           getReporter(),
-          !getDisableDesugaring(),
+          getDesugaringState(),
           intermediate,
           isOptimizeMultidexForLinearAlloc(),
+          getIncludeClassesChecksum(),
+          getDexClassChecksumFilter(),
+          getDesugarGraphConsumer(),
+          desugaredLibraryKeepRuleConsumer,
+          libraryConfiguration,
+          getAssertionsConfiguration(),
+          getOutputInspections(),
+          synthesizedClassPrefix,
+          enableMainDexListCheck,
+          minimalMainDex,
+          getThreadCount(),
+          factory,
           internalOptionsModifier);
     }
   }
 
   static final String USAGE_MESSAGE = D8CommandParser.USAGE_MESSAGE;
 
-  private boolean intermediate = false;
-  private DexItemFactory dexItemFactory;
+  private final boolean intermediate;
+  private final DesugarGraphConsumer desugarGraphConsumer;
+  private final StringConsumer desugaredLibraryKeepRuleConsumer;
+  private final DesugaredLibraryConfiguration libraryConfiguration;
+  private final String synthesizedClassPrefix;
+  private final boolean enableMainDexListCheck;
+  private final boolean minimalMainDex;
+  private final DexItemFactory factory;
 
   public DexItemFactory getDexItemFactory() {
-    return dexItemFactory;
+    return factory;
   }
 
   public static Builder builder() {
@@ -240,9 +335,21 @@ public final class D8Command extends BaseCompilerCommand {
       StringConsumer mainDexListConsumer,
       int minApiLevel,
       Reporter diagnosticsHandler,
-      boolean enableDesugaring,
+      DesugarState enableDesugaring,
       boolean intermediate,
       boolean optimizeMultidexForLinearAlloc,
+      boolean encodeChecksum,
+      BiPredicate<String, Long> dexClassChecksumFilter,
+      DesugarGraphConsumer desugarGraphConsumer,
+      StringConsumer desugaredLibraryKeepRuleConsumer,
+      DesugaredLibraryConfiguration libraryConfiguration,
+      List<AssertionsConfiguration> assertionsConfiguration,
+      List<Consumer<Inspector>> outputInspections,
+      String synthesizedClassPrefix,
+      boolean enableMainDexListCheck,
+      boolean minimalMainDex,
+      int threadCount,
+      DexItemFactory factory,
       Consumer<InternalOptions> internalOptionsModifier) {
     super(
         inputApp,
@@ -252,46 +359,93 @@ public final class D8Command extends BaseCompilerCommand {
         minApiLevel,
         diagnosticsHandler,
         enableDesugaring,
-        optimizeMultidexForLinearAlloc);
+        optimizeMultidexForLinearAlloc,
+        encodeChecksum,
+        dexClassChecksumFilter,
+        assertionsConfiguration,
+        outputInspections,
+        threadCount);
     this.intermediate = intermediate;
+    this.desugarGraphConsumer = desugarGraphConsumer;
+    this.desugaredLibraryKeepRuleConsumer = desugaredLibraryKeepRuleConsumer;
+    this.libraryConfiguration = libraryConfiguration;
+    this.synthesizedClassPrefix = synthesizedClassPrefix;
+    this.enableMainDexListCheck = enableMainDexListCheck;
+    this.minimalMainDex = minimalMainDex;
+    this.factory = factory;
     this.internalOptionsModifier = internalOptionsModifier;
   }
 
   private D8Command(boolean printHelp, boolean printVersion) {
     super(printHelp, printVersion);
+    intermediate = false;
+    desugarGraphConsumer = null;
+    desugaredLibraryKeepRuleConsumer = null;
+    libraryConfiguration = null;
+    synthesizedClassPrefix = null;
+    enableMainDexListCheck = true;
+    minimalMainDex = false;
+    factory = null;
   }
 
   @Override
   InternalOptions getInternalOptions() {
-    dexItemFactory = new DexItemFactory();
-    InternalOptions internal = new InternalOptions(dexItemFactory, getReporter());
+    InternalOptions internal = new InternalOptions(factory, getReporter());
     assert !internal.debug;
     internal.debug = getMode() == CompilationMode.DEBUG;
     internal.programConsumer = getProgramConsumer();
+    if (internal.programConsumer instanceof ClassFileConsumer) {
+      internal.cfToCfDesugar = true;
+    }
     internal.mainDexListConsumer = getMainDexListConsumer();
-    internal.minimalMainDex = internal.debug;
+    internal.minimalMainDex = internal.debug || minimalMainDex;
+    internal.enableMainDexListCheck = enableMainDexListCheck;
     internal.minApiLevel = getMinApiLevel();
     internal.intermediate = intermediate;
+    internal.readCompileTimeAnnotations = intermediate;
+    internal.desugarGraphConsumer = desugarGraphConsumer;
+
     // Assert and fixup defaults.
     assert !internal.isShrinking();
     assert !internal.isMinifying();
     assert !internal.passthroughDexCode;
     internal.passthroughDexCode = true;
+    assert internal.neverMergePrefixes.contains("j$.");
 
     // Assert some of R8 optimizations are disabled.
-    assert !internal.enableDynamicTypeOptimization;
     assert !internal.enableInlining;
     assert !internal.enableClassInlining;
     assert !internal.enableHorizontalClassMerging;
     assert !internal.enableVerticalClassMerging;
     assert !internal.enableClassStaticizer;
-    assert !internal.enableSwitchMapRemoval;
+    assert !internal.enableEnumValueOptimization;
     assert !internal.outline.enabled;
     assert !internal.enableValuePropagation;
     assert !internal.enableLambdaMerging;
+    assert !internal.enableTreeShakingOfLibraryMethodOverrides;
 
-    internal.enableDesugaring = getEnableDesugaring();
+    internal.desugarState = getDesugarState();
+    internal.encodeChecksums = getIncludeClassesChecksum();
+    internal.dexClassChecksumFilter = getDexClassChecksumFilter();
     internal.enableInheritanceClassInDexDistributor = isOptimizeMultidexForLinearAlloc();
+
+    internal.desugaredLibraryConfiguration = libraryConfiguration;
+    internal.synthesizedClassPrefix = synthesizedClassPrefix;
+    internal.desugaredLibraryKeepRuleConsumer = desugaredLibraryKeepRuleConsumer;
+
+    // Default is to remove all javac generated assertion code when generating dex.
+    assert internal.assertionsConfiguration == null;
+    internal.assertionsConfiguration =
+        new AssertionConfigurationWithDefault(
+            AssertionTransformation.DISABLE, getAssertionsConfiguration());
+
+    internal.outputInspections = InspectorImpl.wrapInspections(getOutputInspections());
+
+    if (!DETERMINISTIC_DEBUGGING) {
+      assert internal.threadCount == ThreadUtils.NOT_SPECIFIED;
+      internal.threadCount = getThreadCount();
+    }
+
     if (internalOptionsModifier != null) {
       internalOptionsModifier.accept(internal);
     }

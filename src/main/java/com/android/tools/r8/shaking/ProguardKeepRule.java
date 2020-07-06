@@ -3,6 +3,7 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.shaking;
 
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.position.Position;
 import java.util.List;
@@ -24,9 +25,22 @@ public class ProguardKeepRule extends ProguardKeepRuleBase {
 
     @Override
     public ProguardKeepRule build() {
-      return new ProguardKeepRule(origin, getPosition(), source, classAnnotation, classAccessFlags,
-          negatedClassAccessFlags, classTypeNegated, classType, classNames, inheritanceAnnotation,
-          inheritanceClassName, inheritanceIsExtends, memberRules, type, modifiersBuilder.build());
+      return new ProguardKeepRule(
+          origin,
+          getPosition(),
+          source,
+          buildClassAnnotations(),
+          classAccessFlags,
+          negatedClassAccessFlags,
+          classTypeNegated,
+          classType,
+          classNames,
+          buildInheritanceAnnotations(),
+          inheritanceClassName,
+          inheritanceIsExtends,
+          memberRules,
+          type,
+          modifiersBuilder.build());
     }
   }
 
@@ -34,21 +48,34 @@ public class ProguardKeepRule extends ProguardKeepRuleBase {
       Origin origin,
       Position position,
       String source,
-      ProguardTypeMatcher classAnnotation,
+      List<ProguardTypeMatcher> classAnnotations,
       ProguardAccessFlags classAccessFlags,
       ProguardAccessFlags negatedClassAccessFlags,
       boolean classTypeNegated,
       ProguardClassType classType,
       ProguardClassNameList classNames,
-      ProguardTypeMatcher inheritanceAnnotation,
+      List<ProguardTypeMatcher> inheritanceAnnotations,
       ProguardTypeMatcher inheritanceClassName,
       boolean inheritanceIsExtends,
       List<ProguardMemberRule> memberRules,
       ProguardKeepRuleType type,
       ProguardKeepRuleModifiers modifiers) {
-    super(origin, position, source, classAnnotation, classAccessFlags, negatedClassAccessFlags,
-        classTypeNegated, classType, classNames, inheritanceAnnotation, inheritanceClassName,
-        inheritanceIsExtends, memberRules, type, modifiers);
+    super(
+        origin,
+        position,
+        source,
+        classAnnotations,
+        classAccessFlags,
+        negatedClassAccessFlags,
+        classTypeNegated,
+        classType,
+        classNames,
+        inheritanceAnnotations,
+        inheritanceClassName,
+        inheritanceIsExtends,
+        memberRules,
+        type,
+        modifiers);
   }
 
   /**
@@ -58,24 +85,26 @@ public class ProguardKeepRule extends ProguardKeepRuleBase {
     return new Builder();
   }
 
-  protected ProguardKeepRule materialize() {
+  protected ProguardKeepRule materialize(DexItemFactory dexItemFactory) {
     return new ProguardKeepRule(
         getOrigin(),
         getPosition(),
         getSource(),
-        getClassAnnotation() == null ? null : getClassAnnotation().materialize(),
+        ProguardTypeMatcher.materializeList(getClassAnnotations(), dexItemFactory),
         getClassAccessFlags(),
         getNegatedClassAccessFlags(),
         getClassTypeNegated(),
         getClassType(),
-        getClassNames() == null ? null : getClassNames().materialize(),
-        getInheritanceAnnotation() == null ? null : getInheritanceAnnotation().materialize(),
-        getInheritanceClassName() == null ? null : getInheritanceClassName().materialize(),
+        getClassNames() == null ? null : getClassNames().materialize(dexItemFactory),
+        ProguardTypeMatcher.materializeList(getInheritanceAnnotations(), dexItemFactory),
+        getInheritanceClassName() == null
+            ? null
+            : getInheritanceClassName().materialize(dexItemFactory),
         getInheritanceIsExtends(),
         getMemberRules() == null
             ? null
             : getMemberRules().stream()
-                .map(ProguardMemberRule::materialize)
+                .map(memberRule -> memberRule.materialize(dexItemFactory))
                 .collect(Collectors.toList()),
         getType(),
         getModifiers());
@@ -121,5 +150,15 @@ public class ProguardKeepRule extends ProguardKeepRuleBase {
     builder.setType(ProguardKeepRuleType.KEEP);
     modifiers.accept(builder.getModifiersBuilder());
     return builder.build();
+  }
+
+  @Override
+  public boolean isProguardKeepRule() {
+    return true;
+  }
+
+  @Override
+  public ProguardKeepRule asProguardKeepRule() {
+    return this;
   }
 }

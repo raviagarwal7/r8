@@ -14,8 +14,8 @@ import com.android.tools.r8.ToolHelper;
 import com.android.tools.r8.ToolHelper.ProcessResult;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.ir.optimize.enums.EnumUnboxingRewriter;
 import com.android.tools.r8.origin.Origin;
-import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.FileUtils;
 import com.android.tools.r8.utils.ZipUtils;
@@ -50,7 +50,8 @@ public class R8InliningTest extends TestBase {
 
   @Parameters(name = "{1}, allow access modification: {0}")
   public static Collection<Object[]> data() {
-    return buildParameters(BooleanUtils.values(), getTestParameters().withAllRuntimes().build());
+    return buildParameters(
+        BooleanUtils.values(), getTestParameters().withAllRuntimesAndApiLevels().build());
   }
 
   private final boolean allowAccessModification;
@@ -99,13 +100,13 @@ public class R8InliningTest extends TestBase {
             .addProgramFiles(getInputFile())
             .setOutput(out, outputMode(parameters.getBackend()))
             .addProguardConfigurationFiles(Paths.get(KEEP_RULES_FILE))
-            .addLibraryFiles(TestBase.runtimeJar(parameters.getBackend()))
+            .addLibraryFiles(ToolHelper.getMostRecentAndroidJar())
             .setDisableMinification(true);
     if (mapFile != null) {
       commandBuilder.setProguardMapOutputPath(mapFile);
     }
     if (parameters.isDexRuntime()) {
-      commandBuilder.setMinApiLevel(AndroidApiLevel.M.getLevel());
+      commandBuilder.setMinApiLevel(parameters.getApiLevel().getLevel());
     }
     if (allowAccessModification) {
       commandBuilder.addProguardConfiguration(
@@ -121,6 +122,9 @@ public class R8InliningTest extends TestBase {
           o.enableInlining = inlining;
           o.enableInliningOfInvokesWithNullableReceivers = false;
           o.inliningInstructionLimit = 6;
+          // Tests depend on nullability of receiver and argument in general. Learning very accurate
+          // nullability from actual usage in tests bothers what we want to test.
+          o.callSiteOptimizationOptions().disableTypePropagationForTesting();
         });
   }
 
@@ -133,10 +137,19 @@ public class R8InliningTest extends TestBase {
     if (parameters.isDexRuntime()) {
       output =
           ToolHelper.runArtNoVerificationErrors(
-              outputDir.resolve(DEFAULT_DEX_FILENAME).toString(), "inlining.Inlining");
+              Collections.singletonList(outputDir.resolve(DEFAULT_DEX_FILENAME).toString()),
+              "inlining.Inlining",
+              builder -> {},
+              parameters.getRuntime().asDex().getVm());
     } else {
       assert parameters.isCfRuntime();
-      output = ToolHelper.runJavaNoVerify(outputDir, "inlining.Inlining").stdout;
+      output =
+          ToolHelper.runJava(
+                  parameters.getRuntime().asCf(),
+                  Collections.singletonList("-noverify"),
+                  Collections.singletonList(outputDir),
+                  "inlining.Inlining")
+              .stdout;
     }
 
     // Compare result with Java to make sure we have the same behavior.
@@ -344,11 +357,8 @@ public class R8InliningTest extends TestBase {
     assertEquals(1, instanceGetCount);
     assertEquals(0, invokeCount);
 
-    m =
-        clazz.method(
-            "int",
-            "moreControlFlows",
-            ImmutableList.of("inlining.A", "inlining.Nullability$Factor"));
+    // The enum parameter may get unboxed.
+    m = clazz.uniqueMethodWithName("moreControlFlows");
     assertTrue(m.isPresent());
 
     // Verify that a.b() is resolved to an inline instance-get.
@@ -360,14 +370,15 @@ public class R8InliningTest extends TestBase {
       if (instruction.isInstanceGet()) {
         ++instanceGetCount;
       } else if (instruction.isInvoke()
-          && !((InvokeInstructionSubject) instruction)
-              .holder()
+          && !instruction
+              .getMethod()
+              .name
               .toString()
-              .contains("java.lang.Enum")) {
+              .startsWith(EnumUnboxingRewriter.ENUM_UNBOXING_UTILITY_METHOD_PREFIX)) {
         ++invokeCount;
       }
     }
     assertEquals(1, instanceGetCount);
-    assertEquals(0, invokeCount);
+    assertEquals(BooleanUtils.intValue(parameters.isCfRuntime()), invokeCount);
   }
 }

@@ -5,9 +5,9 @@
 package com.android.tools.r8.naming.b126592786;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.ToolHelper;
@@ -44,27 +44,31 @@ public class B126592786 extends TestBase {
     Class<?> mainClass = genericTypeLive ? MainGenericTypeLive.class : MainGenericTypeNotLive.class;
     testForR8(backend)
         .minification(minify)
-        .addProgramClasses(A.class, GenericType.class, mainClass)
+        .addProgramClasses(GetClassUtil.class, A.class, GenericType.class, mainClass)
         .addKeepMainRule(mainClass)
         .addKeepRules(
+            "-keep class " + GetClassUtil.class.getTypeName() + " {",
+            "  static java.lang.Class getClass(java.lang.Object);",
+            "}",
             "-keepclassmembers @" + Marker.class.getTypeName() + " class * {",
             "  <fields>;",
             "}",
             "-keepattributes InnerClasses,EnclosingMethod,Signature ")
         .compile()
-        .inspect(inspector -> {
-            String genericTypeDescriptor = "Ljava/lang/Object;";
-            if (genericTypeLive) {
-              ClassSubject genericType = inspector.clazz(GenericType.class);
-              assertThat(genericType, isRenamed(minify));
-              genericTypeDescriptor = genericType.getFinalDescriptor();
-            }
-            String expectedSignature = "Ljava/util/List<" + genericTypeDescriptor + ">;";
-            FieldSubject list = inspector.clazz(A.class).uniqueFieldWithName("list");
-            assertThat(list, isPresent());
-            assertThat(list.getSignatureAnnotation(), isPresent());
-            assertEquals(expectedSignature, list.getSignatureAnnotationValue());
-        })
+        .inspect(
+            inspector -> {
+              String genericTypeDescriptor = "Ljava/lang/Object;";
+              if (genericTypeLive) {
+                ClassSubject genericType = inspector.clazz(GenericType.class);
+                assertThat(genericType, isPresentAndRenamed(minify));
+                genericTypeDescriptor = genericType.getFinalDescriptor();
+              }
+              String expectedSignature = "Ljava/util/List<" + genericTypeDescriptor + ">;";
+              FieldSubject list = inspector.clazz(A.class).uniqueFieldWithName("list");
+              assertThat(list, isPresent());
+              assertThat(list.getSignatureAnnotation(), isPresent());
+              assertEquals(expectedSignature, list.getSignatureAnnotationValue());
+            })
         .run(mainClass)
         .assertSuccess();
   }
@@ -96,17 +100,25 @@ class GenericType {
 
 }
 
+// GetClassUtil is used below to ensure that the types remain instantiated.
+class GetClassUtil {
+
+  public static Class<?> getClass(Object o) {
+    return o.getClass();
+  }
+}
+
 class MainGenericTypeNotLive {
 
   public static void main(String[] args) {
-    System.out.println(A.class);
+    System.out.println(GetClassUtil.getClass(new A()));
   }
 }
 
 class MainGenericTypeLive {
 
   public static void main(String[] args) {
-    System.out.println(A.class);
-    System.out.println(GenericType.class);
+    System.out.println(GetClassUtil.getClass(new A()));
+    System.out.println(GetClassUtil.getClass(new GenericType()));
   }
 }

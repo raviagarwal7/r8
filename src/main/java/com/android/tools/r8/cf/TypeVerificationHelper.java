@@ -5,12 +5,11 @@ package com.android.tools.r8.cf;
 
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Argument;
 import com.android.tools.r8.ir.code.ConstNumber;
 import com.android.tools.r8.ir.code.IRCode;
@@ -21,9 +20,9 @@ import com.android.tools.r8.ir.code.Phi;
 import com.android.tools.r8.ir.code.StackValue;
 import com.android.tools.r8.ir.code.Value;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -104,7 +103,7 @@ public class TypeVerificationHelper {
   private final TypeInfo LONG;
   private final TypeInfo DOUBLE;
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   private final IRCode code;
 
   private Map<Value, TypeInfo> types;
@@ -113,7 +112,7 @@ public class TypeVerificationHelper {
   // Flag to indicate that we are computing types in the fixed point.
   private boolean computingVerificationTypes = false;
 
-  public TypeVerificationHelper(AppView<? extends AppInfo> appView, IRCode code) {
+  public TypeVerificationHelper(AppView<?> appView, IRCode code) {
     this.appView = appView;
     this.code = code;
 
@@ -183,15 +182,15 @@ public class TypeVerificationHelper {
       return types.iterator().next();
     }
     Iterator<DexType> iterator = types.iterator();
-    TypeLatticeElement result = getLatticeElement(iterator.next());
+    TypeElement result = toTypeElement(iterator.next());
     while (iterator.hasNext()) {
-      result = result.join(getLatticeElement(iterator.next()), appView);
+      result = result.join(toTypeElement(iterator.next()), appView);
     }
     // All types are reference types so the join is either a class or an array.
     if (result.isClassType()) {
-      return result.asClassTypeLatticeElement().getClassType();
+      return result.asClassType().getClassType();
     } else if (result.isArrayType()) {
-      return result.asArrayTypeLatticeElement().getArrayType(appView.dexItemFactory());
+      return result.asArrayType().toDexType(appView.dexItemFactory());
     }
     throw new CompilationError("Unexpected join " + result + " of types: " +
         String.join(", ",
@@ -216,20 +215,20 @@ public class TypeVerificationHelper {
     return createInitializedType(join(ImmutableSet.of(type1, type2)));
   }
 
-  private TypeLatticeElement getLatticeElement(DexType type) {
-    return TypeLatticeElement.fromDexType(type, Nullability.maybeNull(), appView);
+  private TypeElement toTypeElement(DexType type) {
+    return TypeElement.fromDexType(type, Nullability.maybeNull(), appView);
   }
 
   public Map<Value, TypeInfo> computeVerificationTypes() {
     computingVerificationTypes = true;
     types = new HashMap<>();
     List<ConstNumber> nullsUsedInPhis = new ArrayList<>();
-    Set<Value> worklist = new HashSet<>();
+    Set<Value> worklist = Sets.newIdentityHashSet();
     {
       InstructionIterator it = code.instructionIterator();
       Instruction instruction = null;
       // Set the out-value types of each argument based on the method signature.
-      int argumentIndex = code.method.accessFlags.isStatic() ? 0 : -1;
+      int argumentIndex = code.method().accessFlags.isStatic() ? 0 : -1;
       while (it.hasNext()) {
         instruction = it.next();
         if (!instruction.isArgument()) {
@@ -238,12 +237,12 @@ public class TypeVerificationHelper {
         TypeInfo argumentType;
         if (argumentIndex < 0) {
           argumentType =
-              code.method.isInstanceInitializer()
-                  ? new ThisInstanceInfo(instruction.asArgument(), code.method.method.holder)
-                  : createInitializedType(code.method.method.holder);
+              code.method().isInstanceInitializer()
+                  ? new ThisInstanceInfo(instruction.asArgument(), code.method().holder())
+                  : createInitializedType(code.method().holder());
         } else {
           argumentType =
-              createInitializedType(code.method.method.proto.parameters.values[argumentIndex]);
+              createInitializedType(code.method().method.proto.parameters.values[argumentIndex]);
         }
         Value outValue = instruction.outValue();
         if (outValue.outType().isObject()) {

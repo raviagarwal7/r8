@@ -5,16 +5,25 @@ package com.android.tools.r8.graph;
 
 import static com.android.tools.r8.graph.DexEncodedMethod.CompilationState.PROCESSED_INLINING_CANDIDATE_ANY;
 import static com.android.tools.r8.graph.DexEncodedMethod.CompilationState.PROCESSED_INLINING_CANDIDATE_SAME_CLASS;
+import static com.android.tools.r8.graph.DexEncodedMethod.CompilationState.PROCESSED_INLINING_CANDIDATE_SAME_NEST;
 import static com.android.tools.r8.graph.DexEncodedMethod.CompilationState.PROCESSED_INLINING_CANDIDATE_SAME_PACKAGE;
 import static com.android.tools.r8.graph.DexEncodedMethod.CompilationState.PROCESSED_INLINING_CANDIDATE_SUBCLASS;
 import static com.android.tools.r8.graph.DexEncodedMethod.CompilationState.PROCESSED_NOT_INLINING_CANDIDATE;
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+import static com.android.tools.r8.kotlin.KotlinMetadataUtils.NO_KOTLIN_INFO;
 
 import com.android.tools.r8.cf.code.CfConstNull;
+import com.android.tools.r8.cf.code.CfConstString;
 import com.android.tools.r8.cf.code.CfInstruction;
+import com.android.tools.r8.cf.code.CfInvoke;
+import com.android.tools.r8.cf.code.CfLoad;
+import com.android.tools.r8.cf.code.CfNew;
+import com.android.tools.r8.cf.code.CfStackInstruction;
+import com.android.tools.r8.cf.code.CfStackInstruction.Opcode;
+import com.android.tools.r8.cf.code.CfStore;
 import com.android.tools.r8.cf.code.CfThrow;
 import com.android.tools.r8.code.Const;
 import com.android.tools.r8.code.ConstString;
-import com.android.tools.r8.code.ConstStringJumbo;
 import com.android.tools.r8.code.Instruction;
 import com.android.tools.r8.code.InvokeDirect;
 import com.android.tools.r8.code.InvokeStatic;
@@ -27,35 +36,49 @@ import com.android.tools.r8.dex.MethodToCodeObjectMapping;
 import com.android.tools.r8.dex.MixedSectionCollection;
 import com.android.tools.r8.errors.InternalCompilerError;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo.ResolutionResult;
-import com.android.tools.r8.graph.ParameterUsagesInfo.ParameterUsage;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Invoke;
-import com.android.tools.r8.ir.code.Position;
-import com.android.tools.r8.ir.code.ValueNumberGenerator;
 import com.android.tools.r8.ir.code.ValueType;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.desugar.NestBasedAccessDesugaring.DexFieldWithAccess;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.Inliner.Reason;
+import com.android.tools.r8.ir.optimize.NestUtils;
+import com.android.tools.r8.ir.optimize.info.CallSiteOptimizationInfo;
+import com.android.tools.r8.ir.optimize.info.DefaultMethodOptimizationInfo;
+import com.android.tools.r8.ir.optimize.info.MethodOptimizationInfo;
+import com.android.tools.r8.ir.optimize.info.UpdatableMethodOptimizationInfo;
+import com.android.tools.r8.ir.optimize.inliner.WhyAreYouNotInliningReporter;
 import com.android.tools.r8.ir.regalloc.RegisterAllocator;
+import com.android.tools.r8.ir.synthetic.EmulateInterfaceSyntheticCfCodeProvider;
+import com.android.tools.r8.ir.synthetic.FieldAccessorSourceCode;
 import com.android.tools.r8.ir.synthetic.ForwardMethodSourceCode;
 import com.android.tools.r8.ir.synthetic.SynthesizedCode;
-import com.android.tools.r8.logging.Log;
+import com.android.tools.r8.kotlin.KotlinMethodLevelInfo;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.naming.MemberNaming.Signature;
 import com.android.tools.r8.naming.NamingLens;
-import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.shaking.AnnotationRemover;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.InternalOptions;
-import com.google.common.collect.ImmutableSet;
+import com.android.tools.r8.utils.OptionalBool;
+import com.android.tools.r8.utils.Pair;
+import com.google.common.collect.ImmutableList;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceArrayMap;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 import java.util.function.Consumer;
+import java.util.function.IntPredicate;
+import org.objectweb.asm.Opcodes;
 
-public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements ResolutionResult {
+public class DexEncodedMethod extends DexEncodedMember<DexEncodedMethod, DexMethod> {
+
+  public static final String CONFIGURATION_DEBUGGING_PREFIX = "Shaking error: Missing method in ";
 
   /**
    * Encodes the processing state of a method.
@@ -87,34 +110,54 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
      * the same package.
      */
     PROCESSED_INLINING_CANDIDATE_SAME_PACKAGE,
-    /**
-     * Code contains instructions that reference private entities.
-     */
-    PROCESSED_INLINING_CANDIDATE_SAME_CLASS,
+    /** Code contains instructions that reference private entities. */
+    PROCESSED_INLINING_CANDIDATE_SAME_NEST,
+    /** Code contains invoke super */
+    PROCESSED_INLINING_CANDIDATE_SAME_CLASS
   }
 
   public static final DexEncodedMethod[] EMPTY_ARRAY = {};
   public static final DexEncodedMethod SENTINEL =
-      new DexEncodedMethod(null, null, null, null, null);
+      new DexEncodedMethod(
+          null, null, DexAnnotationSet.empty(), ParameterAnnotationsList.empty(), null);
+  public static final Int2ReferenceMap<DebugLocalInfo> NO_PARAMETER_INFO =
+      new Int2ReferenceArrayMap<>(0);
 
   public final DexMethod method;
   public final MethodAccessFlags accessFlags;
-  public DexAnnotationSet annotations;
   public ParameterAnnotationsList parameterAnnotationsList;
   private Code code;
   // TODO(b/128967328): towards finer-grained inlining constraints,
   //   we need to maintain a set of states with (potentially different) contexts.
   private CompilationState compilationState = CompilationState.NOT_PROCESSED;
-  private OptimizationInfo optimizationInfo = DefaultOptimizationInfoImpl.DEFAULT_INSTANCE;
-  private int classFileVersion = -1;
+  private MethodOptimizationInfo optimizationInfo = DefaultMethodOptimizationInfo.DEFAULT_INSTANCE;
+  private CallSiteOptimizationInfo callSiteOptimizationInfo = CallSiteOptimizationInfo.bottom();
+  private int classFileVersion;
+  private KotlinMethodLevelInfo kotlinMemberInfo = NO_KOTLIN_INFO;
 
   private DexEncodedMethod defaultInterfaceMethodImplementation = null;
+
+  private OptionalBool isLibraryMethodOverride = OptionalBool.unknown();
+
+  private Int2ReferenceMap<DebugLocalInfo> parameterInfo = NO_PARAMETER_INFO;
 
   // This flag indicates the current instance is no longer up-to-date as another instance was
   // created based on this. Any further (public) operations on this instance will raise an error
   // to catch potential bugs due to the inconsistency (e.g., http://b/111893131)
   // Any newly added `public` method should check if `this` instance is obsolete.
   private boolean obsolete = false;
+
+  // This flag indicates if the method has been synthesized by D8/R8. Such method do not require
+  // a proguard mapping file entry. This flag is different from the synthesized access flag. When a
+  // non synthesized method is inlined into a synthesized method, the method no longer has the
+  // synthesized access flag, but the d8R8Synthesized flag is still there. Methods can also have
+  // the synthesized access flag prior to D8/R8 compilation, in which case d8R8Synthesized is not
+  // set.
+  private final boolean d8R8Synthesized;
+
+  public boolean isD8R8Synthesized() {
+    return d8R8Synthesized;
+  }
 
   private void checkIfObsolete() {
     assert !obsolete;
@@ -141,11 +184,8 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     assert implementation != null;
     assert code != null;
     assert code == implementation.getCode();
-    assert code.getOwner() == implementation;
     accessFlags.setAbstract();
     removeCode();
-    // Reset the code ownership to the implementation method as the above removeCode cleared it.
-    implementation.setCodeOwnership();
     defaultInterfaceMethodImplementation = implementation;
   }
 
@@ -168,24 +208,99 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
       DexAnnotationSet annotations,
       ParameterAnnotationsList parameterAnnotationsList,
       Code code) {
-    this.method = method;
-    this.accessFlags = accessFlags;
-    this.annotations = annotations;
-    this.parameterAnnotationsList = parameterAnnotationsList;
-    this.code = code;
-    assert code == null || !shouldNotHaveCode();
-    setCodeOwnership();
+    this(method, accessFlags, annotations, parameterAnnotationsList, code, -1);
   }
 
   public DexEncodedMethod(
       DexMethod method,
-      MethodAccessFlags flags,
-      DexAnnotationSet annotationSet,
-      ParameterAnnotationsList annotationsList,
+      MethodAccessFlags accessFlags,
+      DexAnnotationSet annotations,
+      ParameterAnnotationsList parameterAnnotationsList,
       Code code,
       int classFileVersion) {
-    this(method, flags, annotationSet, annotationsList, code);
+    this(method, accessFlags, annotations, parameterAnnotationsList, code, classFileVersion, false);
+  }
+
+  public DexEncodedMethod(
+      DexMethod method,
+      MethodAccessFlags accessFlags,
+      DexAnnotationSet annotations,
+      ParameterAnnotationsList parameterAnnotationsList,
+      Code code,
+      boolean d8R8Synthesized) {
+    this(method, accessFlags, annotations, parameterAnnotationsList, code, -1, d8R8Synthesized);
+  }
+
+  public DexEncodedMethod(
+      DexMethod method,
+      MethodAccessFlags accessFlags,
+      DexAnnotationSet annotations,
+      ParameterAnnotationsList parameterAnnotationsList,
+      Code code,
+      int classFileVersion,
+      boolean d8R8Synthesized) {
+    super(annotations);
+    this.method = method;
+    this.accessFlags = accessFlags;
+    this.parameterAnnotationsList = parameterAnnotationsList;
+    this.code = code;
     this.classFileVersion = classFileVersion;
+    this.d8R8Synthesized = d8R8Synthesized;
+    assert code == null || !shouldNotHaveCode();
+    assert parameterAnnotationsList != null;
+  }
+
+  public DexType getHolderType() {
+    return getReference().holder;
+  }
+
+  public DexString getName() {
+    return getReference().name;
+  }
+
+  public DexProto getProto() {
+    return getReference().proto;
+  }
+
+  public DexMethod getReference() {
+    return method;
+  }
+
+  public DexTypeList parameters() {
+    return method.proto.parameters;
+  }
+
+  public DexProto proto() {
+    return method.proto;
+  }
+
+  public DexType returnType() {
+    return method.proto.returnType;
+  }
+
+  public ParameterAnnotationsList liveParameterAnnotations(AppView<AppInfoWithLiveness> appView) {
+    return parameterAnnotationsList.keepIf(
+        annotation -> AnnotationRemover.shouldKeepAnnotation(appView, this, annotation));
+  }
+
+  public OptionalBool isLibraryMethodOverride() {
+    return isNonPrivateVirtualMethod() ? isLibraryMethodOverride : OptionalBool.FALSE;
+  }
+
+  public void setLibraryMethodOverride(OptionalBool isLibraryMethodOverride) {
+    assert isNonPrivateVirtualMethod();
+    assert !isLibraryMethodOverride.isUnknown();
+    assert isLibraryMethodOverride.isPossiblyFalse()
+            || this.isLibraryMethodOverride.isPossiblyTrue()
+        : "Method `"
+            + method.toSourceString()
+            + "` went from not overriding a library method to overriding a library method";
+    assert isLibraryMethodOverride.isPossiblyTrue()
+            || this.isLibraryMethodOverride.isPossiblyFalse()
+        : "Method `"
+            + method.toSourceString()
+            + "` went from overriding a library method to not overriding a library method";
+    this.isLibraryMethodOverride = isLibraryMethodOverride;
   }
 
   public boolean isProgramMethod(DexDefinitionSupplier definitions) {
@@ -196,9 +311,51 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     return false;
   }
 
+  public ProgramMethod asProgramMethod(DexDefinitionSupplier definitions) {
+    assert method.holder.isClassType();
+    DexProgramClass clazz = asProgramClassOrNull(definitions.definitionForHolder(method));
+    if (clazz != null) {
+      return new ProgramMethod(clazz, this);
+    }
+    return null;
+  }
+
+  public static ProgramMethod asProgramMethodOrNull(
+      DexEncodedMethod method, DexDefinitionSupplier definitions) {
+    return method != null ? method.asProgramMethod(definitions) : null;
+  }
+
   public boolean isProcessed() {
     checkIfObsolete();
     return compilationState != CompilationState.NOT_PROCESSED;
+  }
+
+  public boolean isAbstract() {
+    return accessFlags.isAbstract();
+  }
+
+  public boolean isBridge() {
+    return accessFlags.isBridge();
+  }
+
+  public boolean isFinal() {
+    return accessFlags.isFinal();
+  }
+
+  public boolean isNative() {
+    return accessFlags.isNative();
+  }
+
+  public boolean isPrivate() {
+    return accessFlags.isPrivate();
+  }
+
+  public boolean isPublic() {
+    return accessFlags.isPublic();
+  }
+
+  public boolean isSynchronized() {
+    return accessFlags.isSynchronized();
   }
 
   public boolean isInitializer() {
@@ -221,13 +378,25 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     return accessFlags.isConstructor() && accessFlags.isStatic();
   }
 
+  public boolean isDefaultMethod() {
+    // Assumes holder is an interface
+    return !isStatic() && !isAbstract() && !isPrivateMethod() && !isInstanceInitializer();
+  }
+
   /**
-   * Returns true if this method can be invoked via invoke-virtual, invoke-super or
-   * invoke-interface.
+   * Returns true if this method can be invoked via invoke-virtual/interface.
+   *
+   * <p>Note that also private methods can be the target of a virtual invoke. In such cases, the
+   * validity of the invoke depends on the access granted to the call site.
    */
   public boolean isVirtualMethod() {
     checkIfObsolete();
-    return !accessFlags.isStatic() && !accessFlags.isPrivate() && !accessFlags.isConstructor();
+    return !accessFlags.isStatic() && !accessFlags.isConstructor();
+  }
+
+  public boolean isNonPrivateVirtualMethod() {
+    checkIfObsolete();
+    return !isPrivateMethod() && isVirtualMethod();
   }
 
   /**
@@ -237,6 +406,11 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
   public boolean isNonAbstractVirtualMethod() {
     checkIfObsolete();
     return isVirtualMethod() && !accessFlags.isAbstract();
+  }
+
+  public boolean isNonAbstractNonNativeMethod() {
+    checkIfObsolete();
+    return !accessFlags.isAbstract() && !accessFlags.isNative();
   }
 
   public boolean isPublicized() {
@@ -282,40 +456,107 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     return accessFlags.isSynthetic();
   }
 
-  public boolean isInliningCandidate(
-      DexEncodedMethod container, Reason inliningReason, AppInfoWithSubtyping appInfo) {
-    checkIfObsolete();
-    return isInliningCandidate(container.method.holder, inliningReason, appInfo);
+  public KotlinMethodLevelInfo getKotlinMemberInfo() {
+    return kotlinMemberInfo;
+  }
+
+  public void setKotlinMemberInfo(KotlinMethodLevelInfo kotlinMemberInfo) {
+    // Structure-changing optimizations, such as (vertical|horizontal) merger or inliner, that
+    // may need to redefine what this method is. Simply, the method merged/inlined by optimization
+    // is no longer what it used to be; it's safe to ignore metadata of that method, since it is
+    // not asked to be kept. But, the nature of the current one is not changed, hence keeping the
+    // original one as-is.
+    // E.g., originally the current method is extension function, and new information, say, from
+    // an inlinee, is extension property. Being merged here means:
+    //   * That inlinee is not an extension property anymore. We can ignore metadata from it.
+    //   * This method is still an extension function, just with a bigger body.
+    assert this.kotlinMemberInfo == NO_KOTLIN_INFO;
+    this.kotlinMemberInfo = kotlinMemberInfo;
+  }
+
+  public boolean isKotlinFunction() {
+    return kotlinMemberInfo.isFunction();
+  }
+
+  public boolean isKotlinExtensionFunction() {
+    return kotlinMemberInfo.isFunction() && kotlinMemberInfo.asFunction().isExtensionFunction();
+  }
+
+  public boolean isOnlyInlinedIntoNestMembers() {
+    return compilationState == PROCESSED_INLINING_CANDIDATE_SAME_NEST;
   }
 
   public boolean isInliningCandidate(
-      DexType containerType, Reason inliningReason, AppInfoWithSubtyping appInfo) {
+      ProgramMethod container,
+      Reason inliningReason,
+      AppInfoWithClassHierarchy appInfo,
+      WhyAreYouNotInliningReporter whyAreYouNotInliningReporter) {
     checkIfObsolete();
-    if (isClassInitializer()) {
-      // This will probably never happen but never inline a class initializer.
-      return false;
-    }
+    return isInliningCandidate(
+        container.getHolderType(), inliningReason, appInfo, whyAreYouNotInliningReporter);
+  }
+
+  public boolean isInliningCandidate(
+      DexType containerType,
+      Reason inliningReason,
+      AppInfoWithClassHierarchy appInfo,
+      WhyAreYouNotInliningReporter whyAreYouNotInliningReporter) {
+    checkIfObsolete();
+
     if (inliningReason == Reason.FORCE) {
       // Make sure we would be able to inline this normally.
-      if (!isInliningCandidate(containerType, Reason.SIMPLE, appInfo)) {
+      if (!isInliningCandidate(
+          containerType, Reason.SIMPLE, appInfo, whyAreYouNotInliningReporter)) {
         // If not, raise a flag, because some optimizations that depend on force inlining would
         // silently produce an invalid code, which is worse than an internal error.
         throw new InternalCompilerError("FORCE inlining on non-inlinable: " + toSourceString());
       }
       return true;
     }
+
     // TODO(b/128967328): inlining candidate should satisfy all states if multiple states are there.
     switch (compilationState) {
       case PROCESSED_INLINING_CANDIDATE_ANY:
         return true;
+
       case PROCESSED_INLINING_CANDIDATE_SUBCLASS:
-        return appInfo.isSubtype(containerType, method.holder);
-      case PROCESSED_INLINING_CANDIDATE_SAME_PACKAGE:
-        return containerType.isSamePackage(method.holder);
-      case PROCESSED_INLINING_CANDIDATE_SAME_CLASS:
-        return containerType == method.holder;
-      default:
+        if (appInfo.isSubtype(containerType, method.holder)) {
+          return true;
+        }
+        whyAreYouNotInliningReporter.reportCallerNotSubtype();
         return false;
+
+      case PROCESSED_INLINING_CANDIDATE_SAME_PACKAGE:
+        if (containerType.isSamePackage(method.holder)) {
+          return true;
+        }
+        whyAreYouNotInliningReporter.reportCallerNotSamePackage();
+        return false;
+
+      case PROCESSED_INLINING_CANDIDATE_SAME_NEST:
+        if (NestUtils.sameNest(containerType, method.holder, appInfo)) {
+          return true;
+        }
+        whyAreYouNotInliningReporter.reportCallerNotSameNest();
+        return false;
+
+      case PROCESSED_INLINING_CANDIDATE_SAME_CLASS:
+        if (containerType == method.holder) {
+          return true;
+        }
+        whyAreYouNotInliningReporter.reportCallerNotSameClass();
+        return false;
+
+      case PROCESSED_NOT_INLINING_CANDIDATE:
+        whyAreYouNotInliningReporter.reportInlineeNotInliningCandidate();
+        return false;
+
+      case NOT_PROCESSED:
+        whyAreYouNotInliningReporter.reportInlineeNotProcessed();
+        return false;
+
+      default:
+        throw new Unreachable("Unexpected compilation state: " + compilationState);
     }
   }
 
@@ -332,6 +573,9 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
       case PACKAGE:
         compilationState = PROCESSED_INLINING_CANDIDATE_SAME_PACKAGE;
         break;
+      case SAMENEST:
+        compilationState = PROCESSED_INLINING_CANDIDATE_SAME_NEST;
+        break;
       case SAMECLASS:
         compilationState = PROCESSED_INLINING_CANDIDATE_SAME_CLASS;
         break;
@@ -347,33 +591,40 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     compilationState = CompilationState.NOT_PROCESSED;
   }
 
-  public IRCode buildIR(AppView<? extends AppInfo> appView, Origin origin) {
+  public void setCode(Code newCode, AppView<?> appView) {
     checkIfObsolete();
-    return code == null ? null : code.buildIR(this, appView, origin);
+    // If the locals are not kept, we might still need information to satisfy -keepparameternames.
+    // The information needs to be retrieved on the original code object before replacing it.
+    if (code != null && code.isCfCode() && !hasParameterInfo() && !keepLocals(appView.options())) {
+      setParameterInfo(code.collectParameterInfo(this, appView));
+    }
+    code = newCode;
   }
 
-  public IRCode buildInliningIR(
-      DexEncodedMethod context,
-      AppView<? extends AppInfo> appView,
-      ValueNumberGenerator valueNumberGenerator,
-      Position callerPosition,
-      Origin origin) {
+  public void setCode(IRCode ir, RegisterAllocator registerAllocator, AppView<?> appView) {
     checkIfObsolete();
-    return code.buildInliningIR(
-        context, this, appView, valueNumberGenerator, callerPosition, origin);
+    DexBuilder builder = new DexBuilder(ir, registerAllocator);
+    setCode(builder.build(), appView);
   }
 
-  public void setCode(Code code) {
-    checkIfObsolete();
-    voidCodeOwnership();
-    this.code = code;
-    setCodeOwnership();
+  public boolean keepLocals(InternalOptions options) {
+    if (options.testing.noLocalsTableOnInput) {
+      return false;
+    }
+    return options.debug || getOptimizationInfo().isReachabilitySensitive();
   }
 
-  public void setCode(IRCode ir, RegisterAllocator registerAllocator, InternalOptions options) {
-    checkIfObsolete();
-    final DexBuilder builder = new DexBuilder(ir, registerAllocator);
-    setCode(builder.build());
+  private void setParameterInfo(Int2ReferenceMap<DebugLocalInfo> parameterInfo) {
+    assert this.parameterInfo == NO_PARAMETER_INFO;
+    this.parameterInfo = parameterInfo;
+  }
+
+  public boolean hasParameterInfo() {
+    return parameterInfo != NO_PARAMETER_INFO;
+  }
+
+  public Map<Integer, DebugLocalInfo> getParameterInfo() {
+    return parameterInfo;
   }
 
   @Override
@@ -390,7 +641,7 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     if (code != null) {
       code.collectIndexedItems(indexedItems, this.method);
     }
-    annotations.collectIndexedItems(indexedItems);
+    annotations().collectIndexedItems(indexedItems);
     parameterAnnotationsList.collectIndexedItems(indexedItems);
   }
 
@@ -405,7 +656,7 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     if (code != null) {
       code.collectMixedSectionItems(mixedItems);
     }
-    annotations.collectMixedSectionItems(mixedItems);
+    annotations().collectMixedSectionItems(mixedItems);
     parameterAnnotationsList.collectMixedSectionItems(mixedItems);
   }
 
@@ -424,20 +675,7 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
 
   public void removeCode() {
     checkIfObsolete();
-    voidCodeOwnership();
     code = null;
-  }
-
-  private void setCodeOwnership() {
-    if (code != null) {
-      code.setOwner(this);
-    }
-  }
-
-  public void voidCodeOwnership() {
-    if (code != null) {
-      code.setOwner(null);
-    }
   }
 
   public int getClassFileVersion() {
@@ -454,8 +692,7 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
   public void upgradeClassFileVersion(int version) {
     checkIfObsolete();
     assert version >= 0;
-    assert !hasClassFileVersion() || version >= getClassFileVersion();
-    classFileVersion = version;
+    classFileVersion = Math.max(classFileVersion, version);
   }
 
   public String qualifiedName() {
@@ -478,6 +715,10 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     builder.append(")");
     builder.append(namingLens.lookupDescriptor(method.proto.returnType).toString());
     return builder.toString();
+  }
+
+  public void clearParameterAnnotations() {
+    parameterAnnotationsList = ParameterAnnotationsList.empty();
   }
 
   public String toSmaliString(ClassNameMapper naming) {
@@ -511,30 +752,20 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     // 'final' wants this to be *not* overridden, while 'abstract' wants this to be implemented in
     // a subtype, i.e., self contradict.
     assert !accessFlags.isFinal();
+    // static abstract is an invalid access combination and we should never create that.
+    assert !accessFlags.isStatic();
     accessFlags.setAbstract();
-    voidCodeOwnership();
     this.code = null;
     return this;
   }
 
-  public IRCode buildEmptyThrowingIRCode(AppView<? extends AppInfo> appView, Origin origin) {
-    DexCode emptyThrowingDexCode = buildEmptyThrowingDexCode();
-    emptyThrowingDexCode.setOwner(this);
-    return emptyThrowingDexCode.buildIR(this, appView, origin);
-  }
-
   /**
    * Generates a {@link DexCode} object for the given instructions.
-   * <p>
-   * As the code object is produced outside of the normal compilation cycle, it has to use {@link
-   * ConstStringJumbo} to reference string constants. Hence, code produced form these templates
-   * might incur a size overhead.
    */
   private DexCode generateCodeFromTemplate(
       int numberOfRegisters, int outRegisters, Instruction... instructions) {
     int offset = 0;
     for (Instruction instruction : instructions) {
-      assert !(instruction instanceof ConstString);
       instruction.setOffset(offset);
       offset += instruction.getSize();
     }
@@ -552,28 +783,48 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
         null);
   }
 
-  public DexCode buildEmptyThrowingDexCode() {
-    Instruction insn[] = {new Const(0, 0), new Throw(0)};
-    return generateCodeFromTemplate(1, 0, insn);
+  public DexEncodedMethod toEmptyThrowingMethod(InternalOptions options) {
+    return options.isGeneratingClassFiles()
+        ? toEmptyThrowingMethodCf()
+        : toEmptyThrowingMethodDex(true);
   }
 
-  public DexEncodedMethod toEmptyThrowingMethodDex() {
+  public DexEncodedMethod toEmptyThrowingMethodDex(boolean setIsLibraryOverride) {
     checkIfObsolete();
     assert !shouldNotHaveCode();
     Builder builder = builder(this);
     builder.setCode(buildEmptyThrowingDexCode());
-    // Note that we are not marking this instance obsolete, since this util is only used by
-    // TreePruner while keeping non-live yet targeted, empty method. Such method can be retrieved
-    // again only during the 2nd round of tree sharking, and seeing an obsolete empty body v.s.
-    // seeing this empty throwing code do not matter.
-    // If things are changed, the cure point is obsolete instances inside RootSet.
-    return builder.build();
+    if (setIsLibraryOverride && isNonPrivateVirtualMethod()) {
+      builder.setIsLibraryMethodOverride(isLibraryMethodOverride());
+    }
+    DexEncodedMethod result = builder.build();
+    setObsolete();
+    return result;
+  }
+
+  private DexEncodedMethod toEmptyThrowingMethodCf() {
+    checkIfObsolete();
+    assert !shouldNotHaveCode();
+    Builder builder = builder(this);
+    builder.setCode(buildEmptyThrowingCfCode());
+    if (isNonPrivateVirtualMethod()) {
+      builder.setIsLibraryMethodOverride(isLibraryMethodOverride());
+    }
+    DexEncodedMethod result = builder.build();
+    setObsolete();
+    return result;
+  }
+
+  public Code buildEmptyThrowingCode(InternalOptions options) {
+    return options.isGeneratingClassFiles()
+        ? buildEmptyThrowingCfCode()
+        : buildEmptyThrowingDexCode();
   }
 
   public CfCode buildEmptyThrowingCfCode() {
     CfInstruction insn[] = {new CfConstNull(), new CfThrow()};
     return new CfCode(
-        method,
+        method.holder,
         1,
         method.proto.parameters.size() + 1,
         Arrays.asList(insn),
@@ -581,57 +832,116 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
         Collections.emptyList());
   }
 
-  public DexEncodedMethod toEmptyThrowingMethodCf() {
+  public DexCode buildEmptyThrowingDexCode() {
+    Instruction insn[] = {new Const(0, 0), new Throw(0)};
+    return generateCodeFromTemplate(1, 0, insn);
+  }
+
+  public DexEncodedMethod toMethodThatLogsError(AppView<?> appView) {
+    if (appView.options().isGeneratingDex()) {
+      return toMethodThatLogsErrorDexCode(appView.dexItemFactory());
+    } else {
+      return toMethodThatLogsErrorCfCode(appView.dexItemFactory());
+    }
+  }
+
+  public static void setDebugInfoWithFakeThisParameter(Code code, int arity, AppView<?> appView) {
+    if (code.isDexCode()) {
+      DexCode dexCode = code.asDexCode();
+      dexCode.setDebugInfo(dexCode.debugInfoWithFakeThisParameter(appView.dexItemFactory()));
+      assert (dexCode.getDebugInfo() == null)
+          || (arity == dexCode.getDebugInfo().parameters.length);
+    } else {
+      assert code.isCfCode();
+      CfCode cfCode = code.asCfCode();
+      cfCode.addFakeThisParameter(appView.dexItemFactory());
+    }
+  }
+
+  private DexEncodedMethod toMethodThatLogsErrorDexCode(DexItemFactory itemFactory) {
     checkIfObsolete();
-    assert !shouldNotHaveCode();
+    Signature signature = MethodSignature.fromDexMethod(method);
+    DexString message =
+        itemFactory.createString(
+            CONFIGURATION_DEBUGGING_PREFIX + method.holder.toSourceString() + ": " + signature);
+    DexString tag = itemFactory.createString("[R8]");
+    DexType[] args = {itemFactory.stringType, itemFactory.stringType};
+    DexProto proto = itemFactory.createProto(itemFactory.intType, args);
+    DexMethod logMethod =
+        itemFactory.createMethod(
+            itemFactory.androidUtilLogType, proto, itemFactory.createString("e"));
+    DexType exceptionType = itemFactory.runtimeExceptionType;
+    DexMethod exceptionInitMethod =
+        itemFactory.createMethod(
+            exceptionType,
+            itemFactory.createProto(itemFactory.voidType, itemFactory.stringType),
+            itemFactory.constructorMethodName);
+    DexCode code =
+        generateCodeFromTemplate(
+            2,
+            2,
+            new ConstString(0, tag),
+            new ConstString(1, message),
+            new InvokeStatic(2, logMethod, 0, 1, 0, 0, 0),
+            new NewInstance(0, exceptionType),
+            new InvokeDirect(2, exceptionInitMethod, 0, 1, 0, 0, 0),
+            new Throw(0));
     Builder builder = builder(this);
-    builder.setCode(buildEmptyThrowingCfCode());
-    // Note that we are not marking this instance obsolete:
-    // refer to Dex-backend version of this method above.
+    builder.setCode(code);
+    setObsolete();
     return builder.build();
   }
 
-  public DexEncodedMethod toMethodThatLogsError(DexItemFactory itemFactory) {
+  private DexEncodedMethod toMethodThatLogsErrorCfCode(DexItemFactory itemFactory) {
     checkIfObsolete();
     Signature signature = MethodSignature.fromDexMethod(method);
-    // TODO(herhut): Construct this out of parts to enable reuse, maybe even using descriptors.
-    DexString message = itemFactory.createString(
-        "Shaking error: Missing method in " + method.holder.toSourceString() + ": "
-            + signature);
-    DexString tag = itemFactory.createString("TOIGHTNESS");
-    DexType[] args = {itemFactory.stringType, itemFactory.stringType};
-    DexProto proto = itemFactory.createProto(itemFactory.intType, args);
-    DexMethod logMethod = itemFactory
-        .createMethod(itemFactory.createType("Landroid/util/Log;"), proto,
-            itemFactory.createString("e"));
-    DexType exceptionType = itemFactory.createType("Ljava/lang/RuntimeException;");
-    DexMethod exceptionInitMethod = itemFactory
-        .createMethod(exceptionType, itemFactory.createProto(itemFactory.voidType,
-            itemFactory.stringType),
+    DexString message =
+        itemFactory.createString(
+            CONFIGURATION_DEBUGGING_PREFIX + method.holder.toSourceString() + ": " + signature);
+    DexString tag = itemFactory.createString("[R8]");
+    DexType logger = itemFactory.javaUtilLoggingLoggerType;
+    DexMethod getLogger =
+        itemFactory.createMethod(
+            logger,
+            itemFactory.createProto(logger, itemFactory.stringType),
+            itemFactory.createString("getLogger"));
+    DexMethod severe =
+        itemFactory.createMethod(
+            logger,
+            itemFactory.createProto(itemFactory.voidType, itemFactory.stringType),
+            itemFactory.createString("severe"));
+    DexType exceptionType = itemFactory.runtimeExceptionType;
+    DexMethod exceptionInitMethod =
+        itemFactory.createMethod(
+            exceptionType,
+            itemFactory.createProto(itemFactory.voidType, itemFactory.stringType),
             itemFactory.constructorMethodName);
-    DexCode code;
-    if (isInstanceInitializer()) {
-      // The Java VM Spec requires that a constructor calls an initializer from the super class
-      // or another constructor from the current class. For simplicity we do the latter by just
-      // calling ourself. This is ok, as the constructor always throws before the recursive call.
-      code = generateCodeFromTemplate(3, 2, new ConstStringJumbo(0, tag),
-          new ConstStringJumbo(1, message),
-          new InvokeStatic(2, logMethod, 0, 1, 0, 0, 0),
-          new NewInstance(0, exceptionType),
-          new InvokeDirect(2, exceptionInitMethod, 0, 1, 0, 0, 0),
-          new Throw(0),
-          new InvokeDirect(1, method, 2, 0, 0, 0, 0));
-
-    } else {
-      // These methods might not get registered for jumbo string processing, therefore we always
-      // use the jumbo string encoding for the const string instruction.
-      code = generateCodeFromTemplate(2, 2, new ConstStringJumbo(0, tag),
-          new ConstStringJumbo(1, message),
-          new InvokeStatic(2, logMethod, 0, 1, 0, 0, 0),
-          new NewInstance(0, exceptionType),
-          new InvokeDirect(2, exceptionInitMethod, 0, 1, 0, 0, 0),
-          new Throw(0));
+    int locals = method.proto.parameters.size() + 1;
+    if (!isStaticMember()) {
+      // Consider `this` pointer
+      locals++;
     }
+    ImmutableList.Builder<CfInstruction> instructionBuilder = ImmutableList.builder();
+    instructionBuilder
+        .add(new CfConstString(tag))
+        .add(new CfInvoke(Opcodes.INVOKESTATIC, getLogger, false))
+        .add(new CfStore(ValueType.OBJECT, locals - 1))
+        .add(new CfLoad(ValueType.OBJECT, locals - 1))
+        .add(new CfConstString(message))
+        .add(new CfInvoke(Opcodes.INVOKEVIRTUAL, severe, false))
+        .add(new CfNew(exceptionType))
+        .add(new CfStackInstruction(Opcode.Dup))
+        .add(new CfConstString(message))
+        .add(new CfInvoke(Opcodes.INVOKESPECIAL, exceptionInitMethod, false))
+        .add(new CfThrow());
+    CfCode code =
+        new CfCode(
+            method.holder,
+            3,
+            locals,
+            instructionBuilder.build(),
+            Collections.emptyList(),
+            Collections.emptyList());
     Builder builder = builder(this);
     builder.setCode(code);
     setObsolete();
@@ -640,27 +950,147 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
 
   public DexEncodedMethod toTypeSubstitutedMethod(DexMethod method) {
     checkIfObsolete();
+    return toTypeSubstitutedMethod(method, null);
+  }
+
+  public DexEncodedMethod toTypeSubstitutedMethod(DexMethod method, Consumer<Builder> consumer) {
+    checkIfObsolete();
     if (this.method == method) {
       return this;
     }
     Builder builder = builder(this);
     builder.setMethod(method);
-    // TODO(b/112847660): Fix type fixers that use this method: Staticizer
-    // TODO(b/112847660): Fix type fixers that use this method: VerticalClassMerger
+    // TODO(b/112847660): Fix type fixers that use this method: Class staticizer
+    // TODO(b/112847660): Fix type fixers that use this method: Uninstantiated type optimization
+    // TODO(b/112847660): Fix type fixers that use this method: Unused argument removal
+    // TODO(b/112847660): Fix type fixers that use this method: Vertical class merger
     // setObsolete();
+    if (consumer != null) {
+      consumer.accept(builder);
+    }
     return builder.build();
   }
 
-  public DexEncodedMethod toRenamedMethod(DexString name, DexItemFactory factory) {
-    checkIfObsolete();
-    if (method.name == name) {
-      return this;
-    }
-    DexMethod newMethod = factory.createMethod(method.holder, method.proto, name);
-    Builder builder = builder(this);
+  public ProgramMethod toInitializerForwardingBridge(DexProgramClass holder, DexMethod newMethod) {
+    assert accessFlags.isPrivate()
+        : "Expected to create bridge for private constructor as part of nest-based access"
+            + " desugaring";
+    Builder builder = syntheticBuilder(this);
     builder.setMethod(newMethod);
-    setObsolete();
+    ForwardMethodSourceCode.Builder forwardSourceCodeBuilder =
+        ForwardMethodSourceCode.builder(newMethod);
+    forwardSourceCodeBuilder
+        .setReceiver(holder.type)
+        .setTargetReceiver(holder.type)
+        .setTarget(method)
+        .setInvokeType(Invoke.Type.DIRECT)
+        .setExtraNullParameter();
+    builder.setCode(
+        new SynthesizedCode(
+            forwardSourceCodeBuilder::build, registry -> registry.registerInvokeDirect(method)));
+    assert !builder.accessFlags.isStatic();
+    assert !holder.isInterface();
+    builder.accessFlags.unsetPrivate();
+    builder.accessFlags.setSynthetic();
+    builder.accessFlags.setConstructor();
+    return new ProgramMethod(holder, builder.build());
+  }
+
+  public static ProgramMethod createFieldAccessorBridge(
+      DexFieldWithAccess fieldWithAccess, DexProgramClass holder, DexMethod newMethod) {
+    assert holder.type == fieldWithAccess.getHolder();
+    MethodAccessFlags accessFlags =
+        MethodAccessFlags.fromSharedAccessFlags(
+            Constants.ACC_SYNTHETIC
+                | Constants.ACC_STATIC
+                | (holder.isInterface() ? Constants.ACC_PUBLIC : 0),
+            false);
+    Code code =
+        new SynthesizedCode(
+            callerPosition ->
+                new FieldAccessorSourceCode(
+                    null, newMethod, callerPosition, newMethod, fieldWithAccess),
+            registry -> {
+              if (fieldWithAccess.isInstanceGet()) {
+                registry.registerInstanceFieldRead(fieldWithAccess.getField());
+              } else if (fieldWithAccess.isStaticGet()) {
+                registry.registerStaticFieldRead(fieldWithAccess.getField());
+              } else if (fieldWithAccess.isInstancePut()) {
+                registry.registerInstanceFieldWrite(fieldWithAccess.getField());
+              } else {
+                assert fieldWithAccess.isStaticPut();
+                registry.registerStaticFieldWrite(fieldWithAccess.getField());
+              }
+            });
+    return new ProgramMethod(
+        holder,
+        new DexEncodedMethod(
+            newMethod,
+            accessFlags,
+            DexAnnotationSet.empty(),
+            ParameterAnnotationsList.empty(),
+            code,
+            true));
+  }
+
+  public DexEncodedMethod toRenamedHolderMethod(DexType newHolderType, DexItemFactory factory) {
+    DexEncodedMethod.Builder builder = DexEncodedMethod.builder(this);
+    builder.setMethod(factory.createMethod(newHolderType, method.proto, method.name));
     return builder.build();
+  }
+
+  public static DexEncodedMethod toEmulateDispatchLibraryMethod(
+      DexType interfaceType,
+      DexMethod newMethod,
+      DexMethod companionMethod,
+      DexMethod libraryMethod,
+      List<Pair<DexType, DexMethod>> extraDispatchCases,
+      AppView<?> appView) {
+    MethodAccessFlags accessFlags =
+        MethodAccessFlags.fromSharedAccessFlags(
+            Constants.ACC_SYNTHETIC | Constants.ACC_STATIC | Constants.ACC_PUBLIC, false);
+    CfCode code =
+        new EmulateInterfaceSyntheticCfCodeProvider(
+                interfaceType, companionMethod, libraryMethod, extraDispatchCases, appView)
+            .generateCfCode();
+    return new DexEncodedMethod(
+        newMethod,
+        accessFlags,
+        DexAnnotationSet.empty(),
+        ParameterAnnotationsList.empty(),
+        code,
+        true);
+  }
+
+  public ProgramMethod toStaticForwardingBridge(DexProgramClass holder, DexMethod newMethod) {
+    assert accessFlags.isPrivate()
+        : "Expected to create bridge for private method as part of nest-based access desugaring";
+    Builder builder = syntheticBuilder(this);
+    builder.setMethod(newMethod);
+    ForwardMethodSourceCode.Builder forwardSourceCodeBuilder =
+        ForwardMethodSourceCode.builder(newMethod);
+    forwardSourceCodeBuilder
+        .setTargetReceiver(accessFlags.isStatic() ? null : method.holder)
+        .setTarget(method)
+        .setInvokeType(accessFlags.isStatic() ? Invoke.Type.STATIC : Invoke.Type.DIRECT)
+        .setIsInterface(holder.isInterface());
+    builder.setCode(
+        new SynthesizedCode(
+            forwardSourceCodeBuilder::build,
+            registry -> {
+              if (accessFlags.isStatic()) {
+                registry.registerInvokeStatic(method);
+              } else {
+                registry.registerInvokeDirect(method);
+              }
+            }));
+    builder.accessFlags.setSynthetic();
+    builder.accessFlags.setStatic();
+    builder.accessFlags.unsetPrivate();
+    if (holder.isInterface()) {
+      builder.accessFlags.setPublic();
+    }
+    return new ProgramMethod(holder, builder.build());
   }
 
   public DexEncodedMethod toForwardingMethod(DexClass holder, DexDefinitionSupplier definitions) {
@@ -673,7 +1103,7 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     DexMethod newMethod =
         definitions.dexItemFactory().createMethod(holder.type, method.proto, method.name);
     Invoke.Type type = accessFlags.isStatic() ? Invoke.Type.STATIC : Invoke.Type.SUPER;
-    Builder builder = builder(this);
+    Builder builder = syntheticBuilder(this);
     builder.setMethod(newMethod);
     if (accessFlags.isAbstract()) {
       // If the forwarding target is abstract, we can just create an abstract method. While it
@@ -682,18 +1112,17 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     } else {
       // Create code that forwards the call to the target.
       DexClass target = definitions.definitionFor(method.holder);
+      ForwardMethodSourceCode.Builder forwardSourceCodeBuilder =
+          ForwardMethodSourceCode.builder(newMethod);
+      forwardSourceCodeBuilder
+          .setReceiver(accessFlags.isStatic() ? null : holder.type)
+          .setTargetReceiver(accessFlags.isStatic() ? null : method.holder)
+          .setTarget(method)
+          .setInvokeType(type)
+          .setIsInterface(target.isInterface());
       builder.setCode(
           new SynthesizedCode(
-              callerPosition ->
-                  new ForwardMethodSourceCode(
-                      accessFlags.isStatic() ? null : holder.type,
-                      newMethod,
-                      newMethod,
-                      accessFlags.isStatic() ? null : method.holder,
-                      method,
-                      type,
-                      callerPosition,
-                      target.isInterface()),
+              forwardSourceCodeBuilder::build,
               registry -> {
                 if (accessFlags.isStatic()) {
                   registry.registerInvokeStatic(method);
@@ -709,11 +1138,41 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
     return builder.build();
   }
 
+  public static DexEncodedMethod createDesugaringForwardingMethod(
+      DexEncodedMethod target, DexClass clazz, DexMethod forwardMethod, DexItemFactory factory) {
+    DexMethod method = target.method;
+    assert forwardMethod != null;
+    // New method will have the same name, proto, and also all the flags of the
+    // default method, including bridge flag.
+    DexMethod newMethod = factory.createMethod(clazz.type, method.proto, method.name);
+    MethodAccessFlags newFlags = target.accessFlags.copy();
+    // Some debuggers (like IntelliJ) automatically skip synthetic methods on single step.
+    newFlags.setSynthetic();
+    newFlags.unsetAbstract();
+    ForwardMethodSourceCode.Builder forwardSourceCodeBuilder =
+        ForwardMethodSourceCode.builder(newMethod);
+    forwardSourceCodeBuilder
+        .setReceiver(clazz.type)
+        .setTarget(forwardMethod)
+        .setInvokeType(Invoke.Type.STATIC)
+        .setIsInterface(false); // Holder is companion class, or retarget method, not an interface.
+    return new DexEncodedMethod(
+        newMethod,
+        newFlags,
+        DexAnnotationSet.empty(),
+        ParameterAnnotationsList.empty(),
+        new SynthesizedCode(forwardSourceCodeBuilder::build),
+        true);
+  }
+
   public DexEncodedMethod toStaticMethodWithoutThis() {
     checkIfObsolete();
     assert !accessFlags.isStatic();
     Builder builder =
-        builder(this).promoteToStatic().unsetOptimizationInfo().withoutThisParameter();
+        builder(this)
+            .promoteToStatic()
+            .withoutThisParameter()
+            .adjustOptimizationInfoAfterRemovingThisParameter();
     DexEncodedMethod method = builder.build();
     method.copyMetadata(this);
     setObsolete();
@@ -754,14 +1213,7 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
   }
 
   @Override
-  public DexMethod getKey() {
-    // Here, we can't check if the current instance of DexEncodedMethod is obsolete
-    // because itself can be used as a key while making mappings to avoid using obsolete instances.
-    return method;
-  }
-
-  @Override
-  public DexReference toReference() {
+  public DexMethod toReference() {
     checkIfObsolete();
     return method;
   }
@@ -780,583 +1232,148 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
 
   public boolean hasAnnotation() {
     checkIfObsolete();
-    return !annotations.isEmpty() || !parameterAnnotationsList.isEmpty();
-  }
-
-  public void registerCodeReferences(UseRegistry registry) {
-    checkIfObsolete();
-    if (code != null) {
-      if (Log.ENABLED) {
-        Log.verbose(getClass(), "Registering definitions reachable from `%s`.", method);
-      }
-      code.registerCodeReferences(registry);
-    }
+    return !annotations().isEmpty() || !parameterAnnotationsList.isEmpty();
   }
 
   public static int slowCompare(DexEncodedMethod m1, DexEncodedMethod m2) {
     return m1.method.slowCompareTo(m2.method);
   }
 
-  public static class ClassInlinerEligibility {
-    public final boolean returnsReceiver;
-
-    public ClassInlinerEligibility(boolean returnsReceiver) {
-      this.returnsReceiver = returnsReceiver;
-    }
-  }
-
-  public static class TrivialInitializer {
-    private TrivialInitializer() {
-    }
-
-    // Defines instance trivial initialized, see details in comments
-    // to CodeRewriter::computeInstanceInitializerInfo(...)
-    public static final class TrivialInstanceInitializer extends TrivialInitializer {
-      public static final TrivialInstanceInitializer INSTANCE =
-          new TrivialInstanceInitializer();
-    }
-
-    // Defines class trivial initialized, see details in comments
-    // to CodeRewriter::computeClassInitializerInfo(...)
-    public static final class TrivialClassInitializer extends TrivialInitializer {
-      public final DexField field;
-
-      public TrivialClassInitializer(DexField field) {
-        this.field = field;
-      }
-    }
-  }
-
-  public static class DefaultOptimizationInfoImpl implements OptimizationInfo {
-    public static final OptimizationInfo DEFAULT_INSTANCE = new DefaultOptimizationInfoImpl();
-
-    public static Set<DexType> UNKNOWN_INITIALIZED_CLASSES_ON_NORMAL_EXIT = ImmutableSet.of();
-    public static int UNKNOWN_RETURNED_ARGUMENT = -1;
-    public static boolean UNKNOWN_NEVER_RETURNS_NULL = false;
-    public static boolean UNKNOWN_NEVER_RETURNS_NORMALLY = false;
-    public static boolean UNKNOWN_RETURNS_CONSTANT = false;
-    public static long UNKNOWN_RETURNED_CONSTANT_NUMBER = 0;
-    public static DexString UNKNOWN_RETURNED_CONSTANT_STRING = null;
-    public static boolean DOES_NOT_USE_IDNETIFIER_NAME_STRING = false;
-    public static boolean UNKNOWN_CHECKS_NULL_RECEIVER_BEFORE_ANY_SIDE_EFFECT = false;
-    public static boolean UNKNOWN_TRIGGERS_CLASS_INIT_BEFORE_ANY_SIDE_EFFECT = false;
-    public static ClassInlinerEligibility UNKNOWN_CLASS_INLINER_ELIGIBILITY = null;
-    public static TrivialInitializer UNKNOWN_TRIVIAL_INITIALIZER = null;
-    public static boolean UNKNOWN_INITIALIZER_ENABLING_JAVA_ASSERTIONS = false;
-    public static ParameterUsagesInfo UNKNOWN_PARAMETER_USAGE_INFO = null;
-    public static boolean UNKNOWN_MAY_HAVE_SIDE_EFFECTS = true;
-    public static BitSet NO_NULL_PARAMETER_OR_THROW_FACTS = null;
-    public static BitSet NO_NULL_PARAMETER_ON_NORMAL_EXITS_FACTS = null;
-
-    private DefaultOptimizationInfoImpl() {}
-
-    @Override
-    public Set<DexType> getInitializedClassesOnNormalExit() {
-      return UNKNOWN_INITIALIZED_CLASSES_ON_NORMAL_EXIT;
-    }
-
-    @Override
-    public TrivialInitializer getTrivialInitializerInfo() {
-      return UNKNOWN_TRIVIAL_INITIALIZER;
-    }
-
-    @Override
-    public ParameterUsage getParameterUsages(int parameter) {
-      assert UNKNOWN_PARAMETER_USAGE_INFO == null;
-      return null;
-    }
-
-    @Override
-    public BitSet getNonNullParamOrThrow() {
-      return NO_NULL_PARAMETER_OR_THROW_FACTS;
-    }
-
-    @Override
-    public BitSet getNonNullParamOnNormalExits() {
-      return NO_NULL_PARAMETER_ON_NORMAL_EXITS_FACTS;
-    }
-
-    @Override
-    public boolean isReachabilitySensitive() {
-      return false;
-    }
-
-    @Override
-    public boolean returnsArgument() {
-      return false;
-    }
-
-    @Override
-    public int getReturnedArgument() {
-      assert returnsArgument();
-      return UNKNOWN_RETURNED_ARGUMENT;
-    }
-
-    @Override
-    public boolean neverReturnsNull() {
-      return UNKNOWN_NEVER_RETURNS_NULL;
-    }
-
-    @Override
-    public boolean neverReturnsNormally() {
-      return UNKNOWN_NEVER_RETURNS_NORMALLY;
-    }
-
-    @Override
-    public boolean returnsConstant() {
-      return UNKNOWN_RETURNS_CONSTANT;
-    }
-
-    @Override
-    public boolean returnsConstantNumber() {
-      return UNKNOWN_RETURNS_CONSTANT;
-    }
-
-    @Override
-    public boolean returnsConstantString() {
-      return UNKNOWN_RETURNS_CONSTANT;
-    }
-
-    @Override
-    public ClassInlinerEligibility getClassInlinerEligibility() {
-      return UNKNOWN_CLASS_INLINER_ELIGIBILITY;
-    }
-
-    @Override
-    public long getReturnedConstantNumber() {
-      assert returnsConstantNumber();
-      return UNKNOWN_RETURNED_CONSTANT_NUMBER;
-    }
-
-    @Override
-    public DexString getReturnedConstantString() {
-      assert returnsConstantString();
-      return UNKNOWN_RETURNED_CONSTANT_STRING;
-    }
-
-    @Override
-    public boolean isInitializerEnablingJavaAssertions() {
-      return UNKNOWN_INITIALIZER_ENABLING_JAVA_ASSERTIONS;
-    }
-
-    @Override
-    public boolean useIdentifierNameString() {
-      return DOES_NOT_USE_IDNETIFIER_NAME_STRING;
-    }
-
-    @Override
-    public boolean forceInline() {
-      return false;
-    }
-
-    @Override
-    public boolean neverInline() {
-      return false;
-    }
-
-    @Override
-    public boolean checksNullReceiverBeforeAnySideEffect() {
-      return UNKNOWN_CHECKS_NULL_RECEIVER_BEFORE_ANY_SIDE_EFFECT;
-    }
-
-    @Override
-    public boolean triggersClassInitBeforeAnySideEffect() {
-      return UNKNOWN_TRIGGERS_CLASS_INIT_BEFORE_ANY_SIDE_EFFECT;
-    }
-
-    @Override
-    public boolean mayHaveSideEffects() {
-      return UNKNOWN_MAY_HAVE_SIDE_EFFECTS;
-    }
-
-    @Override
-    public UpdatableOptimizationInfo mutableCopy() {
-      return new OptimizationInfoImpl();
-    }
-  }
-
-  public static class OptimizationInfoImpl implements UpdatableOptimizationInfo {
-
-    private Set<DexType> initializedClassesOnNormalExit =
-        DefaultOptimizationInfoImpl.UNKNOWN_INITIALIZED_CLASSES_ON_NORMAL_EXIT;
-    private int returnedArgument = DefaultOptimizationInfoImpl.UNKNOWN_RETURNED_ARGUMENT;
-    private boolean mayHaveSideEffects = DefaultOptimizationInfoImpl.UNKNOWN_MAY_HAVE_SIDE_EFFECTS;
-    private boolean neverReturnsNull = DefaultOptimizationInfoImpl.UNKNOWN_NEVER_RETURNS_NULL;
-    private boolean neverReturnsNormally =
-        DefaultOptimizationInfoImpl.UNKNOWN_NEVER_RETURNS_NORMALLY;
-    private boolean returnsConstantNumber = DefaultOptimizationInfoImpl.UNKNOWN_RETURNS_CONSTANT;
-    private long returnedConstantNumber =
-        DefaultOptimizationInfoImpl.UNKNOWN_RETURNED_CONSTANT_NUMBER;
-    private boolean returnsConstantString = DefaultOptimizationInfoImpl.UNKNOWN_RETURNS_CONSTANT;
-    private DexString returnedConstantString =
-        DefaultOptimizationInfoImpl.UNKNOWN_RETURNED_CONSTANT_STRING;
-    private InlinePreference inlining = InlinePreference.Default;
-    private boolean useIdentifierNameString =
-        DefaultOptimizationInfoImpl.DOES_NOT_USE_IDNETIFIER_NAME_STRING;
-    private boolean checksNullReceiverBeforeAnySideEffect =
-        DefaultOptimizationInfoImpl.UNKNOWN_CHECKS_NULL_RECEIVER_BEFORE_ANY_SIDE_EFFECT;
-    private boolean triggersClassInitBeforeAnySideEffect =
-        DefaultOptimizationInfoImpl.UNKNOWN_TRIGGERS_CLASS_INIT_BEFORE_ANY_SIDE_EFFECT;
-    // Stores information about instance methods and constructors for
-    // class inliner, null value indicates that the method is not eligible.
-    private ClassInlinerEligibility classInlinerEligibility =
-        DefaultOptimizationInfoImpl.UNKNOWN_CLASS_INLINER_ELIGIBILITY;
-    private TrivialInitializer trivialInitializerInfo =
-        DefaultOptimizationInfoImpl.UNKNOWN_TRIVIAL_INITIALIZER;
-    private boolean initializerEnablingJavaAssertions =
-        DefaultOptimizationInfoImpl.UNKNOWN_INITIALIZER_ENABLING_JAVA_ASSERTIONS;
-    private ParameterUsagesInfo parametersUsages =
-        DefaultOptimizationInfoImpl.UNKNOWN_PARAMETER_USAGE_INFO;
-    // Stores information about nullability hint per parameter. If set, that means, the method
-    // somehow (e.g., null check, such as arg != null, or using checkParameterIsNotNull) ensures
-    // the corresponding parameter is not null, or throws NPE before any other side effects.
-    // This info is used by {@link UninstantiatedTypeOptimization#rewriteInvoke} that replaces an
-    // invocation with null throwing code if an always-null argument is passed. Also used by Inliner
-    // to give a credit to null-safe code, e.g., Kotlin's null safe argument.
-    // Note that this bit set takes into account the receiver for instance methods.
-    private BitSet nonNullParamOrThrow = null;
-    // Stores information about nullability facts per parameter. If set, that means, the method
-    // somehow (e.g., null check, such as arg != null, or NPE-throwing instructions such as array
-    // access or another invocation) ensures the corresponding parameter is not null, and that is
-    // guaranteed until the normal exits. That is, if the invocation of this method is finished
-    // normally, the recorded parameter is definitely not null. These facts are used to propagate
-    // non-null information through {@link NonNullTracker}.
-    // Note that this bit set takes into account the receiver for instance methods.
-    private BitSet nonNullParamOnNormalExits = null;
-    private boolean reachabilitySensitive = false;
-
-    private OptimizationInfoImpl() {
-      // Intentionally left empty, just use the default values.
-    }
-
-    private OptimizationInfoImpl(OptimizationInfoImpl template) {
-      returnedArgument = template.returnedArgument;
-      neverReturnsNull = template.neverReturnsNull;
-      neverReturnsNormally = template.neverReturnsNormally;
-      returnsConstantNumber = template.returnsConstantNumber;
-      returnedConstantNumber = template.returnedConstantNumber;
-      returnsConstantString = template.returnsConstantString;
-      returnedConstantString = template.returnedConstantString;
-      inlining = template.inlining;
-      useIdentifierNameString = template.useIdentifierNameString;
-      checksNullReceiverBeforeAnySideEffect = template.checksNullReceiverBeforeAnySideEffect;
-      triggersClassInitBeforeAnySideEffect = template.triggersClassInitBeforeAnySideEffect;
-      classInlinerEligibility = template.classInlinerEligibility;
-      trivialInitializerInfo = template.trivialInitializerInfo;
-      initializerEnablingJavaAssertions = template.initializerEnablingJavaAssertions;
-      parametersUsages = template.parametersUsages;
-      nonNullParamOrThrow = template.nonNullParamOrThrow;
-      nonNullParamOnNormalExits = template.nonNullParamOnNormalExits;
-      reachabilitySensitive = template.reachabilitySensitive;
-    }
-
-    @Override
-    public Set<DexType> getInitializedClassesOnNormalExit() {
-      return initializedClassesOnNormalExit;
-    }
-
-    @Override
-    public TrivialInitializer getTrivialInitializerInfo() {
-      return trivialInitializerInfo;
-    }
-
-    @Override
-    public ParameterUsage getParameterUsages(int parameter) {
-      return parametersUsages == null ? null : parametersUsages.getParameterUsage(parameter);
-    }
-
-    @Override
-    public BitSet getNonNullParamOrThrow() {
-      return nonNullParamOrThrow;
-    }
-
-    @Override
-    public BitSet getNonNullParamOnNormalExits() {
-      return nonNullParamOnNormalExits;
-    }
-
-    @Override
-    public boolean isReachabilitySensitive() {
-      return reachabilitySensitive;
-    }
-
-    @Override
-    public boolean returnsArgument() {
-      return returnedArgument != -1;
-    }
-
-    @Override
-    public int getReturnedArgument() {
-      assert returnsArgument();
-      return returnedArgument;
-    }
-
-    @Override
-    public boolean neverReturnsNull() {
-      return neverReturnsNull;
-    }
-
-    @Override
-    public boolean neverReturnsNormally() {
-      return neverReturnsNormally;
-    }
-
-    @Override
-    public boolean returnsConstant() {
-      assert !(returnsConstantNumber && returnsConstantString);
-      return returnsConstantNumber || returnsConstantString;
-    }
-
-    @Override
-    public boolean returnsConstantNumber() {
-      return returnsConstantNumber;
-    }
-
-    @Override
-    public boolean returnsConstantString() {
-      return returnsConstantString;
-    }
-
-    @Override
-    public ClassInlinerEligibility getClassInlinerEligibility() {
-      return classInlinerEligibility;
-    }
-
-    @Override
-    public long getReturnedConstantNumber() {
-      assert returnsConstant();
-      return returnedConstantNumber;
-    }
-
-    @Override
-    public DexString getReturnedConstantString() {
-      assert returnsConstant();
-      return returnedConstantString;
-    }
-
-    @Override
-    public boolean isInitializerEnablingJavaAssertions() {
-      return initializerEnablingJavaAssertions;
-    }
-
-    @Override
-    public boolean useIdentifierNameString() {
-      return useIdentifierNameString;
-    }
-
-    @Override
-    public boolean forceInline() {
-      return inlining == InlinePreference.ForceInline;
-    }
-
-    @Override
-    public boolean neverInline() {
-      return inlining == InlinePreference.NeverInline;
-    }
-
-    @Override
-    public boolean checksNullReceiverBeforeAnySideEffect() {
-      return checksNullReceiverBeforeAnySideEffect;
-    }
-
-    @Override
-    public boolean triggersClassInitBeforeAnySideEffect() {
-      return triggersClassInitBeforeAnySideEffect;
-    }
-
-    @Override
-    public boolean mayHaveSideEffects() {
-      return mayHaveSideEffects;
-    }
-
-    @Override
-    public void setParameterUsages(ParameterUsagesInfo parametersUsages) {
-      this.parametersUsages = parametersUsages;
-    }
-
-    @Override
-    public void setNonNullParamOrThrow(BitSet facts) {
-      this.nonNullParamOrThrow = facts;
-    }
-
-    @Override
-    public void setNonNullParamOnNormalExits(BitSet facts) {
-      this.nonNullParamOnNormalExits = facts;
-    }
-
-    @Override
-    public void setReachabilitySensitive(boolean reachabilitySensitive) {
-      this.reachabilitySensitive = reachabilitySensitive;
-    }
-
-    @Override
-    public void setClassInlinerEligibility(ClassInlinerEligibility eligibility) {
-      this.classInlinerEligibility = eligibility;
-    }
-
-    @Override
-    public void setTrivialInitializer(TrivialInitializer info) {
-      this.trivialInitializerInfo = info;
-    }
-
-    @Override
-    public void setInitializerEnablingJavaAssertions() {
-      this.initializerEnablingJavaAssertions = true;
-    }
-
-    @Override
-    public void markInitializesClassesOnNormalExit(Set<DexType> initializedClassesOnNormalExit) {
-      this.initializedClassesOnNormalExit = initializedClassesOnNormalExit;
-    }
-
-    @Override
-    public void markReturnsArgument(int argument) {
-      assert argument >= 0;
-      assert returnedArgument == -1 || returnedArgument == argument;
-      returnedArgument = argument;
-    }
-
-    @Override
-    public void markMayNotHaveSideEffects() {
-      mayHaveSideEffects = false;
-    }
-
-    @Override
-    public void markNeverReturnsNull() {
-      neverReturnsNull = true;
-    }
-
-    @Override
-    public void markNeverReturnsNormally() {
-      neverReturnsNormally = true;
-    }
-
-    @Override
-    public void markReturnsConstantNumber(long value) {
-      assert !returnsConstantString;
-      assert !returnsConstantNumber || returnedConstantNumber == value;
-      returnsConstantNumber = true;
-      returnedConstantNumber = value;
-    }
-
-    @Override
-    public void markReturnsConstantString(DexString value) {
-      assert !returnsConstantNumber;
-      assert !returnsConstantString || returnedConstantString == value;
-      returnsConstantString = true;
-      returnedConstantString = value;
-    }
-
-    @Override
-    public void markForceInline() {
-      // For concurrent scenarios we should allow the flag to be already set
-      assert inlining == InlinePreference.Default || inlining == InlinePreference.ForceInline;
-      inlining = InlinePreference.ForceInline;
-    }
-
-    @Override
-    public void unsetForceInline() {
-      // For concurrent scenarios we should allow the flag to be already unset
-      assert inlining == InlinePreference.Default || inlining == InlinePreference.ForceInline;
-      inlining = InlinePreference.Default;
-    }
-
-    @Override
-    public void markNeverInline() {
-      // For concurrent scenarios we should allow the flag to be already set
-      assert inlining == InlinePreference.Default || inlining == InlinePreference.NeverInline;
-      inlining = InlinePreference.NeverInline;
-    }
-
-    @Override
-    public void markUseIdentifierNameString() {
-      useIdentifierNameString = true;
-    }
-
-    @Override
-    public void markCheckNullReceiverBeforeAnySideEffect(boolean mark) {
-      checksNullReceiverBeforeAnySideEffect = mark;
-    }
-
-    @Override
-    public void markTriggerClassInitBeforeAnySideEffect(boolean mark) {
-      triggersClassInitBeforeAnySideEffect = mark;
-    }
-
-    @Override
-    public UpdatableOptimizationInfo mutableCopy() {
-      assert this != DefaultOptimizationInfoImpl.DEFAULT_INSTANCE;
-      return new OptimizationInfoImpl(this);
-    }
-  }
-
-  public OptimizationInfo getOptimizationInfo() {
+  public MethodOptimizationInfo getOptimizationInfo() {
     checkIfObsolete();
     return optimizationInfo;
   }
 
-  public synchronized UpdatableOptimizationInfo getMutableOptimizationInfo() {
+  public synchronized UpdatableMethodOptimizationInfo getMutableOptimizationInfo() {
     checkIfObsolete();
-    if (optimizationInfo == DefaultOptimizationInfoImpl.DEFAULT_INSTANCE) {
+    if (optimizationInfo == DefaultMethodOptimizationInfo.DEFAULT_INSTANCE) {
       optimizationInfo = optimizationInfo.mutableCopy();
     }
-    return (UpdatableOptimizationInfo) optimizationInfo;
+    return (UpdatableMethodOptimizationInfo) optimizationInfo;
   }
 
-  public void setOptimizationInfo(UpdatableOptimizationInfo info) {
+  public void setOptimizationInfo(UpdatableMethodOptimizationInfo info) {
     checkIfObsolete();
     optimizationInfo = info;
   }
 
+  public synchronized void abandonCallSiteOptimizationInfo() {
+    checkIfObsolete();
+    callSiteOptimizationInfo = CallSiteOptimizationInfo.abandoned();
+  }
+
+  public synchronized CallSiteOptimizationInfo getCallSiteOptimizationInfo() {
+    checkIfObsolete();
+    return callSiteOptimizationInfo;
+  }
+
+  public synchronized void joinCallSiteOptimizationInfo(
+      CallSiteOptimizationInfo other, AppView<?> appView) {
+    checkIfObsolete();
+    callSiteOptimizationInfo = callSiteOptimizationInfo.join(other, appView, this);
+  }
+
   public void copyMetadata(DexEncodedMethod from) {
     checkIfObsolete();
-    // Record that the current method uses identifier name string if the inlinee did so.
-    if (from.getOptimizationInfo().useIdentifierNameString()) {
-      getMutableOptimizationInfo().markUseIdentifierNameString();
-    }
     if (from.classFileVersion > classFileVersion) {
       upgradeClassFileVersion(from.getClassFileVersion());
     }
+  }
+
+  private static Builder syntheticBuilder(DexEncodedMethod from) {
+    return new Builder(from, true);
   }
 
   private static Builder builder(DexEncodedMethod from) {
     return new Builder(from);
   }
 
-  private static class Builder {
+  public static class Builder {
 
     private DexMethod method;
     private final MethodAccessFlags accessFlags;
     private final DexAnnotationSet annotations;
-    private final ParameterAnnotationsList parameterAnnotations;
+    private OptionalBool isLibraryMethodOverride = OptionalBool.UNKNOWN;
+    private ParameterAnnotationsList parameterAnnotations;
     private Code code;
     private CompilationState compilationState;
-    private OptimizationInfo optimizationInfo;
+    private MethodOptimizationInfo optimizationInfo;
+    private KotlinMethodLevelInfo kotlinMemberInfo;
     private final int classFileVersion;
+    private boolean d8R8Synthesized;
 
     private Builder(DexEncodedMethod from) {
+      this(from, from.d8R8Synthesized);
+    }
+
+    private Builder(DexEncodedMethod from, boolean d8R8Synthesized) {
       // Copy all the mutable state of a DexEncodedMethod here.
       method = from.method;
       accessFlags = from.accessFlags.copy();
-      annotations = from.annotations;
-      parameterAnnotations = from.parameterAnnotationsList;
+      annotations = from.annotations();
       code = from.code;
-      compilationState = from.compilationState;
+      compilationState = CompilationState.NOT_PROCESSED;
       optimizationInfo = from.optimizationInfo.mutableCopy();
+      kotlinMemberInfo = from.kotlinMemberInfo;
       classFileVersion = from.classFileVersion;
+      this.d8R8Synthesized = d8R8Synthesized;
+
+      if (from.parameterAnnotationsList.isEmpty()
+          || from.parameterAnnotationsList.size() == method.proto.parameters.size()) {
+        parameterAnnotations = from.parameterAnnotationsList;
+      } else {
+        // If the there are missing parameter annotations populate these when creating the builder.
+        parameterAnnotations =
+            from.parameterAnnotationsList.withParameterCount(method.proto.parameters.size());
+      }
     }
 
     public void setMethod(DexMethod method) {
       this.method = method;
     }
 
-    public Builder promoteToStatic() {
-      this.accessFlags.promoteToStatic();
+    public Builder setIsLibraryMethodOverride(OptionalBool isLibraryMethodOverride) {
+      assert !isLibraryMethodOverride.isUnknown();
+      this.isLibraryMethodOverride = isLibraryMethodOverride;
       return this;
     }
 
-    public Builder unsetOptimizationInfo() {
-      optimizationInfo = DefaultOptimizationInfoImpl.DEFAULT_INSTANCE;
+    public Builder setParameterAnnotations(ParameterAnnotationsList parameterAnnotations) {
+      this.parameterAnnotations = parameterAnnotations;
+      return this;
+    }
+
+    public Builder removeParameterAnnotations(IntPredicate predicate) {
+      if (parameterAnnotations.isEmpty()) {
+        // Nothing to do.
+        return this;
+      }
+
+      List<DexAnnotationSet> newParameterAnnotations = new ArrayList<>();
+      int newNumberOfMissingParameterAnnotations = 0;
+
+      for (int oldIndex = 0; oldIndex < parameterAnnotations.size(); oldIndex++) {
+        if (!predicate.test(oldIndex)) {
+          if (parameterAnnotations.isMissing(oldIndex)) {
+            newNumberOfMissingParameterAnnotations++;
+          } else {
+            newParameterAnnotations.add(parameterAnnotations.get(oldIndex));
+          }
+        }
+      }
+
+      if (newParameterAnnotations.isEmpty()) {
+        return setParameterAnnotations(ParameterAnnotationsList.empty());
+      }
+
+      return setParameterAnnotations(
+          new ParameterAnnotationsList(
+              newParameterAnnotations.toArray(DexAnnotationSet.EMPTY_ARRAY),
+              newNumberOfMissingParameterAnnotations));
+    }
+
+    public Builder promoteToStatic() {
+      this.accessFlags.promoteToStatic();
       return this;
     }
 
@@ -1370,6 +1387,14 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
       return this;
     }
 
+    public Builder adjustOptimizationInfoAfterRemovingThisParameter() {
+      if (optimizationInfo.isUpdatableMethodOptimizationInfo()) {
+        optimizationInfo.asUpdatableMethodOptimizationInfo()
+            .adjustOptimizationInfoAfterRemovingThisParameter();
+      }
+      return this;
+    }
+
     public void setCode(Code code) {
       this.code = code;
     }
@@ -1379,43 +1404,24 @@ public class DexEncodedMethod extends KeyedDexItem<DexMethod> implements Resolut
       assert accessFlags != null;
       assert annotations != null;
       assert parameterAnnotations != null;
+      assert parameterAnnotations.isEmpty()
+          || parameterAnnotations.size() == method.proto.parameters.size();
       DexEncodedMethod result =
           new DexEncodedMethod(
-              method, accessFlags, annotations, parameterAnnotations, code, classFileVersion);
+              method,
+              accessFlags,
+              annotations,
+              parameterAnnotations,
+              code,
+              classFileVersion,
+              d8R8Synthesized);
+      result.setKotlinMemberInfo(kotlinMemberInfo);
       result.compilationState = compilationState;
       result.optimizationInfo = optimizationInfo;
+      if (!isLibraryMethodOverride.isUnknown()) {
+        result.setLibraryMethodOverride(isLibraryMethodOverride);
+      }
       return result;
     }
   }
-
-  @Override
-  public DexEncodedMethod asResultOfResolve() {
-    checkIfObsolete();
-    return this;
-  }
-
-  @Override
-  public DexEncodedMethod asSingleTarget() {
-    checkIfObsolete();
-    return this;
-  }
-
-  @Override
-  public boolean hasSingleTarget() {
-    checkIfObsolete();
-    return true;
-  }
-
-  @Override
-  public List<DexEncodedMethod> asListOfTargets() {
-    checkIfObsolete();
-    return Collections.singletonList(this);
-  }
-
-  @Override
-  public void forEachTarget(Consumer<DexEncodedMethod> consumer) {
-    checkIfObsolete();
-    consumer.accept(this);
-  }
-
 }

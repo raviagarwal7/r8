@@ -3,12 +3,12 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.shaking.ifrule;
 
-import static com.android.tools.r8.utils.codeinspector.Matchers.isNotRenamed;
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndNotRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
 import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.shaking.forceproguardcompatibility.ProguardCompatibilityTestBase;
 import com.android.tools.r8.utils.InternalOptions;
@@ -108,7 +108,7 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
     }
 
     ClassSubject clazz = codeInspector.clazz(DependentUser.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     // Members of DependentUser are not used anywhere.
     MethodSubject m = clazz.method("void", "callFoo", ImmutableList.of());
     assertThat(m, not(isPresent()));
@@ -117,7 +117,7 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
 
     // Although DependentUser#callFoo is shrinked, Dependent is kept via -if.
     clazz = codeInspector.clazz(Dependent.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     // But, its members are gone.
     m = clazz.method("java.lang.String", "foo", ImmutableList.of());
     assertThat(m, not(isPresent()));
@@ -145,7 +145,7 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
     }
 
     ClassSubject clazz = codeInspector.clazz(DependentUser.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     // Members of DependentUser are not used anywhere.
     MethodSubject m = clazz.method("void", "callFoo", ImmutableList.of());
     assertThat(m, not(isPresent()));
@@ -154,7 +154,7 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
 
     // Although DependentUser#callFoo is shrinked, Dependent is kept via -if.
     clazz = codeInspector.clazz(Dependent.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     // But, its members are gone.
     m = clazz.method("java.lang.String", "foo", ImmutableList.of());
     assertThat(m, not(isPresent()));
@@ -178,19 +178,19 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
     }
 
     ClassSubject clazz = codeInspector.clazz(DependentUser.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     MethodSubject m = clazz.method("void", "callFoo", ImmutableList.of());
-    assertThat(m, isRenamed());
+    assertThat(m, isPresentAndRenamed());
     FieldSubject f = clazz.field("int", "canBeShrinked");
     assertThat(f, not(isPresent()));
 
     // Dependent is kept due to DependentUser#callFoo, but renamed.
     clazz = codeInspector.clazz(Dependent.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     m = clazz.method("java.lang.String", "foo", ImmutableList.of());
-    assertThat(m, isRenamed());
+    assertThat(m, isPresentAndRenamed());
     f = clazz.field("int", "intField");
-    assertThat(f, isRenamed());
+    assertThat(f, isPresentAndRenamed());
   }
 
   @Test
@@ -217,20 +217,29 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
       return;
     }
 
+    if (shrinker.isR8()) {
+      // The -keepclassmembers rule should not keep Dependent nor DependentUser since DependentUser
+      // is never referenced.
+      assertThat(codeInspector.clazz(EmptyMainClassForIfOnClassTests.class), isPresent());
+      assertThat(codeInspector.clazz(Precondition.class), isPresent());
+      assertEquals(2, codeInspector.allClasses().size());
+      return;
+    }
+
     ClassSubject clazz = codeInspector.clazz(DependentUser.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     MethodSubject m = clazz.method("void", "callFoo", ImmutableList.of());
-    assertThat(m, isRenamed());
+    assertThat(m, isPresentAndRenamed());
     FieldSubject f = clazz.field("int", "canBeShrinked");
     assertThat(f, not(isPresent()));
 
     // Dependent is kept due to DependentUser#callFoo, but renamed.
     clazz = codeInspector.clazz(Dependent.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     m = clazz.method("java.lang.String", "foo", ImmutableList.of());
-    assertThat(m, isRenamed());
+    assertThat(m, isPresentAndRenamed());
     f = clazz.field("int", "intField");
-    assertThat(f, isRenamed());
+    assertThat(f, isPresentAndRenamed());
   }
 
   @Test
@@ -257,20 +266,29 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
       return;
     }
 
+    if (shrinker.isR8()) {
+      // The -keepclassmembers rule should not keep Dependent nor DependentUser since DependentUser
+      // is never referenced.
+      assertThat(codeInspector.clazz(EmptyMainClassForIfOnClassTests.class), isPresent());
+      assertThat(codeInspector.clazz(Precondition.class), isPresent());
+      assertEquals(2, codeInspector.allClasses().size());
+      return;
+    }
+
     ClassSubject clazz = codeInspector.clazz(DependentUser.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     MethodSubject m = clazz.method("void", "callFoo", ImmutableList.of());
-    assertThat(m, isRenamed());
+    assertThat(m, isPresentAndRenamed());
     FieldSubject f = clazz.field("int", "canBeShrinked");
     assertThat(f, not(isPresent()));
 
     // Dependent is kept due to DependentUser#callFoo, but renamed.
     clazz = codeInspector.clazz(Dependent.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     m = clazz.method("java.lang.String", "foo", ImmutableList.of());
-    assertThat(m, isRenamed());
+    assertThat(m, isPresentAndRenamed());
     f = clazz.field("int", "intField");
-    assertThat(f, isRenamed());
+    assertThat(f, isPresentAndRenamed());
   }
 
   @Test
@@ -289,11 +307,11 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
 
     ClassSubject clazz = codeInspector.clazz(Dependent.class);
     // Only class name is not renamed, if triggered.
-    assertThat(clazz, keepPrecondition ? isNotRenamed() : isRenamed());
+    assertThat(clazz, keepPrecondition ? isPresentAndNotRenamed() : isPresentAndRenamed());
     MethodSubject m = clazz.method("java.lang.String", "foo", ImmutableList.of());
-    assertThat(m, isRenamed());
+    assertThat(m, isPresentAndRenamed());
     FieldSubject f = clazz.field("int", "intField");
-    assertThat(f, isRenamed());
+    assertThat(f, isPresentAndRenamed());
   }
 
   @Test
@@ -314,12 +332,12 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
 
     ClassSubject clazz = codeInspector.clazz(Dependent.class);
     // Class name is not renamed, if triggered.
-    assertThat(clazz, keepPrecondition ? isNotRenamed() : isRenamed());
+    assertThat(clazz, keepPrecondition ? isPresentAndNotRenamed() : isPresentAndRenamed());
     MethodSubject m = clazz.method("java.lang.String", "foo", ImmutableList.of());
     // Method name is not renamed either, if triggered.
-    assertThat(m, keepPrecondition ? isNotRenamed() : isRenamed());
+    assertThat(m, keepPrecondition ? isPresentAndNotRenamed() : isPresentAndRenamed());
     FieldSubject f = clazz.field("int", "intField");
-    assertThat(f, isRenamed());
+    assertThat(f, isPresentAndRenamed());
   }
 
   @Test
@@ -339,12 +357,11 @@ public class IfOnClassTest extends ProguardCompatibilityTestBase {
     CodeInspector codeInspector = inspectAfterShrinking(shrinker, CLASSES, config);
 
     ClassSubject clazz = codeInspector.clazz(Dependent.class);
-    assertThat(clazz, isRenamed());
+    assertThat(clazz, isPresentAndRenamed());
     MethodSubject m = clazz.method("java.lang.String", "foo", ImmutableList.of());
     // Only method name is not renamed, if triggered.
-    assertThat(m, keepPrecondition ? isNotRenamed() : isRenamed());
+    assertThat(m, keepPrecondition ? isPresentAndNotRenamed() : isPresentAndRenamed());
     FieldSubject f = clazz.field("int", "intField");
-    assertThat(f, isRenamed());
+    assertThat(f, isPresentAndRenamed());
   }
-
 }

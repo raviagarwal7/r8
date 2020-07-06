@@ -4,13 +4,15 @@
 
 package com.android.tools.r8.ir.analysis.type;
 
-import static com.android.tools.r8.ir.analysis.type.TypeLatticeElement.DOUBLE;
-import static com.android.tools.r8.ir.analysis.type.TypeLatticeElement.FLOAT;
-import static com.android.tools.r8.ir.analysis.type.TypeLatticeElement.INT;
-import static com.android.tools.r8.ir.analysis.type.TypeLatticeElement.LONG;
+import static com.android.tools.r8.ir.analysis.type.TypeElement.getDouble;
+import static com.android.tools.r8.ir.analysis.type.TypeElement.getFloat;
+import static com.android.tools.r8.ir.analysis.type.TypeElement.getInt;
+import static com.android.tools.r8.ir.analysis.type.TypeElement.getLong;
 import static org.junit.Assert.assertEquals;
 
 import com.android.tools.r8.NeverInline;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
 import com.android.tools.r8.ir.analysis.AnalysisTestBase;
 import com.android.tools.r8.ir.code.ConstNumber;
 import com.android.tools.r8.ir.code.IRCode;
@@ -19,11 +21,19 @@ import com.android.tools.r8.utils.StringUtils;
 import com.google.common.collect.Streams;
 import java.util.function.Consumer;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
+@RunWith(Parameterized.class)
 public class ConstrainedPrimitiveTypeTest extends AnalysisTestBase {
 
-  public ConstrainedPrimitiveTypeTest() throws Exception {
-    super(TestClass.class);
+  @Parameterized.Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withAllRuntimes().withAllApiLevels().build();
+  }
+
+  public ConstrainedPrimitiveTypeTest(TestParameters parameters) throws Exception {
+    super(parameters, TestClass.class);
   }
 
   @Test
@@ -33,62 +43,62 @@ public class ConstrainedPrimitiveTypeTest extends AnalysisTestBase {
 
     testForJvm().addTestClasspath().run(TestClass.class).assertSuccessWithOutput(expectedOutput);
 
-    testForR8(Backend.DEX)
+    testForR8(parameters.getBackend())
         .addInnerClasses(ConstrainedPrimitiveTypeTest.class)
         .addKeepMainRule(TestClass.class)
         .enableInliningAnnotations()
-        .run(TestClass.class)
+        .setMinApi(parameters.getApiLevel())
+        .run(parameters.getRuntime(), TestClass.class)
         .assertSuccessWithOutput(expectedOutput);
   }
 
   @Test
   public void testIntWithInvokeUser() throws Exception {
-    buildAndCheckIR("intWithInvokeUserTest", testInspector(INT, 1));
+    buildAndCheckIR("intWithInvokeUserTest", testInspector(getInt(), 1));
   }
 
   @Test
   public void testIntWithIndirectInvokeUser() throws Exception {
-    buildAndCheckIR("intWithIndirectInvokeUserTest", testInspector(INT, 2));
+    buildAndCheckIR("intWithIndirectInvokeUserTest", testInspector(getInt(), 2));
   }
 
   @Test
   public void testFloatWithInvokeUser() throws Exception {
-    buildAndCheckIR("floatWithInvokeUserTest", testInspector(FLOAT, 1));
+    buildAndCheckIR("floatWithInvokeUserTest", testInspector(getFloat(), 1));
   }
 
   @Test
   public void testFloatWithIndirectInvokeUser() throws Exception {
-    buildAndCheckIR("floatWithIndirectInvokeUserTest", testInspector(FLOAT, 2));
+    buildAndCheckIR("floatWithIndirectInvokeUserTest", testInspector(getFloat(), 2));
   }
 
   @Test
   public void testLongWithInvokeUser() throws Exception {
-    buildAndCheckIR("longWithInvokeUserTest", testInspector(LONG, 1));
+    buildAndCheckIR("longWithInvokeUserTest", testInspector(getLong(), 1));
   }
 
   @Test
   public void testLongWithIndirectInvokeUser() throws Exception {
-    buildAndCheckIR("longWithIndirectInvokeUserTest", testInspector(LONG, 2));
+    buildAndCheckIR("longWithIndirectInvokeUserTest", testInspector(getLong(), 2));
   }
 
   @Test
   public void testDoubleWithInvokeUser() throws Exception {
-    buildAndCheckIR("doubleWithInvokeUserTest", testInspector(DOUBLE, 1));
+    buildAndCheckIR("doubleWithInvokeUserTest", testInspector(getDouble(), 1));
   }
 
   @Test
   public void testDoubleWithIndirectInvokeUser() throws Exception {
-    buildAndCheckIR("doubleWithIndirectInvokeUserTest", testInspector(DOUBLE, 2));
+    buildAndCheckIR("doubleWithIndirectInvokeUserTest", testInspector(getDouble(), 2));
   }
 
   private static Consumer<IRCode> testInspector(
-      TypeLatticeElement expectedType, int expectedNumberOfConstNumberInstructions) {
+      TypeElement expectedType, int expectedNumberOfConstNumberInstructions) {
     return code -> {
-      Iterable<Instruction> instructions = code::instructionIterator;
-      for (Instruction instruction : instructions) {
+      for (Instruction instruction : code.instructions()) {
         if (instruction.isConstNumber()) {
           ConstNumber constNumberInstruction = instruction.asConstNumber();
-          assertEquals(expectedType, constNumberInstruction.outValue().getTypeLattice());
+          assertEquals(expectedType, constNumberInstruction.getOutType());
         }
       }
 

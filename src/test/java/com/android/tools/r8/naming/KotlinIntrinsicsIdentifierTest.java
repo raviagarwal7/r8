@@ -4,8 +4,9 @@
 package com.android.tools.r8.naming;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 
 import com.android.tools.r8.TestCompileResult;
@@ -14,6 +15,7 @@ import com.android.tools.r8.ToolHelper.KotlinTargetVersion;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.kotlin.TestKotlinClass;
+import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -21,12 +23,23 @@ import com.android.tools.r8.utils.codeinspector.InstructionSubject;
 import com.android.tools.r8.utils.codeinspector.InstructionSubject.JumboStringMode;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.stream.Collectors;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
+@RunWith(Parameterized.class)
 public class KotlinIntrinsicsIdentifierTest extends AbstractR8KotlinNamingTestBase {
   private static final String FOLDER = "intrinsics_identifiers";
+
+  @Parameters(name = "target: {0}, allowAccessModification: {1}, minification: {2}")
+  public static Collection<Object[]> data() {
+    return buildParameters(
+        KotlinTargetVersion.values(), BooleanUtils.values(), BooleanUtils.values());
+  }
 
   public KotlinIntrinsicsIdentifierTest(
       KotlinTargetVersion targetVersion, boolean allowAccessModification, boolean minification) {
@@ -55,12 +68,16 @@ public class KotlinIntrinsicsIdentifierTest extends AbstractR8KotlinNamingTestBa
   public void test_example3() throws Exception {
     TestKotlinClass ex3 = new TestKotlinClass("intrinsics_identifiers.Example3Kt");
     String mainClassName = ex3.getClassName();
-    TestCompileResult result = testForR8(Backend.DEX)
-        .addProgramFiles(getKotlinJarFile(FOLDER))
-        .addProgramFiles(getJavaJarFile(FOLDER))
-        .addKeepMainRule(mainClassName)
-        .minification(minification)
-        .compile();
+    TestCompileResult result =
+        testForR8(Backend.DEX)
+            .addProgramFiles(getKotlinJarFile(FOLDER))
+            .addProgramFiles(getJavaJarFile(FOLDER))
+            .addKeepMainRule(mainClassName)
+            .allowDiagnosticWarningMessages()
+            .minification(minification)
+            .compile()
+            .assertAllWarningMessagesMatch(
+                equalTo("Resource 'META-INF/MANIFEST.MF' already exists."));
     CodeInspector codeInspector = result.inspector();
     MethodSubject main = codeInspector.clazz(ex3.getClassName()).mainMethod();
     assertThat(main, isPresent());
@@ -104,18 +121,23 @@ public class KotlinIntrinsicsIdentifierTest extends AbstractR8KotlinNamingTestBa
       String targetFieldName,
       String targetMethodName) throws Exception {
     String mainClassName = testMain.getClassName();
-    TestRunResult result = testForR8(Backend.DEX)
-        .addProgramFiles(getKotlinJarFile(FOLDER))
-        .addProgramFiles(getJavaJarFile(FOLDER))
-        .enableProguardTestOptions()
-        .addKeepMainRule(mainClassName)
-        .addKeepRules(StringUtils.lines(
-            "-neverclassinline class **." + targetClassName,
-            "-nevermerge class **." + targetClassName,
-            "-neverinline class **." + targetClassName + " { <methods>; }"
-        ))
-        .minification(minification)
-        .run(mainClassName);
+    TestRunResult result =
+        testForR8(Backend.DEX)
+            .addProgramFiles(getKotlinJarFile(FOLDER))
+            .addProgramFiles(getJavaJarFile(FOLDER))
+            .enableProguardTestOptions()
+            .addKeepMainRule(mainClassName)
+            .addKeepRules(
+                StringUtils.lines(
+                    "-neverclassinline class **." + targetClassName,
+                    "-nevermerge class **." + targetClassName,
+                    "-neverinline class **." + targetClassName + " { <methods>; }"))
+            .allowDiagnosticWarningMessages()
+            .minification(minification)
+            .compile()
+            .assertAllWarningMessagesMatch(
+                equalTo("Resource 'META-INF/MANIFEST.MF' already exists."))
+            .run(mainClassName);
     CodeInspector codeInspector = result.inspector();
 
     MethodSubject main = codeInspector.clazz(testMain.getClassName()).mainMethod();

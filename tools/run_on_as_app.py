@@ -12,12 +12,14 @@ import json
 import os
 import optparse
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import utils
 import zipfile
 from xml.dom import minidom
+from datetime import datetime
 
 import as_utils
 import update_prebuilds_in_android
@@ -25,6 +27,8 @@ import download_all_benchmark_dependencies
 
 SHRINKERS = ['r8', 'r8-full', 'r8-nolib', 'r8-nolib-full', 'pg']
 WORKING_DIR = os.path.join(utils.BUILD, 'opensource_apps')
+
+GRADLE_USER_HOME = '.gradle_user_home'
 
 if ('R8_BENCHMARK_DIR' in os.environ
     and os.path.isdir(os.environ['R8_BENCHMARK_DIR'])):
@@ -48,7 +52,7 @@ class App(object):
       'archives_base_name': module,
       'build_dir': 'build',
       'compile_sdk': None,
-      'dir': '.',
+      'dir': None,
       'flavor': None,
       'has_instrumentation_tests': False,
       'main_dex_rules': None,
@@ -57,13 +61,16 @@ class App(object):
       'name': None,
       'releaseTarget': None,
       'signed_apk_name': None,
-      'skip': False
+      'skip': False,
+      'has_lint_task': True
     }
     self.__dict__ = dict(defaults.items() + fields.items())
 
 # For running on Golem all third-party repositories are bundled as an x20-
 # dependency and then copied to WORKING_DIR. To update the app-bundle use
 # 'run_on_as_app_x20_packager.py'.
+# For showing benchmark data, also include the app in appSegmentBenchmarks in
+# the file <golem_repo>/config/r8/benchmarks.dart.
 APP_REPOSITORIES = [
   # ...
   # Repo({
@@ -93,7 +100,8 @@ APP_REPOSITORIES = [
               'id': 'com.numix.calculator',
               'dir': 'Calculator',
               'name': 'numix-calculator',
-              'has_instrumentation_tests': True
+              'has_instrumentation_tests': True,
+              'has_lint_task': False
           })
       ]
   }),
@@ -152,7 +160,8 @@ APP_REPOSITORIES = [
       'revision': '6e53458f167b6d78398da60c20fd0da01a232617',
       'apps': [
           App({
-              'id': 'com.chanapps.four.activity'
+              'id': 'com.chanapps.four.activity',
+              'has_lint_task': False
           })
       ]
   }),
@@ -167,12 +176,39 @@ APP_REPOSITORIES = [
       ]
   }),
   Repo({
+      'name': 'googlesamples',
+      'url': 'https://github.com/christofferqa/android-sunflower.git',
+      'revision': 'df0a082a0bcbeae253817e13daca3c7a7c54f67a',
+      'apps': [
+          App({
+              'id': 'com.google.samples.apps.sunflower',
+              'name': 'android-sunflower',
+              'min_sdk': 19,
+              'compile_sdk': 28
+          })
+      ]
+  }),
+  Repo({
       'name': 'Instabug-Android',
       'url': 'https://github.com/christofferqa/Instabug-Android.git',
       'revision': 'b8df78c96630a6537fbc07787b4990afc030cc0f',
       'apps': [
           App({
              'id': 'com.example.instabug'
+          })
+      ]
+  }),
+  Repo({
+      'name': 'iosched',
+      'url': 'https://github.com/christofferqa/iosched.git',
+      'revision': '581cbbe2253711775dbccb753cdb53e7e506cb02',
+      'apps': [
+          App({
+              'id': 'com.google.samples.apps.iosched',
+              'module': 'mobile',
+              'min_sdk': 21,
+              'compile_sdk': 29,
+              'has_lint_task': False
           })
       ]
   }),
@@ -225,7 +261,8 @@ APP_REPOSITORIES = [
       'revision': 'ed543099c7823be00f15d9340f94bdb7cb37d1e6',
       'apps': [
           App({
-              'id': 'org.schabi.newpipe'
+              'id': 'org.schabi.newpipe',
+              'has_lint_task': False
           })
       ]
   }),
@@ -237,6 +274,19 @@ APP_REPOSITORIES = [
           App({
               'id': 'io.rover.app.debug',
               'module': 'debug-app'
+          })
+      ]
+  }),
+  Repo({
+      'name': 'santa-tracker-android',
+      'url': 'https://github.com/christofferqa/santa-tracker-android.git',
+      'revision': '8dee74be7d9ee33c69465a07088c53087d24a6dd',
+      'apps': [
+          App({
+              'id': 'com.google.android.apps.santatracker',
+              'module': 'santa-tracker',
+              'min_sdk': 21,
+              'compile_sdk': 28
           })
       ]
   }),
@@ -261,7 +311,44 @@ APP_REPOSITORIES = [
       'apps': [
           App({
               'id': 'com.simplemobiletools.calendar.pro',
-              'signed_apk_name': 'calendar-release.apk'
+              'signed_apk_name': 'calendar-release.apk',
+              'has_lint_task': False
+          })
+      ]
+  }),
+  Repo({
+      'name': 'Simple-Camera',
+      'url': 'https://github.com/jsjeon/Simple-Camera',
+      'revision': '451fe188ab123e6956413b42e89839b44c05ac14',
+      'apps': [
+          App({
+              'id': 'com.simplemobiletools.camera.pro',
+              'signed_apk_name': 'camera-release.apk',
+              'has_lint_task': False
+          })
+      ]
+  }),
+  Repo({
+      'name': 'Simple-File-Manager',
+      'url': 'https://github.com/jsjeon/Simple-File-Manager',
+      'revision': '282b57d9e73f4d250cc844d8d73fd223509a141e',
+      'apps': [
+          App({
+              'id': 'com.simplemobiletools.filemanager.pro',
+              'signed_apk_name': 'file-manager-release.apk',
+              'has_lint_task': False
+          })
+      ]
+  }),
+  Repo({
+      'name': 'Simple-Gallery',
+      'url': 'https://github.com/jsjeon/Simple-Gallery',
+      'revision': '679125601eee7e057dfdfecd7bea6c4a6ac73ef9',
+      'apps': [
+          App({
+              'id': 'com.simplemobiletools.gallery.pro',
+              'signed_apk_name': 'gallery-release.apk',
+              'has_lint_task': False
           })
       ]
   }),
@@ -287,7 +374,8 @@ APP_REPOSITORIES = [
           App({
               'id': 'eu.kanade.tachiyomi',
               'flavor': 'dev',
-              'min_sdk': 16
+              'min_sdk': 16,
+              'has_lint_task': False
           })
       ]
   }),
@@ -300,6 +388,7 @@ APP_REPOSITORIES = [
               'id': 'app.tivi',
               'min_sdk': 23,
               'compile_sdk': 28,
+              'has_lint_task': False
           })
       ]
   }),
@@ -320,11 +409,30 @@ APP_REPOSITORIES = [
       'revision': '138d3f18c027b61b195c98911f1c5ab7d87ad18b',
       'apps': [
           App({
-              'id': 'com.publisher.vungle.sample'
+              'id': 'com.publisher.vungle.sample',
+              'skip': True, # TODO(b/144058031)
           })
       ]
   })
 ]
+
+def signal_handler(signum, frame):
+  subprocess.call(['pkill', 'java'])
+  raise Exception('Got killed by %s' % signum)
+
+class EnsureNoGradleAlive(object):
+ def __init__(self, active):
+   self.active = active
+
+ def __enter__(self):
+   if self.active:
+     # If we timeout and get a sigterm we should still kill all java
+     signal.signal(signal.SIGTERM, signal_handler)
+     print 'Running with wrapper that will kill java after'
+
+ def __exit__(self, *_):
+   if self.active:
+     subprocess.call(['pkill', 'java'])
 
 def GetAllApps():
   apps = []
@@ -373,7 +481,28 @@ def ExtractMarker(apk, temp_dir, options):
   return lines[-1]
 
 def CheckIsBuiltWithExpectedR8(apk, temp_dir, shrinker, options):
-  marker = ExtractMarker(apk, temp_dir, options)
+  marker_raw = ExtractMarker(apk, temp_dir, options)
+
+  # Marker should be a string on the following format (no whitespace):
+  #   ~~R8{"compilation-mode":"release",
+  #        "min-api":16,
+  #        "pg-map-id":"767707e",
+  #        "sha-1":"7111a35bae6d5185dcfb338d61074aca8426c006",
+  #        "version":"1.5.14-dev"}
+  if not marker_raw.startswith('~~R8'):
+    raise Exception(
+        'Expected marker to start with \'~~R8\' (was: {})'.format(marker_raw))
+
+  marker = json.loads(marker_raw[4:])
+
+  if options.hash:
+    actual_hash = marker.get('sha-1')
+    if actual_hash != options.hash:
+      raise Exception(
+          'Expected APK to be built with R8 version {} (was: {})'.format(
+              expected_hash, marker_raw))
+    return True
+
   expected_version = (
       options.version
       if options.version
@@ -381,13 +510,12 @@ def CheckIsBuiltWithExpectedR8(apk, temp_dir, shrinker, options):
           os.path.join(
               temp_dir,
               'r8lib.jar' if IsMinifiedR8(shrinker) else 'r8.jar')))
-  if marker.startswith('~~R8'):
-    actual_version = json.loads(marker[4:]).get('version')
-    if actual_version == expected_version:
-      return True
-  raise Exception(
-      'Expected APK to be built with R8 version {} (was: {})'.format(
-          expected_version, marker))
+  actual_version = marker.get('version')
+  if actual_version != expected_version:
+    raise Exception(
+        'Expected APK to be built with R8 version {} (was: {})'.format(
+            expected_version, marker_raw))
+  return True
 
 def IsR8(shrinker):
   return 'r8' in shrinker
@@ -496,7 +624,9 @@ def GetResultsForApp(app, repo, options, temp_dir):
 
   result['status'] = 'success'
 
-  app_checkout_dir = os.path.join(repo_checkout_dir, app.dir)
+  app_checkout_dir = (os.path.join(repo_checkout_dir, app.dir)
+                      if app.dir else repo_checkout_dir)
+
   result_per_shrinker = BuildAppWithSelectedShrinkers(
       app, repo, options, app_checkout_dir, temp_dir)
   for shrinker, shrinker_result in result_per_shrinker.iteritems():
@@ -513,39 +643,45 @@ def BuildAppWithSelectedShrinkers(
       apk_dest = None
 
       result = {}
-      try:
-        out_dir = os.path.join(checkout_dir, 'out', shrinker)
-        (apk_dest, profile_dest_dir, proguard_config_file) = \
-            BuildAppWithShrinker(
-                app, repo, shrinker, checkout_dir, out_dir, temp_dir,
-                options)
-        dex_size = ComputeSizeOfDexFilesInApk(apk_dest)
-        result['apk_dest'] = apk_dest
-        result['build_status'] = 'success'
-        result['dex_size'] = dex_size
-        result['profile_dest_dir'] = profile_dest_dir
+      proguard_config_file = None
+      if not options.r8_compilation_steps_only:
+        try:
+          out_dir = os.path.join(checkout_dir, 'out', shrinker)
+          (apk_dest, profile_dest_dir, res_proguard_config_file) = \
+              BuildAppWithShrinker(
+                  app, repo, shrinker, checkout_dir, out_dir, temp_dir,
+                  options)
+          proguard_config_file = res_proguard_config_file
+          dex_size = ComputeSizeOfDexFilesInApk(apk_dest)
+          result['apk_dest'] = apk_dest
+          result['build_status'] = 'success'
+          result['dex_size'] = dex_size
+          result['profile_dest_dir'] = profile_dest_dir
 
-        profile = as_utils.ParseProfileReport(profile_dest_dir)
-        result['profile'] = {
-            task_name:duration for task_name, duration in profile.iteritems()
-            if as_utils.IsGradleCompilerTask(task_name, shrinker)}
-      except Exception as e:
-        warn('Failed to build {} with {}'.format(app.name, shrinker))
-        if e:
-          print('Error: ' + str(e))
-        result['build_status'] = 'failed'
+          profile = as_utils.ParseProfileReport(profile_dest_dir)
+          result['profile'] = {
+              task_name:duration for task_name, duration in profile.iteritems()
+              if as_utils.IsGradleCompilerTask(task_name, shrinker)}
+        except Exception as e:
+          warn('Failed to build {} with {}'.format(app.name, shrinker))
+          if e:
+            print('Error: ' + str(e))
+          result['build_status'] = 'failed'
 
       if result.get('build_status') == 'success':
         if options.monkey:
           result['monkey_status'] = 'success' if RunMonkey(
               app, options, apk_dest) else 'failed'
 
+      if (result.get('build_status') == 'success'
+          or options.r8_compilation_steps_only):
         if 'r8' in shrinker and options.r8_compilation_steps > 1:
           result['recompilation_results'] = \
               ComputeRecompilationResults(
                   app, repo, options, checkout_dir, temp_dir, shrinker,
                   proguard_config_file)
 
+      if result.get('build_status') == 'success':
         if options.run_tests and app.has_instrumentation_tests:
           result['instrumentation_test_results'] = \
               ComputeInstrumentationTestResults(
@@ -563,11 +699,20 @@ def BuildAppWithSelectedShrinkers(
 def BuildAppWithShrinker(
     app, repo, shrinker, checkout_dir, out_dir, temp_dir, options,
     keepRuleSynthesisForRecompilation=False):
-  print('Building {} with {}{}'.format(
+  print('[{}] Building {} with {}{}'.format(
+      datetime.now().strftime("%H:%M:%S"),
       app.name,
       shrinker,
       ' for recompilation' if keepRuleSynthesisForRecompilation else ''))
-
+  print('To compile locally: '
+        'tools/run_on_as_app.py --shrinker {} --r8-compilation-steps {} '
+        '--app {} {}'.format(
+            shrinker,
+            options.r8_compilation_steps,
+            app.name,
+            '--r8-compilation-steps-only'
+              if options.r8_compilation_steps_only else ''))
+  print('HINT: use --shrinker r8-nolib --no-build if you have a local R8.jar')
   # Add settings.gradle file if it is not present to prevent gradle from finding
   # the settings.gradle file in the r8 root when apps are placed under
   # $R8/build.
@@ -588,19 +733,26 @@ def BuildAppWithShrinker(
       app, checkout_dir, proguard_config_dest)
 
   env_vars = {}
+  env_vars['JAVA_HOME'] = jdk.GetJdk8Home()
   env_vars['ANDROID_HOME'] = utils.getAndroidHome()
   if not options.disable_assertions:
     env_vars['JAVA_OPTS'] = '-ea:com.android.tools.r8...'
 
-  releaseTarget = app.releaseTarget
-  if not releaseTarget:
-    releaseTarget = app.module.replace('/', ':') + ':' + 'assemble' + (
-        app.flavor.capitalize() if app.flavor else '') + 'Release'
+  release_target = app.releaseTarget
+  if not release_target:
+    app_module = app.module.replace('/', ':')
+    app_flavor = (app.flavor.capitalize() if app.flavor else '') + 'Release'
+    release_target = app_module + ':' + 'assemble' + app_flavor
 
   # Build using gradle.
-  args = [releaseTarget,
+  args = [release_target,
+          '-g=' + os.path.join(checkout_dir, GRADLE_USER_HOME),
           '-Pandroid.enableR8=' + str(IsR8(shrinker)).lower(),
           '-Pandroid.enableR8.fullMode=' + str(IsR8FullMode(shrinker)).lower()]
+  if app.has_lint_task:
+    args.extend(['-x', app_module + ':lintVital' + app_flavor])
+  if options.bot:
+    args.extend(['--console=plain', '--info'])
 
   # Warm up gradle if pre_runs > 0. For posterity we generate the same sequence
   # as the benchmarking at https://github.com/madsager/santa-tracker-android.
@@ -653,10 +805,13 @@ def BuildAppWithShrinker(
   unsigned_apk = os.path.join(build_output_apks, unsigned_apk_name)
 
   assert os.path.isfile(signed_apk) or os.path.isfile(unsigned_apk), (
-      "Expected a file to be present at {} or {}, found: {}".format(
-          signed_apk, unsigned_apk,
+      "Expected a file to be present at {} or {}, found: {}\n"
+      "Standard out from compilation: {}".format(
+          signed_apk,
+          unsigned_apk,
           ', '.join(
-              as_utils.ListFiles(build_dir, lambda x : x.endswith('.apk')))))
+              as_utils.ListFiles(build_dir, lambda x : x.endswith('.apk'))),
+          stdout))
 
   if options.sign_apks and not os.path.isfile(signed_apk):
     assert os.path.isfile(unsigned_apk)
@@ -681,6 +836,9 @@ def BuildAppWithShrinker(
 
   profile_dest_dir = os.path.join(out_dir, 'profile')
   as_utils.MoveProfileReportTo(profile_dest_dir, stdout, quiet=options.quiet)
+  # Ensure that the gradle daemon is stopped if we are running with it.
+  if options.use_daemon:
+    utils.RunGradlew(['--stop', '-g=' + os.path.join(checkout_dir, GRADLE_USER_HOME)])
 
   return (apk_dest, profile_dest_dir, proguard_config_dest)
 
@@ -734,15 +892,17 @@ def ComputeRecompilationResults(
   }
   recompilation_results.append(recompilation_result)
 
-  # Sanity check that keep rules have changed.
-  with open(ext_proguard_config_file) as new:
-    with open(proguard_config_file) as old:
-      assert(
-          sum(1 for line in new
-              if line.strip() and '-printconfiguration' not in line)
-          >
-          sum(1 for line in old
-              if line.strip() and '-printconfiguration' not in line))
+  # Sanity check that keep rules have changed. If we are only doing
+  # recompilation, the passed in proguard_config_file is None.
+  if proguard_config_file:
+    with open(ext_proguard_config_file) as new:
+      with open(proguard_config_file) as old:
+        assert(
+            sum(1 for line in new
+                if line.strip() and '-printconfiguration' not in line)
+            >
+            sum(1 for line in old
+                if line.strip() and '-printconfiguration' not in line))
 
   # Extract min-sdk and target-sdk
   (min_sdk, compile_sdk) = \
@@ -760,6 +920,8 @@ def ComputeRecompilationResults(
     try:
       recompiled_apk_dest = os.path.join(
           checkout_dir, 'out', shrinker, 'app-release-{}.apk'.format(i))
+      if not os.path.exists(os.path.dirname(recompiled_apk_dest)):
+        os.makedirs(os.path.dirname(recompiled_apk_dest))
       RebuildAppWithShrinker(
           app, previous_apk, recompiled_apk_dest,
           ext_proguard_config_file, shrinker, min_sdk, compile_sdk,
@@ -900,22 +1062,24 @@ def LogComparisonResultsForApp(app, result_per_shrinker, options):
       continue
     result = result_per_shrinker.get(shrinker)
     build_status = result.get('build_status')
-    if build_status != 'success':
+    if build_status != 'success' and build_status is not None:
       app_error = True
       warn('  {}: {}'.format(shrinker, build_status))
-    else:
-      print('  {}:'.format(shrinker))
-      dex_size = result.get('dex_size')
-      msg = '    dex size: {}'.format(dex_size)
-      if dex_size != proguard_dex_size and proguard_dex_size >= 0:
-        msg = '{} ({}, {})'.format(
-            msg, dex_size - proguard_dex_size,
-            PercentageDiffAsString(proguard_dex_size, dex_size))
-        success(msg) if dex_size < proguard_dex_size else warn(msg)
-      else:
-        print(msg)
+      continue
 
-      profile = result.get('profile')
+    print('  {}:'.format(shrinker))
+    dex_size = result.get('dex_size')
+    msg = '    dex size: {}'.format(dex_size)
+    if dex_size != proguard_dex_size and proguard_dex_size >= 0:
+      msg = '{} ({}, {})'.format(
+          msg, dex_size - proguard_dex_size,
+          PercentageDiffAsString(proguard_dex_size, dex_size))
+      success(msg) if dex_size < proguard_dex_size else warn(msg)
+    else:
+      print(msg)
+
+    profile = result.get('profile')
+    if profile:
       duration = sum(profile.values())
       msg = '    performance: {}s'.format(duration)
       if duration != proguard_duration and proguard_duration > 0:
@@ -929,53 +1093,53 @@ def LogComparisonResultsForApp(app, result_per_shrinker, options):
         for task_name, task_duration in profile.iteritems():
           print('      {}: {}s'.format(task_name, task_duration))
 
-      if options.monkey:
-        monkey_status = result.get('monkey_status')
-        if monkey_status != 'success':
-          app_error = True
-          warn('    monkey: {}'.format(monkey_status))
-        else:
-          success('    monkey: {}'.format(monkey_status))
+    if options.monkey:
+      monkey_status = result.get('monkey_status')
+      if monkey_status != 'success':
+        app_error = True
+        warn('    monkey: {}'.format(monkey_status))
+      else:
+        success('    monkey: {}'.format(monkey_status))
 
-      recompilation_results = result.get('recompilation_results', [])
-      i = 0
-      for recompilation_result in recompilation_results:
-        build_status = recompilation_result.get('build_status')
-        if build_status != 'success':
-          app_error = True
-          print('    recompilation #{}: {}'.format(i, build_status))
-        else:
-          dex_size = recompilation_result.get('dex_size')
-          print('    recompilation #{}'.format(i))
-          print('      dex size: {}'.format(dex_size))
-          if options.monkey:
-            monkey_status = recompilation_result.get('monkey_status')
-            msg = '      monkey: {}'.format(monkey_status)
-            if monkey_status == 'success':
-              success(msg)
-            elif monkey_status == 'skipped':
-              print(msg)
-            else:
-              warn(msg)
-        i += 1
+    recompilation_results = result.get('recompilation_results', [])
+    i = 0
+    for recompilation_result in recompilation_results:
+      build_status = recompilation_result.get('build_status')
+      if build_status != 'success':
+        app_error = True
+        print('    recompilation #{}: {}'.format(i, build_status))
+      else:
+        dex_size = recompilation_result.get('dex_size')
+        print('    recompilation #{}'.format(i))
+        print('      dex size: {}'.format(dex_size))
+        if options.monkey:
+          monkey_status = recompilation_result.get('monkey_status')
+          msg = '      monkey: {}'.format(monkey_status)
+          if monkey_status == 'success':
+            success(msg)
+          elif monkey_status == 'skipped':
+            print(msg)
+          else:
+            warn(msg)
+      i += 1
 
-      if options.run_tests and 'instrumentation_test_results' in result:
-        instrumentation_test_results = \
-            result.get('instrumentation_test_results')
-        succeeded = (
-            instrumentation_test_results.get('failures')
-                + instrumentation_test_results.get('errors')
-                + instrumentation_test_results.get('skipped')) == 0
-        if succeeded:
-          success('    tests: succeeded')
-        else:
-          app_error = True
-          warn(
-              '    tests: failed (failures: {}, errors: {}, skipped: {})'
-              .format(
-                  instrumentation_test_results.get('failures'),
-                  instrumentation_test_results.get('errors'),
-                  instrumentation_test_results.get('skipped')))
+    if options.run_tests and 'instrumentation_test_results' in result:
+      instrumentation_test_results = \
+          result.get('instrumentation_test_results')
+      succeeded = (
+          instrumentation_test_results.get('failures')
+              + instrumentation_test_results.get('errors')
+              + instrumentation_test_results.get('skipped')) == 0
+      if succeeded:
+        success('    tests: succeeded')
+      else:
+        app_error = True
+        warn(
+            '    tests: failed (failures: {}, errors: {}, skipped: {})'
+            .format(
+                instrumentation_test_results.get('failures'),
+                instrumentation_test_results.get('errors'),
+                instrumentation_test_results.get('skipped')))
 
   return app_error
 
@@ -983,8 +1147,13 @@ def ParseOptions(argv):
   result = optparse.OptionParser()
   result.add_option('--app',
                     help='What app to run on',
-                    choices=GetAllAppNames())
-  result.add_option('--disable-assertions',
+                    choices=GetAllAppNames(),
+                    action='append')
+  result.add_option('--bot',
+                    help='Running on bot, use third_party dependency.',
+                    default=False,
+                    action='store_true')
+  result.add_option('--disable-assertions', '--disable_assertions',
                     help='Disable assertions when compiling',
                     default=False,
                     action='store_true')
@@ -999,16 +1168,14 @@ def ParseOptions(argv):
                     help='Running on golem, do not download',
                     default=False,
                     action='store_true')
-  result.add_option('--bot',
-                    help='Running on bot, use third_party dependency.',
-                    default=False,
-                    action='store_true')
   result.add_option('--gradle-flags', '--gradle_flags',
                     help='Flags to pass in to gradle')
   result.add_option('--gradle-pre-runs', '--gradle_pre_runs',
                     help='Do rounds of compilations to warm up gradle',
                     default=0,
                     type=int)
+  result.add_option('--hash',
+                    help='The version of R8 to use')
   result.add_option('--ignore-versions', '--ignore_versions',
                     help='Allow checked-out app to differ in revision from '
                          'pinned',
@@ -1035,10 +1202,6 @@ def ParseOptions(argv):
                     help='Run without building ToT first (only when using ToT)',
                     default=False,
                     action='store_true')
-  result.add_option('--quiet',
-                    help='Disable verbose logging',
-                    default=False,
-                    action='store_true')
   result.add_option('--no-logging', '--no_logging',
                     help='Disable logging except for errors',
                     default=False,
@@ -1048,10 +1211,18 @@ def ParseOptions(argv):
                     help='Print the sizes of individual dex segments as ' +
                          '\'<BENCHMARKNAME>-<APP>-<segment>(CodeSize): '
                          '<bytes>\'')
+  result.add_option('--quiet',
+                    help='Disable verbose logging',
+                    default=False,
+                    action='store_true')
   result.add_option('--r8-compilation-steps', '--r8_compilation_steps',
                     help='Number of times R8 should be run on each app',
                     default=2,
                     type=int)
+  result.add_option('--r8-compilation-steps-only', '--r8_compilation_steps_only',
+                    help='Specify to only run compilation steps',
+                    default=False,
+                    action='store_true')
   result.add_option('--run-tests', '--run_tests',
                     help='Whether to run instrumentation tests',
                     default=False,
@@ -1071,7 +1242,8 @@ def ParseOptions(argv):
                     help='The version of R8 to use (e.g., 1.4.51)')
   (options, args) = result.parse_args(argv)
   if options.app:
-    options.apps = [GetAppWithName(options.app)]
+    options.apps = [(app, repo) for (app, repo) in GetAllApps()
+                    if app.name in options.app]
     del options.app
   else:
     options.apps = GetAllApps()
@@ -1083,17 +1255,20 @@ def ParseOptions(argv):
       assert shrinker in SHRINKERS
   else:
     options.shrinker = [shrinker for shrinker in SHRINKERS]
-  if options.version:
-    # No need to build R8 if a specific release version should be used.
+
+  if options.hash or options.version:
+    # No need to build R8 if a specific version should be used.
     options.no_build = True
     if 'r8-nolib' in options.shrinker:
-      warn('Skipping shrinker r8-nolib because a specific release version '
+      warn('Skipping shrinker r8-nolib because a specific version '
           + 'of r8 was specified')
       options.shrinker.remove('r8-nolib')
     if 'r8-nolib-full' in options.shrinker:
-      warn('Skipping shrinker r8-nolib-full because a specific release version '
+      warn('Skipping shrinker r8-nolib-full because a specific version '
           + 'of r8 was specified')
       options.shrinker.remove('r8-nolib-full')
+  assert not options.r8_compilation_steps_only \
+         or options.r8_compilation_steps > 1
   return (options, args)
 
 def clone_repositories(quiet):
@@ -1119,8 +1294,11 @@ def main(argv):
     os.environ[utils.ANDROID_HOME_ENVIROMENT_NAME] = os.path.join(
         utils.ANDROID_SDK)
     os.environ[utils.ANDROID_TOOLS_VERSION_ENVIRONMENT_NAME] = '28.0.3'
-    options.no_logging = True
-    options.shrinker = [shrinker for shrinker in SHRINKERS if shrinker != 'pg']
+    # TODO(b/141081520): Set to True once fixed.
+    options.no_logging = False
+    # TODO(b/141081520): Remove logging filter once fixed.
+    options.app_logging_filter = ['sqldelight']
+    options.shrinker = ['r8', 'r8-full']
     print(options.shrinker)
 
   if options.golem:
@@ -1149,11 +1327,26 @@ def main(argv):
 
   with utils.TempDir() as temp_dir:
     if not (options.no_build or options.golem):
-      gradle.RunGradle(['r8', 'r8lib', '-Pno_internal'])
+      gradle.RunGradle(['r8', '-Pno_internal'])
+      build_r8lib = False
+      for shrinker in options.shrinker:
+        if IsMinifiedR8(shrinker):
+          build_r8lib = True
+      if build_r8lib:
+        gradle.RunGradle(['r8lib', '-Pno_internal'])
 
-    if options.version:
+    if options.hash:
+      # Download r8-<hash>.jar from
+      # https://storage.googleapis.com/r8-releases/raw/.
+      target = 'r8-{}.jar'.format(options.hash)
+      update_prebuilds_in_android.download_hash(
+          temp_dir, 'com/android/tools/r8/' + options.hash, target)
+      as_utils.MoveFile(
+          os.path.join(temp_dir, target), os.path.join(temp_dir, 'r8lib.jar'),
+          quiet=options.quiet)
+    elif options.version:
       # Download r8-<version>.jar from
-      # http://storage.googleapis.com/r8-releases/raw/.
+      # https://storage.googleapis.com/r8-releases/raw/.
       target = 'r8-{}.jar'.format(options.version)
       update_prebuilds_in_android.download_version(
           temp_dir, 'com/android/tools/r8/' + options.version, target)
@@ -1171,13 +1364,14 @@ def main(argv):
         shutil.copyfile(utils.R8LIB_JAR, os.path.join(temp_dir, 'r8lib.jar'))
 
     result_per_shrinker_per_app = []
-
-    for (app, repo) in options.apps:
-      if app.skip:
-        continue
-      result_per_shrinker_per_app.append(
-          (app, GetResultsForApp(app, repo, options, temp_dir)))
-
+    # If we are running on golem we kill all java processes after the run
+    # to ensure no hanging gradle daemons.
+    with EnsureNoGradleAlive(options.golem):
+      for (app, repo) in options.apps:
+        if app.skip:
+          continue
+        result_per_shrinker_per_app.append(
+            (app, GetResultsForApp(app, repo, options, temp_dir)))
     return LogResultsForApps(result_per_shrinker_per_app, options)
 
 def success(message):

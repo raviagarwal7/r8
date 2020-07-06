@@ -70,7 +70,7 @@ public class NameThenLengthTest extends TestBase {
 
   @Parameterized.Parameters(name = "{0}")
   public static TestParametersCollection data() {
-    return getTestParameters().withAllRuntimes().build();
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
   }
 
   private final TestParameters parameters;
@@ -81,7 +81,7 @@ public class NameThenLengthTest extends TestBase {
 
   @Test
   public void testJVMOutput() throws Exception {
-    assumeTrue("Only run JVM reference once (for CF backend)", parameters.isCfRuntime());
+    assumeTrue("Only run JVM reference on CF runtimes", parameters.isCfRuntime());
     testForJvm()
         .addTestClasspath()
         .run(parameters.getRuntime(), MAIN)
@@ -140,7 +140,7 @@ public class NameThenLengthTest extends TestBase {
             .debug()
             .addProgramClasses(MAIN)
             .addOptionsModification(this::configure)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
     test(result, 2, 0, 2, 0);
@@ -150,7 +150,7 @@ public class NameThenLengthTest extends TestBase {
             .release()
             .addProgramClasses(MAIN)
             .addOptionsModification(this::configure)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
     // TODO(b/125303292): NAME_LENGTH is still not computed at compile time.
@@ -166,7 +166,7 @@ public class NameThenLengthTest extends TestBase {
             .addKeepMainRule(MAIN)
             .noMinification()
             .addOptionsModification(this::configure)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
     // No canonicalization in CF.

@@ -5,32 +5,40 @@ package com.android.tools.r8.ir.code;
 
 import com.android.tools.r8.cf.code.CfInvoke;
 import com.android.tools.r8.code.InvokeSuperRange;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
-import org.objectweb.asm.Opcodes;
 
 public class InvokeSuper extends InvokeMethodWithReceiver {
 
-  public final boolean itf;
+  public final boolean isInterface;
 
-  public InvokeSuper(DexMethod target, Value result, List<Value> arguments, boolean itf) {
+  public InvokeSuper(DexMethod target, Value result, List<Value> arguments, boolean isInterface) {
     super(target, result, arguments);
-    this.itf = itf;
+    this.isInterface = isInterface;
+  }
+
+  @Override
+  public boolean getInterfaceBit() {
+    return isInterface;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INVOKE_SUPER;
   }
 
   @Override
@@ -74,7 +82,8 @@ public class InvokeSuper extends InvokeMethodWithReceiver {
 
   @Override
   public void buildCf(CfBuilder builder) {
-    builder.add(new CfInvoke(Opcodes.INVOKESPECIAL, getInvokedMethod(), itf));
+    builder.add(
+        new CfInvoke(org.objectweb.asm.Opcodes.INVOKESPECIAL, getInvokedMethod(), isInterface));
   }
 
   @Override
@@ -93,36 +102,32 @@ public class InvokeSuper extends InvokeMethodWithReceiver {
   }
 
   @Override
-  public DexEncodedMethod lookupSingleTarget(AppInfoWithLiveness appInfo,
-      DexType invocationContext) {
-    if (invocationContext == null) {
-      return null;
+  public DexEncodedMethod lookupSingleTarget(
+      AppView<?> appView,
+      ProgramMethod context,
+      TypeElement receiverUpperBoundType,
+      ClassTypeElement receiverLowerBoundType) {
+    if (appView.appInfo().hasLiveness() && context != null) {
+      AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
+      AppInfoWithLiveness appInfo = appViewWithLiveness.appInfo();
+      if (appInfo.isSubtype(context.getHolderType(), getInvokedMethod().holder)) {
+        return appInfo.lookupSuperTarget(getInvokedMethod(), context);
+      }
     }
-    if (!appInfo.isSubtype(invocationContext, getInvokedMethod().holder)) {
-      return null;
-    } else {
-      return appInfo.lookupSuperTarget(getInvokedMethod(), invocationContext);
-    }
-  }
-
-  @Override
-  public Collection<DexEncodedMethod> lookupTargets(AppInfoWithSubtyping appInfo,
-      DexType invocationContext) {
-    DexEncodedMethod target = appInfo.lookupSuperTarget(getInvokedMethod(), invocationContext);
-    return target == null ? Collections.emptyList() : Collections.singletonList(target);
+    return null;
   }
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInvokeSuper(getInvokedMethod(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInvokeSuper(getInvokedMethod(), context.getHolder());
   }
 
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forInvokeSuper(

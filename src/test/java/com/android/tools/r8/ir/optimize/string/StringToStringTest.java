@@ -6,7 +6,6 @@ package com.android.tools.r8.ir.optimize.string;
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
 import com.android.tools.r8.D8TestRunResult;
@@ -21,33 +20,9 @@ import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
-import com.google.common.collect.Streams;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-
-class StringToStringTestMain {
-
-  @NeverInline
-  static String hideNPE(String s) {
-    return s.toString();
-  }
-
-  public static void main(String[] args) {
-    String x = "constant-x";
-    System.out.println(x.toString());
-    StringBuilder builder = new StringBuilder();
-    builder.append("R");
-    builder.append(8);
-    System.out.println(builder.toString());
-    try {
-      System.out.println(hideNPE(null));
-      fail("Expected NullPointerException");
-    } catch (NullPointerException npe) {
-      // Expected
-    }
-  }
-}
 
 @RunWith(Parameterized.class)
 public class StringToStringTest extends TestBase {
@@ -55,8 +30,7 @@ public class StringToStringTest extends TestBase {
       "constant-x",
       "R8"
   );
-  private static final Class<?> MAIN = StringToStringTestMain.class;
-
+  private static final Class<?> MAIN = TestClass.class;
   private static final String STRING_DESCRIPTOR = "Ljava/lang/String;";
 
   @Parameterized.Parameters(name = "{0}")
@@ -72,7 +46,7 @@ public class StringToStringTest extends TestBase {
 
   @Test
   public void testJVMOutput() throws Exception {
-    assumeTrue("Only run JVM reference once (for CF backend)", parameters.isCfRuntime());
+    assumeTrue("Only run JVM reference on CF runtimes", parameters.isCfRuntime());
     testForJvm()
         .addTestClasspath()
         .run(parameters.getRuntime(), MAIN)
@@ -87,12 +61,12 @@ public class StringToStringTest extends TestBase {
   }
 
   private long countStringToString(MethodSubject method) {
-    return Streams.stream(method.iterateInstructions(instructionSubject -> {
+    return method.streamInstructions().filter(instructionSubject -> {
       if (instructionSubject.isInvoke()) {
         return isStringToString(instructionSubject.getMethod());
       }
       return false;
-    })).count();
+    }).count();
   }
 
   private void test(TestRunResult result, int expectedStringToStringCount) throws Exception {
@@ -100,8 +74,7 @@ public class StringToStringTest extends TestBase {
     ClassSubject mainClass = codeInspector.clazz(MAIN);
     MethodSubject mainMethod = mainClass.mainMethod();
     assertThat(mainMethod, isPresent());
-    long count = countStringToString(mainMethod);
-    assertEquals(expectedStringToStringCount, count);
+    assertEquals(expectedStringToStringCount, countStringToString(mainMethod));
   }
 
   @Test
@@ -139,5 +112,28 @@ public class StringToStringTest extends TestBase {
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
     test(result, 0);
+  }
+
+  static class TestClass {
+
+    @NeverInline
+    static String hideNPE(String s) {
+      return s.toString();
+    }
+
+    public static void main(String[] args) {
+      String x = "constant-x";
+      System.out.println(x.toString());
+      StringBuilder builder = new StringBuilder();
+      builder.append("R");
+      builder.append(8);
+      System.out.println(builder.toString());
+      try {
+        System.out.println(hideNPE(null));
+        throw new AssertionError("Expected NullPointerException");
+      } catch (NullPointerException npe) {
+        // Expected
+      }
+    }
   }
 }

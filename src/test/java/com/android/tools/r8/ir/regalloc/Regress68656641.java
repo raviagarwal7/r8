@@ -6,7 +6,7 @@ package com.android.tools.r8.ir.regalloc;
 import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexApplication;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.smali.SmaliBuilder;
@@ -22,7 +22,7 @@ import org.junit.Test;
 public class Regress68656641 extends SmaliTestBase {
 
   private static class MyRegisterAllocator extends LinearScanRegisterAllocator {
-    public MyRegisterAllocator(AppView<? extends AppInfo> appView, IRCode code) {
+    public MyRegisterAllocator(AppView<?> appView, IRCode code) {
       super(appView, code);
     }
 
@@ -56,27 +56,24 @@ public class Regress68656641 extends SmaliTestBase {
   @Test
   public void splitOverlappingInactiveIntervalWithNoNextUse() {
     InternalOptions options = new InternalOptions();
-    AppInfo appInfo = new AppInfo(DexApplication.builder(options.itemFactory, null).build());
-    AppView<? extends AppInfo> appView = AppView.createForD8(appInfo, options);
+    AppInfo appInfo = new AppInfo(DexApplication.builder(options, null).build());
+    AppView<?> appView = AppView.createForD8(appInfo);
     IRCode code = simpleCode();
     MyRegisterAllocator allocator = new MyRegisterAllocator(appView, code);
     // Setup live an inactive live interval with ranges [0, 10[ and [20, 30[ with only
     // uses in the first interval and which is linked to another interval.
-    LiveIntervals inactiveIntervals =
-        new LiveIntervals(new Value(0, TypeLatticeElement.INT, null));
+    LiveIntervals inactiveIntervals = new LiveIntervals(new Value(0, TypeElement.getInt(), null));
     inactiveIntervals.addRange(new LiveRange(0, 10));
     inactiveIntervals.addUse(new LiveIntervalsUse(0, 10));
     inactiveIntervals.addUse(new LiveIntervalsUse(4, 10));
     inactiveIntervals.addRange(new LiveRange(20, 30));
     inactiveIntervals.setRegister(0);
-    LiveIntervals linked =
-        new LiveIntervals(new Value(1, TypeLatticeElement.INT, null));
+    LiveIntervals linked = new LiveIntervals(new Value(1, TypeElement.getInt(), null));
     linked.setRegister(1);
     inactiveIntervals.link(linked);
     allocator.addInactiveIntervals(inactiveIntervals);
     // Setup an unhandled interval that overlaps the inactive interval.
-    LiveIntervals unhandledIntervals =
-        new LiveIntervals(new Value(2, TypeLatticeElement.INT, null));
+    LiveIntervals unhandledIntervals = new LiveIntervals(new Value(2, TypeElement.getInt(), null));
     unhandledIntervals.addRange(new LiveRange(12, 24));
     // Split the overlapping inactive intervals and check that after the split, the second
     // part of the inactive interval is unhandled and will therefore get a new register

@@ -8,7 +8,11 @@ import com.android.tools.r8.graph.DexDebugEvent;
 import com.android.tools.r8.graph.DexDebugInfo;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexString;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.ObjectToOffsetMapping;
+import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.Reporter;
 import java.util.Collections;
 import org.junit.Assert;
 import org.junit.Test;
@@ -17,7 +21,10 @@ public class DebugByteCodeWriterTest {
 
   private ObjectToOffsetMapping emptyObjectTObjectMapping() {
     return new ObjectToOffsetMapping(
-        DexApplication.builder(new DexItemFactory(), null).build(),
+        DexApplication.builder(new InternalOptions(new DexItemFactory(), new Reporter()), null)
+            .build(),
+        NamingLens.getIdentityLens(),
+        InitClassLens.getDefault(),
         Collections.emptyList(),
         Collections.emptyList(),
         Collections.emptyList(),

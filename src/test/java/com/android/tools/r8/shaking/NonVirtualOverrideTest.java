@@ -5,7 +5,7 @@
 package com.android.tools.r8.shaking;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
 import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
@@ -35,7 +35,6 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-import org.junit.runners.Parameterized.BeforeParam;
 
 @RunWith(Parameterized.class)
 public class NonVirtualOverrideTest extends TestBase {
@@ -90,14 +89,6 @@ public class NonVirtualOverrideTest extends TestBase {
   }
 
   @ClassRule public static TemporaryFolder staticTemp = ToolHelper.getTemporaryFolderForTest();
-
-  @BeforeParam
-  public static void forceCompilation(
-      TestParameters parameters, boolean enableClassInlining, boolean enableVerticalClassMerging) {
-    expectedResults.apply(isDexVmBetween5_1_1and7_0_0(parameters));
-    compilationResults.apply(
-        new Dimensions(parameters.getBackend(), enableClassInlining, enableVerticalClassMerging));
-  }
 
   private static Function<Boolean, String> expectedResults =
       memoizeFunction(NonVirtualOverrideTest::getExpectedResult);
@@ -178,7 +169,8 @@ public class NonVirtualOverrideTest extends TestBase {
   @Test
   public void test() throws Exception {
     // Run the program on Art after is has been compiled with R8.
-    String referenceResult = expectedResults.apply(isDexVmBetween5_1_1and7_0_0(parameters));
+    String referenceResult =
+        expectedResults.apply(!enableClassInlining && isDexVmBetween5_1_1and7_0_0(parameters));
     R8TestCompileResult compiled =
         compilationResults.apply(
             new Dimensions(
@@ -191,7 +183,7 @@ public class NonVirtualOverrideTest extends TestBase {
     if (!enableClassInlining && !enableVerticalClassMerging) {
       CodeInspector inspector = compiled.inspector();
       ClassSubject classSubject = inspector.clazz(B.class.getName());
-      assertThat(classSubject, isRenamed());
+      assertThat(classSubject, isPresentAndRenamed());
       assertThat(classSubject.method("void", "m1", ImmutableList.of()), isPresent());
       assertThat(classSubject.method("void", "m2", ImmutableList.of()), not(isPresent()));
       assertThat(classSubject.method("void", "m3", ImmutableList.of()), isPresent());

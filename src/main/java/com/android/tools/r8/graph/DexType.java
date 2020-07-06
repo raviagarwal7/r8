@@ -3,31 +3,50 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.graph;
 
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+import static com.android.tools.r8.ir.desugar.DesugaredLibraryWrapperSynthesizer.TYPE_WRAPPER_SUFFIX;
+import static com.android.tools.r8.ir.desugar.DesugaredLibraryWrapperSynthesizer.VIVIFIED_TYPE_WRAPPER_SUFFIX;
 import static com.android.tools.r8.ir.desugar.InterfaceMethodRewriter.COMPANION_CLASS_NAME_SUFFIX;
 import static com.android.tools.r8.ir.desugar.InterfaceMethodRewriter.DISPATCH_CLASS_NAME_SUFFIX;
+import static com.android.tools.r8.ir.desugar.InterfaceMethodRewriter.EMULATE_LIBRARY_CLASS_NAME_SUFFIX;
 import static com.android.tools.r8.ir.desugar.LambdaRewriter.LAMBDA_CLASS_NAME_PREFIX;
 import static com.android.tools.r8.ir.desugar.LambdaRewriter.LAMBDA_GROUP_CLASS_NAME_PREFIX;
+import static com.android.tools.r8.ir.optimize.enums.EnumUnboxingRewriter.ENUM_UNBOXING_UTILITY_CLASS_NAME;
 
 import com.android.tools.r8.dex.IndexedItemCollection;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.ir.desugar.Java8MethodRewriter;
+import com.android.tools.r8.ir.desugar.BackportedMethodRewriter;
+import com.android.tools.r8.ir.desugar.DesugaredLibraryRetargeter;
+import com.android.tools.r8.ir.desugar.NestBasedAccessDesugaring;
 import com.android.tools.r8.ir.desugar.TwrCloseResourceRewriter;
+import com.android.tools.r8.ir.optimize.ServiceLoaderRewriter;
 import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.DescriptorUtils;
 import com.android.tools.r8.utils.InternalOptions.OutlineOptions;
 import com.google.common.base.Predicates;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Sets;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 
 public class DexType extends DexReference implements PresortedComparable<DexType> {
   public static final DexType[] EMPTY_ARRAY = {};
 
+  // Bundletool is merging classes that may originate from a build with an old version of R8.
+  // Allow merging of classes that use names from older versions of R8.
+  private static List<String> OLD_SYNTHESIZED_NAMES = ImmutableList.of("$r8$java8methods$utility");
+
   public final DexString descriptor;
   private String toStringCache = null;
 
   DexType(DexString descriptor) {
-    assert !descriptor.toString().contains(".");
+    assert !descriptor.toString().contains(".") : "Malformed descriptor: " + descriptor.toString();
     this.descriptor = descriptor;
   }
 
@@ -44,32 +63,40 @@ public class DexType extends DexReference implements PresortedComparable<DexType
     return false;
   }
 
-  public boolean classInitializationMayHaveSideEffects(DexDefinitionSupplier definitions) {
-    return classInitializationMayHaveSideEffects(definitions, Predicates.alwaysFalse());
+  public boolean classInitializationMayHaveSideEffects(AppView<?> appView) {
+    return classInitializationMayHaveSideEffects(
+        appView, Predicates.alwaysFalse(), Sets.newIdentityHashSet());
   }
 
   public boolean classInitializationMayHaveSideEffects(
-      DexDefinitionSupplier definitions, Predicate<DexType> ignore) {
-    DexClass clazz = definitions.definitionFor(this);
-    return clazz == null || clazz.classInitializationMayHaveSideEffects(definitions, ignore);
+      AppView<?> appView, Predicate<DexType> ignore, Set<DexType> seen) {
+    DexClass clazz = appView.definitionFor(this);
+    return clazz == null || clazz.classInitializationMayHaveSideEffects(appView, ignore, seen);
   }
 
-  public boolean initializationOfParentTypesMayHaveSideEffects(AppInfo appInfo) {
-    return initializationOfParentTypesMayHaveSideEffects(appInfo, Predicates.alwaysFalse());
+  public boolean initializationOfParentTypesMayHaveSideEffects(AppView<?> appView) {
+    return initializationOfParentTypesMayHaveSideEffects(
+        appView, Predicates.alwaysFalse(), Sets.newIdentityHashSet());
   }
 
   public boolean initializationOfParentTypesMayHaveSideEffects(
-      AppInfo appInfo, Predicate<DexType> ignore) {
-    DexClass clazz = appInfo.definitionFor(this);
-    return clazz == null || clazz.initializationOfParentTypesMayHaveSideEffects(appInfo, ignore);
+      AppView<?> appView, Predicate<DexType> ignore, Set<DexType> seen) {
+    DexClass clazz = appView.definitionFor(this);
+    return clazz == null
+        || clazz.initializationOfParentTypesMayHaveSideEffects(appView, ignore, seen);
   }
 
   public boolean isAlwaysNull(AppView<AppInfoWithLiveness> appView) {
     if (isClassType()) {
-      DexClass clazz = appView.definitionFor(this);
-      return clazz != null
-          && clazz.isProgramClass()
-          && !appView.appInfo().isInstantiatedDirectlyOrIndirectly(this);
+      DexProgramClass clazz = asProgramClassOrNull(appView.definitionFor(this));
+      if (clazz == null) {
+        return false;
+      }
+      if (appView.options().enableUninstantiatedTypeOptimizationForInterfaces) {
+        return !appView.appInfo().isInstantiatedDirectlyOrIndirectly(clazz);
+      } else {
+        return !clazz.isInterface() && !appView.appInfo().isInstantiatedDirectlyOrIndirectly(clazz);
+      }
     }
     return false;
   }
@@ -88,6 +115,31 @@ public class DexType extends DexReference implements PresortedComparable<DexType
         && descriptor.charAt(0) == 'L'
         && descriptor.charAt(descriptor.length() - 1) == ';';
     return descriptor.substring(1, descriptor.length() - 1);
+  }
+
+  @Override
+  public <T> T apply(
+      Function<DexType, T> classConsumer,
+      Function<DexField, T> fieldConsumer,
+      Function<DexMethod, T> methodConsumer) {
+    return classConsumer.apply(this);
+  }
+
+  @Override
+  public void accept(
+      Consumer<DexType> classConsumer,
+      Consumer<DexField> fieldConsumer,
+      Consumer<DexMethod> methodConsumer) {
+    classConsumer.accept(this);
+  }
+
+  @Override
+  public <T> void accept(
+      BiConsumer<DexType, T> classConsumer,
+      BiConsumer<DexField, T> fieldConsumer,
+      BiConsumer<DexMethod, T> methodConsumer,
+      T arg) {
+    classConsumer.accept(this, arg);
   }
 
   @Override
@@ -119,11 +171,12 @@ public class DexType extends DexReference implements PresortedComparable<DexType
   }
 
   @Override
-  public void collectIndexedItems(IndexedItemCollection collection,
-      DexMethod method, int instructionOffset) {
+  public void collectIndexedItems(
+      IndexedItemCollection collection, DexMethod method, int instructionOffset) {
     if (collection.addType(this)) {
-      collection.getRenamedDescriptor(this).collectIndexedItems(collection, method,
-          instructionOffset);
+      collection
+          .getRenamedDescriptor(this)
+          .collectIndexedItems(collection, method, instructionOffset);
     }
   }
 
@@ -149,11 +202,6 @@ public class DexType extends DexReference implements PresortedComparable<DexType
   }
 
   @Override
-  public int compareTo(DexType other) {
-    return sortedCompareTo(other.getSortedIndex());
-  }
-
-  @Override
   public int slowCompareTo(DexType other) {
     return descriptor.slowCompareTo(other.descriptor);
   }
@@ -162,23 +210,11 @@ public class DexType extends DexReference implements PresortedComparable<DexType
   public int slowCompareTo(DexType other, NamingLens namingLens) {
     DexString thisDescriptor = namingLens.lookupDescriptor(this);
     DexString otherDescriptor = namingLens.lookupDescriptor(other);
-    return thisDescriptor.slowCompareTo(otherDescriptor);
-  }
-
-  @Override
-  public int layeredCompareTo(DexType other, NamingLens namingLens) {
-    DexString thisDescriptor = namingLens.lookupDescriptor(this);
-    DexString otherDescriptor = namingLens.lookupDescriptor(other);
-    return thisDescriptor.compareTo(otherDescriptor);
+    return thisDescriptor.slowCompareTo(otherDescriptor, namingLens);
   }
 
   public boolean isPrimitiveType() {
-    return isPrimitiveType((char) descriptor.content[0]);
-  }
-
-  private boolean isPrimitiveType(char c) {
-    return c == 'Z' || c == 'B' || c == 'S' || c == 'C' || c == 'I' || c == 'F' || c == 'J'
-        || c == 'D';
+    return DescriptorUtils.isPrimitiveType((char) descriptor.content[0]);
   }
 
   public boolean isVoidType() {
@@ -227,22 +263,54 @@ public class DexType extends DexReference implements PresortedComparable<DexType
     return firstChar == 'L';
   }
 
+  public boolean isReferenceType() {
+    boolean isReferenceType = isArrayType() || isClassType();
+    assert isReferenceType != isPrimitiveType() || isVoidType();
+    return isReferenceType;
+  }
+
   public boolean isPrimitiveArrayType() {
     if (!isArrayType()) {
       return false;
     }
-    return isPrimitiveType((char) descriptor.content[1]);
+    return DescriptorUtils.isPrimitiveType((char) descriptor.content[1]);
+  }
+
+  public boolean isWideType() {
+    return isDoubleType() || isLongType();
+  }
+
+  public boolean isD8R8SynthesizedLambdaClassType() {
+    String name = toSourceString();
+    return name.contains(LAMBDA_CLASS_NAME_PREFIX);
   }
 
   public boolean isD8R8SynthesizedClassType() {
     String name = toSourceString();
     return name.contains(COMPANION_CLASS_NAME_SUFFIX)
+        || name.contains(ENUM_UNBOXING_UTILITY_CLASS_NAME)
+        || name.contains(EMULATE_LIBRARY_CLASS_NAME_SUFFIX)
         || name.contains(DISPATCH_CLASS_NAME_SUFFIX)
+        || name.contains(TYPE_WRAPPER_SUFFIX)
+        || name.contains(VIVIFIED_TYPE_WRAPPER_SUFFIX)
         || name.contains(LAMBDA_CLASS_NAME_PREFIX)
         || name.contains(LAMBDA_GROUP_CLASS_NAME_PREFIX)
         || name.contains(OutlineOptions.CLASS_NAME)
         || name.contains(TwrCloseResourceRewriter.UTILITY_CLASS_NAME)
-        || name.contains(Java8MethodRewriter.UTILITY_CLASS_NAME_PREFIX);
+        || name.contains(NestBasedAccessDesugaring.NEST_CONSTRUCTOR_NAME)
+        || name.contains(BackportedMethodRewriter.UTILITY_CLASS_NAME_PREFIX)
+        || name.contains(DesugaredLibraryRetargeter.DESUGAR_LIB_RETARGET_CLASS_NAME_PREFIX)
+        || name.contains(ServiceLoaderRewriter.SERVICE_LOADER_CLASS_NAME)
+        || oldSynthesizedName(name);
+  }
+
+  private boolean oldSynthesizedName(String name) {
+    for (String synthesizedPrefix : OLD_SYNTHESIZED_NAMES) {
+      if (name.contains(synthesizedPrefix)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public boolean isProgramType(DexDefinitionSupplier definitions) {
@@ -250,20 +318,25 @@ public class DexType extends DexReference implements PresortedComparable<DexType
     return clazz != null && clazz.isProgramClass();
   }
 
+  public boolean isResolvable(AppView<?> appView) {
+    DexClass clazz = appView.definitionFor(this);
+    return clazz != null && clazz.isResolvable(appView);
+  }
+
   public int elementSizeForPrimitiveArrayType() {
     assert isPrimitiveArrayType();
     switch (descriptor.content[1]) {
-      case 'Z':  // boolean
-      case 'B':  // byte
+      case 'Z': // boolean
+      case 'B': // byte
         return 1;
-      case 'S':  // short
-      case 'C':  // char
+      case 'S': // short
+      case 'C': // char
         return 2;
-      case 'I':  // int
-      case 'F':  // float
+      case 'I': // int
+      case 'F': // float
         return 4;
-      case 'J':  // long
-      case 'D':  // double
+      case 'J': // long
+      case 'D': // double
         return 8;
       default:
         throw new Unreachable("Not array of primitives '" + descriptor + "'");
@@ -283,28 +356,49 @@ public class DexType extends DexReference implements PresortedComparable<DexType
     if (leadingSquareBrackets == 0) {
       return this;
     }
-    DexString newDesc = dexItemFactory.createString(descriptor.size - leadingSquareBrackets,
-        Arrays.copyOfRange(descriptor.content, leadingSquareBrackets, descriptor.content.length));
+    DexString newDesc =
+        dexItemFactory.createString(
+            descriptor.size - leadingSquareBrackets,
+            Arrays.copyOfRange(
+                descriptor.content, leadingSquareBrackets, descriptor.content.length));
     return dexItemFactory.createType(newDesc);
+  }
+
+  // Similar to the method above, but performs a lookup only, allowing to use
+  // this method also after strings are sorted in the ApplicationWriter.
+  public DexType lookupBaseType(DexItemFactory dexItemFactory) {
+    int leadingSquareBrackets = getNumberOfLeadingSquareBrackets();
+    if (leadingSquareBrackets == 0) {
+      return this;
+    }
+    DexString newDesc =
+        dexItemFactory.lookupString(
+            descriptor.size - leadingSquareBrackets,
+            Arrays.copyOfRange(
+                descriptor.content, leadingSquareBrackets, descriptor.content.length));
+    return dexItemFactory.lookupType(newDesc);
   }
 
   public DexType replaceBaseType(DexType newBase, DexItemFactory dexItemFactory) {
     assert this.isArrayType();
     assert !newBase.isArrayType();
-    int leadingSquareBrackets = getNumberOfLeadingSquareBrackets();
-    byte[] content = new byte[newBase.descriptor.content.length + leadingSquareBrackets];
-    Arrays.fill(content, 0, leadingSquareBrackets, (byte) '[');
-    System.arraycopy(newBase.descriptor.content, 0, content, leadingSquareBrackets,
-        newBase.descriptor.content.length);
-    DexString newDesc = dexItemFactory
-        .createString(newBase.descriptor.size + leadingSquareBrackets, content);
+    return newBase.toArrayType(getNumberOfLeadingSquareBrackets(), dexItemFactory);
+  }
+
+  public DexType toArrayType(int dimensions, DexItemFactory dexItemFactory) {
+    byte[] content = new byte[descriptor.content.length + dimensions];
+    Arrays.fill(content, 0, dimensions, (byte) '[');
+    System.arraycopy(descriptor.content, 0, content, dimensions, descriptor.content.length);
+    DexString newDesc = dexItemFactory.createString(descriptor.size + dimensions, content);
     return dexItemFactory.createType(newDesc);
   }
 
   public DexType toArrayElementType(DexItemFactory dexItemFactory) {
     assert this.isArrayType();
-    DexString newDesc = dexItemFactory.createString(descriptor.size - 1,
-        Arrays.copyOfRange(descriptor.content, 1, descriptor.content.length));
+    DexString newDesc =
+        dexItemFactory.createString(
+            descriptor.size - 1,
+            Arrays.copyOfRange(descriptor.content, 1, descriptor.content.length));
     return dexItemFactory.createType(newDesc);
   }
 
@@ -315,7 +409,8 @@ public class DexType extends DexReference implements PresortedComparable<DexType
     if (lastSeparator == -1) {
       return packagePart ? "" : descriptor.substring(1, descriptor.length() - 1);
     } else {
-      return packagePart ? descriptor.substring(1, lastSeparator)
+      return packagePart
+          ? descriptor.substring(1, lastSeparator)
           : descriptor.substring(lastSeparator + 1, descriptor.length() - 1);
     }
   }

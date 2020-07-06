@@ -4,6 +4,8 @@
 
 package com.android.tools.r8.ir.optimize.lambda;
 
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.ClassAccessFlags;
 import com.android.tools.r8.graph.DexAnnotationSet;
 import com.android.tools.r8.graph.DexEncodedField;
@@ -14,6 +16,7 @@ import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexTypeList;
 import com.android.tools.r8.graph.EnclosingMethodAttribute;
 import com.android.tools.r8.graph.InnerClassAttribute;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback;
 import com.android.tools.r8.origin.SynthesizedOrigin;
 import java.util.Collections;
 import java.util.List;
@@ -31,28 +34,32 @@ public abstract class LambdaGroupClassBuilder<T extends LambdaGroup> {
     this.origin = origin;
   }
 
-  public final DexProgramClass synthesizeClass() {
+  public final DexProgramClass synthesizeClass(
+      AppView<? extends AppInfoWithClassHierarchy> appView, OptimizationFeedback feedback) {
     DexType groupClassType = group.getGroupClassType();
     DexType superClassType = getSuperClassType();
-
-    return new DexProgramClass(
-        groupClassType,
-        null,
-        new SynthesizedOrigin(origin, getClass()),
-        buildAccessFlags(),
-        superClassType,
-        buildInterfaces(),
-        factory.createString(origin),
-        null,
-        Collections.emptyList(),
-        buildEnclosingMethodAttribute(),
-        buildInnerClasses(),
-        buildAnnotations(),
-        buildStaticFields(),
-        buildInstanceFields(),
-        buildDirectMethods(),
-        buildVirtualMethods(),
-        factory.getSkipNameValidationForTesting());
+    DexProgramClass programClass =
+        new DexProgramClass(
+            groupClassType,
+            null,
+            new SynthesizedOrigin(origin, getClass()),
+            buildAccessFlags(),
+            superClassType,
+            buildInterfaces(),
+            factory.createString(origin),
+            null,
+            Collections.emptyList(),
+            buildEnclosingMethodAttribute(),
+            buildInnerClasses(),
+            buildAnnotations(),
+            buildStaticFields(appView, feedback),
+            buildInstanceFields(),
+            buildDirectMethods(),
+            buildVirtualMethods(),
+            factory.getSkipNameValidationForTesting(),
+            // The name of the class is based on the hash of the content.
+            DexProgramClass::checksumFromType);
+    return programClass;
   }
 
   protected abstract DexType getSuperClassType();
@@ -71,7 +78,8 @@ public abstract class LambdaGroupClassBuilder<T extends LambdaGroup> {
 
   protected abstract DexEncodedField[] buildInstanceFields();
 
-  protected abstract DexEncodedField[] buildStaticFields();
+  protected abstract DexEncodedField[] buildStaticFields(
+      AppView<? extends AppInfoWithClassHierarchy> appView, OptimizationFeedback feedback);
 
   protected abstract DexTypeList buildInterfaces();
 }

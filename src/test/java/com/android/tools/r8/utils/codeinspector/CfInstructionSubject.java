@@ -6,6 +6,7 @@ package com.android.tools.r8.utils.codeinspector;
 
 
 import com.android.tools.r8.cf.code.CfArithmeticBinop;
+import com.android.tools.r8.cf.code.CfArrayLength;
 import com.android.tools.r8.cf.code.CfArrayStore;
 import com.android.tools.r8.cf.code.CfCheckCast;
 import com.android.tools.r8.cf.code.CfConstClass;
@@ -39,10 +40,18 @@ import com.android.tools.r8.ir.code.ValueType;
 import org.objectweb.asm.Opcodes;
 
 public class CfInstructionSubject implements InstructionSubject {
-  protected final CfInstruction instruction;
 
-  public CfInstructionSubject(CfInstruction instruction) {
+  protected final CfInstruction instruction;
+  private final MethodSubject method;
+
+  public CfInstructionSubject(CfInstruction instruction, MethodSubject method) {
     this.instruction = instruction;
+    this.method = method;
+  }
+
+  @Override
+  public DexInstructionSubject asDexInstruction() {
+    return null;
   }
 
   @Override
@@ -121,8 +130,7 @@ public class CfInstructionSubject implements InstructionSubject {
 
   @Override
   public boolean isConstNumber(long value) {
-    return instruction instanceof CfConstNumber
-        && ((CfConstNumber) instruction).getRawValue() == value;
+    return isConstNumber() && getConstNumber() == value;
   }
 
   @Override
@@ -139,6 +147,16 @@ public class CfInstructionSubject implements InstructionSubject {
   public boolean isConstString(String value, JumboStringMode jumboStringMode) {
     return isConstString(jumboStringMode)
         && ((CfConstString) instruction).getString().toSourceString().equals(value);
+  }
+
+  @Override
+  public boolean isJumboString() {
+    return false;
+  }
+
+  @Override public long getConstNumber() {
+    assert isConstNumber();
+    return ((CfConstNumber) instruction).getRawValue();
   }
 
   @Override
@@ -232,6 +250,11 @@ public class CfInstructionSubject implements InstructionSubject {
   }
 
   @Override
+  public boolean isSwitch() {
+    return isPackedSwitch() || isSparseSwitch();
+  }
+
+  @Override
   public boolean isPackedSwitch() {
     return instruction instanceof CfSwitch
         && ((CfSwitch) instruction).getKind() == CfSwitch.Kind.TABLE;
@@ -243,6 +266,7 @@ public class CfInstructionSubject implements InstructionSubject {
         && ((CfSwitch) instruction).getKind() == CfSwitch.Kind.LOOKUP;
   }
 
+  @Override
   public boolean isInvokeSpecial() {
     return instruction instanceof CfInvoke
         && ((CfInvoke) instruction).getOpcode() == Opcodes.INVOKESPECIAL;
@@ -306,9 +330,15 @@ public class CfInstructionSubject implements InstructionSubject {
   }
 
   @Override
+  public boolean isArrayLength() {
+    return instruction instanceof CfArrayLength;
+  }
+
+  @Override
   public boolean isArrayPut() {
     return instruction instanceof CfArrayStore;
   }
+
 
   @Override
   public int size() {
@@ -320,6 +350,11 @@ public class CfInstructionSubject implements InstructionSubject {
   public InstructionOffsetSubject getOffset(MethodSubject methodSubject) {
     // TODO(b/122302789): CfInstruction#getOffset()
     throw new UnsupportedOperationException("CfInstruction doesn't have offset yet.");
+  }
+
+  @Override
+  public MethodSubject getMethodSubject() {
+    return method;
   }
 
   @Override

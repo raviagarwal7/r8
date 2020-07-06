@@ -4,11 +4,13 @@
 
 package com.android.tools.r8.graph;
 
+import com.android.tools.r8.errors.Unreachable;
+
 public class TopDownClassHierarchyTraversal<T extends DexClass>
     extends ClassHierarchyTraversal<T, TopDownClassHierarchyTraversal<T>> {
 
   private TopDownClassHierarchyTraversal(
-      AppView<? extends AppInfoWithSubtyping> appView, Scope scope) {
+      AppView<? extends AppInfoWithClassHierarchy> appView, Scope scope) {
     super(appView, scope);
   }
 
@@ -17,8 +19,26 @@ public class TopDownClassHierarchyTraversal<T extends DexClass>
    * classes) that are reachable from a given set of sources.
    */
   public static TopDownClassHierarchyTraversal<DexClass> forAllClasses(
-      AppView<? extends AppInfoWithSubtyping> appView) {
+      AppView<? extends AppInfoWithClassHierarchy> appView) {
     return new TopDownClassHierarchyTraversal<>(appView, Scope.ALL_CLASSES);
+  }
+
+  /**
+   * Returns a visitor that can be used to visit all the library classes that are reachable from a
+   * given set of sources.
+   */
+  public static TopDownClassHierarchyTraversal<DexLibraryClass> forLibraryClasses(
+      AppView<? extends AppInfoWithClassHierarchy> appView) {
+    return new TopDownClassHierarchyTraversal<>(appView, Scope.ONLY_LIBRARY_CLASSES);
+  }
+
+  /**
+   * Returns a visitor that can be used to visit all the library and classpath classes that are
+   * reachable from a given set of sources.
+   */
+  public static TopDownClassHierarchyTraversal<DexClass> forLibraryAndClasspathClasses(
+      AppView<? extends AppInfoWithClassHierarchy> appView) {
+    return new TopDownClassHierarchyTraversal<>(appView, Scope.ONLY_LIBRARY_AND_CLASSPATH_CLASSES);
   }
 
   /**
@@ -26,7 +46,7 @@ public class TopDownClassHierarchyTraversal<T extends DexClass>
    * given set of sources.
    */
   public static TopDownClassHierarchyTraversal<DexProgramClass> forProgramClasses(
-      AppView<? extends AppInfoWithSubtyping> appView) {
+      AppView<? extends AppInfoWithClassHierarchy> appView) {
     return new TopDownClassHierarchyTraversal<>(appView, Scope.ONLY_PROGRAM_CLASSES);
   }
 
@@ -37,26 +57,26 @@ public class TopDownClassHierarchyTraversal<T extends DexClass>
 
   @Override
   void addDependentsToWorklist(DexClass clazz) {
-    @SuppressWarnings("unchecked")
-    T clazzWithTypeT = (T) clazz;
 
-    if (excludeInterfaces && clazzWithTypeT.isInterface()) {
+    if (excludeInterfaces && clazz.isInterface()) {
       return;
     }
 
-    if (visited.contains(clazzWithTypeT)) {
+    if (visited.contains(clazz)) {
       return;
     }
 
-    worklist.addFirst(clazzWithTypeT);
+    if (scope.shouldBePassedToVisitor(clazz)) {
+      @SuppressWarnings("unchecked")
+      T clazzWithTypeT = (T) clazz;
+      worklist.addFirst(clazzWithTypeT);
+    }
 
     // Add super classes to worklist.
     if (clazz.superType != null) {
       DexClass definition = appView.definitionFor(clazz.superType);
-      if (definition != null) {
-        if (scope != Scope.ONLY_PROGRAM_CLASSES || definition.isProgramClass()) {
-          addDependentsToWorklist(definition);
-        }
+      if (definition != null && shouldTraverseUpwardsFrom(definition)) {
+        addDependentsToWorklist(definition);
       }
     }
 
@@ -64,12 +84,24 @@ public class TopDownClassHierarchyTraversal<T extends DexClass>
     if (!excludeInterfaces) {
       for (DexType interfaceType : clazz.interfaces.values) {
         DexClass definition = appView.definitionFor(interfaceType);
-        if (definition != null) {
-          if (scope != Scope.ONLY_PROGRAM_CLASSES || definition.isProgramClass()) {
-            addDependentsToWorklist(definition);
-          }
+        if (definition != null && shouldTraverseUpwardsFrom(definition)) {
+          addDependentsToWorklist(definition);
         }
       }
+    }
+  }
+
+  private boolean shouldTraverseUpwardsFrom(DexClass clazz) {
+    switch (scope) {
+      case ALL_CLASSES:
+      case ONLY_LIBRARY_CLASSES:
+      case ONLY_LIBRARY_AND_CLASSPATH_CLASSES:
+        return true;
+      case ONLY_PROGRAM_CLASSES:
+        return clazz.isProgramClass();
+
+      default:
+        throw new Unreachable();
     }
   }
 }

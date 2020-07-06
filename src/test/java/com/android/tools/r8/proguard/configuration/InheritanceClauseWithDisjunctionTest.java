@@ -6,17 +6,17 @@ package com.android.tools.r8.proguard.configuration;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 import static org.junit.Assert.fail;
 
 import com.android.tools.r8.CompilationFailedException;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.TestShrinkerBuilder;
+import com.android.tools.r8.utils.ThrowingConsumer;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.google.common.collect.ImmutableList;
 import java.util.List;
-import java.util.function.Consumer;
 import org.junit.Ignore;
 import org.junit.Test;
 
@@ -224,7 +224,7 @@ public class InheritanceClauseWithDisjunctionTest extends TestBase {
   private static void runTest(
       TestShrinkerBuilder<?, ?, ?, ?, ?> builder,
       List<String> keepRules,
-      Consumer<CodeInspector> consumer)
+      ThrowingConsumer<CodeInspector, RuntimeException> consumer)
       throws Exception {
     builder
         .addProgramClasses(

@@ -4,12 +4,13 @@
 
 package com.android.tools.r8.shaking;
 
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+
 import com.android.tools.r8.dex.IndexedItemCollection;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.DexAnnotationSet;
 import com.android.tools.r8.graph.DexCallSite;
 import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
@@ -18,7 +19,9 @@ import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.graph.UseRegistry;
+import com.android.tools.r8.utils.BooleanBox;
 import java.util.Set;
 import java.util.function.Consumer;
 
@@ -27,10 +30,11 @@ public class MainDexDirectReferenceTracer {
       new AnnotationDirectReferenceCollector();
   private final DirectReferencesCollector codeDirectReferenceCollector;
 
-  private final AppInfoWithSubtyping appInfo;
+  private final AppInfoWithClassHierarchy appInfo;
   private final Consumer<DexType> consumer;
 
-  public MainDexDirectReferenceTracer(AppInfoWithSubtyping appInfo, Consumer<DexType> consumer) {
+  public MainDexDirectReferenceTracer(
+      AppInfoWithClassHierarchy appInfo, Consumer<DexType> consumer) {
     this.codeDirectReferenceCollector = new DirectReferencesCollector(appInfo.dexItemFactory());
     this.appInfo = appInfo;
     this.consumer = consumer;
@@ -38,30 +42,28 @@ public class MainDexDirectReferenceTracer {
 
   public void run(Set<DexType> roots) {
     for (DexType type : roots) {
-      DexClass clazz = appInfo.definitionFor(type);
+      DexProgramClass clazz = asProgramClassOrNull(appInfo.definitionFor(type));
       // Should only happen for library classes, which are filtered out.
       assert clazz != null;
       consumer.accept(type);
       // Super and interfaces are live, no need to add them.
-      traceAnnotationsDirectDependencies(clazz.annotations);
+      traceAnnotationsDirectDependencies(clazz.annotations());
       clazz.forEachField(field -> consumer.accept(field.field.type));
-      clazz.forEachMethod(method -> {
-        traceMethodDirectDependencies(method.method, consumer);
-        method.registerCodeReferences(codeDirectReferenceCollector);
-      });
+      clazz.forEachProgramMethodMatching(
+          definition -> {
+            traceMethodDirectDependencies(definition.getReference(), consumer);
+            return definition.hasCode();
+          },
+          method -> method.registerCodeReferences(codeDirectReferenceCollector));
     }
   }
 
-  public void runOnCode(DexEncodedMethod method) {
+  public void runOnCode(ProgramMethod method) {
     method.registerCodeReferences(codeDirectReferenceCollector);
   }
 
-  private static class BooleanBox {
-    boolean value = false;
-  }
-
   public static boolean hasReferencesOutsideFromCode(
-      AppInfoWithSubtyping appInfo, DexEncodedMethod method, Set<DexType> classes) {
+      AppInfoWithClassHierarchy appInfo, ProgramMethod method, Set<DexType> classes) {
 
     BooleanBox result = new BooleanBox();
 
@@ -72,13 +74,13 @@ public class MainDexDirectReferenceTracer {
               if (baseType.isClassType() && !classes.contains(baseType)) {
                 DexClass cls = appInfo.definitionFor(baseType);
                 if (cls != null && cls.isProgramClass()) {
-                  result.value = true;
+                  result.set(true);
                 }
               }
             })
         .runOnCode(method);
 
-    return result.value;
+    return result.get();
   }
 
   private void traceAnnotationsDirectDependencies(DexAnnotationSet annotations) {
@@ -97,6 +99,12 @@ public class MainDexDirectReferenceTracer {
 
     private DirectReferencesCollector(DexItemFactory factory) {
       super(factory);
+    }
+
+    @Override
+    public boolean registerInitClass(DexType clazz) {
+      consumer.accept(clazz);
+      return true;
     }
 
     @Override

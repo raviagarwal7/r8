@@ -6,8 +6,8 @@ package com.android.tools.r8;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
-import com.android.tools.r8.graph.invokesuper.Consumer;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.origin.PathOrigin;
 import com.android.tools.r8.position.Position;
@@ -17,6 +17,7 @@ import com.android.tools.r8.utils.ListUtils;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 
 // Helper to check that a particular error occurred.
 public class DiagnosticsChecker implements DiagnosticsHandler {
@@ -43,23 +44,35 @@ public class DiagnosticsChecker implements DiagnosticsHandler {
     void run(DiagnosticsHandler handler) throws CompilationFailedException;
   }
 
+  private static void checkContains(String snippet, List<Diagnostic> diagnostics) {
+    List<String> messages = ListUtils.map(diagnostics, Diagnostic::getDiagnosticMessage);
+    System.out.println("Expecting match for '" + snippet + "'");
+    System.out.println("StdErr:\n" + messages);
+    assertTrue(
+        "Expected to find snippet '"
+            + snippet
+            + "' in error messages:\n"
+            + String.join("\n", messages),
+        diagnostics.stream().anyMatch(d -> d.getDiagnosticMessage().contains(snippet)));
+  }
+
   public static void checkErrorsContains(String snippet, FailingRunner runner)
       throws CompilationFailedException {
     DiagnosticsChecker handler = new DiagnosticsChecker();
     try {
       runner.run(handler);
+      fail("Failure expected");
     } catch (CompilationFailedException e) {
-      List<String> messages = ListUtils.map(handler.errors, Diagnostic::getDiagnosticMessage);
-      System.out.println("Expecting match for '" + snippet + "'");
-      System.out.println("StdErr:\n" + messages);
-      assertTrue(
-          "Expected to find snippet '"
-              + snippet
-              + "' in error messages:\n"
-              + String.join("\n", messages),
-          handler.errors.stream().anyMatch(d -> d.getDiagnosticMessage().contains(snippet)));
+      checkContains(snippet, handler.errors);
       throw e;
     }
+  }
+
+  public static void checkWarningsContains(String snippet, FailingRunner runner)
+      throws CompilationFailedException {
+    DiagnosticsChecker handler = new DiagnosticsChecker();
+    runner.run(handler);
+    checkContains(snippet, handler.warnings);
   }
 
   public static Diagnostic checkDiagnostic(Diagnostic diagnostic, Consumer<Origin> originChecker,
@@ -73,8 +86,12 @@ public class DiagnosticsChecker implements DiagnosticsHandler {
     } else {
       position = ((TextPosition) diagnostic.getPosition());
     }
-    assertEquals(lineStart, position.getLine());
-    assertEquals(columnStart, position.getColumn());
+    if (lineStart > 0) {
+      assertEquals(lineStart, position.getLine());
+    }
+    if (columnStart > 0) {
+      assertEquals(columnStart, position.getColumn());
+    }
     for (String part : messageParts) {
       assertTrue(diagnostic.getDiagnosticMessage() + " doesn't contain \"" + part + "\"",
           diagnostic.getDiagnosticMessage().contains(part));

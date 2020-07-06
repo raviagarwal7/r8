@@ -3,7 +3,10 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static org.junit.Assert.assertEquals;
+
 import com.android.tools.r8.TestBase.Backend;
+import com.android.tools.r8.TestRuntime.NoneRuntime;
 import com.android.tools.r8.utils.AndroidApiLevel;
 
 // Actual test parameters for a specific configuration. Currently just the runtime configuration.
@@ -22,6 +25,11 @@ public class TestParameters {
     this.apiLevel = apiLevel;
   }
 
+  public boolean canUseDefaultAndStaticInterfaceMethods() {
+    assert isCfRuntime() || isDexRuntime();
+    return isCfRuntime() || getApiLevel().isGreaterThanOrEqualTo(AndroidApiLevel.N);
+  }
+
   // Convenience predicates.
   public boolean isDexRuntime() {
     return runtime.isDex();
@@ -29,6 +37,10 @@ public class TestParameters {
 
   public boolean isCfRuntime() {
     return runtime.isCf();
+  }
+
+  public boolean isNoneRuntime() {
+    return runtime == NoneRuntime.getInstance();
   }
 
   public AndroidApiLevel getApiLevel() {
@@ -44,6 +56,10 @@ public class TestParameters {
     return runtime;
   }
 
+  public boolean useRuntimeAsNoneRuntime() {
+    return isNoneRuntime() || (runtime != null && runtime.equals(TestRuntime.getCheckedInJdk9()));
+  }
+
   // Helper function to get the "backend" for a given runtime target.
   public Backend getBackend() {
     return runtime.getBackend();
@@ -55,5 +71,9 @@ public class TestParameters {
       return runtime.toString() + ", api:" + apiLevel.getLevel();
     }
     return runtime.toString();
+  }
+
+  public void assertNoneRuntime() {
+    assertEquals(NoneRuntime.getInstance(), runtime);
   }
 }

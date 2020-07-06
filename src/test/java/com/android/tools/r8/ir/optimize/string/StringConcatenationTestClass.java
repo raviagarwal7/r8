@@ -7,11 +7,35 @@ import com.android.tools.r8.NeverInline;
 
 class StringConcatenationTestClass {
   @NeverInline
+  public static void unusedBuilder() {
+    StringBuilder builder = new StringBuilder();
+    builder.append(4);
+    builder.append(2);
+    builder.toString();
+  }
+
+  @NeverInline
   public static void trivialSequence() {
     String x = "x";
     String y = "y";
     String z = "z";
     System.out.println(x + y + z);
+  }
+
+  @NeverInline
+  public static void builderWithInitialValue() {
+    StringBuilder builder = new StringBuilder("Hello");
+    builder.append(",");
+    builder.append("R8");
+    System.out.println(builder.toString());
+  }
+
+  @NeverInline
+  public static void builderWithCapacity() {
+    StringBuilder builder = new StringBuilder(3);
+    builder.append(4);
+    builder.append(2);
+    System.out.println(builder.toString());
   }
 
   @NeverInline
@@ -41,14 +65,29 @@ class StringConcatenationTestClass {
   }
 
   @NeverInline
+  public static void typeConversion_withPhis() {
+    StringBuilder builder = new StringBuilder();
+    float pi = 3.14f;
+    float f = 0.14f;
+    float phi = System.currentTimeMillis() > 0 ? pi : f;
+    builder.append(phi);
+    builder.append(' ');
+    int i_phi = (int) phi;
+    builder.append(i_phi);
+    builder.append(' ');
+    int another_i_phi = System.currentTimeMillis() > 0 ? (int) f : (int) pi;
+    builder.append(another_i_phi);
+    System.out.println(builder.toString());
+  }
+
+  @NeverInline
   public static void nestedBuilders_appendBuilderItself() {
     StringBuilder b1 = new StringBuilder();
     b1.append("Hello");
     b1.append(",");
     StringBuilder b2 = new StringBuilder();
     b2.append("R");
-    // TODO(b/114002137): switch to use the integer.
-    b2.append("8");
+    b2.append(8);
     b1.append(b2);
     System.out.println(b1.toString());
   }
@@ -60,10 +99,70 @@ class StringConcatenationTestClass {
     b1.append(",");
     StringBuilder b2 = new StringBuilder();
     b2.append("R");
-    // TODO(b/114002137): switch to use the integer.
-    b2.append("8");
+    b2.append(8);
     b1.append(b2.toString());
     System.out.println(b1.toString());
+  }
+
+  @NeverInline
+  public static void nestedBuilders_conditional() {
+    StringBuilder b1 = new StringBuilder();
+    StringBuilder b2 = new StringBuilder();
+    StringBuilder b3 = new StringBuilder();
+    b1.append("Hello,");
+    if (System.currentTimeMillis() > 0) {
+      b2.append("R");
+      b2.append("8");
+      b1.append(b2);
+    } else {
+      // To avoid canonicalization
+      b3.append("D");
+      b3.append(8);
+      b1.append(b3.toString());
+    }
+    System.out.println(b1.toString());
+  }
+
+  @NeverInline
+  public static void concatenatedBuilders_init() {
+    StringBuilder b1 = new StringBuilder();
+    b1.append("Hello,");
+    b1.append("R");
+    StringBuilder b2 = new StringBuilder(b1);
+    b2.append(8);
+    System.out.println(b2.toString());
+  }
+
+  @NeverInline
+  public static void concatenatedBuilders_append() {
+    StringBuilder b1 = new StringBuilder();
+    b1.append("Hello,");
+    b1.append("R");
+    StringBuilder b2 = new StringBuilder();
+    b2.append(b1);
+    b2.append(8);
+    System.out.println(b2.toString());
+  }
+
+  @NeverInline
+  public static void concatenatedBuilders_conditional() {
+    String result;
+    StringBuilder b1 = new StringBuilder();
+    b1.append("Hello,");
+    if (System.currentTimeMillis() > 0) {
+      StringBuilder b2 = new StringBuilder();
+      b2.append(b1);
+      b2.append("R");
+      b2.append("8");
+      result = b2.toString();
+    } else {
+      StringBuilder b3 = new StringBuilder();
+      // To avoid canonicalization
+      b3.append("D");
+      b3.append(8);
+      result = b3.toString();
+    }
+    System.out.println(result);
   }
 
   @NeverInline
@@ -78,9 +177,35 @@ class StringConcatenationTestClass {
     } else {
       builder.append("R");
     }
-    // TODO(b/114002137): switch to use the integer.
-    builder.append("8");
+    builder.append(8);
     System.out.println(builder.toString());
+  }
+
+  @NeverInline
+  public static void phiAtInit() {
+    StringBuilder builder =
+        System.currentTimeMillis() > 0 ? new StringBuilder("Hello") : new StringBuilder("Hi");
+    builder.append(",R8");
+    System.out.println(builder.toString());
+  }
+
+  @NeverInline
+  public static void phiWithDifferentInits() {
+    StringBuilder b1 = new StringBuilder("Hello");
+    StringBuilder b2 = new StringBuilder("Hi");
+    StringBuilder builder = System.currentTimeMillis() > 0 ? b1 : b2;
+    builder.append(",R8");
+    System.out.println(builder.toString());
+  }
+
+  @NeverInline
+  public static void conditionalPhiWithoutAppend() {
+    StringBuilder b = new StringBuilder("initial");
+    String suffix = "suffix";
+    if (!suffix.isEmpty()) {
+      b.append(":").append(suffix);
+    }
+    System.out.println(b.toString());
   }
 
   @NeverInline
@@ -103,12 +228,23 @@ class StringConcatenationTestClass {
   }
 
   public static void main(String[] args) {
+    unusedBuilder();
     trivialSequence();
+    builderWithInitialValue();
+    builderWithCapacity();
     nonStringArgs();
     typeConversion();
+    typeConversion_withPhis();
     nestedBuilders_appendBuilderItself();
     nestedBuilders_appendBuilderResult();
+    nestedBuilders_conditional();
+    concatenatedBuilders_init();
+    concatenatedBuilders_append();
+    concatenatedBuilders_conditional();
     simplePhi();
+    phiAtInit();
+    phiWithDifferentInits();
+    conditionalPhiWithoutAppend();
     loop();
     loopWithBuilder();
   }

@@ -29,17 +29,19 @@ import java.util.function.Function;
 import java.util.function.Predicate;
 
 /**
- * Implements a translation of the Dex graph from original names to new names produced by
- * the {@link Minifier}.
- * <p>
- * The minifier does not actually rename classes and members but instead only produces a mapping
+ * Implements a translation of the Dex graph from original names to new names produced by the {@link
+ * Minifier}.
+ *
+ * <p>The minifier does not actually rename classes and members but instead only produces a mapping
  * from original ids to renamed ids. When writing the file, the graph has to be interpreted with
  * that mapping in mind, i.e., it should be looked at only through this lens.
- * <p>
- * The translation relies on members being statically dispatched to actual definitions, as done
+ *
+ * <p>The translation relies on members being statically dispatched to actual definitions, as done
  * by the {@link MemberRebindingAnalysis} optimization.
  */
 public abstract class NamingLens {
+
+  protected boolean isSortingBeforeWriting;
 
   public abstract String lookupPackageName(String packageName);
 
@@ -99,6 +101,16 @@ public abstract class NamingLens {
     return dexItemFactory.createType(lookupDescriptor(type));
   }
 
+  public abstract boolean verifyNoOverlap(Map<DexType, DexString> map);
+
+  public boolean hasPrefixRewritingLogic() {
+    return false;
+  }
+
+  public DexString prefixRewrittenType(DexType type) {
+    return null;
+  }
+
   public static NamingLens getIdentityLens() {
     return new IdentityLens();
   }
@@ -112,19 +124,18 @@ public abstract class NamingLens {
     return DescriptorUtils.descriptorToInternalName(lookupDescriptor(type).toString());
   }
 
-  abstract void forAllRenamedTypes(Consumer<DexType> consumer);
+  public abstract void forAllRenamedTypes(Consumer<DexType> consumer);
 
-  abstract <T extends DexItem> Map<String, T> getRenamedItems(
+  public abstract <T extends DexItem> Map<String, T> getRenamedItems(
       Class<T> clazz, Predicate<T> predicate, Function<T, String> namer);
 
   /**
    * Checks whether the target will be translated properly by this lense.
-   * <p>
-   * Normally, this means that the target corresponds to an actual definition that has been
-   * renamed. For identity renamings, we are more relaxed, as no targets will be translated
-   * anyway.
+   *
+   * <p>Normally, this means that the target corresponds to an actual definition that has been
+   * renamed. For identity renamings, we are more relaxed, as no targets will be translated anyway.
    */
-  public abstract boolean checkTargetCanBeTranslated(DexMethod item);
+  public abstract boolean verifyRenamingConsistentWithResolution(DexMethod item);
 
   public final boolean verifyNoCollisions(
       Iterable<DexProgramClass> classes, DexItemFactory dexItemFactory) {
@@ -152,6 +163,10 @@ public abstract class NamingLens {
       }
     }
     return true;
+  }
+
+  public void setIsSortingBeforeWriting(boolean isSorting) {
+    isSortingBeforeWriting = isSorting;
   }
 
   private static class IdentityLens extends NamingLens {
@@ -186,23 +201,28 @@ public abstract class NamingLens {
     }
 
     @Override
+    public boolean verifyNoOverlap(Map<DexType, DexString> map) {
+      return true;
+    }
+
+    @Override
     public String lookupPackageName(String packageName) {
       return packageName;
     }
 
     @Override
-    void forAllRenamedTypes(Consumer<DexType> consumer) {
+    public void forAllRenamedTypes(Consumer<DexType> consumer) {
       // Intentionally left empty.
     }
 
     @Override
-    <T extends DexItem> Map<String, T> getRenamedItems(
+    public <T extends DexItem> Map<String, T> getRenamedItems(
         Class<T> clazz, Predicate<T> predicate, Function<T, String> namer) {
       return ImmutableMap.of();
     }
 
     @Override
-    public boolean checkTargetCanBeTranslated(DexMethod item) {
+    public boolean verifyRenamingConsistentWithResolution(DexMethod item) {
       return true;
     }
   }

@@ -68,4 +68,7 @@
   public static void main(...);
 }
 
--printmapping
+-neverclassinline @classmerging.NeverClassInline class *
+-neverinline class * {
+  @classmerging.NeverInline <methods>;
+}

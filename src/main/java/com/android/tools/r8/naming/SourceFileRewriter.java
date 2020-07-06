@@ -3,7 +3,6 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.naming;
 
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.Code;
 import com.android.tools.r8.graph.DexClass;
@@ -11,6 +10,7 @@ import com.android.tools.r8.graph.DexDebugEvent;
 import com.android.tools.r8.graph.DexDebugEvent.SetFile;
 import com.android.tools.r8.graph.DexDebugInfo;
 import com.android.tools.r8.graph.DexString;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.shaking.ProguardConfiguration;
 import java.util.Arrays;
 
@@ -21,26 +21,35 @@ import java.util.Arrays;
  */
 public class SourceFileRewriter {
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<AppInfoWithLiveness> appView;
 
-  public SourceFileRewriter(AppView<? extends AppInfo> appView) {
+  public SourceFileRewriter(AppView<AppInfoWithLiveness> appView) {
     this.appView = appView;
   }
 
   public void run() {
     ProguardConfiguration proguardConfiguration = appView.options().getProguardConfiguration();
     String renameSourceFile = proguardConfiguration.getRenameSourceFileAttribute();
+    boolean hasRenameSourceFileAttribute = renameSourceFile != null;
     // Return early if a user wants to keep the current source file attribute as-is.
-    if (renameSourceFile == null && proguardConfiguration.getKeepAttributes().sourceFile) {
+    if (!hasRenameSourceFileAttribute
+        && proguardConfiguration.getKeepAttributes().sourceFile
+        && appView.options().forceProguardCompatibility) {
       return;
     }
-    // Now, the user wants either to remove source file attribute or to rename it.
-    DexString dexRenameSourceFile =
-        renameSourceFile == null
-            ? appView.dexItemFactory().createString("")
-            : appView.dexItemFactory().createString(renameSourceFile);
+    // Now, the user wants either to remove source file attribute or to rename it for non-kept
+    // classes.
+    DexString defaultRenaming = getSourceFileRenaming(proguardConfiguration);
     for (DexClass clazz : appView.appInfo().classes()) {
-      clazz.sourceFile = dexRenameSourceFile;
+      // We only parse sourceFile if -keepattributes SourceFile, but for compat we should add
+      // a source file name, otherwise line positions will not be printed on the JVM or old version
+      // of ART.
+      if (!hasRenameSourceFileAttribute
+          && proguardConfiguration.getKeepAttributes().sourceFile
+          && !appView.appInfo().isMinificationAllowed(clazz.type)) {
+        continue;
+      }
+      clazz.sourceFile = defaultRenaming;
       clazz.forEachMethod(encodedMethod -> {
         // Abstract methods do not have code_item.
         if (encodedMethod.shouldNotHaveCode()) {
@@ -66,5 +75,25 @@ public class SourceFileRewriter {
         }
       });
     }
+  }
+
+  private DexString getSourceFileRenaming(ProguardConfiguration proguardConfiguration) {
+    // If we should not be keeping the source file, null it out.
+    if (!appView.options().forceProguardCompatibility
+        && !proguardConfiguration.getKeepAttributes().sourceFile) {
+      return null;
+    }
+
+    String renamedSourceFileAttribute = proguardConfiguration.getRenameSourceFileAttribute();
+    if (renamedSourceFileAttribute != null) {
+      return appView.dexItemFactory().createString(renamedSourceFileAttribute);
+    }
+
+    // Otherwise, take the smallest size depending on platform. We cannot use NULL since the jvm
+    // and art will write at foo.bar.baz(Unknown Source) without a line-number. Newer version of ART
+    // will report the DEX PC.
+    return appView
+        .dexItemFactory()
+        .createString(appView.options().isGeneratingClassFiles() ? "SourceFile" : "");
   }
 }

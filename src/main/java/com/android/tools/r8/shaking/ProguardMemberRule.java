@@ -4,11 +4,11 @@
 package com.android.tools.r8.shaking;
 
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
+import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.shaking.ProguardConfigurationParser.IdentifierPatternWithWildcards;
@@ -16,6 +16,7 @@ import com.android.tools.r8.utils.StringUtils;
 import com.google.common.collect.Iterables;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
@@ -23,7 +24,7 @@ public class ProguardMemberRule {
 
   public static class Builder {
 
-    private ProguardTypeMatcher annotation;
+    private List<ProguardTypeMatcher> annotations = Collections.emptyList();
     private ProguardAccessFlags accessFlags = new ProguardAccessFlags();
     private ProguardAccessFlags negatedAccessFlags = new ProguardAccessFlags();
     private ProguardMemberType ruleType;
@@ -34,8 +35,9 @@ public class ProguardMemberRule {
 
     private Builder() {}
 
-    public void setAnnotation(ProguardTypeMatcher annotation) {
-      this.annotation = annotation;
+    public void setAnnotations(List<ProguardTypeMatcher> annotations) {
+      assert annotations != null;
+      this.annotations = annotations;
     }
 
     public ProguardAccessFlags getAccessFlags() {
@@ -74,8 +76,9 @@ public class ProguardMemberRule {
       return this;
     }
 
-    public void setArguments(List<ProguardTypeMatcher> arguments) {
+    public Builder setArguments(List<ProguardTypeMatcher> arguments) {
       this.arguments = arguments;
+      return this;
     }
 
     public Builder setReturnValue(ProguardMemberRuleReturnValue value) {
@@ -89,12 +92,19 @@ public class ProguardMemberRule {
 
     public ProguardMemberRule build() {
       assert isValid();
-      return new ProguardMemberRule(annotation, accessFlags, negatedAccessFlags, ruleType, type,
-          name, arguments, returnValue);
+      return new ProguardMemberRule(
+          annotations,
+          accessFlags,
+          negatedAccessFlags,
+          ruleType,
+          type,
+          name,
+          arguments,
+          returnValue);
     }
   }
 
-  private final ProguardTypeMatcher annotation;
+  private final List<ProguardTypeMatcher> annotations;
   private final ProguardAccessFlags accessFlags;
   private final ProguardAccessFlags negatedAccessFlags;
   private final ProguardMemberType ruleType;
@@ -104,7 +114,7 @@ public class ProguardMemberRule {
   private final ProguardMemberRuleReturnValue returnValue;
 
   private ProguardMemberRule(
-      ProguardTypeMatcher annotation,
+      List<ProguardTypeMatcher> annotations,
       ProguardAccessFlags accessFlags,
       ProguardAccessFlags negatedAccessFlags,
       ProguardMemberType ruleType,
@@ -112,7 +122,7 @@ public class ProguardMemberRule {
       ProguardNameMatcher name,
       List<ProguardTypeMatcher> arguments,
       ProguardMemberRuleReturnValue returnValue) {
-    this.annotation = annotation;
+    this.annotations = annotations;
     this.accessFlags = accessFlags;
     this.negatedAccessFlags = negatedAccessFlags;
     this.ruleType = ruleType;
@@ -129,8 +139,8 @@ public class ProguardMemberRule {
     return new Builder();
   }
 
-  public ProguardTypeMatcher getAnnotation() {
-    return annotation;
+  public List<ProguardTypeMatcher> getAnnotations() {
+    return annotations;
   }
 
   public ProguardAccessFlags getAccessFlags() {
@@ -170,39 +180,48 @@ public class ProguardMemberRule {
   }
 
   public boolean matches(
-      DexEncodedField field, AppView<? extends AppInfo> appView, DexStringCache stringCache) {
+      DexEncodedField field,
+      AppView<?> appView,
+      Consumer<AnnotationMatchResult> matchedAnnotationsConsumer,
+      DexStringCache stringCache) {
     DexField originalSignature = appView.graphLense().getOriginalFieldSignature(field.field);
     switch (getRuleType()) {
       case ALL:
       case ALL_FIELDS:
-        // Access flags check.
-        if (!getAccessFlags().containsAll(field.accessFlags)
-            || !getNegatedAccessFlags().containsNone(field.accessFlags)) {
-          break;
+        {
+          // Access flags check.
+          if (!getAccessFlags().containsAll(field.accessFlags)
+              || !getNegatedAccessFlags().containsNone(field.accessFlags)) {
+            break;
+          }
+          // Annotations check.
+          return RootSetBuilder.containsAllAnnotations(
+              annotations, field, matchedAnnotationsConsumer);
         }
-        // Annotations check.
-        return RootSetBuilder.containsAnnotation(annotation, field.annotations);
+
       case FIELD:
-        // Name check.
-        String name = stringCache.lookupString(originalSignature.name);
-        if (!getName().matches(name)) {
-          break;
+        {
+          // Name check.
+          String name = stringCache.lookupString(originalSignature.name);
+          if (!getName().matches(name)) {
+            break;
+          }
+          // Access flags check.
+          if (!getAccessFlags().containsAll(field.accessFlags)
+              || !getNegatedAccessFlags().containsNone(field.accessFlags)) {
+            break;
+          }
+          // Type check.
+          if (!getType().matches(originalSignature.type, appView)) {
+            break;
+          }
+          // Annotations check
+          return RootSetBuilder.containsAllAnnotations(
+              annotations, field, matchedAnnotationsConsumer);
         }
-        // Access flags check.
-        if (!getAccessFlags().containsAll(field.accessFlags)
-            || !getNegatedAccessFlags().containsNone(field.accessFlags)) {
-          break;
-        }
-        // Type check.
-        if (!getType().matches(originalSignature.type, appView)) {
-          break;
-        }
-        // Annotations check
-        if (!RootSetBuilder.containsAnnotation(annotation, field.annotations)) {
-          break;
-        }
-        return true;
+
       case ALL_METHODS:
+      case CLINIT:
       case INIT:
       case CONSTRUCTOR:
       case METHOD:
@@ -212,7 +231,10 @@ public class ProguardMemberRule {
   }
 
   public boolean matches(
-      DexEncodedMethod method, AppView<? extends AppInfo> appView, DexStringCache stringCache) {
+      DexEncodedMethod method,
+      AppView<?> appView,
+      Consumer<AnnotationMatchResult> matchedAnnotationsConsumer,
+      DexStringCache stringCache) {
     DexMethod originalSignature = appView.graphLense().getOriginalMethodSignature(method.method);
     switch (getRuleType()) {
       case ALL_METHODS:
@@ -220,52 +242,63 @@ public class ProguardMemberRule {
           break;
         }
         // Fall through for all other methods.
+
       case ALL:
-        // Access flags check.
-        if (!getAccessFlags().containsAll(method.accessFlags)
-            || !getNegatedAccessFlags().containsNone(method.accessFlags)) {
-          break;
+        {
+          // Access flags check.
+          if (!getAccessFlags().containsAll(method.accessFlags)
+              || !getNegatedAccessFlags().containsNone(method.accessFlags)) {
+            break;
+          }
+          // Annotations check.
+          return RootSetBuilder.containsAllAnnotations(
+              annotations, method, matchedAnnotationsConsumer);
         }
-        // Annotations check.
-        return RootSetBuilder.containsAnnotation(annotation, method.annotations);
+
       case METHOD:
         // Check return type.
         if (!type.matches(originalSignature.proto.returnType, appView)) {
           break;
         }
         // Fall through for access flags, name and arguments.
+
       case CONSTRUCTOR:
       case INIT:
-        // Name check.
-        String name = stringCache.lookupString(originalSignature.name);
-        if (!getName().matches(name)) {
-          break;
-        }
-        // Access flags check.
-        if (!getAccessFlags().containsAll(method.accessFlags)
-            || !getNegatedAccessFlags().containsNone(method.accessFlags)) {
-          break;
-        }
-        // Annotations check.
-        if (!RootSetBuilder.containsAnnotation(annotation, method.annotations)) {
-          break;
-        }
-        // Parameter types check.
-        List<ProguardTypeMatcher> arguments = getArguments();
-        if (arguments.size() == 1 && arguments.get(0).isTripleDotPattern()) {
-          return true;
-        }
-        DexType[] parameters = originalSignature.proto.parameters.values;
-        if (parameters.length != arguments.size()) {
-          break;
-        }
-        for (int i = 0; i < parameters.length; i++) {
-          if (!arguments.get(i).matches(parameters[i], appView)) {
+      case CLINIT:
+        {
+          // Name check.
+          String name = stringCache.lookupString(originalSignature.name);
+          if (!getName().matches(name)) {
+            break;
+          }
+          // Access flags check.
+          if (!getAccessFlags().containsAll(method.accessFlags)
+              || !getNegatedAccessFlags().containsNone(method.accessFlags)) {
+            break;
+          }
+          // Annotations check.
+          if (!RootSetBuilder.containsAllAnnotations(
+              annotations, method, matchedAnnotationsConsumer)) {
             return false;
           }
+          // Parameter types check.
+          List<ProguardTypeMatcher> arguments = getArguments();
+          if (arguments.size() == 1 && arguments.get(0).isTripleDotPattern()) {
+            return true;
+          }
+          DexType[] parameters = originalSignature.proto.parameters.values;
+          if (parameters.length != arguments.size()) {
+            break;
+          }
+          for (int i = 0; i < parameters.length; i++) {
+            if (!arguments.get(i).matches(parameters[i], appView)) {
+              return false;
+            }
+          }
+          // All parameters matched.
+          return true;
         }
-        // All parameters matched.
-        return true;
+
       case ALL_FIELDS:
       case FIELD:
         break;
@@ -288,29 +321,30 @@ public class ProguardMemberRule {
 
   Iterable<ProguardWildcard> getWildcards() {
     return Iterables.concat(
-        ProguardTypeMatcher.getWildcardsOrEmpty(annotation),
+        ProguardTypeMatcher.getWildcardsOrEmpty(annotations),
         ProguardTypeMatcher.getWildcardsOrEmpty(type),
         ProguardNameMatcher.getWildcardsOrEmpty(name),
         arguments != null
             ? arguments.stream()
-                .map(ProguardTypeMatcher::getWildcards)
-                .flatMap(it -> StreamSupport.stream(it.spliterator(), false))
+                    .map(ProguardTypeMatcher::getWildcards)
+                    .flatMap(it -> StreamSupport.stream(it.spliterator(), false))
                 ::iterator
-            : Collections::emptyIterator
-    );
+            : Collections::emptyIterator);
   }
 
-  ProguardMemberRule materialize() {
+  ProguardMemberRule materialize(DexItemFactory dexItemFactory) {
     return new ProguardMemberRule(
-        getAnnotation() == null ? null : getAnnotation().materialize(),
+        ProguardTypeMatcher.materializeList(getAnnotations(), dexItemFactory),
         getAccessFlags(),
         getNegatedAccessFlags(),
         getRuleType(),
-        getType() == null ? null : getType().materialize(),
+        getType() == null ? null : getType().materialize(dexItemFactory),
         getName() == null ? null : getName().materialize(),
-        getArguments() == null ? null :
-            getArguments().stream()
-                .map(ProguardTypeMatcher::materialize).collect(Collectors.toList()),
+        getArguments() == null
+            ? null
+            : getArguments().stream()
+                .map(argument -> argument.materialize(dexItemFactory))
+                .collect(Collectors.toList()),
         getReturnValue());
   }
 
@@ -322,7 +356,7 @@ public class ProguardMemberRule {
 
     ProguardMemberRule that = (ProguardMemberRule) o;
 
-    if (annotation != null ? !annotation.equals(that.annotation) : that.annotation != null) {
+    if (!annotations.equals(that.annotations)) {
       return false;
     }
     if (!accessFlags.equals(that.accessFlags)) {
@@ -345,7 +379,7 @@ public class ProguardMemberRule {
 
   @Override
   public int hashCode() {
-    int result = annotation != null ? annotation.hashCode() : 0;
+    int result = annotations.hashCode();
     result = 31 * result + accessFlags.hashCode();
     result = 31 * result + negatedAccessFlags.hashCode();
     result = 31 * result + (ruleType != null ? ruleType.hashCode() : 0);
@@ -358,7 +392,9 @@ public class ProguardMemberRule {
   @Override
   public String toString() {
     StringBuilder result = new StringBuilder();
-    ProguardKeepRule.appendNonEmpty(result, "@", annotation, " ");
+    for (ProguardTypeMatcher annotation : annotations) {
+      ProguardKeepRule.appendNonEmpty(result, "@", annotation, " ");
+    }
     ProguardKeepRule.appendNonEmpty(result, null, accessFlags, " ");
     ProguardKeepRule
         .appendNonEmpty(result, null, negatedAccessFlags.toString().replace(" ", " !"), " ");
@@ -374,6 +410,7 @@ public class ProguardMemberRule {
         result.append(' ');
         // Fall through for rest of method signature.
       case CONSTRUCTOR:
+      case CLINIT:
       case INIT: {
         result.append(getName());
         result.append('(');
@@ -405,5 +442,4 @@ public class ProguardMemberRule {
     ruleBuilder.setRuleType(ProguardMemberType.ALL);
     return ruleBuilder.build();
   }
-
 }

@@ -6,6 +6,7 @@ package com.android.tools.r8.shaking.ifrule.verticalclassmerging;
 
 import static org.junit.Assert.assertEquals;
 
+import com.android.tools.r8.R8FullTestBuilder;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -22,6 +23,16 @@ public class ImplementsMergedTypeIndirectlyTest extends MergedTypeBaseTest {
   public ImplementsMergedTypeIndirectlyTest(
       TestParameters parameters, boolean enableVerticalClassMerging) {
     super(parameters, enableVerticalClassMerging);
+  }
+
+  @Override
+  public void configure(R8FullTestBuilder builder) {
+    super.configure(builder);
+
+    // If unused interface removal is enabled, the `implements J` clause will be removed by the tree
+    // pruner.
+    // TODO(b/135083634): Should handle unused interfaces similar to vertically merged classes.
+    builder.addOptionsModification(options -> options.enableUnusedInterfaceRemoval = false);
   }
 
   @Override
@@ -52,6 +63,7 @@ public class ImplementsMergedTypeIndirectlyTest extends MergedTypeBaseTest {
 
     // Verify that TestClass still implements J.
     ClassSubject testClassSubject = inspector.clazz(TestClass.class);
-    assertEquals(J.class.getTypeName(), testClassSubject.getDexClass().interfaces.toSourceString());
+    assertEquals(
+        J.class.getTypeName(), testClassSubject.getDexProgramClass().interfaces.toSourceString());
   }
 }

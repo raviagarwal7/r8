@@ -68,6 +68,11 @@ public class ProguardConfiguration {
     private boolean forceProguardCompatibility = false;
     private boolean overloadAggressively;
     private boolean keepRuleSynthesisForRecompilation = false;
+    private boolean configurationDebugging = false;
+    private boolean dontUseMixedCaseClassnames = false;
+    private boolean protoShrinking = false;
+    private int maxRemovedAndroidLogLevel = 1;
+    private ProguardKeepRule keepAllRule;
 
     private Builder(DexItemFactory dexItemFactory, Reporter reporter) {
       this.dexItemFactory = dexItemFactory;
@@ -165,6 +170,10 @@ public class ProguardConfiguration {
       this.applyMappingFile = file;
     }
 
+    public boolean hasApplyMappingFile() {
+      return applyMappingFile != null;
+    }
+
     public void setVerbose(boolean verbose) {
       this.verbose = verbose;
     }
@@ -242,8 +251,9 @@ public class ProguardConfiguration {
       adaptClassStrings.addPattern(pattern);
     }
 
-    public void addAdaptResourceFilenames(ProguardPathList pattern) {
+    public Builder addAdaptResourceFilenames(ProguardPathList pattern) {
       adaptResourceFilenames.addPattern(pattern);
+      return this;
     }
 
     public void addAdaptResourceFileContents(ProguardPathList pattern) {
@@ -268,6 +278,30 @@ public class ProguardConfiguration {
 
     public void enableKeepRuleSynthesisForRecompilation() {
       this.keepRuleSynthesisForRecompilation = true;
+    }
+
+    public void setConfigurationDebugging(boolean configurationDebugging) {
+      this.configurationDebugging = configurationDebugging;
+    }
+
+    boolean isConfigurationDebugging() {
+      return configurationDebugging;
+    }
+
+    public void setDontUseMixedCaseClassnames(boolean dontUseMixedCaseClassnames) {
+      this.dontUseMixedCaseClassnames = dontUseMixedCaseClassnames;
+    }
+
+    public void enableProtoShrinking() {
+      protoShrinking = true;
+    }
+
+    public int getMaxRemovedAndroidLogLevel() {
+      return maxRemovedAndroidLogLevel;
+    }
+
+    public void setMaxRemovedAndroidLogLevel(int maxRemovedAndroidLogLevel) {
+      this.maxRemovedAndroidLogLevel = maxRemovedAndroidLogLevel;
     }
 
     /**
@@ -326,7 +360,12 @@ public class ProguardConfiguration {
               adaptClassStrings.build(),
               adaptResourceFilenames.build(),
               adaptResourceFileContents.build(),
-              keepDirectories.build());
+              keepDirectories.build(),
+              configurationDebugging,
+              dontUseMixedCaseClassnames,
+              protoShrinking,
+              maxRemovedAndroidLogLevel,
+              keepAllRule);
 
       reporter.failIfPendingErrors();
 
@@ -342,11 +381,15 @@ public class ProguardConfiguration {
       // shrinking or minification is turned off through the API, then add a match all rule
       // which will apply that.
       if (!isShrinking() || !isObfuscating() || !isOptimizing()) {
-        addRule(ProguardKeepRule.defaultKeepAllRule(modifiers -> {
-          modifiers.setAllowsShrinking(isShrinking());
-          modifiers.setAllowsOptimization(isOptimizing());
-          modifiers.setAllowsObfuscation(isObfuscating());
-        }));
+        ProguardKeepRule rule =
+            ProguardKeepRule.defaultKeepAllRule(
+                modifiers -> {
+                  modifiers.setAllowsShrinking(isShrinking());
+                  modifiers.setAllowsOptimization(isOptimizing());
+                  modifiers.setAllowsObfuscation(isObfuscating());
+                });
+        addRule(rule);
+        this.keepAllRule = rule;
       }
 
       if (keepRuleSynthesisForRecompilation) {
@@ -393,6 +436,11 @@ public class ProguardConfiguration {
   private final ProguardPathFilter adaptResourceFilenames;
   private final ProguardPathFilter adaptResourceFileContents;
   private final ProguardPathFilter keepDirectories;
+  private final boolean configurationDebugging;
+  private final boolean dontUseMixedCaseClassnames;
+  private final boolean protoShrinking;
+  private final int maxRemovedAndroidLogLevel;
+  private final ProguardKeepRule keepAllRule;
 
   private ProguardConfiguration(
       String parsedConfiguration,
@@ -430,7 +478,12 @@ public class ProguardConfiguration {
       ProguardClassFilter adaptClassStrings,
       ProguardPathFilter adaptResourceFilenames,
       ProguardPathFilter adaptResourceFileContents,
-      ProguardPathFilter keepDirectories) {
+      ProguardPathFilter keepDirectories,
+      boolean configurationDebugging,
+      boolean dontUseMixedCaseClassnames,
+      boolean protoShrinking,
+      int maxRemovedAndroidLogLevel,
+      ProguardKeepRule keepAllRule) {
     this.parsedConfiguration = parsedConfiguration;
     this.dexItemFactory = factory;
     this.injars = ImmutableList.copyOf(injars);
@@ -467,6 +520,11 @@ public class ProguardConfiguration {
     this.adaptResourceFilenames = adaptResourceFilenames;
     this.adaptResourceFileContents = adaptResourceFileContents;
     this.keepDirectories = keepDirectories;
+    this.configurationDebugging = configurationDebugging;
+    this.dontUseMixedCaseClassnames = dontUseMixedCaseClassnames;
+    this.protoShrinking = protoShrinking;
+    this.maxRemovedAndroidLogLevel = maxRemovedAndroidLogLevel;
+    this.keepAllRule = keepAllRule;
   }
 
   /**
@@ -623,6 +681,26 @@ public class ProguardConfiguration {
 
   public Path getSeedFile() {
     return seedFile;
+  }
+
+  public boolean isConfigurationDebugging() {
+    return configurationDebugging;
+  }
+
+  public boolean hasDontUseMixedCaseClassnames() {
+    return dontUseMixedCaseClassnames;
+  }
+
+  public boolean isProtoShrinkingEnabled() {
+    return protoShrinking;
+  }
+
+  public int getMaxRemovedAndroidLogLevel() {
+    return maxRemovedAndroidLogLevel;
+  }
+
+  public ProguardKeepRule getKeepAllRule() {
+    return keepAllRule;
   }
 
   @Override

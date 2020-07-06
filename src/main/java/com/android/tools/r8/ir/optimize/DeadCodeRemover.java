@@ -3,9 +3,11 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.optimize;
 
-import com.android.tools.r8.graph.AppInfo;
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+
+import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.CatchHandlers;
@@ -16,37 +18,63 @@ import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.Phi;
 import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.utils.Timing;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterators;
+import java.util.ArrayDeque;
 import java.util.Collection;
+import java.util.Deque;
 import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.Queue;
 
 public class DeadCodeRemover {
 
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   private final CodeRewriter codeRewriter;
 
-  public DeadCodeRemover(AppView<? extends AppInfo> appView, CodeRewriter codeRewriter) {
+  public DeadCodeRemover(AppView<?> appView, CodeRewriter codeRewriter) {
     this.appView = appView;
     this.codeRewriter = codeRewriter;
   }
 
-  public void run(IRCode code) {
-    removeUnneededCatchHandlers(code);
-    Queue<BasicBlock> worklist = new LinkedList<>();
-    // We may encounter unneeded catch handlers again, e.g., if a dead instruction (due to
-    // const-string canonicalization for example) is the only throwing instruction in a block.
-    // Removing unneeded catch handlers can lead to more dead instructions.
+  public void run(IRCode code, Timing timing) {
+    timing.begin("Remove dead code");
+
+    codeRewriter.rewriteMoveResult(code);
+
+    // We may encounter unneeded catch handlers after each iteration, e.g., if a dead instruction
+    // is the only throwing instruction in a block. Removing unneeded catch handlers can lead to
+    // more dead instructions.
+    Deque<BasicBlock> worklist = new ArrayDeque<>();
     do {
-      worklist.addAll(code.blocks);
-      for (BasicBlock block = worklist.poll(); block != null; block = worklist.poll()) {
+      worklist.addAll(code.topologicallySortedBlocks());
+      while (!worklist.isEmpty()) {
+        BasicBlock block = worklist.removeLast();
         removeDeadInstructions(worklist, code, block);
         removeDeadPhis(worklist, code, block);
       }
     } while (removeUnneededCatchHandlers(code));
     assert code.isConsistentSSA();
-    codeRewriter.rewriteMoveResult(code);
+
+    timing.end();
+  }
+
+  public boolean verifyNoDeadCode(IRCode code) {
+    assert !codeRewriter.rewriteMoveResult(code);
+    assert !removeUnneededCatchHandlers(code);
+    for (BasicBlock block : code.blocks) {
+      assert !block.hasDeadPhi(appView, code);
+      for (Instruction instruction : block.getInstructions()) {
+        // No unused move-result instructions.
+        assert !instruction.isInvoke()
+            || !instruction.hasOutValue()
+            || instruction.outValue().hasAnyUsers();
+        // No dead instructions.
+        assert !instruction.canBeDeadCode(appView, code).isDeadIfOutValueIsDead()
+            || (instruction.hasOutValue() && !instruction.outValue().isDead(appView, code));
+      }
+    }
+    return true;
   }
 
   // Add the block from where the value originates to the worklist.
@@ -87,17 +115,28 @@ public class DeadCodeRemover {
   }
 
   private void removeDeadInstructions(Queue<BasicBlock> worklist, IRCode code, BasicBlock block) {
-    InstructionListIterator iterator = block.listIterator(block.getInstructions().size());
+    InstructionListIterator iterator = block.listIterator(code, block.getInstructions().size());
     while (iterator.hasPrevious()) {
       Instruction current = iterator.previous();
       // Remove unused invoke results.
-      if (current.isInvoke()
-          && current.outValue() != null
-          && !current.outValue().isUsed()) {
+      if (current.isInvoke() && current.hasOutValue() && !current.outValue().isUsed()) {
         current.setOutValue(null);
       }
-      if (!current.canBeDeadCode(appView, code)) {
+      DeadInstructionResult deadInstructionResult = current.canBeDeadCode(appView, code);
+      if (deadInstructionResult.isNotDead()) {
         continue;
+      }
+      if (deadInstructionResult.isMaybeDead()) {
+        boolean satisfied = true;
+        for (Value valueRequiredToBeDead : deadInstructionResult.getValuesRequiredToBeDead()) {
+          if (!valueRequiredToBeDead.isDead(appView, code)) {
+            satisfied = false;
+            break;
+          }
+        }
+        if (!satisfied) {
+          continue;
+        }
       }
       Value outValue = current.outValue();
       if (outValue != null && !outValue.isDead(appView, code)) {
@@ -172,15 +211,70 @@ public class DeadCodeRemover {
       // We can exploit that a catch handler must be dead if its guard is never instantiated
       // directly or indirectly.
       if (appInfoWithLiveness != null && appView.options().enableUninstantiatedTypeOptimization) {
-        DexClass clazz = appView.definitionFor(guard);
-        if (clazz != null
-            && clazz.isProgramClass()
-            && !appInfoWithLiveness.isInstantiatedDirectlyOrIndirectly(guard)) {
+        DexProgramClass clazz = asProgramClassOrNull(appView.definitionFor(guard));
+        if (clazz != null && !appInfoWithLiveness.isInstantiatedDirectlyOrIndirectly(clazz)) {
           builder.add(new CatchHandler<>(guard, target));
           continue;
         }
       }
     }
     return builder.build();
+  }
+
+  public abstract static class DeadInstructionResult {
+
+    private static final DeadInstructionResult DEFINITELY_DEAD_INSTANCE =
+        new DeadInstructionResult() {
+          @Override
+          public boolean isDeadIfOutValueIsDead() {
+            return true;
+          }
+        };
+
+    private static final DeadInstructionResult DEFINITELY_NOT_DEAD_INSTANCE =
+        new DeadInstructionResult() {
+          @Override
+          public boolean isNotDead() {
+            return true;
+          }
+        };
+
+    public static DeadInstructionResult deadIfOutValueIsDead() {
+      return DEFINITELY_DEAD_INSTANCE;
+    }
+
+    public static DeadInstructionResult notDead() {
+      return DEFINITELY_NOT_DEAD_INSTANCE;
+    }
+
+    public static DeadInstructionResult deadIfInValueIsDead(Value inValueRequiredToBeDead) {
+      return new DeadInstructionResult() {
+        @Override
+        public boolean isMaybeDead() {
+          return true;
+        }
+
+        @Override
+        public Iterable<Value> getValuesRequiredToBeDead() {
+          return () -> Iterators.singletonIterator(inValueRequiredToBeDead);
+        }
+      };
+    }
+
+    public boolean isDeadIfOutValueIsDead() {
+      return false;
+    }
+
+    public boolean isNotDead() {
+      return false;
+    }
+
+    public boolean isMaybeDead() {
+      return false;
+    }
+
+    public Iterable<Value> getValuesRequiredToBeDead() {
+      throw new Unreachable();
+    }
   }
 }

@@ -7,23 +7,54 @@ import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
+import java.util.Set;
 
 /**
  * Argument pseudo instruction used to introduce values for all arguments for SSA conversion.
  */
 public class Argument extends Instruction {
 
-  public Argument(Value outValue) {
+  private final int index;
+  private final boolean knownToBeBoolean;
+
+  public Argument(Value outValue, int index, boolean knownToBeBoolean) {
     super(outValue);
-    outValue.markAsArgument();
+    this.index = index;
+    this.knownToBeBoolean = knownToBeBoolean;
+  }
+
+  public int getIndex() {
+    assert verifyIndex();
+    return index;
+  }
+
+  private boolean verifyIndex() {
+    int index = 0;
+    InstructionIterator instructionIterator = getBlock().iterator();
+    while (instructionIterator.hasNext()) {
+      Instruction instruction = instructionIterator.next();
+      assert instruction.isArgument();
+      if (instruction == this) {
+        assert index == this.index;
+        return true;
+      }
+      index++;
+    }
+    return false;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.ARGUMENT;
   }
 
   @Override
@@ -32,11 +63,11 @@ public class Argument extends Instruction {
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appview, IRCode code) {
+  public DeadInstructionResult canBeDeadCode(AppView<?> appview, IRCode code) {
     // Never remove argument instructions. That would change the signature of the method.
     // TODO(b/65810338): If we can tell that a method never uses an argument we might be able to
     // rewrite the signature and call-sites.
-    return false;
+    return DeadInstructionResult.notDead();
   }
 
   @Override
@@ -72,7 +103,7 @@ public class Argument extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forArgument();
   }
 
@@ -82,8 +113,7 @@ public class Argument extends Instruction {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     throw new Unreachable();
   }
 
@@ -93,12 +123,22 @@ public class Argument extends Instruction {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return outValue.getTypeLattice();
+  public TypeElement evaluate(AppView<?> appView) {
+    return outValue.getType();
   }
 
   @Override
   public boolean hasInvariantOutType() {
     return true;
+  }
+
+  @Override
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return knownToBeBoolean;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

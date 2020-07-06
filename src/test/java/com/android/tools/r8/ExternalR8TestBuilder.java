@@ -5,7 +5,6 @@
 package com.android.tools.r8;
 
 import static com.android.tools.r8.ToolHelper.CLASSPATH_SEPARATOR;
-import static com.android.tools.r8.ToolHelper.getJavaExecutable;
 import static org.junit.Assert.assertEquals;
 
 import com.android.tools.r8.R8Command.Builder;
@@ -51,19 +50,33 @@ public class ExternalR8TestBuilder
   // Additional Proguard configuration files.
   private List<Path> proguardConfigFiles = new ArrayList<>();
 
+  // External JDK to use to run R8
+  private final TestRuntime runtime;
+
   private boolean addR8ExternalDeps = false;
 
-  private ExternalR8TestBuilder(TestState state, Builder builder, Backend backend) {
+  private List<String> jvmFlags = new ArrayList<>();
+
+  private ExternalR8TestBuilder(
+      TestState state, Builder builder, Backend backend, TestRuntime runtime) {
     super(state, builder, backend);
+    assert runtime != null;
+    this.runtime = runtime;
   }
 
-  public static ExternalR8TestBuilder create(TestState state, Backend backend) {
-    return new ExternalR8TestBuilder(state, R8Command.builder(), backend);
+  public static ExternalR8TestBuilder create(
+      TestState state, Backend backend, TestRuntime runtime) {
+    return new ExternalR8TestBuilder(state, R8Command.builder(), backend, runtime);
   }
 
   @Override
   ExternalR8TestBuilder self() {
     return this;
+  }
+
+  public ExternalR8TestBuilder addJvmFlag(String flag) {
+    jvmFlags.add(flag);
+    return self();
   }
 
   @Override
@@ -77,15 +90,19 @@ public class ExternalR8TestBuilder
 
       String classPath =
           addR8ExternalDeps
-              ? r8jar.toAbsolutePath().toString()
-                  + CLASSPATH_SEPARATOR
-                  + ToolHelper.DEPS_NOT_RELOCATED
+              ? r8jar.toAbsolutePath().toString() + CLASSPATH_SEPARATOR + ToolHelper.DEPS
               : r8jar.toAbsolutePath().toString();
 
       List<String> command = new ArrayList<>();
+      if (runtime.isDex()) {
+        throw new Unimplemented();
+      }
+      Collections.addAll(command, runtime.asCf().getJavaExecutable().toString());
+
+      command.addAll(jvmFlags);
+
       Collections.addAll(
           command,
-          getJavaExecutable(),
           "-ea",
           "-cp",
           classPath,
@@ -118,13 +135,14 @@ public class ExternalR8TestBuilder
       command.addAll(programJars.stream().map(Path::toString).collect(Collectors.toList()));
 
       ProcessBuilder processBuilder = new ProcessBuilder(command);
-      ProcessResult processResult = ToolHelper.runProcess(processBuilder);
+      ProcessResult processResult = ToolHelper.runProcess(processBuilder, getStdoutForTesting());
       assertEquals(processResult.stderr, 0, processResult.exitCode);
       String proguardMap =
           proguardMapFile.toFile().exists()
               ? FileUtils.readTextFile(proguardMapFile, Charsets.UTF_8)
               : "";
-      return new ExternalR8TestCompileResult(getState(), outputJar, processResult, proguardMap);
+      return new ExternalR8TestCompileResult(
+          getState(), outputJar, processResult, proguardMap, getOutputMode());
     } catch (IOException e) {
       throw new CompilationFailedException(e);
     }

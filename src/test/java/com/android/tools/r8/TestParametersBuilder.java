@@ -3,15 +3,16 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
-import com.android.tools.r8.TestRuntime.CfRuntime;
 import com.android.tools.r8.TestRuntime.CfVm;
-import com.android.tools.r8.TestRuntime.DexRuntime;
 import com.android.tools.r8.TestRuntime.NoneRuntime;
 import com.android.tools.r8.ToolHelper.DexVm;
-import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.utils.AndroidApiLevel;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -23,8 +24,9 @@ public class TestParametersBuilder {
       getAvailableRuntimes().collect(Collectors.toList());
 
   // Predicate describing which test parameters are applicable to the test.
-  // Built via the methods found below. Default to no applicable parameters, i.e., the emtpy set.
+  // Built via the methods found below. Defaults to no applicable parameters, i.e., the emtpy set.
   private Predicate<TestParameters> filter = param -> false;
+  private boolean hasDexRuntimeFilter = false;
 
   private TestParametersBuilder() {}
 
@@ -42,6 +44,7 @@ public class TestParametersBuilder {
   }
 
   private TestParametersBuilder withDexRuntimeFilter(Predicate<DexVm.Version> predicate) {
+    hasDexRuntimeFilter = true;
     return withFilter(
         p -> p.isDexRuntime() && predicate.test(p.getRuntime().asDex().getVm().getVersion()));
   }
@@ -52,6 +55,10 @@ public class TestParametersBuilder {
 
   public TestParametersBuilder withAllRuntimes() {
     return withCfRuntimes().withDexRuntimes();
+  }
+
+  public TestParametersBuilder withAllRuntimesAndApiLevels() {
+    return withCfRuntimes().withDexRuntimes().withAllApiLevels();
   }
 
   /** Add specific runtime if available. */
@@ -142,14 +149,50 @@ public class TestParametersBuilder {
    */
   private static final AndroidApiLevel lowestCompilerApiLevel = AndroidApiLevel.B;
 
-  private boolean enableAllApiLevels = false;
+  private boolean enableApiLevels = false;
+  private boolean enableApiLevelsForCf = false;
 
-  public TestParametersBuilder withAllApiLevels() {
-    enableAllApiLevels = true;
+  private Predicate<AndroidApiLevel> apiLevelFilter = param -> false;
+  private List<AndroidApiLevel> explicitApiLevels = new ArrayList<>();
+
+  private TestParametersBuilder withApiFilter(Predicate<AndroidApiLevel> filter) {
+    enableApiLevels = true;
+    apiLevelFilter = apiLevelFilter.or(filter);
     return this;
   }
 
+  public TestParametersBuilder withAllApiLevels() {
+    return withApiFilter(api -> true);
+  }
+
+  public TestParametersBuilder withAllApiLevelsAlsoForCf() {
+    enableApiLevelsForCf = true;
+    return withAllApiLevels();
+  }
+
+  public TestParametersBuilder withApiLevel(AndroidApiLevel api) {
+    explicitApiLevels.add(api);
+    return withApiFilter(api::equals);
+  }
+
+  public TestParametersBuilder withApiLevelsStartingAtIncluding(AndroidApiLevel startInclusive) {
+    return withApiFilter(api -> startInclusive.getLevel() <= api.getLevel());
+  }
+
+  public TestParametersBuilder withApiLevelsStartingAtExcluding(AndroidApiLevel startExclusive) {
+    return withApiFilter(api -> startExclusive.getLevel() < api.getLevel());
+  }
+
+  public TestParametersBuilder withApiLevelsEndingAtIncluding(AndroidApiLevel endInclusive) {
+    return withApiFilter(api -> api.getLevel() <= endInclusive.getLevel());
+  }
+
+  public TestParametersBuilder withApiLevelsEndingAtExcluding(AndroidApiLevel endExclusive) {
+    return withApiFilter(api -> api.getLevel() < endExclusive.getLevel());
+  }
+
   public TestParametersCollection build() {
+    assert !enableApiLevels || hasDexRuntimeFilter;
     return new TestParametersCollection(
         getAvailableRuntimes()
             .flatMap(this::createParameters)
@@ -158,60 +201,90 @@ public class TestParametersBuilder {
   }
 
   public Stream<TestParameters> createParameters(TestRuntime runtime) {
-    if (enableAllApiLevels && runtime.isDex()) {
-      AndroidApiLevel vmLevel = runtime.asDex().getMinApiLevel();
-      if (vmLevel != lowestCompilerApiLevel) {
-        return Stream.of(
-            new TestParameters(runtime, vmLevel),
-            new TestParameters(runtime, lowestCompilerApiLevel));
+    if (!enableApiLevels) {
+      return Stream.of(new TestParameters(runtime));
+    }
+    if (!runtime.isDex()) {
+      if (!enableApiLevelsForCf) {
+        return Stream.of(new TestParameters(runtime));
+      }
+      return Stream.of(
+          new TestParameters(runtime, AndroidApiLevel.B),
+          new TestParameters(runtime, AndroidApiLevel.LATEST));
+    }
+    List<AndroidApiLevel> sortedApiLevels =
+        AndroidApiLevel.getAndroidApiLevelsSorted().stream()
+            .filter(apiLevelFilter)
+            .collect(Collectors.toList());
+    if (sortedApiLevels.isEmpty()) {
+      return Stream.of();
+    }
+    AndroidApiLevel vmLevel = runtime.asDex().getMinApiLevel();
+    AndroidApiLevel lowestApplicable = sortedApiLevels.get(0);
+    if (vmLevel.getLevel() < lowestApplicable.getLevel()) {
+      return Stream.of();
+    }
+    if (sortedApiLevels.size() > 1) {
+      for (int i = sortedApiLevels.size() - 1; i >= 0; i--) {
+        AndroidApiLevel highestApplicable = sortedApiLevels.get(i);
+        if (highestApplicable.getLevel() <= vmLevel.getLevel()
+            && lowestApplicable != highestApplicable) {
+          Set<AndroidApiLevel> set = new TreeSet<>();
+          set.add(lowestApplicable);
+          set.add(highestApplicable);
+          for (AndroidApiLevel explicitApiLevel : explicitApiLevels) {
+            if (explicitApiLevel.getLevel() <= vmLevel.getLevel()) {
+              set.add(explicitApiLevel);
+            }
+          }
+          return set.stream().map(api -> new TestParameters(runtime, api));
+        }
       }
     }
-    return Stream.of(new TestParameters(runtime));
+    return Stream.of(new TestParameters(runtime, lowestApplicable));
   }
 
   // Public method to check that the CF runtime coincides with the system runtime.
   public static boolean isSystemJdk(CfVm vm) {
-    String version = System.getProperty("java.version");
-    switch (vm) {
-      case JDK8:
-        return version.startsWith("1.8.");
-      case JDK9:
-        return version.startsWith("9.");
-      case JDK11:
-        return version.startsWith("11.");
-    }
-    throw new Unreachable();
+    TestRuntime systemRuntime = TestRuntime.getSystemRuntime();
+    return systemRuntime.isCf() && systemRuntime.asCf().getVm().equals(vm);
   }
 
-  private static boolean isSupportedJdk(CfVm vm) {
-    return isSystemJdk(vm) || TestRuntime.isCheckedInJDK(vm);
+  public static boolean isRuntimesPropertySet() {
+    return getRuntimesProperty() != null;
+  }
+
+  public static String getRuntimesProperty() {
+    return System.getProperty("runtimes");
+  }
+
+  private static Stream<TestRuntime> getUnfilteredAvailableRuntimes() {
+    // The runtimes are built in a linked hash map to ensure a deterministic order and avoid
+    // duplicates.
+    LinkedHashMap<TestRuntime, TestRuntime> runtimes = new LinkedHashMap<>();
+    // Place the none-runtime first.
+    NoneRuntime noneRuntime = NoneRuntime.getInstance();
+    runtimes.putIfAbsent(noneRuntime, noneRuntime);
+    // Then the checked in runtimes (CF and DEX).
+    for (TestRuntime checkedInRuntime : TestRuntime.getCheckedInRuntimes()) {
+      runtimes.putIfAbsent(checkedInRuntime, checkedInRuntime);
+    }
+    // Then finally the system runtime. It will likely be the same as a checked in and adding it
+    // makes the overall order more stable.
+    TestRuntime systemRuntime = TestRuntime.getSystemRuntime();
+    runtimes.putIfAbsent(systemRuntime, systemRuntime);
+    return runtimes.values().stream();
   }
 
   private static Stream<TestRuntime> getAvailableRuntimes() {
-    String runtimesProperty = System.getProperty("runtimes");
-    Stream<TestRuntime> runtimes;
-    if (runtimesProperty != null) {
-      runtimes =
-          Arrays.stream(runtimesProperty.split(":"))
-              .filter(s -> !s.isEmpty())
-              .map(
-                  name -> {
-                    TestRuntime runtime = TestRuntime.fromName(name);
-                    if (runtime != null) {
-                      return runtime;
-                    }
-                    throw new RuntimeException("Unexpected runtime property name: " + name);
-                  });
-    } else {
-      runtimes =
-          Stream.concat(
-              Stream.of(NoneRuntime.getInstance()),
-              Stream.concat(
-                  Arrays.stream(TestRuntime.CfVm.values()).map(CfRuntime::new),
-                  Arrays.stream(DexVm.Version.values()).map(DexRuntime::new)));
+    if (isRuntimesPropertySet()) {
+      String[] runtimeFilters = getRuntimesProperty().split(":");
+      return getUnfilteredAvailableRuntimes()
+          .filter(
+              runtime ->
+                  Arrays.stream(runtimeFilters).anyMatch(filter -> runtime.name().equals(filter)));
     }
-    // TODO(b/127785410) Support multiple VMs at the same time.
-    return runtimes.filter(runtime -> !runtime.isCf() || isSupportedJdk(runtime.asCf().getVm()));
+    return getUnfilteredAvailableRuntimes();
   }
 
   public static List<CfVm> getAvailableCfVms() {

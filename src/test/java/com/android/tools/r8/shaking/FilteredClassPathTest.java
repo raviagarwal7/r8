@@ -7,14 +7,15 @@ import com.android.tools.r8.ClassFileResourceProvider;
 import com.android.tools.r8.ProgramResource;
 import com.android.tools.r8.ProgramResourceProvider;
 import com.android.tools.r8.ResourceException;
+import com.android.tools.r8.ThrowingBiFunction;
 import com.android.tools.r8.ToolHelper;
+import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.position.Position;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.AndroidApp.Builder;
 import com.android.tools.r8.utils.ListUtils;
-import com.android.tools.r8.utils.ThrowingBiFunction;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
-import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -43,7 +44,8 @@ public class FilteredClassPathTest {
   }
 
   private static FilteredClassPath makeFilteredClassPath(Path path, List<String> filters) {
-    return new FilteredClassPath(path, ImmutableList.copyOf(filters));
+    return new FilteredClassPath(
+        path, ImmutableList.copyOf(filters), Origin.unknown(), Position.UNKNOWN);
   }
 
   @Test

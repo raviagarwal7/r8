@@ -17,6 +17,7 @@ import com.android.tools.r8.dex.ApplicationReader;
 import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.origin.EmbeddedOrigin;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.shaking.ProguardConfiguration;
@@ -62,9 +63,8 @@ public class SmaliTestBase extends TestBase {
 
   protected DexApplication buildApplication(AndroidApp input, InternalOptions options) {
     try {
-      options.itemFactory.resetSortedIndices();
-      return new ApplicationReader(input, options, new Timing("SmaliTest")).read();
-    } catch (IOException | ExecutionException e) {
+      return new ApplicationReader(input, options, Timing.empty()).read();
+    } catch (IOException e) {
       throw new RuntimeException(e);
     }
   }
@@ -113,7 +113,7 @@ public class SmaliTestBase extends TestBase {
     CodeInspector inspector = new CodeInspector(application);
     ClassSubject clazz = inspector.clazz(className);
     assertTrue(clazz.isPresent());
-    return clazz.getDexClass();
+    return clazz.getDexProgramClass();
   }
 
   protected DexClass getClass(DexApplication application, MethodSignature signature) {
@@ -125,8 +125,8 @@ public class SmaliTestBase extends TestBase {
       CodeInspector inspector = new CodeInspector(appPath);
       ClassSubject clazz = inspector.clazz(className);
       assertTrue(clazz.isPresent());
-      return clazz.getDexClass();
-    } catch (IOException | ExecutionException e) {
+      return clazz.getDexProgramClass();
+    } catch (IOException e) {
       throw new RuntimeException(e);
     }
   }
@@ -135,7 +135,7 @@ public class SmaliTestBase extends TestBase {
     try {
       CodeInspector inspector = new CodeInspector(appPath);
       return getMethodSubject(inspector, signature);
-    } catch (IOException | ExecutionException e) {
+    } catch (IOException e) {
       throw new RuntimeException(e);
     }
   }
@@ -164,6 +164,10 @@ public class SmaliTestBase extends TestBase {
 
   protected DexEncodedMethod getMethod(AndroidApp application, MethodSignature signature) {
     return getMethodSubject(application, signature).getMethod();
+  }
+
+  protected ProgramMethod getProgramMethod(AndroidApp application, MethodSignature signature) {
+    return getMethodSubject(application, signature).getProgramMethod();
   }
 
   /**

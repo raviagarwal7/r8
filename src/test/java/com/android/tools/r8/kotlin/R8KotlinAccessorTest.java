@@ -17,17 +17,22 @@ import com.android.tools.r8.kotlin.TestKotlinClass.AccessorKind;
 import com.android.tools.r8.kotlin.TestKotlinClass.Visibility;
 import com.android.tools.r8.naming.MemberNaming;
 import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.FieldSubject;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.function.Consumer;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
+@RunWith(Parameterized.class)
 public class R8KotlinAccessorTest extends AbstractR8KotlinTestBase {
 
   private static final String JAVA_LANG_STRING = "java.lang.String";
@@ -64,6 +69,11 @@ public class R8KotlinAccessorTest extends AbstractR8KotlinTestBase {
 
   private Consumer<InternalOptions> disableClassStaticizer =
       opts -> opts.enableClassStaticizer = false;
+
+  @Parameterized.Parameters(name = "target: {0}, allowAccessModification: {1}")
+  public static Collection<Object[]> data() {
+    return buildParameters(KotlinTargetVersion.values(), BooleanUtils.values());
+  }
 
   public R8KotlinAccessorTest(
       KotlinTargetVersion targetVersion, boolean allowAccessModification) {
@@ -291,29 +301,18 @@ public class R8KotlinAccessorTest extends AbstractR8KotlinTestBase {
   @Test
   public void testAccessor() throws Exception {
     TestKotlinCompanionClass testedClass = ACCESSOR_COMPANION_PROPERTY_CLASS;
-    String mainClass = addMainToClasspath("accessors.AccessorKt",
-        "accessor_accessPropertyFromCompanionClass");
+    String mainClass =
+        addMainToClasspath("accessors.AccessorKt", "accessor_accessPropertyFromCompanionClass");
     runTest(
         "accessors",
         mainClass,
         disableClassStaticizer,
-        (app) -> {
+        app -> {
+          // The classes are removed entirely as a result of member value propagation, inlining, and
+          // the fact that the classes do not have observable side effects.
           CodeInspector codeInspector = new CodeInspector(app);
-          ClassSubject outerClass =
-              checkClassIsKept(codeInspector, testedClass.getOuterClassName());
-          ClassSubject companionClass = checkClassIsKept(codeInspector, testedClass.getClassName());
-
-          // Property field has been removed due to member value propagation.
-          String propertyName = "property";
-          checkFieldIsRemoved(outerClass, JAVA_LANG_STRING, propertyName);
-
-          // The getter is always inlined since it just calls into the accessor.
-          MemberNaming.MethodSignature getter = testedClass.getGetterForProperty(propertyName);
-          checkMethodIsAbsent(companionClass, getter);
-
-          MemberNaming.MethodSignature getterAccessor =
-              testedClass.getGetterAccessorForProperty(propertyName, AccessorKind.FROM_COMPANION);
-          checkMethodIsKept(outerClass, getterAccessor);
+          checkClassIsRemoved(codeInspector, testedClass.getOuterClassName());
+          checkClassIsRemoved(codeInspector, testedClass.getClassName());
         });
   }
 

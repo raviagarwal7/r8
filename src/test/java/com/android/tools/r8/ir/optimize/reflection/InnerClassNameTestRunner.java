@@ -4,24 +4,25 @@
 package com.android.tools.r8.ir.optimize.reflection;
 
 import static org.hamcrest.CoreMatchers.containsString;
-import static org.junit.Assert.assertTrue;
+import static org.junit.Assume.assumeTrue;
 
-import com.android.tools.r8.CompilationFailedException;
+import com.android.tools.r8.D8TestCompileResult;
+import com.android.tools.r8.D8TestRunResult;
 import com.android.tools.r8.JvmTestRunResult;
 import com.android.tools.r8.R8TestCompileResult;
 import com.android.tools.r8.R8TestRunResult;
 import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestCompileResult;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.TestRuntime.CfVm;
 import com.android.tools.r8.ToolHelper.DexVm;
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
-import java.io.IOException;
 import java.util.Collection;
-import java.util.concurrent.ExecutionException;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -32,6 +33,8 @@ public class InnerClassNameTestRunner extends TestBase {
 
   private static final Class<?> MAIN_CLASS = InnerClassNameTest.class;
   private static final String PACKAGE = "com/android/tools/r8/ir/optimize/reflection/";
+  private static final String REPACKAGE =
+      "com/android/some/other/repackage/tools/r8/ir/optimize/reflection/";
 
   public enum TestNamingConfig {
     DEFAULT,
@@ -39,6 +42,7 @@ public class InnerClassNameTestRunner extends TestBase {
     EMTPY_SEPARATOR,
     UNDERBAR_SEPARATOR,
     NON_NESTED_INNER,
+    WRONG_REPACKAGE,
     OUTER_ENDS_WITH_DOLLAR,
     $_$_$;
 
@@ -49,6 +53,7 @@ public class InnerClassNameTestRunner extends TestBase {
         case EMTPY_SEPARATOR:
         case UNDERBAR_SEPARATOR:
         case NON_NESTED_INNER:
+        case WRONG_REPACKAGE:
           return "OuterClass";
         case OUTER_ENDS_WITH_DOLLAR:
           return "OuterClass$";
@@ -61,6 +66,7 @@ public class InnerClassNameTestRunner extends TestBase {
     public String getSeparator() {
       switch (this) {
         case DEFAULT:
+        case WRONG_REPACKAGE:
         case OUTER_ENDS_WITH_DOLLAR:
         case $_$_$:
           return "$";
@@ -82,6 +88,7 @@ public class InnerClassNameTestRunner extends TestBase {
         case $_$_$:
         case UNDERBAR_SEPARATOR:
         case NON_NESTED_INNER:
+        case WRONG_REPACKAGE:
         case EMTPY_SEPARATOR:
           return "$";
         case DOLLAR2_SEPARATOR:
@@ -97,10 +104,11 @@ public class InnerClassNameTestRunner extends TestBase {
     public String getInnerTypeRaw() {
       switch (this) {
         case DEFAULT:
-        case OUTER_ENDS_WITH_DOLLAR:
         case DOLLAR2_SEPARATOR:
         case EMTPY_SEPARATOR:
         case UNDERBAR_SEPARATOR:
+        case WRONG_REPACKAGE:
+        case OUTER_ENDS_WITH_DOLLAR:
         case $_$_$:
           return getOuterTypeRaw() + getSeparator() + getInnerClassName();
         case NON_NESTED_INNER:
@@ -110,7 +118,8 @@ public class InnerClassNameTestRunner extends TestBase {
     }
 
     public String getInnerInternalType() {
-      return PACKAGE + getInnerTypeRaw();
+      // b/130706685: Intentionally repackage inner type only.
+      return (this == WRONG_REPACKAGE ? REPACKAGE : PACKAGE) + getInnerTypeRaw();
     }
 
     public String getOuterInternalType() {
@@ -134,7 +143,7 @@ public class InnerClassNameTestRunner extends TestBase {
   @Parameters(name = "{0} minify:{1} {2}")
   public static Collection<Object[]> parameters() {
     return buildParameters(
-        getTestParameters().withAllRuntimes().build(),
+        getTestParameters().withAllRuntimesAndApiLevels().build(),
         BooleanUtils.values(),
         TestNamingConfig.values());
   }
@@ -150,8 +159,61 @@ public class InnerClassNameTestRunner extends TestBase {
     this.config = config;
   }
 
+  public boolean hasMalformedInnerClassAttribute() {
+    switch (config) {
+      case DEFAULT:
+      case OUTER_ENDS_WITH_DOLLAR:
+      case $_$_$:
+      case DOLLAR2_SEPARATOR:
+        return false;
+      case EMTPY_SEPARATOR:
+      case UNDERBAR_SEPARATOR:
+      case NON_NESTED_INNER:
+      case WRONG_REPACKAGE:
+        return true;
+      default:
+        throw new Unreachable("Unexpected test configuration: " + config);
+    }
+  }
+
+  private void checkWarningsAboutMalformedAttribute(TestCompileResult<?, ?> result) {
+    switch (config) {
+      case DEFAULT:
+      case OUTER_ENDS_WITH_DOLLAR:
+      case $_$_$:
+      case DOLLAR2_SEPARATOR:
+        result.assertNoMessages();
+        break;
+      case EMTPY_SEPARATOR:
+      case UNDERBAR_SEPARATOR:
+      case NON_NESTED_INNER:
+      case WRONG_REPACKAGE:
+        result
+            .assertInfoMessageThatMatches(containsString("Malformed inner-class attribute"))
+            .assertInfoMessageThatMatches(containsString(config.getOuterTypeRaw()))
+            .assertInfoMessageThatMatches(containsString(config.getInnerTypeRaw()));
+        break;
+      default:
+        throw new Unreachable("Unexpected test configuration: " + config);
+    }
+  }
+
   @Test
-  public void test() throws IOException, CompilationFailedException, ExecutionException {
+  public void testD8() throws Exception {
+    assumeTrue("Only run D8 for Dex backend", parameters.isDexRuntime() && !minify);
+    D8TestCompileResult d8CompileResult =
+        testForD8()
+            .addProgramClassFileData(InnerClassNameTestDump.dump(config, parameters))
+            .addOptionsModification(InternalOptions::disableNameReflectionOptimization)
+            .setMinApi(parameters.getApiLevel())
+            .compile();
+    checkWarningsAboutMalformedAttribute(d8CompileResult);
+    D8TestRunResult d8RunResult = d8CompileResult.run(parameters.getRuntime(), MAIN_CLASS);
+    d8RunResult.assertSuccessWithOutput(getExpectedNonMinified(config.getInnerClassName()));
+  }
+
+  @Test
+  public void testR8() throws Exception {
     JvmTestRunResult runResult = null;
     if (parameters.isCfRuntime()) {
       runResult =
@@ -160,22 +222,19 @@ public class InnerClassNameTestRunner extends TestBase {
               .run(parameters.getRuntime(), MAIN_CLASS);
     }
 
-    R8TestCompileResult r8CompileResult;
-    try {
-      r8CompileResult =
+    R8TestCompileResult r8CompileResult =
         testForR8(parameters.getBackend())
             .addKeepMainRule(MAIN_CLASS)
             .addKeepRules("-keep,allowobfuscation class * { *; }")
             .addKeepRules("-keepattributes InnerClasses,EnclosingMethod")
             .addProgramClassFileData(InnerClassNameTestDump.dump(config, parameters))
+            .allowDiagnosticInfoMessages(hasMalformedInnerClassAttribute())
             .minification(minify)
-            .setMinApi(parameters.getRuntime())
-            .compile();
-    } catch (CompilationFailedException e) {
-      assertTrue("b/120597515", config == TestNamingConfig.NON_NESTED_INNER);
-      assertTrue("b/120597515", minify);
-      return;
-    }
+            .addOptionsModification(InternalOptions::disableNameReflectionOptimization)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .apply(this::checkWarningsAboutMalformedAttribute);
+
     CodeInspector inspector = r8CompileResult.inspector();
     R8TestRunResult r8RunResult = r8CompileResult.run(parameters.getRuntime(), MAIN_CLASS);
     switch (config) {
@@ -205,6 +264,8 @@ public class InnerClassNameTestRunner extends TestBase {
         break;
       case EMTPY_SEPARATOR:
       case UNDERBAR_SEPARATOR:
+      case NON_NESTED_INNER:
+      case WRONG_REPACKAGE:
         if (!minify
             && parameters.isCfRuntime()
             && parameters.getRuntime().asCf().getVm().lessThanOrEqual(CfVm.JDK8)) {
@@ -213,21 +274,6 @@ public class InnerClassNameTestRunner extends TestBase {
         } else {
           assert minify
               || parameters.isDexRuntime()
-              || !parameters.getRuntime().asCf().getVm().lessThanOrEqual(CfVm.JDK8);
-          r8RunResult.assertSuccessWithOutput(getExpectedMinified(inspector));
-        }
-        break;
-      case NON_NESTED_INNER:
-        if (minify) {
-          // TODO(b/120597515): better fail early while reading class file.
-          throw new Unreachable("Expect to see compilation error: " + config);
-        }
-        if (parameters.isCfRuntime()
-            && parameters.getRuntime().asCf().getVm().lessThanOrEqual(CfVm.JDK8)) {
-          // Any non-$ separator results in a runtime exception in getCanonicalName.
-          r8RunResult.assertFailureWithErrorThatMatches(containsString("Malformed class name"));
-        } else {
-          assert parameters.isDexRuntime()
               || !parameters.getRuntime().asCf().getVm().lessThanOrEqual(CfVm.JDK8);
           r8RunResult.assertSuccessWithOutput(getExpectedMinified(inspector));
         }

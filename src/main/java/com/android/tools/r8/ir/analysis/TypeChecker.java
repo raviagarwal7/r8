@@ -4,18 +4,19 @@
 
 package com.android.tools.r8.ir.analysis;
 
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.ir.analysis.type.Nullability;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.FieldInstruction;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.InstancePut;
 import com.android.tools.r8.ir.code.Instruction;
-import com.android.tools.r8.ir.code.InstructionIterator;
+import com.android.tools.r8.ir.code.Return;
 import com.android.tools.r8.ir.code.StaticPut;
 import com.android.tools.r8.ir.code.Throw;
-import com.android.tools.r8.ir.code.Value;
 
 /**
  * Utility to determine if a given IR code object type checks.
@@ -29,18 +30,20 @@ import com.android.tools.r8.ir.code.Value;
  */
 public class TypeChecker {
 
-  private final AppView<? extends AppInfoWithSubtyping> appView;
+  private final AppView<? extends AppInfoWithClassHierarchy> appView;
 
-  public TypeChecker(AppView<? extends AppInfoWithSubtyping> appView) {
+  public TypeChecker(AppView<? extends AppInfoWithClassHierarchy> appView) {
     this.appView = appView;
   }
 
   public boolean check(IRCode code) {
-    InstructionIterator instructionIterator = code.instructionIterator();
-    while (instructionIterator.hasNext()) {
-      Instruction instruction = instructionIterator.next();
+    for (Instruction instruction : code.instructions()) {
       if (instruction.isInstancePut()) {
         if (!check(instruction.asInstancePut())) {
+          return false;
+        }
+      } else if (instruction.isReturn()) {
+        if (!check(instruction.asReturn(), code.method())) {
           return false;
         }
       } else if (instruction.isStaticPut()) {
@@ -60,25 +63,41 @@ public class TypeChecker {
     return checkFieldPut(instruction);
   }
 
+  public boolean check(Return instruction, DexEncodedMethod method) {
+    if (instruction.isReturnVoid()) {
+      return true;
+    }
+    TypeElement valueType = instruction.returnValue().getType();
+    TypeElement returnType =
+        TypeElement.fromDexType(method.method.proto.returnType, Nullability.maybeNull(), appView);
+    if (isSubtypeOf(valueType, returnType)) {
+      return true;
+    }
+
+    if (returnType.isClassType() && valueType.isReferenceType()) {
+      // Interface types are treated like Object according to the JVM spec.
+      // https://docs.oracle.com/javase/specs/jvms/se9/html/jvms-4.html#jvms-4.10.1.2-100
+      DexClass clazz = appView.definitionFor(method.method.proto.returnType);
+      return clazz != null && clazz.isInterface();
+    }
+
+    return false;
+  }
+
   public boolean check(StaticPut instruction) {
     return checkFieldPut(instruction);
   }
 
-  private boolean checkFieldPut(FieldInstruction instruction) {
+  public boolean checkFieldPut(FieldInstruction instruction) {
     assert instruction.isFieldPut();
-    Value value =
-        instruction.isInstancePut()
-            ? instruction.asInstancePut().value()
-            : instruction.asStaticPut().inValue();
-    TypeLatticeElement valueType = value.getTypeLattice();
-    TypeLatticeElement fieldType =
-        TypeLatticeElement.fromDexType(
-            instruction.getField().type, valueType.nullability(), appView);
+    TypeElement valueType = instruction.value().getType();
+    TypeElement fieldType =
+        TypeElement.fromDexType(instruction.getField().type, valueType.nullability(), appView);
     if (isSubtypeOf(valueType, fieldType)) {
       return true;
     }
 
-    if (fieldType.isClassType() && valueType.isReference()) {
+    if (fieldType.isClassType() && valueType.isReferenceType()) {
       // Interface types are treated like Object according to the JVM spec.
       // https://docs.oracle.com/javase/specs/jvms/se9/html/jvms-4.html#jvms-4.10.1.2-100
       DexClass clazz = appView.definitionFor(instruction.getField().type);
@@ -89,16 +108,15 @@ public class TypeChecker {
   }
 
   public boolean check(Throw instruction) {
-    TypeLatticeElement valueType = instruction.exception().getTypeLattice();
-    TypeLatticeElement throwableType =
-        TypeLatticeElement.fromDexType(
+    TypeElement valueType = instruction.exception().getType();
+    TypeElement throwableType =
+        TypeElement.fromDexType(
             appView.dexItemFactory().throwableType, valueType.nullability(), appView);
     return isSubtypeOf(valueType, throwableType);
   }
 
-  private boolean isSubtypeOf(
-      TypeLatticeElement expectedSubtype, TypeLatticeElement expectedSupertype) {
-    return (expectedSubtype.isNullType() && expectedSupertype.isReference())
+  private boolean isSubtypeOf(TypeElement expectedSubtype, TypeElement expectedSupertype) {
+    return (expectedSubtype.isNullType() && expectedSupertype.isReferenceType())
         || expectedSubtype.lessThanOrEqual(expectedSupertype, appView)
         || expectedSubtype.isBasedOnMissingClass(appView);
   }

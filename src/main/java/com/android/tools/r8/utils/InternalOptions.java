@@ -3,45 +3,82 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.utils;
 
+import static com.google.common.base.Predicates.not;
+
 import com.android.tools.r8.ClassFileConsumer;
+import com.android.tools.r8.CompilationMode;
 import com.android.tools.r8.DataResourceConsumer;
-import com.android.tools.r8.DataResourceProvider;
+import com.android.tools.r8.DesugarGraphConsumer;
 import com.android.tools.r8.DexFilePerClassFileConsumer;
 import com.android.tools.r8.DexIndexedConsumer;
+import com.android.tools.r8.FeatureSplit;
 import com.android.tools.r8.ProgramConsumer;
 import com.android.tools.r8.StringConsumer;
 import com.android.tools.r8.Version;
 import com.android.tools.r8.dex.Marker;
+import com.android.tools.r8.dex.Marker.Tool;
 import com.android.tools.r8.errors.CompilationError;
+import com.android.tools.r8.errors.IncompleteNestNestDesugarDiagnosic;
+import com.android.tools.r8.errors.InterfaceDesugarMissingTypeDiagnostic;
 import com.android.tools.r8.errors.InvalidDebugInfoException;
+import com.android.tools.r8.errors.InvalidLibrarySuperclassDiagnostic;
+import com.android.tools.r8.errors.MissingNestHostNestDesugarDiagnostic;
+import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.experimental.graphinfo.GraphConsumer;
+import com.android.tools.r8.features.FeatureSplitConfiguration;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexDefinition;
 import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexItem;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.inspector.internal.InspectorImpl;
 import com.android.tools.r8.ir.code.IRCode;
+import com.android.tools.r8.ir.conversion.MethodProcessingId;
+import com.android.tools.r8.ir.desugar.DesugaredLibraryConfiguration;
 import com.android.tools.r8.ir.optimize.Inliner;
-import com.android.tools.r8.naming.InterfaceMethodNameMinifier;
 import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.position.Position;
+import com.android.tools.r8.references.Reference;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.android.tools.r8.shaking.Enqueuer;
+import com.android.tools.r8.shaking.GlobalKeepInfoConfiguration;
 import com.android.tools.r8.shaking.ProguardConfiguration;
 import com.android.tools.r8.shaking.ProguardConfigurationRule;
 import com.android.tools.r8.utils.IROrdering.IdentityIROrdering;
 import com.android.tools.r8.utils.IROrdering.NondeterministicIROrdering;
+import com.android.tools.r8.utils.collections.SortedProgramMethodSet;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Equivalence.Wrapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.lang.reflect.GenericSignatureFormatError;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.BiConsumer;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import org.objectweb.asm.Opcodes;
 
-public class InternalOptions {
+public class InternalOptions implements GlobalKeepInfoConfiguration {
 
   // Set to true to run compilation in a single thread and without randomly shuffling the input.
   // This makes life easier when running R8 in a debugger.
@@ -52,9 +89,24 @@ public class InternalOptions {
     ON
   }
 
+  public enum DesugarState {
+    OFF,
+    // This is for use when desugar has run before, and backports have still not been desugared.
+    ONLY_BACKPORT_STATICS,
+    ON
+  }
+
+  public static final int SUPPORTED_CF_MAJOR_VERSION = Opcodes.V11;
+  public static final int SUPPORTED_DEX_VERSION =
+      AndroidApiLevel.LATEST.getDexVersion().getIntValue();
+
   public static final int ASM_VERSION = Opcodes.ASM7;
 
   public final DexItemFactory itemFactory;
+
+  public boolean hasProguardConfiguration() {
+    return proguardConfiguration != null;
+  }
 
   public ProguardConfiguration getProguardConfiguration() {
     return proguardConfiguration;
@@ -66,8 +118,10 @@ public class InternalOptions {
   // TODO(zerny): Make this private-final once we have full program-consumer support.
   public ProgramConsumer programConsumer = null;
 
-  public final List<DataResourceProvider> dataResourceProviders = new ArrayList<>();
   public DataResourceConsumer dataResourceConsumer;
+  public FeatureSplitConfiguration featureSplitConfiguration;
+
+  public List<Consumer<InspectorImpl>> outputInspections = Collections.emptyList();
 
   // Constructor for testing and/or other utilities.
   public InternalOptions() {
@@ -103,16 +157,28 @@ public class InternalOptions {
     if (!proguardConfiguration.isOptimizing()) {
       disableAllOptimizations();
     }
+    configurationDebugging = proguardConfiguration.isConfigurationDebugging();
+    if (proguardConfiguration.isProtoShrinkingEnabled()) {
+      enableProtoShrinking();
+    }
+  }
+
+  void enableProtoShrinking() {
+    applyInliningToInlinee = true;
+    enableFieldBitAccessAnalysis = true;
+    protoShrinking.enableGeneratedMessageLiteShrinking = true;
+    protoShrinking.enableGeneratedMessageLiteBuilderShrinking = true;
+    protoShrinking.enableGeneratedExtensionRegistryShrinking = true;
   }
 
   void disableAllOptimizations() {
     disableGlobalOptimizations();
-    enableNonNullTracking = false;
+    enableNameReflectionOptimization = false;
+    enableStringConcatenationOptimization = false;
   }
 
   public void disableGlobalOptimizations() {
     enableArgumentRemoval = false;
-    enableDynamicTypeOptimization = false;
     enableInlining = false;
     enableClassInlining = false;
     enableClassStaticizer = false;
@@ -120,54 +186,102 @@ public class InternalOptions {
     enableLambdaMerging = false;
     enableHorizontalClassMerging = false;
     enableVerticalClassMerging = false;
+    enableEnumUnboxing = false;
     enableUninstantiatedTypeOptimization = false;
-    enableUnusedArgumentRemoval = false;
     outline.enabled = false;
-    enableSwitchMapRemoval = false;
+    enableEnumValueOptimization = false;
     enableValuePropagation = false;
     enableSideEffectAnalysis = false;
+    enableTreeShakingOfLibraryMethodOverrides = false;
+    callSiteOptimizationOptions.disableOptimization();
   }
 
   public boolean printTimes = System.getProperty("com.android.tools.r8.printtimes") != null;
+  // To print memory one also have to enable printtimes.
+  public boolean printMemory = System.getProperty("com.android.tools.r8.printmemory") != null;
+
+  public String dumpInputToFile = System.getProperty("com.android.tools.r8.dumpinputtofile");
+  public String dumpInputToDirectory =
+      System.getProperty("com.android.tools.r8.dumpinputtodirectory");
 
   // Flag to toggle if DEX code objects should pass-through without IR processing.
   public boolean passthroughDexCode = false;
 
+  // Flag to toggle if the prefix based merge restriction should be enforced.
+  public boolean enableNeverMergePrefixes = true;
+  public Set<String> neverMergePrefixes = ImmutableSet.of("j$.");
+
+  public boolean libraryInterfacesMayHaveStaticInitialization = false;
+
   // Optimization-related flags. These should conform to -dontoptimize and disableAllOptimizations.
-  public boolean enableDynamicTypeOptimization = true;
+  public boolean enableFieldAssignmentTracker = true;
+  public boolean enableFieldBitAccessAnalysis =
+      System.getProperty("com.android.tools.r8.fieldBitAccessAnalysis") != null;
   public boolean enableHorizontalClassMerging = true;
   public boolean enableVerticalClassMerging = true;
   public boolean enableArgumentRemoval = true;
-  public boolean enableUnusedArgumentRemoval = true;
+  public boolean enableUnusedInterfaceRemoval = true;
   public boolean enableDevirtualization = true;
-  public boolean enableNonNullTracking = true;
   public boolean enableInlining =
-      !Version.isDev() || System.getProperty("com.android.tools.r8.disableinlining") == null;
-  // TODO(b/130202534): Enable this once code size regressions are fixed.
-  public boolean enableInliningOfInvokesWithNullableReceivers = false;
+      !Version.isDevelopmentVersion()
+          || System.getProperty("com.android.tools.r8.disableinlining") == null;
+  public boolean enableEnumUnboxing = true;
+  // TODO(b/141451716): Evaluate the effect of allowing inlining in the inlinee.
+  public boolean applyInliningToInlinee =
+      System.getProperty("com.android.tools.r8.applyInliningToInlinee") != null;
+  public int applyInliningToInlineeMaxDepth = 0;
+  public boolean enableInliningOfInvokesWithClassInitializationSideEffects = true;
+  public boolean enableInliningOfInvokesWithNullableReceivers = true;
+  public boolean disableInliningOfLibraryMethodOverrides = true;
   public boolean enableClassInlining = true;
   public boolean enableClassStaticizer = true;
   public boolean enableInitializedClassesAnalysis = true;
   public boolean enableSideEffectAnalysis = true;
+  public boolean enableDeterminismAnalysis = true;
   public boolean enableServiceLoaderRewriting = true;
-  // TODO(b/120138731): Enable this when it is worthwhile, e.g., combined with Class#forName.
-  public boolean enableNameReflectionOptimization = false;
-  public int classInliningInstructionLimit = 50;
+  public boolean enableNameReflectionOptimization = true;
+  public boolean enableStringConcatenationOptimization = true;
+  public boolean enableTreeShakingOfLibraryMethodOverrides = false;
+  public boolean encodeChecksums = false;
+  public BiPredicate<String, Long> dexClassChecksumFilter = (name, checksum) -> true;
+  public boolean cfToCfDesugar = false;
+
+  public int callGraphLikelySpuriousCallEdgeThreshold = 50;
+
+  // TODO(b/141719453): The inlining limit at least should be consistent with normal inlining.
+  public int classInliningInstructionLimit = 10;
+  public int classInliningInstructionAllowance = 50;
   // This defines the limit of instructions in the inlinee
   public int inliningInstructionLimit = 3;
   // This defines how many instructions of inlinees we can inlinee overall.
   public int inliningInstructionAllowance = 1500;
+  // Maximum number of distinct values in a method that may be used in a monitor-enter instruction.
+  public int inliningMonitorEnterValuesAllowance = 4;
   // Maximum number of control flow resolution blocks that setup the register state before
   // the actual catch handler allowed when inlining. Threshold found empirically by testing on
   // GMS Core.
   public int inliningControlFlowResolutionBlocksThreshold = 15;
-  public boolean enableSwitchMapRemoval = true;
+  public boolean enableStringSwitchConversion = true;
+  public int minimumStringSwitchSize = 3;
+  public boolean enableEnumValueOptimization = true;
+  public boolean enableEnumSwitchMapRemoval = true;
   public final OutlineOptions outline = new OutlineOptions();
+  public boolean enableInitializedClassesInInstanceMethodsAnalysis = true;
+  public boolean enableRedundantFieldLoadElimination = true;
   public boolean enableValuePropagation = true;
+  public boolean enableValuePropagationForInstanceFields = true;
   public boolean enableUninstantiatedTypeOptimization = true;
+  // Currently disabled, see b/146957343.
+  public boolean enableUninstantiatedTypeOptimizationForInterfaces = false;
+  // TODO(b/138917494): Disable until we have numbers on potential performance penalties.
+  public boolean enableRedundantConstNumberOptimization = false;
+
+  public boolean enablePcDebugInfoOutput = false;
+
+  public String synthesizedClassPrefix = "";
 
   // Number of threads to use while processing the dex files.
-  public int numberOfThreads = DETERMINISTIC_DEBUGGING ? 1 : ThreadUtils.NOT_SPECIFIED;
+  public int threadCount = DETERMINISTIC_DEBUGGING ? 1 : ThreadUtils.NOT_SPECIFIED;
   // Print smali disassembly.
   public boolean useSmaliSyntax = false;
   // Verbose output.
@@ -181,21 +295,47 @@ public class InternalOptions {
   // fused together by play store when shipped for pre-L devices.
   public boolean ignoreMainDexMissingClasses = false;
 
+  // Boolean value indicating that byte code pass through may be enabled.
+  public boolean enableCfByteCodePassThrough = false;
+
   // Hidden marker for classes.dex
   private boolean hasMarker = false;
   private Marker marker;
-
-  public boolean hasMarker() {
-    return hasMarker;
-  }
 
   public void setMarker(Marker marker) {
     this.hasMarker = true;
     this.marker = marker;
   }
 
-  public Marker getMarker() {
-    assert hasMarker();
+  public Marker getMarker(Tool tool) {
+    if (hasMarker) {
+      return marker;
+    }
+    return createMarker(tool);
+  }
+
+  // Compute the marker to be placed in the main dex file.
+  private Marker createMarker(Tool tool) {
+    if (tool == Tool.D8 && testing.dontCreateMarkerInD8) {
+      return null;
+    }
+    Marker marker =
+        new Marker(tool)
+            .setVersion(Version.LABEL)
+            .setCompilationMode(debug ? CompilationMode.DEBUG : CompilationMode.RELEASE)
+            .setHasChecksums(encodeChecksums);
+    if (!isGeneratingClassFiles()) {
+      marker.setMinApi(minApiLevel);
+    }
+    if (desugaredLibraryConfiguration.getIdentifier() != null) {
+      marker.setDesugaredLibraryIdentifiers(desugaredLibraryConfiguration.getIdentifier());
+    }
+    if (Version.isDevelopmentVersion()) {
+      marker.setSha1(VersionProperties.INSTANCE.getSha());
+    }
+    if (tool == Tool.R8) {
+      marker.setR8Mode(forceProguardCompatibility ? "compatibility" : "full");
+    }
     return marker;
   }
 
@@ -213,6 +353,29 @@ public class InternalOptions {
       return InternalOutputMode.ClassFile;
     }
     throw new UnsupportedOperationException("Cannot find internal output mode.");
+  }
+
+  public boolean isDesugaredLibraryCompilation() {
+    return desugaredLibraryConfiguration.isLibraryCompilation();
+  }
+
+  public boolean isRelocatorCompilation() {
+    return relocatorCompilation;
+  }
+
+  public boolean shouldBackportMethods() {
+    return !hasConsumer() || isGeneratingDex();
+  }
+
+  public boolean shouldKeepStackMapTable() {
+    assert cfToCfDesugar || isRelocatorCompilation() || getProguardConfiguration() != null;
+    return cfToCfDesugar
+        || isRelocatorCompilation()
+        || getProguardConfiguration().getKeepAttributes().stackMapTable;
+  }
+
+  public boolean shouldRerunEnqueuer() {
+    return isShrinking() || isMinifying() || getProguardConfiguration().hasApplyMappingFile();
   }
 
   public boolean isGeneratingDex() {
@@ -250,10 +413,29 @@ public class InternalOptions {
         dataResourceConsumer.finished(reporter);
       }
     }
+    if (featureSplitConfiguration != null) {
+      for (FeatureSplit featureSplit : featureSplitConfiguration.getFeatureSplits()) {
+        ProgramConsumer programConsumer = featureSplit.getProgramConsumer();
+        programConsumer.finished(reporter);
+        DataResourceConsumer dataResourceConsumer = programConsumer.getDataResourceConsumer();
+        if (dataResourceConsumer != null) {
+          dataResourceConsumer.finished(reporter);
+        }
+      }
+    }
+    if (desugarGraphConsumer != null) {
+      desugarGraphConsumer.finished();
+    }
+  }
+
+  public boolean shouldDesugarNests() {
+    if (testing.enableForceNestBasedAccessDesugaringForTest) {
+      return true;
+    }
+    return enableNestBasedAccessDesugaring && !canUseNestBasedAccess();
   }
 
   public Set<String> extensiveLoggingFilter = getExtensiveLoggingFilter();
-  public Set<String> extensiveFieldMinifierLoggingFilter = getExtensiveFieldMinifierLoggingFilter();
   public Set<String> extensiveInterfaceMethodMinifierLoggingFilter =
       getExtensiveInterfaceMethodMinifierLoggingFilter();
 
@@ -262,12 +444,19 @@ public class InternalOptions {
   // Skipping min_api check and compiling an intermediate result intended for later merging.
   // Intermediate builds also emits or update synthesized classes mapping.
   public boolean intermediate = false;
+  public boolean readCompileTimeAnnotations = true;
   public List<String> logArgumentsFilter = ImmutableList.of();
 
+  // Flag to turn on/offLoad/store optimization in the Cf back-end.
+  public boolean enableLoadStoreOptimization = true;
   // Flag to turn on/off lambda class merging in R8.
   public boolean enableLambdaMerging = false;
   // Flag to turn on/off desugaring in D8/R8.
-  public boolean enableDesugaring = true;
+  public DesugarState desugarState = DesugarState.ON;
+  // Flag to turn on/off JDK11+ nest-access control
+  public boolean enableNestBasedAccessDesugaring = true;
+  // Flag to turn on/off reduction of nest to improve class merging optimizations.
+  public boolean enableNestReduction = true;
   // Defines interface method rewriter behavior.
   public OffOrAuto interfaceMethodDesugaring = OffOrAuto.Auto;
   // Defines try-with-resources rewriter behavior.
@@ -275,6 +464,12 @@ public class InternalOptions {
   // Flag to turn on/off processing of @dalvik.annotation.codegen.CovariantReturnType and
   // @dalvik.annotation.codegen.CovariantReturnType$CovariantReturnTypes.
   public boolean processCovariantReturnTypeAnnotations = true;
+  // Flag to control library/program class lookup order.
+  // TODO(120884788): Enable this flag as the default.
+  public boolean lookupLibraryBeforeProgram = false;
+  // TODO(120884788): Leave this system property as a stop-gap for some time.
+  // public boolean lookupLibraryBeforeProgram =
+  //     System.getProperty("com.android.tools.r8.lookupProgramBeforeLibrary") == null;
 
   // Whether or not to check for valid multi-dex builds.
   //
@@ -287,11 +482,36 @@ public class InternalOptions {
   private final boolean enableMinification;
 
   public boolean isShrinking() {
+    assert proguardConfiguration == null
+        || enableTreeShaking == proguardConfiguration.isShrinking();
     return enableTreeShaking;
   }
 
   public boolean isMinifying() {
+    assert proguardConfiguration == null
+        || enableMinification == proguardConfiguration.isObfuscating();
     return enableMinification;
+  }
+
+  @Override
+  public boolean isTreeShakingEnabled() {
+    return isShrinking();
+  }
+
+  @Override
+  public boolean isMinificationEnabled() {
+    return isMinifying();
+  }
+
+  @Override
+  public boolean isAccessModificationEnabled() {
+    return getProguardConfiguration() != null
+        && getProguardConfiguration().isAccessModificationAllowed();
+  }
+
+  public boolean keepInnerClassStructure() {
+    return getProguardConfiguration().getKeepAttributes().signature
+        || getProguardConfiguration().getKeepAttributes().innerClasses;
   }
 
   public boolean printCfg = false;
@@ -299,29 +519,45 @@ public class InternalOptions {
   public boolean ignoreMissingClasses = false;
   // EXPERIMENTAL flag to get behaviour as close to Proguard as possible.
   public boolean forceProguardCompatibility = false;
-  public boolean disableAssertions = true;
-  public boolean debugKeepRules = false;
-  // Read input classes into CfCode format (instead of JarCode).
-  public boolean enableCfFrontend = false;
+  public AssertionConfigurationWithDefault assertionsConfiguration = null;
+  public boolean configurationDebugging = false;
+
   // Don't convert Code objects to IRCode.
   public boolean skipIR = false;
 
   public boolean debug = false;
+
+  private final CallSiteOptimizationOptions callSiteOptimizationOptions =
+      new CallSiteOptimizationOptions();
+  private final ProtoShrinkingOptions protoShrinking = new ProtoShrinkingOptions();
+  private final KotlinOptimizationOptions kotlinOptimizationOptions =
+      new KotlinOptimizationOptions();
   public final TestingOptions testing = new TestingOptions();
 
   public List<ProguardConfigurationRule> mainDexKeepRules = ImmutableList.of();
   public boolean minimalMainDex;
   /**
-   * Enable usage of InheritanceClassInDexDistributor for multidex legacy builds.
-   * This allows distribution of classes to minimize DexOpt LinearAlloc usage by minimizing linking
-   * errors during DexOpt and controlling the load of classes with linking issues.
-   * This has the consequence of making minimal main dex not absolutely minimal regarding runtime
-   * execution constraints because it's adding classes in the main dex to satisfy also DexOpt
-   * constraints.
+   * Enable usage of InheritanceClassInDexDistributor for multidex legacy builds. This allows
+   * distribution of classes to minimize DexOpt LinearAlloc usage by minimizing linking errors
+   * during DexOpt and controlling the load of classes with linking issues. This has the consequence
+   * of making minimal main dex not absolutely minimal regarding runtime execution constraints
+   * because it's adding classes in the main dex to satisfy also DexOpt constraints.
    */
   public boolean enableInheritanceClassInDexDistributor = true;
 
   public LineNumberOptimization lineNumberOptimization = LineNumberOptimization.ON;
+
+  public CallSiteOptimizationOptions callSiteOptimizationOptions() {
+    return callSiteOptimizationOptions;
+  }
+
+  public ProtoShrinkingOptions protoShrinking() {
+    return protoShrinking;
+  }
+
+  public KotlinOptimizationOptions kotlinOptimizationOptions() {
+    return kotlinOptimizationOptions;
+  }
 
   public static boolean shouldEnableKeepRuleSynthesisForRecompilation() {
     return System.getProperty("com.android.tools.r8.keepRuleSynthesisForRecompilation") != null;
@@ -365,6 +601,40 @@ public class InternalOptions {
     return ImmutableSet.of();
   }
 
+  private static Set<String> getNullableReceiverInliningFilter() {
+    String property = System.getProperty("com.android.tools.r8.nullableReceiverInliningFilter");
+    if (property != null) {
+      // The property is allowed to be either (1) a path to a file where each line is a method
+      // signature, or (2) a semicolon separated list of method signatures.
+      Path path = null;
+      try {
+        Path tmp = Paths.get(property);
+        if (Files.exists(tmp)) {
+          path = tmp;
+        }
+      } catch (InvalidPathException | NullPointerException e) {
+        // Ignore, treat as a semicolon separated list of method signatures.
+      }
+      ImmutableSet.Builder<String> builder = ImmutableSet.builder();
+      if (path != null) {
+        try {
+          Files.readAllLines(path).stream()
+              .map(String::trim)
+              .filter(not(String::isEmpty))
+              .forEach(builder::add);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      } else {
+        for (String method : property.split(";")) {
+          builder.add(method);
+        }
+      }
+      return builder.build();
+    }
+    return ImmutableSet.of();
+  }
+
   public static class InvalidParameterAnnotationInfo {
 
     final DexMethod method;
@@ -395,8 +665,8 @@ public class InternalOptions {
   private final Map<Origin, List<InvalidParameterAnnotationInfo>> warningInvalidParameterAnnotations
       = new HashMap<>();
 
-  private final Map<Origin, List<Pair<DexEncodedMethod, String>>> warningInvalidDebugInfo
-      = new HashMap<>();
+  private final Map<Origin, List<Pair<ProgramMethod, String>>> warningInvalidDebugInfo =
+      new HashMap<>();
 
   // Don't read code from dex files. Used to extract non-code information from vdex files where
   // the code contains unsupported byte codes.
@@ -410,17 +680,32 @@ public class InternalOptions {
   // If non null it must be and passed to the consumer.
   public StringConsumer proguardMapConsumer = null;
 
-  // If null, no proguad seeds info needs to be computed.
-  // If non null it must be and passed to the consumer.
-  public StringConsumer proguardSeedsConsumer = null;
-
   // If null, no usage information needs to be computed.
   // If non-null, it must be and is passed to the consumer.
   public StringConsumer usageInformationConsumer = null;
 
+  public boolean hasUsageInformationConsumer() {
+    return usageInformationConsumer != null;
+  }
+
+  // If null, no proguad seeds info needs to be computed.
+  // If non null it must be and passed to the consumer.
+  public StringConsumer proguardSeedsConsumer = null;
+
   // If null, no configuration information needs to be printed.
   // If non-null, configuration must be passed to the consumer.
   public StringConsumer configurationConsumer = null;
+
+  // If null, no desugaring of library is performed.
+  // If non null it contains flags describing library desugaring.
+  public DesugaredLibraryConfiguration desugaredLibraryConfiguration =
+      DesugaredLibraryConfiguration.empty();
+
+  public boolean relocatorCompilation = false;
+
+  // If null, no keep rules are recorded.
+  // If non null it records desugared library APIs used by the program.
+  public StringConsumer desugaredLibraryKeepRuleConsumer = null;
 
   // If null, no graph information needs to be provided for the keep/inclusion of classes
   // in the output. If non-null, each edge pertaining to kept parts of the resulting program
@@ -432,13 +717,187 @@ public class InternalOptions {
   // of the resulting program must be reported to the consumer.
   public GraphConsumer mainDexKeptGraphConsumer = null;
 
-  public Path proguardCompatibilityRulesOutput = null;
+  // If null, no desugaring dependencies need to be provided. If non-null, each dependency between
+  // code objects needed for correct desugaring needs to be provided to the consumer.
+  public DesugarGraphConsumer desugarGraphConsumer = null;
+
   public Consumer<List<ProguardConfigurationRule>> syntheticProguardRulesConsumer = null;
 
   public static boolean assertionsEnabled() {
     boolean assertionsEnabled = false;
     assert assertionsEnabled = true; // Intentional side-effect.
     return assertionsEnabled;
+  }
+
+  public static void checkAssertionsEnabled() {
+    if (!assertionsEnabled()) {
+      throw new Unreachable();
+    }
+  }
+
+  /** A set of dexitems we have reported missing to dedupe warnings. */
+  private final Set<DexItem> reportedMissingForDesugaring = Sets.newConcurrentHashSet();
+
+  private final Set<DexItem> invalidLibraryClasses = Sets.newConcurrentHashSet();
+
+  public void errorMissingClassMissingNestHost(DexClass compiledClass) {
+    throw reporter.fatalError(messageErrorMissingNestHost(compiledClass));
+  }
+
+  public void warningMissingClassMissingNestHost(DexClass compiledClass) {
+    if (compiledClass.isLibraryClass()) {
+      errorMissingClassMissingNestHost(compiledClass);
+    }
+    reporter.warning(new StringDiagnostic(messageWarningMissingNestHost(compiledClass)));
+  }
+
+  public void nestDesugaringWarningMissingNestHost(DexClass compiledClass) {
+    if (compiledClass.isLibraryClass()) {
+      errorMissingClassMissingNestHost(compiledClass);
+    }
+    reporter.warning(
+        new MissingNestHostNestDesugarDiagnostic(
+            compiledClass.getOrigin(),
+            Position.UNKNOWN,
+            messageWarningMissingNestHost(compiledClass)));
+  }
+
+  public void errorMissingClassIncompleteNest(List<DexType> nest, AppView<?> appView) {
+    throw reporter.fatalError(messageErrorIncompleteNest(nest, appView));
+  }
+
+  public void warningMissingClassIncompleteNest(List<DexType> nest, AppView<?> appView) {
+    for (DexType type : nest) {
+      DexClass clazz = appView.definitionFor(type);
+      if (clazz != null && clazz.isLibraryClass()) {
+        errorMissingClassIncompleteNest(nest, appView);
+        return;
+      }
+    }
+    reporter.warning(new StringDiagnostic(messageWarningIncompleteNest(nest, appView)));
+  }
+
+  public void nestDesugaringWarningIncompleteNest(List<DexType> nest, AppView<?> appView) {
+    DexClass availableClass = null;
+    for (DexType type : nest) {
+      DexClass clazz = appView.definitionFor(type);
+      if (clazz != null && clazz.isProgramClass()) {
+        availableClass = clazz;
+      } else if (clazz != null && clazz.isLibraryClass()) {
+        errorMissingClassIncompleteNest(nest, appView);
+        return;
+      }
+    }
+    assert availableClass != null;
+    reporter.warning(
+        new IncompleteNestNestDesugarDiagnosic(
+            availableClass.getOrigin(),
+            Position.UNKNOWN,
+            messageWarningIncompleteNest(nest, appView)));
+  }
+
+  private String messageErrorMissingNestHost(DexClass compiledClass) {
+    String nestHostName = compiledClass.getNestHost().getName();
+    return "Class "
+        + compiledClass.type.getName()
+        + " requires its nest host "
+        + nestHostName
+        + " to be on program or class path. ";
+  }
+
+  private String messageWarningMissingNestHost(DexClass compiledClass) {
+    return messageErrorMissingNestHost(compiledClass)
+        + "Class "
+        + compiledClass.type.getName()
+        + " is considered as not being part of any nest.";
+  }
+
+  private String messageErrorIncompleteNest(List<DexType> nest, AppView<?> appView) {
+    List<String> programClassesFromNest = new ArrayList<>();
+    List<String> unavailableClasses = new ArrayList<>();
+    List<String> classPathClasses = new ArrayList<>();
+    List<String> libraryClasses = new ArrayList<>();
+    for (DexType type : nest) {
+      DexClass clazz = appView.definitionFor(appView.graphLense().lookupType(type));
+      if (clazz == null) {
+        unavailableClasses.add(type.getName());
+      } else if (clazz.isLibraryClass()) {
+        libraryClasses.add(type.getName());
+      } else if (clazz.isProgramClass()) {
+        programClassesFromNest.add(type.getName());
+      } else {
+        assert clazz.isClasspathClass();
+        classPathClasses.add(type.getName());
+      }
+    }
+    StringBuilder stringBuilder =
+        new StringBuilder("Compilation of classes ")
+            .append(String.join(", ", programClassesFromNest))
+            .append(" requires its nest mates ");
+    if (!unavailableClasses.isEmpty()) {
+      stringBuilder.append(String.join(", ", unavailableClasses)).append(" (unavailable) ");
+    }
+    if (!libraryClasses.isEmpty()) {
+      stringBuilder.append(String.join(", ", unavailableClasses)).append(" (on library path) ");
+    }
+    stringBuilder.append("to be on program or class path.");
+    if (!classPathClasses.isEmpty()) {
+      stringBuilder
+          .append("(Classes ")
+          .append(String.join(", ", classPathClasses))
+          .append(" from the same nest are on class path).");
+    }
+    return stringBuilder.toString();
+  }
+
+  private String messageWarningIncompleteNest(List<DexType> nest, AppView<?> appView) {
+    return messageErrorIncompleteNest(nest, appView)
+        + " Unavailable classes are considered as not being part of the nest.";
+  }
+
+  public void warningMissingTypeForDesugar(
+      Origin origin, Position position, DexType missingType, DexMethod context) {
+    if (reportedMissingForDesugaring.add(missingType)) {
+      reporter.warning(
+          new InterfaceDesugarMissingTypeDiagnostic(
+              origin,
+              position,
+              Reference.classFromDescriptor(missingType.toDescriptorString()),
+              Reference.classFromDescriptor(context.holder.toDescriptorString()),
+              null));
+    }
+  }
+
+  public void warningMissingInterfaceForDesugar(
+      DexClass classToDesugar, DexClass implementing, DexType missing) {
+    if (reportedMissingForDesugaring.add(missing)) {
+      reporter.warning(
+          new InterfaceDesugarMissingTypeDiagnostic(
+              classToDesugar.getOrigin(),
+              Position.UNKNOWN,
+              Reference.classFromDescriptor(missing.toDescriptorString()),
+              Reference.classFromDescriptor(classToDesugar.getType().toDescriptorString()),
+              classToDesugar == implementing
+                  ? null
+                  : Reference.classFromDescriptor(implementing.getType().toDescriptorString())));
+    }
+  }
+
+  public void warningInvalidLibrarySuperclassForDesugar(
+      Origin origin,
+      DexType libraryType,
+      DexType invalidSuperType,
+      String message,
+      Set<DexEncodedMethod> retarget) {
+    if (invalidLibraryClasses.add(invalidSuperType)) {
+      reporter.warning(
+          new InvalidLibrarySuperclassDiagnostic(
+              origin,
+              Reference.classFromDescriptor(libraryType.toDescriptorString()),
+              Reference.classFromDescriptor(invalidSuperType.toDescriptorString()),
+              message,
+              ListUtils.map(retarget, method -> method.getReference().asMethodReference())));
+    }
   }
 
   public void warningMissingEnclosingMember(DexType clazz, Origin origin, int version) {
@@ -458,7 +917,7 @@ public class InternalOptions {
   }
 
   public void warningInvalidDebugInfo(
-      DexEncodedMethod method, Origin origin, InvalidDebugInfoException e) {
+      ProgramMethod method, Origin origin, InvalidDebugInfoException e) {
     if (invalidDebugInfoFatal) {
       throw new CompilationError("Fatal warning: Invalid debug info", e);
     }
@@ -466,6 +925,31 @@ public class InternalOptions {
       warningInvalidDebugInfo.computeIfAbsent(
           origin, k -> new ArrayList<>()).add(new Pair<>(method, e.getMessage()));
     }
+  }
+
+  public void warningInvalidSignature(
+      DexDefinition item, Origin origin, String signature, GenericSignatureFormatError e) {
+    StringBuilder message = new StringBuilder("Invalid signature '");
+    message.append(signature);
+    message.append("' for ");
+    if (item.isDexClass()) {
+      message.append("class ");
+      message.append((item.asDexClass()).getType().toSourceString());
+    } else if (item.isDexEncodedField()) {
+      message.append("field ");
+      message.append(item.toSourceString());
+    } else {
+      assert item.isDexEncodedMethod();
+      message.append("method ");
+      message.append(item.toSourceString());
+    }
+    message.append(".");
+    message.append(System.lineSeparator());
+    message.append("Signature is ignored and will not be present in the output.");
+    message.append(System.lineSeparator());
+    message.append("Parser error: ");
+    message.append(e.getMessage());
+    reporter.warning(new StringDiagnostic(message.toString(), origin));
   }
 
   public boolean printWarnings() {
@@ -495,7 +979,7 @@ public class InternalOptions {
     }
     if (warningInvalidDebugInfo.size() > 0) {
       int count = 0;
-      for (List<Pair<DexEncodedMethod, String>> methods : warningInvalidDebugInfo.values()) {
+      for (List<Pair<ProgramMethod, String>> methods : warningInvalidDebugInfo.values()) {
         count += methods.size();
       }
       reporter.info(
@@ -505,7 +989,7 @@ public class InternalOptions {
                   + (count == 1 ? " method." : " methods.")));
       for (Origin origin : new TreeSet<>(warningInvalidDebugInfo.keySet())) {
         StringBuilder builder = new StringBuilder("Methods with invalid locals information:");
-        for (Pair<DexEncodedMethod, String> method : warningInvalidDebugInfo.get(origin)) {
+        for (Pair<ProgramMethod, String> method : warningInvalidDebugInfo.get(origin)) {
           builder.append("\n  ").append(method.getFirst().toSourceString());
           builder.append("\n  ").append(method.getSecond());
         }
@@ -517,10 +1001,11 @@ public class InternalOptions {
     if (missingEnclosingMembers.size() > 0) {
       reporter.info(
           new StringDiagnostic(
-              "InnerClass annotations are missing corresponding EnclosingMember annotations."
-                  + " Such InnerClass annotations are ignored."));
+              "InnerClasses attribute has entries missing a corresponding "
+                  + "EnclosingMethod attribute. "
+                  + "Such InnerClasses attribute entries are ignored."));
       for (Origin origin : new TreeSet<>(missingEnclosingMembers.keySet())) {
-        StringBuilder builder = new StringBuilder("Classes with missing enclosing members: ");
+        StringBuilder builder = new StringBuilder("Classes with missing EnclosingMethod: ");
         boolean first = true;
         for (TypeVersionPair pair : missingEnclosingMembers.get(origin)) {
           if (first) {
@@ -588,50 +1073,225 @@ public class InternalOptions {
     public int threshold = 20;
   }
 
+  public static class KotlinOptimizationOptions {
+    public boolean disableKotlinSpecificOptimizations =
+        System.getProperty("com.android.tools.r8.disableKotlinSpecificOptimizations") != null;
+  }
+
+  public static class CallSiteOptimizationOptions {
+
+    // Each time we see an invoke with more dispatch targets than the threshold, we stop call site
+    // propagation for all these dispatch targets. The motivation for this is that it is expensive
+    // and that we are somewhat unlikely to have precise knowledge about the value of arguments when
+    // there are many (possibly spurious) call graph edges.
+    private final int maxNumberOfDispatchTargetsBeforeAbandoning = 10;
+
+    // TODO(b/69963623): enable if everything is ready, including signature rewriting at call sites.
+    private boolean enableConstantPropagation = false;
+    private boolean enableTypePropagation = true;
+
+    private void disableOptimization() {
+      enableConstantPropagation = false;
+      enableTypePropagation = false;
+    }
+
+    public void disableTypePropagationForTesting() {
+      enableTypePropagation = false;
+    }
+
+    // TODO(b/69963623): Remove this once enabled.
+    @VisibleForTesting
+    public static void enableConstantPropagationForTesting(InternalOptions options) {
+      assert !options.callSiteOptimizationOptions().isConstantPropagationEnabled();
+      options.callSiteOptimizationOptions().enableConstantPropagation = true;
+    }
+
+    public int getMaxNumberOfDispatchTargetsBeforeAbandoning() {
+      return maxNumberOfDispatchTargetsBeforeAbandoning;
+    }
+
+    public boolean isEnabled() {
+      return enableConstantPropagation || enableTypePropagation;
+    }
+
+    public boolean isConstantPropagationEnabled() {
+      return enableConstantPropagation;
+    }
+
+    public boolean isTypePropagationEnabled() {
+      return enableTypePropagation;
+    }
+  }
+
+  public static class ProtoShrinkingOptions {
+
+    public boolean enableGeneratedExtensionRegistryShrinking = false;
+    public boolean enableGeneratedMessageLiteShrinking = false;
+    public boolean enableGeneratedMessageLiteBuilderShrinking = false;
+    public boolean traverseOneOfAndRepeatedProtoFields = false;
+
+    public boolean isProtoShrinkingEnabled() {
+      return enableGeneratedExtensionRegistryShrinking
+          || enableGeneratedMessageLiteShrinking
+          || enableGeneratedMessageLiteBuilderShrinking;
+    }
+  }
+
   public static class TestingOptions {
+
+    public static int NO_LIMIT = -1;
+
+    // Force writing the specified bytes as the DEX version content.
+    public byte[] forceDexVersionBytes = null;
 
     public IROrdering irOrdering =
         InternalOptions.assertionsEnabled() && !InternalOptions.DETERMINISTIC_DEBUGGING
             ? NondeterministicIROrdering.getInstance()
             : IdentityIROrdering.getInstance();
 
-    public boolean allowProguardRulesThatUseExtendsOrImplementsWrong = true;
+    public BiConsumer<AppInfoWithLiveness, Enqueuer.Mode> enqueuerInspector = null;
+
+    public BiConsumer<ProgramMethod, MethodProcessingId> methodProcessingIdConsumer = null;
+
+    public Consumer<Deque<SortedProgramMethodSet>> waveModifier = waves -> {};
+
+    /**
+     * If this flag is enabled, we will also compute the set of possible targets for invoke-
+     * interface and invoke-virtual instructions that target a library method, and add the
+     * corresponding edges to the call graph.
+     *
+     * <p>Setting this flag leads to more call graph edges, which can be good for size (e.g., it
+     * increases the likelihood that virtual methods have been processed by the time their call
+     * sites are processed, which allows more inlining).
+     *
+     * <p>However, the set of possible targets for such invokes can be very large. As an example,
+     * consider the instruction {@code invoke-virtual {v0, v1}, `void Object.equals(Object)`}).
+     * Therefore, tracing such invokes comes at a considerable performance penalty.
+     */
+    public boolean addCallEdgesForLibraryInvokes = false;
+
+    public boolean allowCheckDiscardedErrors = false;
+    public boolean allowInjectedAnnotationMethods = false;
     public boolean allowTypeErrors =
-        !Version.isDev() || System.getProperty("com.android.tools.r8.allowTypeErrors") != null;;
+        !Version.isDevelopmentVersion()
+            || System.getProperty("com.android.tools.r8.allowTypeErrors") != null;
+    public boolean allowInvokeErrors = false;
+    public boolean disableL8AnnotationRemoval = false;
+    public boolean allowClassInlinerGracefulExit =
+        System.getProperty("com.android.tools.r8.disallowClassInlinerGracefulExit") == null;
+    public boolean reportUnusedProguardConfigurationRules = false;
     public boolean alwaysUsePessimisticRegisterAllocation = false;
+    public boolean enableCheckCastAndInstanceOfRemoval = true;
+    public boolean enableDeadSwitchCaseElimination = true;
+    public boolean enableInvokeSuperToInvokeVirtualRewriting = true;
+    public boolean enableSwitchToIfRewriting = true;
+    public boolean enableEnumUnboxingDebugLogs = false;
+    public boolean forceRedundantConstNumberRemoval = false;
     public boolean invertConditionals = false;
     public boolean placeExceptionalBlocksLast = false;
     public boolean dontCreateMarkerInD8 = false;
     public boolean forceJumboStringProcessing = false;
-    public boolean nondeterministicCycleElimination = false;
     public Set<Inliner.Reason> validInliningReasons = null;
     public boolean noLocalsTableOnInput = false;
     public boolean forceNameReflectionOptimization = false;
-    public boolean disallowLoadStoreOptimization = false;
+    public boolean enableNarrowingChecksInD8 = false;
     public Consumer<IRCode> irModifier = null;
+    public int basicBlockMuncherIterationLimit = NO_LIMIT;
+    public boolean dontReportFailingCheckDiscarded = false;
+    public boolean deterministicSortingBasedOnDexType = true;
+    public PrintStream whyAreYouNotInliningConsumer = System.out;
+    public boolean trackDesugaredAPIConversions =
+        System.getProperty("com.android.tools.r8.trackDesugaredAPIConversions") != null;
+    public boolean forceLibBackportsInL8CfToCf = false;
+    public boolean enumUnboxingRewriteJavaCGeneratedMethod = false;
+    public boolean assertConsistentRenamingOfSignature = false;
 
-    // TODO(b/129458850) When fixed, remove this and change all usages to "true".
-    public boolean enableStatefulLambdaCreateInstanceMethod = false;
+    // TODO(b/144781417): This is disabled by default as some test apps appear to have such classes.
+    public boolean allowNonAbstractClassesWithAbstractMethods = true;
+
+    // Flag to turn on/off JDK11+ nest-access control even when not required (Cf backend)
+    public boolean enableForceNestBasedAccessDesugaringForTest = false;
+    public boolean verifyKeptGraphInfo = false;
+
+    // Force each call of application read to dump its inputs to a file, which is subsequently
+    // deleted. Useful to check that our dump functionality does not cause compilation failure.
+    public boolean dumpAll = false;
+
+    public boolean readInputStackMaps = false;
+
+    // Option for testing outlining with interface array arguments, see b/132420510.
+    public boolean allowOutlinerInterfaceArrayArguments = false;
 
     public MinifierTestingOptions minifier = new MinifierTestingOptions();
+
+    // Testing hooks to trigger effects in various compiler places.
+    public Runnable hookInIrConversion = null;
 
     public static class MinifierTestingOptions {
 
       public Comparator<DexMethod> interfaceMethodOrdering = null;
 
-      public Comparator<Wrapper<DexMethod>> createInterfaceMethodOrdering(
-          InterfaceMethodNameMinifier minifier) {
+      public Comparator<Wrapper<DexEncodedMethod>> getInterfaceMethodOrderingOrDefault(
+          Comparator<Wrapper<DexEncodedMethod>> comparator) {
         if (interfaceMethodOrdering != null) {
-          return (a, b) -> interfaceMethodOrdering.compare(a.get(), b.get());
+          return (a, b) ->
+              interfaceMethodOrdering.compare(a.get().getReference(), b.get().getReference());
         }
-        return minifier.createDefaultInterfaceMethodOrdering();
+        return comparator;
       }
     }
+
+    public boolean measureProguardIfRuleEvaluations = false;
+    public ProguardIfRuleEvaluationData proguardIfRuleEvaluationData =
+        new ProguardIfRuleEvaluationData();
+
+    public static class ProguardIfRuleEvaluationData {
+
+      public int numberOfProguardIfRuleClassEvaluations = 0;
+      public int numberOfProguardIfRuleMemberEvaluations = 0;
+    }
+
+    public Consumer<ProgramMethod> callSiteOptimizationInfoInspector = null;
+
+    public Predicate<DexMethod> cfByteCodePassThrough = null;
+  }
+
+  @VisibleForTesting
+  public void disableNameReflectionOptimization() {
+    // Use this util to disable get*Name() computation if the main intention of tests is checking
+    // const-class, e.g., canonicalization, or some test classes' only usages are get*Name().
+    enableNameReflectionOptimization = false;
   }
 
   private boolean hasMinApi(AndroidApiLevel level) {
     assert isGeneratingDex();
     return minApiLevel >= level.getLevel();
+  }
+
+  /**
+   * Dex2Oat issues a warning for abstract methods on non-abstract classes, so we never allow this.
+   *
+   * <p>Note that having an invoke instruction that targets an abstract method on a non-abstract
+   * class will fail with a verification error on Dalvik. Therefore, this must not be more
+   * permissive than {@code return minApiLevel >= AndroidApiLevel.L.getLevel()}.
+   *
+   * <p>See b/132953944.
+   */
+  @SuppressWarnings("ConstantConditions")
+  public boolean canUseAbstractMethodOnNonAbstractClass() {
+    boolean result = false;
+    assert !(result && canHaveDalvikAbstractMethodOnNonAbstractClassVerificationBug());
+    return result;
+  }
+
+  public boolean canUseConstClassInstructions(int cfVersion) {
+    assert isGeneratingClassFiles();
+    return cfVersion >= requiredCfVersionForConstClassInstructions();
+  }
+
+  public int requiredCfVersionForConstClassInstructions() {
+    assert isGeneratingClassFiles();
+    return Opcodes.V1_5;
   }
 
   public boolean canUseInvokePolymorphicOnVarHandle() {
@@ -658,6 +1318,10 @@ public class InternalOptions {
     return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.N);
   }
 
+  public boolean canUseNestBasedAccess() {
+    return isGeneratingClassFiles();
+  }
+
   public boolean canLeaveStaticInterfaceMethodInvokes() {
     return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.L);
   }
@@ -666,12 +1330,13 @@ public class InternalOptions {
     return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.K);
   }
 
-  public boolean canUseJava8Methods() {
-    return hasMinApi(AndroidApiLevel.N);
-  }
-
   public boolean canUsePrivateInterfaceMethods() {
     return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.N);
+  }
+
+  public boolean canUseDexPcAsDebugInformation() {
+    // TODO(b/37830524): Enable for min-api 26 (OREO) and above.
+    return enablePcDebugInfoOutput;
   }
 
   public boolean isInterfaceMethodDesugaringEnabled() {
@@ -679,9 +1344,13 @@ public class InternalOptions {
     if (!hasConsumer()) {
       return false;
     }
-    return enableDesugaring
+    return desugarState == DesugarState.ON
         && interfaceMethodDesugaring == OffOrAuto.Auto
-        && !canUseDefaultAndStaticInterfaceMethods();
+        && (!canUseDefaultAndStaticInterfaceMethods() || cfToCfDesugar);
+  }
+
+  public boolean isStringSwitchConversionEnabled() {
+    return enableStringSwitchConversion && !debug;
   }
 
   public boolean canUseMultidex() {
@@ -689,22 +1358,26 @@ public class InternalOptions {
     return intermediate || hasMinApi(AndroidApiLevel.L);
   }
 
-  public boolean canUseLongCompareAndObjectsNonNull() {
-    return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.K);
+  public boolean canUseRequireNonNull() {
+    return isGeneratingDex() && hasMinApi(AndroidApiLevel.K);
   }
 
   public boolean canUseSuppressedExceptions() {
     return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.K);
   }
 
-  // APIs for accessing parameter names annotations are not available before Android O, thus does
-  // not emit them to avoid wasting space in Dex files because runtimes before Android O will ignore
-  // them.
-  public boolean canUseParameterNameAnnotations() {
-    if (!hasConsumer()) {
-      return false;
-    }
-    return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.O);
+  public boolean canUseAssertionErrorTwoArgumentConstructor() {
+    return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.K);
+  }
+
+  // The Apache Harmony-based AssertionError constructor which takes an Object on API 15 and older
+  // calls the Error supertype constructor with null as the exception cause. This prevents
+  // subsequent calls to initCause() because its implementation checks that cause==this before
+  // allowing a cause to be set.
+  //
+  // https://android.googlesource.com/platform/libcore/+/refs/heads/ics-mr1/luni/src/main/java/java/lang/AssertionError.java#56
+  public boolean canInitCauseAfterAssertionErrorObjectConstructor() {
+    return isGeneratingClassFiles() || hasMinApi(AndroidApiLevel.J);
   }
 
   // Dalvik x86-atom backend had a bug that made it crash on filled-new-array instructions for
@@ -1012,5 +1685,42 @@ public class InternalOptions {
   // See b/69826014.
   public boolean canHaveIncorrectJoinForArrayOfInterfacesBug() {
     return true;
+  }
+
+  // The dalvik verifier will crash the program if there is a try catch block with an exception
+  // type that does not exist.
+  // We don't do anything special about this, except that we don't inline methods that have a
+  // catch handler with the ReflectiveOperationException type, i.e., if the program did not crash
+  // in the non R8 case it should not in the R8 case.
+  // Currently we handle only the ReflectiveOperationException, but there could be other exceptions.
+  // We do this for all pre art version, in case we add more Exception types later on. The
+  // problem is there for all dalvik vms, but the exception was added in api level 19
+  // so we don't see it there.
+  //
+  // See b/131349148
+  public boolean canHaveDalvikCatchHandlerVerificationBug() {
+    return isGeneratingClassFiles() || minApiLevel < AndroidApiLevel.L.getLevel();
+  }
+
+  // Having an invoke instruction that targets an abstract method on a non-abstract class will fail
+  // with a verification error.
+  //
+  // See b/132953944.
+  public boolean canHaveDalvikAbstractMethodOnNonAbstractClassVerificationBug() {
+    return isGeneratingDex() && minApiLevel < AndroidApiLevel.L.getLevel();
+  }
+
+  // On dalvik we see issues when using an int value in places where a boolean, byte, char, or short
+  // is expected.
+  //
+  // For example, if we inline the following method into the call site:
+  //   public int value;
+  //   public boolean getValue() {
+  //     return value;
+  //   }
+  //
+  // See also b/134304597 and b/124152497.
+  public boolean canHaveDalvikIntUsedAsNonIntPrimitiveTypeBug() {
+    return isGeneratingClassFiles() || minApiLevel < AndroidApiLevel.L.getLevel();
   }
 }

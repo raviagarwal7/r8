@@ -7,14 +7,16 @@ import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.cf.code.CfConstMethodType;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 
 public class ConstMethodType extends ConstInstruction {
 
@@ -26,16 +28,18 @@ public class ConstMethodType extends ConstInstruction {
   }
 
   @Override
+  public int opcode() {
+    return Opcodes.CONST_METHOD_TYPE;
+  }
+
+  @Override
   public <T> T accept(InstructionVisitor<T> visitor) {
     return visitor.visit(this);
   }
 
   public static ConstMethodType copyOf(IRCode code, ConstMethodType original) {
     Value newValue =
-        new Value(
-            code.valueNumberGenerator.next(),
-            original.outValue().getTypeLattice(),
-            original.getLocalInfo());
+        new Value(code.valueNumberGenerator.next(), original.getOutType(), original.getLocalInfo());
     return copyOf(newValue, original);
   }
 
@@ -104,19 +108,24 @@ public class ConstMethodType extends ConstInstruction {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.fromDexType(
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.fromDexType(
         appView.dexItemFactory().methodTypeType, Nullability.definitelyNotNull(), appView);
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return appView.dexItemFactory().methodTypeType;
   }
 
   @Override
   public void insertLoadAndStores(InstructionListIterator it, LoadStoreHelper helper) {
     helper.storeOutValue(this, it);
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forConstMethodType();
   }
 }

@@ -3,31 +3,41 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
+import static com.android.tools.r8.ir.analysis.type.TypeAnalysis.toRefinedReceiverType;
+
 import com.android.tools.r8.cf.code.CfInvoke;
 import com.android.tools.r8.code.InvokeInterfaceRange;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
-import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import java.util.Collection;
 import java.util.List;
-import org.objectweb.asm.Opcodes;
 
 public class InvokeInterface extends InvokeMethodWithReceiver {
 
   public InvokeInterface(DexMethod target, Value result, List<Value> arguments) {
     super(target, result, arguments);
+  }
+
+  @Override
+  public boolean getInterfaceBit() {
+    return true;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INVOKE_INTERFACE;
   }
 
   @Override
@@ -85,35 +95,43 @@ public class InvokeInterface extends InvokeMethodWithReceiver {
   }
 
   @Override
-  public DexEncodedMethod lookupSingleTarget(AppInfoWithLiveness appInfo,
-      DexType invocationContext) {
-    DexType refinedReceiverType = TypeAnalysis.getRefinedReceiverType(appInfo, this);
-    DexMethod method = getInvokedMethod();
-    return appInfo.lookupSingleInterfaceTarget(method, refinedReceiverType);
-  }
-
-  @Override
-  public Collection<DexEncodedMethod> lookupTargets(AppInfoWithSubtyping appInfo,
-      DexType invocationContext) {
-    return appInfo.lookupInterfaceTargets(getInvokedMethod());
+  public DexEncodedMethod lookupSingleTarget(
+      AppView<?> appView,
+      ProgramMethod context,
+      TypeElement receiverUpperBoundType,
+      ClassTypeElement receiverLowerBoundType) {
+    if (appView.appInfo().hasLiveness()) {
+      AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
+      return appViewWithLiveness
+          .appInfo()
+          .lookupSingleVirtualTarget(
+              getInvokedMethod(),
+              context,
+              true,
+              appView,
+              toRefinedReceiverType(
+                  receiverUpperBoundType, getInvokedMethod(), appViewWithLiveness),
+              receiverLowerBoundType);
+    }
+    return null;
   }
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInvokeInterface(getInvokedMethod(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInvokeInterface(getInvokedMethod(), context.getHolder());
   }
 
   @Override
   public void buildCf(CfBuilder builder) {
-    builder.add(new CfInvoke(Opcodes.INVOKEINTERFACE, getInvokedMethod(), true));
+    builder.add(new CfInvoke(org.objectweb.asm.Opcodes.INVOKEINTERFACE, getInvokedMethod(), true));
   }
 
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forInvokeInterface(

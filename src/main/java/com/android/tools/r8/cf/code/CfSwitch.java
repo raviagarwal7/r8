@@ -4,10 +4,14 @@
 package com.android.tools.r8.cf.code;
 
 import com.android.tools.r8.cf.CfPrinter;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.CfState.Slot;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -50,7 +54,22 @@ public class CfSwitch extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public CfSwitch asSwitch() {
+    return this;
+  }
+
+  @Override
+  public boolean isSwitch() {
+    return true;
+  }
+
+  @Override
+  public boolean isJump() {
+    return true;
+  }
+
+  @Override
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     Label[] labels = new Label[targets.size()];
     for (int i = 0; i < targets.size(); i++) {
       labels[i] = targets.get(i).getLabel();
@@ -80,5 +99,11 @@ public class CfSwitch extends CfInstruction {
     }
     Slot value = state.pop();
     builder.addSwitch(value.register, keys, code.getLabelOffset(defaultTarget), labelOffsets);
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return inliningConstraints.forJumpInstruction();
   }
 }

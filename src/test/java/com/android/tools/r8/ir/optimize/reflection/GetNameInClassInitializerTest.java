@@ -52,7 +52,7 @@ public class GetNameInClassInitializerTest extends GetNameTestBase {
   @Test
   public void testJVMOutput() throws Exception {
     assumeTrue(
-        "Only run JVM reference once (for CF backend)",
+        "Only run JVM reference on CF runtimes",
         parameters.isCfRuntime() && !enableMinification);
     testForJvm()
         .addTestClasspath()
@@ -69,7 +69,7 @@ public class GetNameInClassInitializerTest extends GetNameTestBase {
         .addKeepMainRule(MAIN)
         .addKeepRules("-keep class **.GetNameClinit*")
         .minification(enableMinification)
-        .setMinApi(parameters.getRuntime())
+        .setMinApi(parameters.getApiLevel())
         .addOptionsModification(this::configure)
         .run(parameters.getRuntime(), MAIN)
         .assertSuccessWithOutput(JAVA_OUTPUT);
@@ -85,7 +85,7 @@ public class GetNameInClassInitializerTest extends GetNameTestBase {
             .addKeepMainRule(MAIN)
             .addKeepRules("-keep,allowobfuscation class **.GetNameClinit*")
             .minification(enableMinification)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .compile();
     result

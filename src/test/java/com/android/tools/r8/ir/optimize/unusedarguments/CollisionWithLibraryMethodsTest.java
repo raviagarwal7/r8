@@ -46,7 +46,7 @@ public class CollisionWithLibraryMethodsTest extends TestBase {
     testForR8(parameters.getBackend())
         .addInnerClasses(CollisionWithLibraryMethodsTest.class)
         .addKeepMainRule(TestClass.class)
-        .enableClassInliningAnnotations()
+        .enableNeverClassInliningAnnotations()
         .enableInliningAnnotations()
         .minification(minification)
         .setMinApi(parameters.getRuntime())
@@ -84,7 +84,8 @@ public class CollisionWithLibraryMethodsTest extends TestBase {
 
     @NeverInline
     public String toString(Object unused) {
-      return "Hello world!";
+      System.out.print("Hello ");
+      return "world!";
     }
   }
 }

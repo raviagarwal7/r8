@@ -6,7 +6,6 @@ package com.android.tools.r8.ir.optimize;
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
 import com.android.tools.r8.D8TestRunResult;
@@ -19,6 +18,7 @@ import com.android.tools.r8.TestParametersCollection;
 import com.android.tools.r8.TestRunResult;
 import com.android.tools.r8.ToolHelper.DexVm.Version;
 import com.android.tools.r8.graph.DexMethod;
+import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -29,68 +29,6 @@ import java.util.Objects;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-
-class ObjectsRequireNonNullTestMain {
-
-  static class Uninitialized {
-    void noWayToCall() {
-      System.out.println("Uninitialized, hence no way to call this.");
-    }
-  }
-
-  @NeverPropagateValue
-  @NeverInline
-  static void consumeUninitialized(Uninitialized arg) {
-    Uninitialized nonNullArg = Objects.requireNonNull(arg);
-    // Dead code.
-    nonNullArg.noWayToCall();
-  }
-
-  static class Foo {
-    @NeverInline
-    void bar() {
-      System.out.println("Foo::bar");
-    }
-
-    @NeverInline
-    @Override
-    public String toString() {
-      return "Foo::toString";
-    }
-  }
-
-  @NeverInline
-  static void unknownArg(Foo foo) {
-    // It's unclear the argument is definitely null or not null.
-    Foo checked = Objects.requireNonNull(foo);
-    checked.bar();
-  }
-
-  public static void main(String[] args) {
-    Foo instance = new Foo();
-    // Not removable in debug mode.
-    Object nonNull = Objects.requireNonNull(instance);
-    System.out.println(nonNull);
-    // Removable because associated locals are changed while type casting.
-    Foo checked = Objects.requireNonNull(instance);
-    checked.bar();
-
-    unknownArg(instance);
-    try {
-      unknownArg(null);
-      fail("Expected NullPointerException");
-    } catch (NullPointerException npe) {
-      System.out.println("Expected NPE");
-    }
-
-    try {
-      consumeUninitialized(null);
-      fail("Expected NullPointerException");
-    } catch (NullPointerException npe) {
-      System.out.println("Expected NPE");
-    }
-  }
-}
 
 @RunWith(Parameterized.class)
 public class ObjectsRequireNonNullTest extends TestBase {
@@ -109,6 +47,7 @@ public class ObjectsRequireNonNullTest extends TestBase {
         .withCfRuntimes()
         // Objects#requireNonNull will be desugared VMs older than API level K.
         .withDexRuntimesStartingFromExcluding(Version.V4_4_4)
+        .withApiLevelsStartingAtIncluding(AndroidApiLevel.K)
         .build();
   }
 
@@ -120,7 +59,7 @@ public class ObjectsRequireNonNullTest extends TestBase {
 
   @Test
   public void testJvmOutput() throws Exception {
-    assumeTrue("Only run JVM reference once (for CF backend)", parameters.isCfRuntime());
+    assumeTrue("Only run JVM reference on CF runtimes", parameters.isCfRuntime());
     testForJvm()
         .addTestClasspath()
         .run(parameters.getRuntime(), MAIN)
@@ -174,7 +113,7 @@ public class ObjectsRequireNonNullTest extends TestBase {
         testForD8()
             .debug()
             .addProgramClassesAndInnerClasses(MAIN)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
     test(result, 2, 1);
@@ -183,7 +122,7 @@ public class ObjectsRequireNonNullTest extends TestBase {
         testForD8()
             .release()
             .addProgramClassesAndInnerClasses(MAIN)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
     test(result, 0, 1);
@@ -199,9 +138,74 @@ public class ObjectsRequireNonNullTest extends TestBase {
             .enableMemberValuePropagationAnnotations()
             .addKeepMainRule(MAIN)
             .noMinification()
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
-    test(result, 0, 0);
+    // TODO(b/157427150): would be able to remove the call to requireNonNull() if we knew that it
+    //  throws an NullPointerException that does not have a message.
+    test(result, 0, 1);
+  }
+
+  static class ObjectsRequireNonNullTestMain {
+
+    static class Uninitialized {
+      void noWayToCall() {
+        System.out.println("Uninitialized, hence no way to call this.");
+      }
+    }
+
+    @NeverPropagateValue
+    @NeverInline
+    static void consumeUninitialized(Uninitialized arg) {
+      Uninitialized nonNullArg = Objects.requireNonNull(arg);
+      // Dead code.
+      nonNullArg.noWayToCall();
+    }
+
+    static class Foo {
+      @NeverInline
+      void bar() {
+        System.out.println("Foo::bar");
+      }
+
+      @NeverInline
+      @Override
+      public String toString() {
+        return "Foo::toString";
+      }
+    }
+
+    @NeverInline
+    static void unknownArg(Foo foo) {
+      // It's unclear the argument is definitely null or not null.
+      Foo checked = Objects.requireNonNull(foo);
+      checked.bar();
+    }
+
+    public static void main(String[] args) {
+      Foo instance = new Foo();
+      // Not removable in debug mode.
+      Object nonNull = Objects.requireNonNull(instance);
+      System.out.println(nonNull);
+      // Removable because associated locals are changed while type casting.
+      Foo checked = Objects.requireNonNull(instance);
+      checked.bar();
+
+      unknownArg(instance);
+      try {
+        Foo alwaysNull = System.currentTimeMillis() > 0 ? null : instance;
+        unknownArg(alwaysNull);
+        throw new AssertionError("Expected NullPointerException");
+      } catch (NullPointerException npe) {
+        System.out.println("Expected NPE");
+      }
+
+      try {
+        consumeUninitialized(null);
+        throw new AssertionError("Expected NullPointerException");
+      } catch (NullPointerException npe) {
+        System.out.println("Expected NPE");
+      }
+    }
   }
 }

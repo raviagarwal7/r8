@@ -6,11 +6,13 @@ package com.android.tools.r8.ir.optimize;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult.SingleResolutionResult;
 import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Assume;
-import com.android.tools.r8.ir.code.Assume.NonNullAssumption;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.CheckCast;
 import com.android.tools.r8.ir.code.DominatorTree;
@@ -18,6 +20,7 @@ import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.InstructionListIterator;
 import com.android.tools.r8.ir.code.InvokeInterface;
+import com.android.tools.r8.ir.code.InvokeSuper;
 import com.android.tools.r8.ir.code.InvokeVirtual;
 import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -31,8 +34,14 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Rewrites all invoke-interface instructions that have a unique target on a class into
+ * Tries to rewrite virtual invokes to their most specific target by:
+ *
+ * <pre>
+ * 1) Rewriting all invoke-interface instructions that have a unique target on a class into
  * invoke-virtual with the corresponding unique target.
+ * 2) Rewriting all invoke-virtual instructions that have a more specific target to an
+ * invoke-virtual with the corresponding target.
+ * </pre>
  */
 public class Devirtualizer {
 
@@ -42,8 +51,10 @@ public class Devirtualizer {
     this.appView = appView;
   }
 
-  public void devirtualizeInvokeInterface(IRCode code, DexType invocationContext) {
+  public void devirtualizeInvokeInterface(IRCode code) {
     Set<Value> affectedValues = Sets.newIdentityHashSet();
+    AssumeRemover assumeRemover = new AssumeRemover(appView, code);
+    ProgramMethod context = code.context();
     Map<InvokeInterface, InvokeVirtual> devirtualizedCall = new IdentityHashMap<>();
     DominatorTree dominatorTree = new DominatorTree(code);
     Map<Value, Map<DexType, Value>> castedReceiverCache = new IdentityHashMap<>();
@@ -52,7 +63,7 @@ public class Devirtualizer {
     ListIterator<BasicBlock> blocks = code.listIterator();
     while (blocks.hasNext()) {
       BasicBlock block = blocks.next();
-      InstructionListIterator it = block.listIterator();
+      InstructionListIterator it = block.listIterator(code);
       while (it.hasNext()) {
         Instruction current = it.next();
 
@@ -66,8 +77,8 @@ public class Devirtualizer {
         // (out <-) invoke-virtual rcv_c, ... C#foo
         // ...
         // non_null_rcv <- non-null rcv_c  // <- Update the input rcv to the non-null, too.
-        if (current.isAssumeNonNull()) {
-          Assume<NonNullAssumption> nonNull = current.asAssumeNonNull();
+        if (current.isAssumeWithNonNullAssumption()) {
+          Assume nonNull = current.asAssume();
           Instruction origin = nonNull.origin();
           if (origin.isInvokeInterface()
               && !origin.asInvokeInterface().getReceiver().hasLocalInfo()
@@ -92,8 +103,8 @@ public class Devirtualizer {
               // the out-value of the cast instruction is a more precise type than the in-value,
               // otherwise we could introduce type errors.
               Value oldReceiver = newCheckCast.object();
-              TypeLatticeElement oldReceiverType = oldReceiver.getTypeLattice();
-              TypeLatticeElement newReceiverType = newReceiver.getTypeLattice();
+              TypeElement oldReceiverType = oldReceiver.getType();
+              TypeElement newReceiverType = newReceiver.getType();
               if (newReceiverType.lessThanOrEqual(oldReceiverType, appView)
                   && dominatorTree.dominatedBy(block, devirtualizedInvoke.getBlock())) {
                 assert nonNull.src() == oldReceiver;
@@ -105,15 +116,51 @@ public class Devirtualizer {
           }
         }
 
+        if (appView.options().testing.enableInvokeSuperToInvokeVirtualRewriting) {
+          if (current.isInvokeSuper()) {
+            InvokeSuper invoke = current.asInvokeSuper();
+            DexEncodedMethod singleTarget = invoke.lookupSingleTarget(appView, context);
+            if (singleTarget != null) {
+              DexClass holder = appView.definitionForHolder(singleTarget);
+              assert holder != null;
+              DexMethod invokedMethod = invoke.getInvokedMethod();
+              DexEncodedMethod newSingleTarget =
+                  InvokeVirtual.lookupSingleTarget(
+                      appView,
+                      context,
+                      invoke.getReceiver().getDynamicUpperBoundType(appView),
+                      invoke.getReceiver().getDynamicLowerBoundType(appView),
+                      invokedMethod);
+              if (newSingleTarget == singleTarget) {
+                it.replaceCurrentInstruction(
+                    new InvokeVirtual(invokedMethod, invoke.outValue(), invoke.arguments()));
+              }
+            }
+            continue;
+          }
+        }
+
+        if (current.isInvokeVirtual()) {
+          InvokeVirtual invoke = current.asInvokeVirtual();
+          DexMethod invokedMethod = invoke.getInvokedMethod();
+          DexMethod reboundTarget =
+              rebindVirtualInvokeToMostSpecific(invokedMethod, invoke.getReceiver(), context);
+          if (reboundTarget != invokedMethod) {
+            it.replaceCurrentInstruction(
+                new InvokeVirtual(reboundTarget, invoke.outValue(), invoke.arguments()));
+          }
+          continue;
+        }
+
         if (!current.isInvokeInterface()) {
           continue;
         }
         InvokeInterface invoke = current.asInvokeInterface();
-        DexEncodedMethod target = invoke.lookupSingleTarget(appView.appInfo(), invocationContext);
+        DexEncodedMethod target = invoke.lookupSingleTarget(appView, context);
         if (target == null) {
           continue;
         }
-        DexType holderType = target.method.holder;
+        DexType holderType = target.holder();
         DexClass holderClass = appView.definitionFor(holderType);
         // Make sure we are not landing on another interface, e.g., interface's default method.
         if (holderClass == null || holderClass.isInterface()) {
@@ -121,7 +168,7 @@ public class Devirtualizer {
         }
         // Due to the potential downcast below, make sure the new target holder is visible.
         ConstraintWithTarget visibility =
-            ConstraintWithTarget.classIsVisible(invocationContext, holderType, appView);
+            ConstraintWithTarget.classIsVisible(context.getHolder(), holderType, appView);
         if (visibility == ConstraintWithTarget.NEVER) {
           continue;
         }
@@ -143,10 +190,9 @@ public class Devirtualizer {
         // (out <-) invoke-virtual a, ... A#foo
         if (holderType != invoke.getInvokedMethod().holder) {
           Value receiver = invoke.getReceiver();
-          TypeLatticeElement receiverTypeLattice = receiver.getTypeLattice();
-          TypeLatticeElement castTypeLattice =
-              TypeLatticeElement.fromDexType(
-                  holderType, receiverTypeLattice.nullability(), appView);
+          TypeElement receiverTypeLattice = receiver.getType();
+          TypeElement castTypeLattice =
+              TypeElement.fromDexType(holderType, receiverTypeLattice.nullability(), appView);
           // Avoid adding trivial cast and up-cast.
           // We should not use strictlyLessThan(castType, receiverType), which detects downcast,
           // due to side-casts, e.g., A (unused) < I, B < I, and cast from A to B.
@@ -191,13 +237,13 @@ public class Devirtualizer {
                   block.hasCatchHandlers() ? it.split(code, blocks) : block;
               if (blockWithDevirtualizedInvoke != block) {
                 // If we split, add the new checkcast at the end of the currently visiting block.
-                it = block.listIterator(block.getInstructions().size());
+                it = block.listIterator(code, block.getInstructions().size());
                 it.previous();
                 it.add(checkCast);
                 // Update the dominator tree after the split.
                 dominatorTree = new DominatorTree(code);
                 // Restore the cursor.
-                it = blockWithDevirtualizedInvoke.listIterator();
+                it = blockWithDevirtualizedInvoke.listIterator(code);
                 assert it.peekNext() == devirtualizedInvoke;
                 it.next();
               } else {
@@ -208,8 +254,8 @@ public class Devirtualizer {
                 it.next();
               }
             }
-
             affectedValues.addAll(receiver.affectedValues());
+            assumeRemover.markAssumeDynamicTypeUsersForRemoval(receiver);
             if (!receiver.hasLocalInfo()) {
               receiver.replaceSelectiveUsers(
                   newReceiver, ImmutableSet.of(devirtualizedInvoke), ImmutableMap.of());
@@ -221,9 +267,62 @@ public class Devirtualizer {
         }
       }
     }
+    assumeRemover.removeMarkedInstructions();
+    affectedValues.addAll(assumeRemover.getAffectedValues());
     if (!affectedValues.isEmpty()) {
-      new TypeAnalysis(appView, code.method).narrowing(affectedValues);
+      new TypeAnalysis(appView).narrowing(affectedValues);
     }
     assert code.isConsistentSSA();
+  }
+
+  /**
+   * This rebinds invoke-virtual instructions to their most specific target.
+   *
+   * <p>As a simple example, consider the instruction "invoke-virtual A.foo(v0)", and assume that v0
+   * is defined by an instruction "new-instance v0, B". If B is a subtype of A, and B overrides the
+   * method foo(), then we rewrite the invocation into "invoke-virtual B.foo(v0)".
+   *
+   * <p>If A.foo() ends up being unused, this helps to ensure that we can get rid of A.foo()
+   * entirely. Without this rewriting, we would have to keep A.foo() because the method is targeted.
+   */
+  private DexMethod rebindVirtualInvokeToMostSpecific(
+      DexMethod target, Value receiver, ProgramMethod context) {
+    if (!receiver.getType().isClassType()) {
+      return target;
+    }
+
+    SingleResolutionResult resolutionResult =
+        appView.appInfo().resolveMethodOnClass(target).asSingleResolution();
+    if (resolutionResult == null
+        || resolutionResult
+            .isAccessibleForVirtualDispatchFrom(context, appView.appInfo())
+            .isPossiblyFalse()) {
+      // Method does not resolve or is not accessible.
+      return target;
+    }
+
+    DexType receiverType = receiver.getType().asClassType().getClassType();
+    if (receiverType == target.holder) {
+      // Virtual invoke is already as specific as it can get.
+      return target;
+    }
+
+    SingleResolutionResult newResolutionResult =
+        appView.appInfo().resolveMethodOnClass(target, receiverType).asSingleResolution();
+    if (newResolutionResult == null
+        || newResolutionResult
+            .isAccessibleForVirtualDispatchFrom(context, appView.appInfo())
+            .isPossiblyFalse()) {
+      return target;
+    }
+
+    DexClass newTargetHolder = newResolutionResult.getResolvedHolder();
+    if (!newTargetHolder.isProgramClass() || newTargetHolder.isInterface()) {
+      // Not safe to invoke the new resolution result with virtual invoke from the current context.
+      return target;
+    }
+
+    // Change the invoke-virtual instruction to target the refined resolution result instead.
+    return newResolutionResult.getResolvedMethod().method;
   }
 }

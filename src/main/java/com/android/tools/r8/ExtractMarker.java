@@ -26,7 +26,6 @@ import java.nio.file.Paths;
 import java.util.Collection;
 import java.util.concurrent.ExecutionException;
 
-@Keep
 public class ExtractMarker {
   public static class VdexOrigin extends Origin {
 
@@ -48,6 +47,11 @@ public class ExtractMarker {
     AndroidApp.Builder appBuilder = AndroidApp.builder();
     addDexResources(appBuilder, file);
     return extractMarker(appBuilder.build());
+  }
+
+  public static Collection<Marker> extractMarkerFromJarFile(Path file)
+      throws IOException, ExecutionException {
+    return extractMarker(AndroidApp.builder().addProgramFile(file).build());
   }
 
   public static int extractDexSize(Path file) throws IOException, ResourceException {
@@ -101,7 +105,7 @@ public class ExtractMarker {
     options.minApiLevel = AndroidApiLevel.P.getLevel();
     DexApplication dexApp =
         new ApplicationReader(app, options, new Timing("ExtractMarker")).read();
-    return dexApp.dexItemFactory.extractMarker();
+    return dexApp.dexItemFactory.extractMarkers();
   }
 
   public static void main(String[] args)

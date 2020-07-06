@@ -4,173 +4,157 @@
 
 package com.android.tools.r8.shaking.forceproguardcompatibility;
 
+import static com.android.tools.r8.references.Reference.classFromClass;
+import static com.android.tools.r8.references.Reference.methodFromMethod;
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assume.assumeTrue;
 
-import com.android.tools.r8.CompatProguardCommandBuilder;
 import com.android.tools.r8.CompilationFailedException;
-import com.android.tools.r8.R8Command;
+import com.android.tools.r8.R8TestCompileResult;
 import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.ToolHelper;
-import com.android.tools.r8.graph.DexItemFactory;
-import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.graph.invokesuper.Consumer;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
-import com.android.tools.r8.origin.Origin;
-import com.android.tools.r8.shaking.ProguardClassNameList;
-import com.android.tools.r8.shaking.ProguardConfiguration;
-import com.android.tools.r8.shaking.ProguardConfigurationParser;
-import com.android.tools.r8.shaking.ProguardConfigurationRule;
 import com.android.tools.r8.shaking.ProguardKeepAttributes;
-import com.android.tools.r8.shaking.ProguardMemberRule;
-import com.android.tools.r8.shaking.ProguardMemberType;
+import com.android.tools.r8.shaking.forceproguardcompatibility.TestMain.MentionedClass;
 import com.android.tools.r8.shaking.forceproguardcompatibility.defaultmethods.ClassImplementingInterface;
 import com.android.tools.r8.shaking.forceproguardcompatibility.defaultmethods.InterfaceWithDefaultMethods;
 import com.android.tools.r8.shaking.forceproguardcompatibility.defaultmethods.TestClass;
 import com.android.tools.r8.shaking.forceproguardcompatibility.keepattributes.TestKeepAttributes;
 import com.android.tools.r8.utils.AndroidApiLevel;
-import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.BooleanUtils;
 import com.android.tools.r8.utils.FileUtils;
-import com.android.tools.r8.utils.Reporter;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.FieldSubject;
 import com.android.tools.r8.utils.codeinspector.MethodSubject;
+import com.android.tools.r8.utils.graphinspector.GraphInspector;
+import com.android.tools.r8.utils.graphinspector.GraphInspector.QueryNode;
 import com.google.common.collect.ImmutableList;
 import java.io.File;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
 @RunWith(Parameterized.class)
 public class ForceProguardCompatibilityTest extends TestBase {
 
-  private Backend backend;
+  private final TestParameters parameters;
+  private final boolean forceProguardCompatibility;
 
-  @Parameterized.Parameters(name = "Backend: {0}")
-  public static Backend[] data() {
-    return ToolHelper.getBackends();
+  @Parameters(name = "{0}, compat:{1}")
+  public static List<Object[]> data() {
+    return buildParameters(
+        getTestParameters()
+            .withAllRuntimes()
+            .withApiLevelsStartingAtIncluding(AndroidApiLevel.O)
+            .build(),
+        BooleanUtils.values());
   }
 
-  public ForceProguardCompatibilityTest(Backend backend) {
-    this.backend = backend;
+  public ForceProguardCompatibilityTest(
+      TestParameters parameters, boolean forceProguardCompatibility) {
+    this.parameters = parameters;
+    this.forceProguardCompatibility = forceProguardCompatibility;
   }
 
-  private void test(Class mainClass, Class mentionedClass, boolean forceProguardCompatibility)
-      throws Exception {
-    String proguardConfig = keepMainProguardConfiguration(mainClass, true, false);
+  private void test(Class mainClass, Class mentionedClass) throws Exception {
     CodeInspector inspector =
-        new CodeInspector(
-            compileWithR8(
-                readClasses(ImmutableList.of(mainClass, mentionedClass)),
-                proguardConfig,
-                options -> options.forceProguardCompatibility = forceProguardCompatibility,
-                backend));
-    assertTrue(inspector.clazz(mainClass.getCanonicalName()).isPresent());
-    ClassSubject clazz = inspector.clazz(getJavacGeneratedClassName(mentionedClass));
-    assertTrue(clazz.isPresent());
+        testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
+            .noMinification()
+            .allowAccessModification()
+            .addProgramClasses(mainClass, mentionedClass)
+            .addKeepMainRule(mainClass)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .inspector();
+    assertThat(inspector.clazz(mainClass), isPresent());
+    ClassSubject clazz = inspector.clazz(mentionedClass);
+    assertThat(clazz, isPresent());
     MethodSubject defaultInitializer = clazz.method(MethodSignature.initializer(new String[]{}));
     assertEquals(forceProguardCompatibility, defaultInitializer.isPresent());
   }
 
   @Test
   public void testKeepDefaultInitializer() throws Exception {
-    test(TestMain.class, TestMain.MentionedClass.class, true);
-    test(TestMain.class, TestMain.MentionedClass.class, false);
+    test(TestMain.class, TestMain.MentionedClass.class);
   }
 
   @Test
   public void testKeepDefaultInitializerArrayType() throws Exception {
-    test(TestMainArrayType.class, TestMainArrayType.MentionedClass.class, true);
-    test(TestMainArrayType.class, TestMainArrayType.MentionedClass.class, false);
+    test(TestMainArrayType.class, TestMainArrayType.MentionedClass.class);
   }
 
-  private void runAnnotationsTest(boolean forceProguardCompatibility, boolean keepAnnotations)
-      throws Exception {
-    R8Command.Builder builder = new CompatProguardCommandBuilder(forceProguardCompatibility);
+  private void runAnnotationsTest(boolean keepAnnotations) throws Exception {
     // Add application classes including the annotation class.
     Class mainClass = TestMain.class;
     Class mentionedClassWithAnnotations = TestMain.MentionedClassWithAnnotation.class;
     Class annotationClass = TestAnnotation.class;
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(mainClass));
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(TestMain.MentionedClass.class));
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(mentionedClassWithAnnotations));
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(annotationClass));
-    // Keep main class and the annotation class.
-    builder.addProguardConfiguration(
-        ImmutableList.of(keepMainProguardConfiguration(mainClass, true, false)), Origin.unknown());
-    builder.addProguardConfiguration(
-        ImmutableList.of("-keep class " + annotationClass.getCanonicalName() + " { *; }"),
-        Origin.unknown());
-    if (keepAnnotations) {
-      builder.addProguardConfiguration(ImmutableList.of("-keepattributes *Annotation*"),
-          Origin.unknown());
-    }
 
-    builder.setProgramConsumer(emptyConsumer(backend)).addLibraryFiles(runtimeJar(backend));
-    CodeInspector inspector = new CodeInspector(ToolHelper.runR8(builder.build()));
-    assertTrue(inspector.clazz(mainClass.getCanonicalName()).isPresent());
-    ClassSubject clazz = inspector.clazz(getJavacGeneratedClassName(mentionedClassWithAnnotations));
-    assertTrue(clazz.isPresent());
+    CodeInspector inspector =
+        testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
+            .addProgramClasses(
+                mainClass, MentionedClass.class, mentionedClassWithAnnotations, annotationClass)
+            .addKeepMainRule(mainClass)
+            .allowAccessModification()
+            .noMinification()
+            .addKeepClassAndMembersRules(annotationClass)
+            .map(b -> keepAnnotations ? b.addKeepAttributes("*Annotation*") : b)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .inspector();
+
+    assertThat(inspector.clazz(mainClass), isPresent());
+    ClassSubject clazz = inspector.clazz(mentionedClassWithAnnotations);
+    assertThat(clazz, isPresent());
 
     // The test contains only a member class so the enclosing-method attribute will be null.
     assertEquals(
-        forceProguardCompatibility,
-        !clazz.getDexClass().getInnerClasses().isEmpty());
+        forceProguardCompatibility, !clazz.getDexProgramClass().getInnerClasses().isEmpty());
     assertEquals(forceProguardCompatibility || keepAnnotations,
         clazz.annotation(annotationClass.getCanonicalName()).isPresent());
   }
 
   @Test
   public void testAnnotations() throws Exception {
-    runAnnotationsTest(true, true);
-    runAnnotationsTest(true, false);
-    runAnnotationsTest(false, true);
-    runAnnotationsTest(false, false);
+    runAnnotationsTest(true);
+    runAnnotationsTest(false);
   }
 
-  private void runDefaultConstructorTest(boolean forceProguardCompatibility,
-      Class<?> testClass, boolean hasDefaultConstructor) throws Exception {
-    CompatProguardCommandBuilder builder =
-        new CompatProguardCommandBuilder(forceProguardCompatibility);
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(testClass));
+  private void runDefaultConstructorTest(Class<?> testClass, boolean hasDefaultConstructor)
+      throws Exception {
+
     List<String> proguardConfig = ImmutableList.of(
         "-keep class " + testClass.getCanonicalName() + " {",
         "  public void method();",
         "}");
-    builder.addProguardConfiguration(proguardConfig, Origin.unknown());
-    Path proguardCompatibilityRules = temp.newFile().toPath();
-    builder.setProguardCompatibilityRulesOutput(proguardCompatibilityRules);
 
-    builder.setProgramConsumer(emptyConsumer(backend)).addLibraryFiles(runtimeJar(backend));
-    CodeInspector inspector = new CodeInspector(ToolHelper.runR8(builder.build()));
-    ClassSubject clazz = inspector.clazz(getJavacGeneratedClassName(testClass));
-    assertTrue(clazz.isPresent());
-    assertEquals(forceProguardCompatibility && hasDefaultConstructor,
-        clazz.init(ImmutableList.of()).isPresent());
+    GraphInspector inspector =
+        testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
+            .addProgramClasses(testClass)
+            .addKeepRules(proguardConfig)
+            .enableGraphInspector()
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .graphInspector();
 
-    // Check the Proguard compatibility rules generated.
-    ProguardConfigurationParser parser =
-        new ProguardConfigurationParser(new DexItemFactory(), new Reporter());
-    parser.parse(proguardCompatibilityRules);
-    ProguardConfiguration configuration = parser.getConfigRawForTesting();
-    if (forceProguardCompatibility && hasDefaultConstructor) {
-      assertEquals(1, configuration.getRules().size());
-      ProguardClassNameList classNames = configuration.getRules().get(0).getClassNames();
-      assertEquals(1, classNames.size());
-      assertEquals(testClass.getCanonicalName(),
-          classNames.asSpecificDexTypes().get(0).toSourceString());
-      List<ProguardMemberRule> memberRules = configuration.getRules().get(0).getMemberRules();
-      assertEquals(1, memberRules.size());
-      assertEquals(ProguardMemberType.INIT, memberRules.iterator().next().getRuleType());
-    } else {
-      assertEquals(0, configuration.getRules().size());
+    QueryNode clazzNode = inspector.clazz(classFromClass(testClass)).assertPresent();
+    if (hasDefaultConstructor) {
+      QueryNode initNode = inspector.method(methodFromMethod(testClass.getConstructor()));
+      if (forceProguardCompatibility) {
+        initNode.assertPureCompatKeptBy(clazzNode);
+      } else {
+        initNode.assertAbsent();
+      }
     }
 
     if (isRunProguard()) {
@@ -185,29 +169,28 @@ public class ForceProguardCompatibilityTest extends TestBase {
 
   @Test
   public void testDefaultConstructor() throws Exception {
-    runDefaultConstructorTest(true, TestClassWithDefaultConstructor.class, true);
-    runDefaultConstructorTest(true, TestClassWithoutDefaultConstructor.class, false);
-    runDefaultConstructorTest(false, TestClassWithDefaultConstructor.class, true);
-    runDefaultConstructorTest(false, TestClassWithoutDefaultConstructor.class, false);
+    runDefaultConstructorTest(TestClassWithDefaultConstructor.class, true);
+    runDefaultConstructorTest(TestClassWithoutDefaultConstructor.class, false);
   }
 
-  public void testCheckCast(boolean forceProguardCompatibility, Class mainClass,
-      Class instantiatedClass, boolean containsCheckCast)
+  public void testCheckCast(Class mainClass, Class instantiatedClass, boolean containsCheckCast)
       throws Exception {
-    R8Command.Builder builder = new CompatProguardCommandBuilder(forceProguardCompatibility);
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(mainClass));
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(instantiatedClass));
     List<String> proguardConfig = ImmutableList.of(
         "-keep class " + mainClass.getCanonicalName() + " {",
         "  public static void main(java.lang.String[]);",
         "}",
         "-dontobfuscate");
-    builder.addProguardConfiguration(proguardConfig, Origin.unknown());
 
-    builder.setProgramConsumer(emptyConsumer(backend)).addLibraryFiles(runtimeJar(backend));
-    CodeInspector inspector = new CodeInspector(ToolHelper.runR8(builder.build()));
-    assertTrue(inspector.clazz(getJavacGeneratedClassName(mainClass)).isPresent());
-    ClassSubject clazz = inspector.clazz(getJavacGeneratedClassName(instantiatedClass));
+    CodeInspector inspector =
+        testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
+            .addProgramClasses(mainClass, instantiatedClass)
+            .addKeepRules(proguardConfig)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .inspector();
+
+    assertTrue(inspector.clazz(mainClass).isPresent());
+    ClassSubject clazz = inspector.clazz(instantiatedClass);
     assertEquals(containsCheckCast, clazz.isPresent());
     assertEquals(containsCheckCast, clazz.isPresent());
     if (clazz.isPresent()) {
@@ -229,26 +212,15 @@ public class ForceProguardCompatibilityTest extends TestBase {
 
   @Test
   public void checkCastTest() throws Exception {
-    testCheckCast(true, TestMainWithCheckCast.class, TestClassWithDefaultConstructor.class, true);
-    testCheckCast(
-        true, TestMainWithoutCheckCast.class, TestClassWithDefaultConstructor.class, false);
-    testCheckCast(
-        false, TestMainWithCheckCast.class, TestClassWithDefaultConstructor.class, true);
-    testCheckCast(
-        false, TestMainWithoutCheckCast.class, TestClassWithDefaultConstructor.class, false);
+    testCheckCast(TestMainWithCheckCast.class, TestClassWithDefaultConstructor.class, true);
+    testCheckCast(TestMainWithoutCheckCast.class, TestClassWithDefaultConstructor.class, false);
   }
 
-  public void testClassForName(
-      boolean forceProguardCompatibility, boolean allowObfuscation) throws Exception {
-    CompatProguardCommandBuilder builder =
-        new CompatProguardCommandBuilder(forceProguardCompatibility);
+  public void testClassForName(boolean allowObfuscation) throws Exception {
     Class mainClass = TestMainWithClassForName.class;
     Class forNameClass1 = TestClassWithDefaultConstructor.class;
     Class forNameClass2 = TestClassWithoutDefaultConstructor.class;
     List<Class> forNameClasses = ImmutableList.of(forNameClass1, forNameClass2);
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(mainClass));
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(forNameClass1));
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(forNameClass2));
     ImmutableList.Builder<String> proguardConfigurationBuilder = ImmutableList.builder();
     proguardConfigurationBuilder.add(
         "-keep class " + mainClass.getCanonicalName() + " {",
@@ -259,21 +231,22 @@ public class ForceProguardCompatibilityTest extends TestBase {
       proguardConfigurationBuilder.add("-dontobfuscate");
     }
     List<String> proguardConfig = proguardConfigurationBuilder.build();
-    builder.addProguardConfiguration(proguardConfig, Origin.unknown());
-    Path proguardCompatibilityRules = temp.newFile().toPath();
-    builder.setProguardCompatibilityRulesOutput(proguardCompatibilityRules);
-    if (allowObfuscation) {
-      builder.setProguardMapOutputPath(temp.newFile().toPath());
-    }
 
-    builder.setProgramConsumer(emptyConsumer(backend)).addLibraryFiles(runtimeJar(backend));
-    CodeInspector inspector = new CodeInspector(ToolHelper.runR8(builder.build()));
-    assertTrue(inspector.clazz(getJavacGeneratedClassName(mainClass)).isPresent());
-    forNameClasses.forEach(clazz -> {
-      ClassSubject subject = inspector.clazz(getJavacGeneratedClassName(clazz));
-      assertTrue(subject.isPresent());
-      assertEquals(subject.isPresent() && allowObfuscation, subject.isRenamed());
-    });
+    CodeInspector inspector =
+        testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
+            .addProgramClasses(mainClass, forNameClass1, forNameClass2)
+            .addKeepRules(proguardConfig)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .inspector();
+
+    assertTrue(inspector.clazz(mainClass).isPresent());
+    forNameClasses.forEach(
+        clazz -> {
+          ClassSubject subject = inspector.clazz(clazz);
+          assertTrue(subject.isPresent());
+          assertEquals(allowObfuscation, subject.isRenamed());
+        });
 
     if (isRunProguard()) {
       Path proguardedJar = File.createTempFile("proguarded", ".jar", temp.getRoot()).toPath();
@@ -295,20 +268,14 @@ public class ForceProguardCompatibilityTest extends TestBase {
 
   @Test
   public void classForNameTest() throws Exception {
-    testClassForName(true, false);
-    testClassForName(false, false);
-    testClassForName(true, true);
-    testClassForName(false, true);
+    testClassForName(true);
+    testClassForName(false);
   }
 
-  public void testClassGetMembers(
-      boolean forceProguardCompatibility, boolean allowObfuscation) throws Exception {
-    CompatProguardCommandBuilder builder =
-        new CompatProguardCommandBuilder(forceProguardCompatibility);
+  public void testClassGetMembers(boolean allowObfuscation) throws Exception {
     Class mainClass = TestMainWithGetMembers.class;
     Class withMemberClass = TestClassWithMembers.class;
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(mainClass));
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(withMemberClass));
+
     ImmutableList.Builder<String> proguardConfigurationBuilder = ImmutableList.builder();
     proguardConfigurationBuilder.add(
         "-keep class " + mainClass.getCanonicalName() + " {",
@@ -319,27 +286,27 @@ public class ForceProguardCompatibilityTest extends TestBase {
       proguardConfigurationBuilder.add("-dontobfuscate");
     }
     List<String> proguardConfig = proguardConfigurationBuilder.build();
-    builder.addProguardConfiguration(proguardConfig, Origin.unknown());
-    Path proguardCompatibilityRules = temp.newFile().toPath();
-    builder.setProguardCompatibilityRulesOutput(proguardCompatibilityRules);
-    if (allowObfuscation) {
-      builder.setProguardMapOutputPath(temp.newFile().toPath());
-    }
 
-    builder.setProgramConsumer(emptyConsumer(backend)).addLibraryFiles(runtimeJar(backend));
-    CodeInspector inspector = new CodeInspector(ToolHelper.runR8(builder.build()));
-    assertTrue(inspector.clazz(getJavacGeneratedClassName(mainClass)).isPresent());
-    ClassSubject classSubject = inspector.clazz(getJavacGeneratedClassName(withMemberClass));
+    CodeInspector inspector =
+        testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
+            .addProgramClasses(mainClass, withMemberClass)
+            .addKeepRules(proguardConfig)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .inspector();
+
+    assertTrue(inspector.clazz(mainClass).isPresent());
+    ClassSubject classSubject = inspector.clazz(withMemberClass);
     // Due to the direct usage of .class
     assertTrue(classSubject.isPresent());
     assertEquals(allowObfuscation, classSubject.isRenamed());
     FieldSubject foo = classSubject.field("java.lang.String", "foo");
     assertTrue(foo.isPresent());
-    assertEquals(foo.isPresent() && allowObfuscation, foo.isRenamed());
+    assertEquals(allowObfuscation, foo.isRenamed());
     MethodSubject bar =
         classSubject.method("java.lang.String", "bar", ImmutableList.of("java.lang.String"));
     assertTrue(bar.isPresent());
-    assertEquals(bar.isPresent() && allowObfuscation, bar.isRenamed());
+    assertEquals(allowObfuscation, bar.isRenamed());
 
     if (isRunProguard()) {
       Path proguardedJar = File.createTempFile("proguarded", ".jar", temp.getRoot()).toPath();
@@ -366,20 +333,14 @@ public class ForceProguardCompatibilityTest extends TestBase {
 
   @Test
   public void classGetMembersTest() throws Exception {
-    testClassGetMembers(true, false);
-    testClassGetMembers(false, false);
-    testClassGetMembers(true, true);
-    testClassGetMembers(false, true);
+    testClassGetMembers(true);
+    testClassGetMembers(false);
   }
 
-  public void testAtomicFieldUpdaters(
-      boolean forceProguardCompatibility, boolean allowObfuscation) throws Exception {
-    CompatProguardCommandBuilder builder =
-        new CompatProguardCommandBuilder(forceProguardCompatibility);
+  public void testAtomicFieldUpdaters(boolean allowObfuscation) throws Exception {
     Class mainClass = TestMainWithAtomicFieldUpdater.class;
     Class withVolatileFields = TestClassWithVolatileFields.class;
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(mainClass));
-    builder.addProgramFiles(ToolHelper.getClassFileForTestClass(withVolatileFields));
+
     ImmutableList.Builder<String> proguardConfigurationBuilder = ImmutableList.builder();
     proguardConfigurationBuilder.add(
         "-keep class " + mainClass.getCanonicalName() + " {",
@@ -390,29 +351,29 @@ public class ForceProguardCompatibilityTest extends TestBase {
       proguardConfigurationBuilder.add("-dontobfuscate");
     }
     List<String> proguardConfig = proguardConfigurationBuilder.build();
-    builder.addProguardConfiguration(proguardConfig, Origin.unknown());
-    Path proguardCompatibilityRules = temp.newFile().toPath();
-    builder.setProguardCompatibilityRulesOutput(proguardCompatibilityRules);
-    if (allowObfuscation) {
-      builder.setProguardMapOutputPath(temp.newFile().toPath());
-    }
 
-    builder.setProgramConsumer(emptyConsumer(backend)).addLibraryFiles(runtimeJar(backend));
-    CodeInspector inspector = new CodeInspector(ToolHelper.runR8(builder.build()));
-    assertTrue(inspector.clazz(getJavacGeneratedClassName(mainClass)).isPresent());
-    ClassSubject classSubject = inspector.clazz(getJavacGeneratedClassName(withVolatileFields));
+    CodeInspector inspector =
+        testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
+            .addProgramClasses(mainClass, withVolatileFields)
+            .addKeepRules(proguardConfig)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .inspector();
+
+    assertTrue(inspector.clazz(mainClass).isPresent());
+    ClassSubject classSubject = inspector.clazz(withVolatileFields);
     // Due to the direct usage of .class
     assertTrue(classSubject.isPresent());
     assertEquals(allowObfuscation, classSubject.isRenamed());
     FieldSubject f = classSubject.field("int", "intField");
     assertTrue(f.isPresent());
-    assertEquals(f.isPresent() && allowObfuscation, f.isRenamed());
+    assertEquals(allowObfuscation, f.isRenamed());
     f = classSubject.field("long", "longField");
     assertTrue(f.isPresent());
-    assertEquals(f.isPresent() && allowObfuscation, f.isRenamed());
+    assertEquals(allowObfuscation, f.isRenamed());
     f = classSubject.field("java.lang.Object", "objField");
     assertTrue(f.isPresent());
-    assertEquals(f.isPresent() && allowObfuscation, f.isRenamed());
+    assertEquals(allowObfuscation, f.isRenamed());
 
     if (isRunProguard()) {
       Path proguardedJar = File.createTempFile("proguarded", ".jar", temp.getRoot()).toPath();
@@ -442,15 +403,11 @@ public class ForceProguardCompatibilityTest extends TestBase {
 
   @Test
   public void atomicFieldUpdaterTest() throws Exception {
-    testAtomicFieldUpdaters(true, false);
-    testAtomicFieldUpdaters(false, false);
-    testAtomicFieldUpdaters(true, true);
-    testAtomicFieldUpdaters(false, true);
+    testAtomicFieldUpdaters(true);
+    testAtomicFieldUpdaters(false);
   }
 
-  public void testKeepAttributes(
-      boolean forceProguardCompatibility, boolean innerClasses, boolean enclosingMethod)
-      throws Exception {
+  public void testKeepAttributes(boolean innerClasses, boolean enclosingMethod) throws Exception {
     String keepRules = "";
     if (innerClasses || enclosingMethod) {
       List<String> attributes = new ArrayList<>();
@@ -462,12 +419,11 @@ public class ForceProguardCompatibilityTest extends TestBase {
       }
       keepRules = "-keepattributes " + String.join(",", attributes);
     }
-    Path proguardCompatibilityRules = temp.newFile().toPath();
     CodeInspector inspector;
 
     try {
       inspector =
-          testForR8Compat(backend, forceProguardCompatibility)
+          testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
               .addProgramFiles(
                   ToolHelper.getClassFilesForTestPackage(TestKeepAttributes.class.getPackage()))
               .addKeepRules(
@@ -478,9 +434,8 @@ public class ForceProguardCompatibilityTest extends TestBase {
                   keepRules)
               .addOptionsModification(options -> options.enableClassInlining = false)
               .enableSideEffectAnnotations()
-              .setProguardCompatibilityRulesOutput(proguardCompatibilityRules)
-              .compile()
-              .run(TestKeepAttributes.class)
+              .setMinApi(parameters.getApiLevel())
+              .run(parameters.getRuntime(), TestKeepAttributes.class)
               .assertSuccessWithOutput(innerClasses || enclosingMethod ? "1" : "0")
               .inspector();
     } catch (CompilationFailedException e) {
@@ -488,77 +443,60 @@ public class ForceProguardCompatibilityTest extends TestBase {
       return;
     }
 
-    assertThat(inspector.clazz(getJavacGeneratedClassName(TestKeepAttributes.class)), isPresent());
-
-    // Check the Proguard compatibility configuration generated.
-    ProguardConfigurationParser parser =
-        new ProguardConfigurationParser(new DexItemFactory(), new Reporter());
-    parser.parse(proguardCompatibilityRules);
-    ProguardConfiguration configuration = parser.getConfigRawForTesting();
-    assertTrue(configuration.getRules().isEmpty());
-    if (innerClasses ^ enclosingMethod) {
-      assertTrue(configuration.getKeepAttributes().innerClasses);
-      assertTrue(configuration.getKeepAttributes().enclosingMethod);
+    ClassSubject clazz = inspector.clazz(TestKeepAttributes.class);
+    assertThat(clazz, isPresent());
+    if (innerClasses || enclosingMethod) {
+      assertFalse(clazz.getDexProgramClass().getInnerClasses().isEmpty());
     } else {
-      assertFalse(configuration.getKeepAttributes().innerClasses);
-      assertFalse(configuration.getKeepAttributes().enclosingMethod);
+      assertTrue(clazz.getDexProgramClass().getInnerClasses().isEmpty());
     }
   }
 
   @Test
   public void keepAttributesTest() throws Exception {
-    testKeepAttributes(true, false, false);
-    testKeepAttributes(true, true, false);
-    testKeepAttributes(true, false, true);
-    testKeepAttributes(true, true, true);
-    testKeepAttributes(false, false, false);
-    testKeepAttributes(false, true, false);
-    testKeepAttributes(false, false, true);
-    testKeepAttributes(false, true, true);
+    testKeepAttributes(false, false);
+    testKeepAttributes(true, false);
+    testKeepAttributes(false, true);
+    testKeepAttributes(true, true);
   }
 
   private void runKeepDefaultMethodsTest(
       List<String> additionalKeepRules,
       Consumer<CodeInspector> inspection,
-      Consumer<ProguardConfiguration> compatInspection) throws Exception {
-    Class mainClass = TestClass.class;
-    CompatProguardCommandBuilder builder = new CompatProguardCommandBuilder();
-    builder.addProgramFiles(ToolHelper.getClassFilesForTestPackage(mainClass.getPackage()));
-    builder.addProguardConfiguration(ImmutableList.of(
-        "-keep class " + mainClass.getCanonicalName() + "{",
-        "  public <init>();",
-        "  public static void main(java.lang.String[]);",
-        "}",
-        "-dontobfuscate"),
-        Origin.unknown());
-    builder.addProguardConfiguration(additionalKeepRules, Origin.unknown());
-    builder.setProgramConsumer(emptyConsumer(backend)).addLibraryFiles(runtimeJar(backend));
-    if (backend == Backend.DEX) {
-      builder.setMinApiLevel(AndroidApiLevel.O.getLevel());
+      Consumer<GraphInspector> compatInspection)
+      throws Exception {
+    if (parameters.isDexRuntime()) {
+      assert parameters.getApiLevel().getLevel() >= AndroidApiLevel.O.getLevel();
     }
-    Path proguardCompatibilityRules = temp.newFile().toPath();
-    builder.setProguardCompatibilityRulesOutput(proguardCompatibilityRules);
-    AndroidApp app =
-        ToolHelper.runR8(
-            builder.build(),
-            o -> {
-              o.enableClassInlining = false;
 
-              // Prevent InterfaceWithDefaultMethods from being merged into
-              // ClassImplementingInterface.
-              o.enableVerticalClassMerging = false;
-            });
-    inspection.accept(new CodeInspector(app));
-    // Check the Proguard compatibility configuration generated.
-    ProguardConfigurationParser parser =
-        new ProguardConfigurationParser(new DexItemFactory(), new Reporter());
-    parser.parse(proguardCompatibilityRules);
-    ProguardConfiguration configuration = parser.getConfigRawForTesting();
-    compatInspection.accept(configuration);
+    Class mainClass = TestClass.class;
+    R8TestCompileResult compileResult =
+        testForR8Compat(parameters.getBackend(), forceProguardCompatibility)
+            .addProgramFiles(ToolHelper.getClassFilesForTestPackage(mainClass.getPackage()))
+            .addKeepRules(
+                "-keep class " + mainClass.getCanonicalName() + "{",
+                "  public <init>();",
+                "  public static void main(java.lang.String[]);",
+                "}",
+                "-dontobfuscate")
+            .addKeepRules(additionalKeepRules)
+            .enableGraphInspector()
+            .setMinApi(parameters.getApiLevel())
+            .addOptionsModification(
+                o -> {
+                  o.enableClassInlining = false;
+
+                  // Prevent InterfaceWithDefaultMethods from being merged into
+                  // ClassImplementingInterface.
+                  o.enableVerticalClassMerging = false;
+                })
+            .compile();
+    inspection.accept(compileResult.inspector());
+    compatInspection.accept(compileResult.graphInspector());
   }
 
-  private void noCompatibilityRules(ProguardConfiguration configuration) {
-    assertEquals(0, configuration.getRules().size());
+  private void noCompatibilityRules(GraphInspector inspector) {
+    inspector.assertNoPureCompatibilityEdges();
   }
 
   private void defaultMethodKept(CodeInspector inspector) {
@@ -569,20 +507,8 @@ public class ForceProguardCompatibilityTest extends TestBase {
     assertFalse(method.isAbstract());
   }
 
-  private void defaultMethodCompatibilityRules(ProguardConfiguration configuration) {
-    assertEquals(1, configuration.getRules().size());
-    ProguardConfigurationRule rule = configuration.getRules().get(0);
-    List<ProguardMemberRule> memberRules = rule.getMemberRules();
-    ProguardClassNameList classNames = rule.getClassNames();
-    assertEquals(1, classNames.size());
-    DexType type = classNames.asSpecificDexTypes().get(0);
-    assertEquals(type.toSourceString(), InterfaceWithDefaultMethods.class.getCanonicalName());
-    assertEquals(1, memberRules.size());
-    ProguardMemberRule memberRule = memberRules.iterator().next();
-    assertEquals(ProguardMemberType.METHOD, memberRule.getRuleType());
-    assertTrue(memberRule.getName().matches("method"));
-    assertTrue(memberRule.getType().matches(configuration.getDexItemFactory().intType));
-    assertEquals(0, memberRule.getArguments().size());
+  private void defaultMethodCompatibilityRules(GraphInspector inspector) {
+    // The enqueuer does not add an edge for the referenced => kept edges so we cant check compat.
   }
 
   private void defaultMethod2Kept(CodeInspector inspector) {
@@ -594,27 +520,13 @@ public class ForceProguardCompatibilityTest extends TestBase {
     assertFalse(method.isAbstract());
   }
 
-  private void defaultMethod2CompatibilityRules(ProguardConfiguration configuration) {
-    assertEquals(1, configuration.getRules().size());
-    ProguardConfigurationRule rule = configuration.getRules().get(0);
-    List<ProguardMemberRule> memberRules = rule.getMemberRules();
-    ProguardClassNameList classNames = rule.getClassNames();
-    assertEquals(1, classNames.size());
-    DexType type = classNames.asSpecificDexTypes().get(0);
-    assertEquals(type.toSourceString(), InterfaceWithDefaultMethods.class.getCanonicalName());
-    assertEquals(1, memberRules.size());
-    ProguardMemberRule memberRule = memberRules.iterator().next();
-    assertEquals(ProguardMemberType.METHOD, memberRule.getRuleType());
-    assertTrue(memberRule.getName().matches("method2"));
-    assertTrue(memberRule.getType().matches(configuration.getDexItemFactory().voidType));
-    assertEquals(2, memberRule.getArguments().size());
-    assertTrue(
-        memberRule.getArguments().get(0).matches(configuration.getDexItemFactory().stringType));
-    assertTrue(memberRule.getArguments().get(1).matches(configuration.getDexItemFactory().intType));
+  private void defaultMethod2CompatibilityRules(GraphInspector inspector) {
+    // The enqueuer does not add an edge for the referenced => kept edges so we cant check compat.
   }
 
   @Test
   public void keepDefaultMethodsTest() throws Exception {
+    assumeTrue(forceProguardCompatibility);
     runKeepDefaultMethodsTest(ImmutableList.of(
         "-keep interface " + InterfaceWithDefaultMethods.class.getCanonicalName() + "{",
         "  public int method();",

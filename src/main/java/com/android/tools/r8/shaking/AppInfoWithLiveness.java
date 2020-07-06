@@ -3,67 +3,89 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.shaking;
 
-import static com.android.tools.r8.graph.GraphLense.rewriteReferenceKeys;
+import static com.android.tools.r8.graph.DexEncodedMethod.asProgramMethodOrNull;
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
+import static com.android.tools.r8.graph.ResolutionResult.SingleResolutionResult.isOverriding;
 
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
-import com.android.tools.r8.graph.DexApplication;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.DexCallSite;
 import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexClassAndMethod;
+import com.android.tools.r8.graph.DexClasspathClass;
+import com.android.tools.r8.graph.DexDefinition;
+import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexReference;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.graph.DexTypeList;
 import com.android.tools.r8.graph.DirectMappedDexApplication;
+import com.android.tools.r8.graph.EnumValueInfoMapCollection;
+import com.android.tools.r8.graph.EnumValueInfoMapCollection.EnumValueInfoMap;
+import com.android.tools.r8.graph.FieldAccessInfo;
+import com.android.tools.r8.graph.FieldAccessInfoCollection;
+import com.android.tools.r8.graph.FieldAccessInfoCollectionImpl;
+import com.android.tools.r8.graph.FieldAccessInfoImpl;
+import com.android.tools.r8.graph.FieldResolutionResult;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.GraphLense.NestedGraphLense;
+import com.android.tools.r8.graph.InstantiatedSubTypeInfo;
+import com.android.tools.r8.graph.LookupResult.LookupResultSuccess;
+import com.android.tools.r8.graph.LookupTarget;
+import com.android.tools.r8.graph.ObjectAllocationInfoCollection;
+import com.android.tools.r8.graph.ObjectAllocationInfoCollectionImpl;
 import com.android.tools.r8.graph.PresortedComparable;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult.SingleResolutionResult;
+import com.android.tools.r8.graph.SubtypingInfo;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
 import com.android.tools.r8.ir.code.Invoke.Type;
+import com.android.tools.r8.ir.desugar.DesugaredLibraryAPIConverter;
+import com.android.tools.r8.ir.desugar.InterfaceMethodRewriter;
+import com.android.tools.r8.ir.desugar.LambdaDescriptor;
+import com.android.tools.r8.ir.desugar.TwrCloseResourceRewriter;
+import com.android.tools.r8.utils.AssertionUtils;
 import com.android.tools.r8.utils.CollectionUtils;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.ImmutableSortedSet;
-import com.google.common.collect.Iterables;
+import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.ListUtils;
+import com.android.tools.r8.utils.PredicateSet;
+import com.android.tools.r8.utils.TraversalContinuation;
+import com.android.tools.r8.utils.Visibility;
+import com.android.tools.r8.utils.collections.ProgramMethodSet;
 import com.google.common.collect.Sets;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
 import it.unimi.dsi.fastutil.objects.Object2BooleanMap;
-import it.unimi.dsi.fastutil.objects.Reference2IntMap;
 import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
-import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
-import java.util.function.Function;
-import java.util.function.Predicate;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /** Encapsulates liveness and reachability information for an application. */
-public class AppInfoWithLiveness extends AppInfoWithSubtyping {
-
+public class AppInfoWithLiveness extends AppInfoWithClassHierarchy
+    implements InstantiatedSubTypeInfo {
+  /** Set of reachable proto types that will be dead code eliminated. */
+  private final Set<DexType> deadProtoTypes;
+  /** Set of types that are mentioned in the program, but for which no definition exists. */
+  private final Set<DexType> missingTypes;
   /**
    * Set of types that are mentioned in the program. We at least need an empty abstract classitem
    * for these.
    */
-  public final SortedSet<DexType> liveTypes;
-  /** Set of annotation types that are instantiated. */
-  final SortedSet<DexType> instantiatedAnnotationTypes;
+  private final Set<DexType> liveTypes;
   /**
    * Set of service types (from META-INF/services/) that may have been instantiated reflectively via
    * ServiceLoader.load() or ServiceLoader.loadInstalled().
    */
-  public final SortedSet<DexType> instantiatedAppServices;
-  /** Set of types that are actually instantiated. These cannot be abstract. */
-  final SortedSet<DexType> instantiatedTypes;
-  /** Cache for {@link #isInstantiatedDirectlyOrIndirectly(DexType)}. */
-  private final IdentityHashMap<DexType, Boolean> indirectlyInstantiatedTypes =
-      new IdentityHashMap<>();
+  public final Set<DexType> instantiatedAppServices;
   /**
    * Set of methods that are the immediate target of an invoke. They might not actually be live but
    * are required so that invokes can find the method. If such a method is not live (i.e. not
@@ -71,6 +93,10 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
    * removed.
    */
   final SortedSet<DexMethod> targetedMethods;
+
+  /** Set of targets that lead to resolution errors, such as non-existing or invalid targets. */
+  public final Set<DexMethod> failedResolutionTargets;
+
   /**
    * Set of program methods that are used as the bootstrap method for an invoke-dynamic instruction.
    */
@@ -85,50 +111,30 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
    */
   public final SortedSet<DexMethod> liveMethods;
   /**
-   * Set of all fields which may be touched by a get operation. This is actual field definitions.
-   * The set does not include kept fields nor library fields, since these are read by definition.
+   * Information about all fields that are accessed by the program. The information includes whether
+   * a given field is read/written by the program, and it also includes all indirect accesses to
+   * each field. The latter is used, for example, during member rebinding.
    */
-  private final SortedSet<DexField> fieldsRead;
-  /**
-   * Set of all fields which may be touched by a put operation. This is actual field definitions.
-   * The set does not include kept fields nor library fields, since these are written by definition.
-   */
-  private SortedSet<DexField> fieldsWritten;
-  /**
-   * Set of all static fields that are only written inside the <clinit>() method of their enclosing
-   * class.
-   */
-  private SortedSet<DexField> staticFieldsWrittenOnlyInEnclosingStaticInitializer;
-  /** Set of all field ids used in instance field reads, along with access context. */
-  public final SortedMap<DexField, Set<DexEncodedMethod>> instanceFieldReads;
-  /** Set of all field ids used in instance field writes, along with access context. */
-  public final SortedMap<DexField, Set<DexEncodedMethod>> instanceFieldWrites;
-  /** Set of all field ids used in static field reads, along with access context. */
-  public final SortedMap<DexField, Set<DexEncodedMethod>> staticFieldReads;
-  /** Set of all field ids used in static field writes, along with access context. */
-  public final SortedMap<DexField, Set<DexEncodedMethod>> staticFieldWrites;
+  private final FieldAccessInfoCollectionImpl fieldAccessInfoCollection;
+  /** Information about instantiated classes and their allocation sites. */
+  private final ObjectAllocationInfoCollectionImpl objectAllocationInfoCollection;
   /** Set of all methods referenced in virtual invokes, along with calling context. */
-  public final SortedMap<DexMethod, Set<DexEncodedMethod>> virtualInvokes;
+  public final SortedMap<DexMethod, ProgramMethodSet> virtualInvokes;
   /** Set of all methods referenced in interface invokes, along with calling context. */
-  public final SortedMap<DexMethod, Set<DexEncodedMethod>> interfaceInvokes;
+  public final SortedMap<DexMethod, ProgramMethodSet> interfaceInvokes;
   /** Set of all methods referenced in super invokes, along with calling context. */
-  public final SortedMap<DexMethod, Set<DexEncodedMethod>> superInvokes;
+  public final SortedMap<DexMethod, ProgramMethodSet> superInvokes;
   /** Set of all methods referenced in direct invokes, along with calling context. */
-  public final SortedMap<DexMethod, Set<DexEncodedMethod>> directInvokes;
+  public final SortedMap<DexMethod, ProgramMethodSet> directInvokes;
   /** Set of all methods referenced in static invokes, along with calling context. */
-  public final SortedMap<DexMethod, Set<DexEncodedMethod>> staticInvokes;
+  public final SortedMap<DexMethod, ProgramMethodSet> staticInvokes;
   /**
    * Set of live call sites in the code. Note that if desugaring has taken place call site objects
    * will have been removed from the code.
    */
   public final Set<DexCallSite> callSites;
-  /**
-   * Set of method signatures used in invoke-super instructions that either cannot be resolved or
-   * resolve to a private method (leading to an IllegalAccessError).
-   */
-  public final SortedSet<DexMethod> brokenSuperInvokes;
-  /** Set of all items that have to be kept independent of whether they are used. */
-  final Set<DexReference> pinnedItems;
+  /** Collection of keep requirements for the program. */
+  private final KeepInfoCollection keepInfo;
   /** All items with assumemayhavesideeffects rule. */
   public final Map<DexReference, ProguardMemberRule> mayHaveSideEffects;
   /** All items with assumenosideeffects rule. */
@@ -141,14 +147,29 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
   public final Set<DexMethod> forceInline;
   /** All methods that *must* never be inlined due to a configuration directive (testing only). */
   public final Set<DexMethod> neverInline;
+  /** Items for which to print inlining decisions for (testing only). */
+  public final Set<DexMethod> whyAreYouNotInlining;
   /** All methods that may not have any parameters with a constant value removed. */
   public final Set<DexMethod> keepConstantArguments;
   /** All methods that may not have any unused arguments removed. */
   public final Set<DexMethod> keepUnusedArguments;
+  /** All methods that must be reprocessed (testing only). */
+  public final Set<DexMethod> reprocess;
+  /** All methods that must not be reprocessed (testing only). */
+  public final Set<DexMethod> neverReprocess;
+  /** All types that should be inlined if possible due to a configuration directive. */
+  public final PredicateSet<DexType> alwaysClassInline;
   /** All types that *must* never be inlined due to a configuration directive (testing only). */
   public final Set<DexType> neverClassInline;
   /** All types that *must* never be merged due to a configuration directive (testing only). */
   public final Set<DexType> neverMerge;
+  /** Set of const-class references. */
+  public final Set<DexType> constClassReferences;
+  /**
+   * A map from seen init-class references to the minimum required visibility of the corresponding
+   * static field.
+   */
+  public final Map<DexType, Visibility> initClassReferences;
   /**
    * All methods and fields whose value *must* never be propagated due to a configuration directive.
    * (testing only).
@@ -164,73 +185,69 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
   final Set<DexType> prunedTypes;
   /** A map from switchmap class types to their corresponding switchmaps. */
   final Map<DexField, Int2ReferenceMap<DexField>> switchMaps;
-  /** A map from enum types to their ordinal values. */
-  final Map<DexType, Reference2IntMap<DexField>> ordinalsMaps;
+  /** A map from enum types to their value types and ordinals. */
+  final EnumValueInfoMapCollection enumValueInfoMaps;
 
-  final ImmutableSortedSet<DexType> instantiatedLambdas;
+  /* A cache to improve the lookup performance of lookupSingleVirtualTarget */
+  private final SingleTargetLookupCache singleTargetLookupCache = new SingleTargetLookupCache();
 
   // TODO(zerny): Clean up the constructors so we have just one.
-  private AppInfoWithLiveness(
-      DexApplication application,
-      SortedSet<DexType> liveTypes,
-      SortedSet<DexType> instantiatedAnnotationTypes,
-      SortedSet<DexType> instantiatedAppServices,
-      SortedSet<DexType> instantiatedTypes,
+  AppInfoWithLiveness(
+      DirectMappedDexApplication application,
+      Set<DexType> deadProtoTypes,
+      Set<DexType> missingTypes,
+      Set<DexType> liveTypes,
+      Set<DexType> instantiatedAppServices,
       SortedSet<DexMethod> targetedMethods,
+      Set<DexMethod> failedResolutionTargets,
       SortedSet<DexMethod> bootstrapMethods,
       SortedSet<DexMethod> methodsTargetedByInvokeDynamic,
       SortedSet<DexMethod> virtualMethodsTargetedByInvokeDirect,
       SortedSet<DexMethod> liveMethods,
-      SortedSet<DexField> fieldsRead,
-      SortedSet<DexField> fieldsWritten,
-      SortedSet<DexField> staticFieldsWrittenOnlyInEnclosingStaticInitializer,
-      SortedMap<DexField, Set<DexEncodedMethod>> instanceFieldReads,
-      SortedMap<DexField, Set<DexEncodedMethod>> instanceFieldWrites,
-      SortedMap<DexField, Set<DexEncodedMethod>> staticFieldReads,
-      SortedMap<DexField, Set<DexEncodedMethod>> staticFieldWrites,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> virtualInvokes,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> interfaceInvokes,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> superInvokes,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> directInvokes,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> staticInvokes,
+      FieldAccessInfoCollectionImpl fieldAccessInfoCollection,
+      ObjectAllocationInfoCollectionImpl objectAllocationInfoCollection,
+      SortedMap<DexMethod, ProgramMethodSet> virtualInvokes,
+      SortedMap<DexMethod, ProgramMethodSet> interfaceInvokes,
+      SortedMap<DexMethod, ProgramMethodSet> superInvokes,
+      SortedMap<DexMethod, ProgramMethodSet> directInvokes,
+      SortedMap<DexMethod, ProgramMethodSet> staticInvokes,
       Set<DexCallSite> callSites,
-      SortedSet<DexMethod> brokenSuperInvokes,
-      Set<DexReference> pinnedItems,
+      KeepInfoCollection keepInfo,
       Map<DexReference, ProguardMemberRule> mayHaveSideEffects,
       Map<DexReference, ProguardMemberRule> noSideEffects,
       Map<DexReference, ProguardMemberRule> assumedValues,
       Set<DexMethod> alwaysInline,
       Set<DexMethod> forceInline,
       Set<DexMethod> neverInline,
+      Set<DexMethod> whyAreYouNotInlining,
       Set<DexMethod> keepConstantArguments,
       Set<DexMethod> keepUnusedArguments,
+      Set<DexMethod> reprocess,
+      Set<DexMethod> neverReprocess,
+      PredicateSet<DexType> alwaysClassInline,
       Set<DexType> neverClassInline,
       Set<DexType> neverMerge,
       Set<DexReference> neverPropagateValue,
       Object2BooleanMap<DexReference> identifierNameStrings,
       Set<DexType> prunedTypes,
       Map<DexField, Int2ReferenceMap<DexField>> switchMaps,
-      Map<DexType, Reference2IntMap<DexField>> ordinalsMaps,
-      ImmutableSortedSet<DexType> instantiatedLambdas) {
+      EnumValueInfoMapCollection enumValueInfoMaps,
+      Set<DexType> constClassReferences,
+      Map<DexType, Visibility> initClassReferences) {
     super(application);
+    this.deadProtoTypes = deadProtoTypes;
+    this.missingTypes = missingTypes;
     this.liveTypes = liveTypes;
-    this.instantiatedAnnotationTypes = instantiatedAnnotationTypes;
     this.instantiatedAppServices = instantiatedAppServices;
-    this.instantiatedTypes = instantiatedTypes;
     this.targetedMethods = targetedMethods;
+    this.failedResolutionTargets = failedResolutionTargets;
     this.bootstrapMethods = bootstrapMethods;
     this.methodsTargetedByInvokeDynamic = methodsTargetedByInvokeDynamic;
     this.virtualMethodsTargetedByInvokeDirect = virtualMethodsTargetedByInvokeDirect;
     this.liveMethods = liveMethods;
-    this.instanceFieldReads = instanceFieldReads;
-    this.instanceFieldWrites = instanceFieldWrites;
-    this.staticFieldReads = staticFieldReads;
-    this.staticFieldWrites = staticFieldWrites;
-    this.fieldsRead = fieldsRead;
-    this.fieldsWritten = fieldsWritten;
-    this.staticFieldsWrittenOnlyInEnclosingStaticInitializer =
-        staticFieldsWrittenOnlyInEnclosingStaticInitializer;
-    this.pinnedItems = pinnedItems;
+    this.fieldAccessInfoCollection = fieldAccessInfoCollection;
+    this.objectAllocationInfoCollection = objectAllocationInfoCollection;
+    this.keepInfo = keepInfo;
     this.mayHaveSideEffects = mayHaveSideEffects;
     this.noSideEffects = noSideEffects;
     this.assumedValues = assumedValues;
@@ -240,85 +257,82 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
     this.directInvokes = directInvokes;
     this.staticInvokes = staticInvokes;
     this.callSites = callSites;
-    this.brokenSuperInvokes = brokenSuperInvokes;
     this.alwaysInline = alwaysInline;
     this.forceInline = forceInline;
     this.neverInline = neverInline;
+    this.whyAreYouNotInlining = whyAreYouNotInlining;
     this.keepConstantArguments = keepConstantArguments;
     this.keepUnusedArguments = keepUnusedArguments;
+    this.reprocess = reprocess;
+    this.neverReprocess = neverReprocess;
+    this.alwaysClassInline = alwaysClassInline;
     this.neverClassInline = neverClassInline;
     this.neverMerge = neverMerge;
     this.neverPropagateValue = neverPropagateValue;
     this.identifierNameStrings = identifierNameStrings;
     this.prunedTypes = prunedTypes;
     this.switchMaps = switchMaps;
-    this.ordinalsMaps = ordinalsMaps;
-    this.instantiatedLambdas = instantiatedLambdas;
-    assert Sets.intersection(instanceFieldReads.keySet(), staticFieldReads.keySet()).isEmpty();
-    assert Sets.intersection(instanceFieldWrites.keySet(), staticFieldWrites.keySet()).isEmpty();
+    this.enumValueInfoMaps = enumValueInfoMaps;
+    this.constClassReferences = constClassReferences;
+    this.initClassReferences = initClassReferences;
   }
 
   public AppInfoWithLiveness(
-      AppInfoWithSubtyping appInfoWithSubtyping,
-      SortedSet<DexType> liveTypes,
-      SortedSet<DexType> instantiatedAnnotationTypes,
-      SortedSet<DexType> instantiatedAppServices,
-      SortedSet<DexType> instantiatedTypes,
+      AppInfoWithClassHierarchy appInfoWithClassHierarchy,
+      Set<DexType> deadProtoTypes,
+      Set<DexType> missingTypes,
+      Set<DexType> liveTypes,
+      Set<DexType> instantiatedAppServices,
       SortedSet<DexMethod> targetedMethods,
+      Set<DexMethod> failedResolutionTargets,
       SortedSet<DexMethod> bootstrapMethods,
       SortedSet<DexMethod> methodsTargetedByInvokeDynamic,
       SortedSet<DexMethod> virtualMethodsTargetedByInvokeDirect,
       SortedSet<DexMethod> liveMethods,
-      SortedSet<DexField> fieldsRead,
-      SortedSet<DexField> fieldsWritten,
-      SortedSet<DexField> staticFieldsWrittenOnlyInEnclosingStaticInitializer,
-      SortedMap<DexField, Set<DexEncodedMethod>> instanceFieldReads,
-      SortedMap<DexField, Set<DexEncodedMethod>> instanceFieldWrites,
-      SortedMap<DexField, Set<DexEncodedMethod>> staticFieldReads,
-      SortedMap<DexField, Set<DexEncodedMethod>> staticFieldWrites,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> virtualInvokes,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> interfaceInvokes,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> superInvokes,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> directInvokes,
-      SortedMap<DexMethod, Set<DexEncodedMethod>> staticInvokes,
+      FieldAccessInfoCollectionImpl fieldAccessInfoCollection,
+      ObjectAllocationInfoCollectionImpl objectAllocationInfoCollection,
+      SortedMap<DexMethod, ProgramMethodSet> virtualInvokes,
+      SortedMap<DexMethod, ProgramMethodSet> interfaceInvokes,
+      SortedMap<DexMethod, ProgramMethodSet> superInvokes,
+      SortedMap<DexMethod, ProgramMethodSet> directInvokes,
+      SortedMap<DexMethod, ProgramMethodSet> staticInvokes,
       Set<DexCallSite> callSites,
-      SortedSet<DexMethod> brokenSuperInvokes,
-      Set<DexReference> pinnedItems,
+      KeepInfoCollection keepInfo,
       Map<DexReference, ProguardMemberRule> mayHaveSideEffects,
       Map<DexReference, ProguardMemberRule> noSideEffects,
       Map<DexReference, ProguardMemberRule> assumedValues,
       Set<DexMethod> alwaysInline,
       Set<DexMethod> forceInline,
       Set<DexMethod> neverInline,
+      Set<DexMethod> whyAreYouNotInlining,
       Set<DexMethod> keepConstantArguments,
       Set<DexMethod> keepUnusedArguments,
+      Set<DexMethod> reprocess,
+      Set<DexMethod> neverReprocess,
+      PredicateSet<DexType> alwaysClassInline,
       Set<DexType> neverClassInline,
       Set<DexType> neverMerge,
       Set<DexReference> neverPropagateValue,
       Object2BooleanMap<DexReference> identifierNameStrings,
       Set<DexType> prunedTypes,
       Map<DexField, Int2ReferenceMap<DexField>> switchMaps,
-      Map<DexType, Reference2IntMap<DexField>> ordinalsMaps,
-      ImmutableSortedSet<DexType> instantiatedLambdas) {
-    super(appInfoWithSubtyping);
+      EnumValueInfoMapCollection enumValueInfoMaps,
+      Set<DexType> constClassReferences,
+      Map<DexType, Visibility> initClassReferences) {
+    super(appInfoWithClassHierarchy);
+    this.deadProtoTypes = deadProtoTypes;
+    this.missingTypes = missingTypes;
     this.liveTypes = liveTypes;
-    this.instantiatedAnnotationTypes = instantiatedAnnotationTypes;
     this.instantiatedAppServices = instantiatedAppServices;
-    this.instantiatedTypes = instantiatedTypes;
     this.targetedMethods = targetedMethods;
+    this.failedResolutionTargets = failedResolutionTargets;
     this.bootstrapMethods = bootstrapMethods;
     this.methodsTargetedByInvokeDynamic = methodsTargetedByInvokeDynamic;
     this.virtualMethodsTargetedByInvokeDirect = virtualMethodsTargetedByInvokeDirect;
     this.liveMethods = liveMethods;
-    this.instanceFieldReads = instanceFieldReads;
-    this.instanceFieldWrites = instanceFieldWrites;
-    this.staticFieldReads = staticFieldReads;
-    this.staticFieldWrites = staticFieldWrites;
-    this.fieldsRead = fieldsRead;
-    this.fieldsWritten = fieldsWritten;
-    this.staticFieldsWrittenOnlyInEnclosingStaticInitializer =
-        staticFieldsWrittenOnlyInEnclosingStaticInitializer;
-    this.pinnedItems = pinnedItems;
+    this.fieldAccessInfoCollection = fieldAccessInfoCollection;
+    this.objectAllocationInfoCollection = objectAllocationInfoCollection;
+    this.keepInfo = keepInfo;
     this.mayHaveSideEffects = mayHaveSideEffects;
     this.noSideEffects = noSideEffects;
     this.assumedValues = assumedValues;
@@ -328,66 +342,110 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
     this.directInvokes = directInvokes;
     this.staticInvokes = staticInvokes;
     this.callSites = callSites;
-    this.brokenSuperInvokes = brokenSuperInvokes;
     this.alwaysInline = alwaysInline;
     this.forceInline = forceInline;
     this.neverInline = neverInline;
+    this.whyAreYouNotInlining = whyAreYouNotInlining;
     this.keepConstantArguments = keepConstantArguments;
     this.keepUnusedArguments = keepUnusedArguments;
+    this.reprocess = reprocess;
+    this.neverReprocess = neverReprocess;
+    this.alwaysClassInline = alwaysClassInline;
     this.neverClassInline = neverClassInline;
     this.neverMerge = neverMerge;
     this.neverPropagateValue = neverPropagateValue;
     this.identifierNameStrings = identifierNameStrings;
     this.prunedTypes = prunedTypes;
     this.switchMaps = switchMaps;
-    this.ordinalsMaps = ordinalsMaps;
-    this.instantiatedLambdas = instantiatedLambdas;
-    assert Sets.intersection(instanceFieldReads.keySet(), staticFieldReads.keySet()).isEmpty();
-    assert Sets.intersection(instanceFieldWrites.keySet(), staticFieldWrites.keySet()).isEmpty();
+    this.enumValueInfoMaps = enumValueInfoMaps;
+    this.constClassReferences = constClassReferences;
+    this.initClassReferences = initClassReferences;
   }
 
   private AppInfoWithLiveness(AppInfoWithLiveness previous) {
-    this(previous, previous.app(), null);
-  }
-
-  private AppInfoWithLiveness(
-      AppInfoWithLiveness previous,
-      DexApplication application,
-      Collection<DexType> removedClasses) {
     this(
-        application,
+        previous,
+        previous.deadProtoTypes,
+        previous.missingTypes,
         previous.liveTypes,
-        previous.instantiatedAnnotationTypes,
         previous.instantiatedAppServices,
-        previous.instantiatedTypes,
         previous.targetedMethods,
+        previous.failedResolutionTargets,
         previous.bootstrapMethods,
         previous.methodsTargetedByInvokeDynamic,
         previous.virtualMethodsTargetedByInvokeDirect,
         previous.liveMethods,
-        previous.fieldsRead,
-        previous.fieldsWritten,
-        previous.staticFieldsWrittenOnlyInEnclosingStaticInitializer,
-        previous.instanceFieldReads,
-        previous.instanceFieldWrites,
-        previous.staticFieldReads,
-        previous.staticFieldWrites,
+        previous.fieldAccessInfoCollection,
+        previous.objectAllocationInfoCollection,
         previous.virtualInvokes,
         previous.interfaceInvokes,
         previous.superInvokes,
         previous.directInvokes,
         previous.staticInvokes,
         previous.callSites,
-        previous.brokenSuperInvokes,
-        previous.pinnedItems,
+        previous.keepInfo,
         previous.mayHaveSideEffects,
         previous.noSideEffects,
         previous.assumedValues,
         previous.alwaysInline,
         previous.forceInline,
         previous.neverInline,
+        previous.whyAreYouNotInlining,
         previous.keepConstantArguments,
         previous.keepUnusedArguments,
+        previous.reprocess,
+        previous.neverReprocess,
+        previous.alwaysClassInline,
+        previous.neverClassInline,
+        previous.neverMerge,
+        previous.neverPropagateValue,
+        previous.identifierNameStrings,
+        previous.prunedTypes,
+        previous.switchMaps,
+        previous.enumValueInfoMaps,
+        previous.constClassReferences,
+        previous.initClassReferences);
+    copyMetadataFromPrevious(previous);
+  }
+
+  private AppInfoWithLiveness(
+      AppInfoWithLiveness previous,
+      DirectMappedDexApplication application,
+      Collection<DexType> removedClasses,
+      Collection<DexReference> additionalPinnedItems) {
+    this(
+        application,
+        previous.deadProtoTypes,
+        previous.missingTypes,
+        previous.liveTypes,
+        previous.instantiatedAppServices,
+        previous.targetedMethods,
+        previous.failedResolutionTargets,
+        previous.bootstrapMethods,
+        previous.methodsTargetedByInvokeDynamic,
+        previous.virtualMethodsTargetedByInvokeDirect,
+        previous.liveMethods,
+        previous.fieldAccessInfoCollection,
+        previous.objectAllocationInfoCollection,
+        previous.virtualInvokes,
+        previous.interfaceInvokes,
+        previous.superInvokes,
+        previous.directInvokes,
+        previous.staticInvokes,
+        previous.callSites,
+        extendPinnedItems(previous, additionalPinnedItems),
+        previous.mayHaveSideEffects,
+        previous.noSideEffects,
+        previous.assumedValues,
+        previous.alwaysInline,
+        previous.forceInline,
+        previous.neverInline,
+        previous.whyAreYouNotInlining,
+        previous.keepConstantArguments,
+        previous.keepUnusedArguments,
+        previous.reprocess,
+        previous.neverReprocess,
+        previous.alwaysClassInline,
         previous.neverClassInline,
         previous.neverMerge,
         previous.neverPropagateValue,
@@ -396,129 +454,68 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
             ? previous.prunedTypes
             : CollectionUtils.mergeSets(previous.prunedTypes, removedClasses),
         previous.switchMaps,
-        previous.ordinalsMaps,
-        previous.instantiatedLambdas);
+        previous.enumValueInfoMaps,
+        previous.constClassReferences,
+        previous.initClassReferences);
     copyMetadataFromPrevious(previous);
-    assert removedClasses == null || assertNoItemRemoved(previous.pinnedItems, removedClasses);
-    assert Sets.intersection(instanceFieldReads.keySet(), staticFieldReads.keySet()).isEmpty();
-    assert Sets.intersection(instanceFieldWrites.keySet(), staticFieldWrites.keySet()).isEmpty();
+    assert keepInfo.verifyNoneArePinned(removedClasses, previous);
   }
 
-  private AppInfoWithLiveness(
-      AppInfoWithLiveness previous, DirectMappedDexApplication application, GraphLense lense) {
-    super(application);
-    this.liveTypes = rewriteItems(previous.liveTypes, lense::lookupType);
-    this.instantiatedAnnotationTypes =
-        rewriteItems(previous.instantiatedAnnotationTypes, lense::lookupType);
-    this.instantiatedAppServices =
-        rewriteItems(previous.instantiatedAppServices, lense::lookupType);
-    this.instantiatedTypes = rewriteItems(previous.instantiatedTypes, lense::lookupType);
-    this.instantiatedLambdas = rewriteItems(previous.instantiatedLambdas, lense::lookupType);
-    this.targetedMethods = lense.rewriteMethodsConservatively(previous.targetedMethods);
-    this.bootstrapMethods = lense.rewriteMethodsConservatively(previous.bootstrapMethods);
-    this.methodsTargetedByInvokeDynamic =
-        lense.rewriteMethodsConservatively(previous.methodsTargetedByInvokeDynamic);
-    this.virtualMethodsTargetedByInvokeDirect =
-        lense.rewriteMethodsConservatively(previous.virtualMethodsTargetedByInvokeDirect);
-    this.liveMethods = lense.rewriteMethodsConservatively(previous.liveMethods);
-    this.instanceFieldReads =
-        rewriteKeysWhileMergingValues(previous.instanceFieldReads, lense::lookupField);
-    this.instanceFieldWrites =
-        rewriteKeysWhileMergingValues(previous.instanceFieldWrites, lense::lookupField);
-    this.staticFieldReads =
-        rewriteKeysWhileMergingValues(previous.staticFieldReads, lense::lookupField);
-    this.staticFieldWrites =
-        rewriteKeysWhileMergingValues(previous.staticFieldWrites, lense::lookupField);
-    this.fieldsRead = rewriteItems(previous.fieldsRead, lense::lookupField);
-    this.fieldsWritten = rewriteItems(previous.fieldsWritten, lense::lookupField);
-    this.staticFieldsWrittenOnlyInEnclosingStaticInitializer =
-        rewriteItems(
-            previous.staticFieldsWrittenOnlyInEnclosingStaticInitializer, lense::lookupField);
-    this.pinnedItems = lense.rewriteReferencesConservatively(previous.pinnedItems);
-    this.virtualInvokes =
-        rewriteKeysConservativelyWhileMergingValues(
-            previous.virtualInvokes, lense::lookupMethodInAllContexts);
-    this.interfaceInvokes =
-        rewriteKeysConservativelyWhileMergingValues(
-            previous.interfaceInvokes, lense::lookupMethodInAllContexts);
-    this.superInvokes =
-        rewriteKeysConservativelyWhileMergingValues(
-            previous.superInvokes, lense::lookupMethodInAllContexts);
-    this.directInvokes =
-        rewriteKeysConservativelyWhileMergingValues(
-            previous.directInvokes, lense::lookupMethodInAllContexts);
-    this.staticInvokes =
-        rewriteKeysConservativelyWhileMergingValues(
-            previous.staticInvokes, lense::lookupMethodInAllContexts);
-    // TODO(sgjesse): Rewrite call sites as well? Right now they are only used by minification
-    // after second tree shaking.
-    this.callSites = previous.callSites;
-    this.brokenSuperInvokes = lense.rewriteMethodsConservatively(previous.brokenSuperInvokes);
-    // Don't rewrite pruned types - the removed types are identified by their original name.
-    this.prunedTypes = previous.prunedTypes;
-    this.mayHaveSideEffects =
-        rewriteReferenceKeys(previous.mayHaveSideEffects, lense::lookupReference);
-    this.noSideEffects = rewriteReferenceKeys(previous.noSideEffects, lense::lookupReference);
-    this.assumedValues = rewriteReferenceKeys(previous.assumedValues, lense::lookupReference);
-    assert lense.assertDefinitionsNotModified(
-        previous.alwaysInline.stream()
-            .map(this::definitionFor)
-            .filter(Objects::nonNull)
-            .collect(Collectors.toList()));
-    this.alwaysInline = lense.rewriteMethodsWithRenamedSignature(previous.alwaysInline);
-    this.forceInline = lense.rewriteMethodsWithRenamedSignature(previous.forceInline);
-    this.neverInline = lense.rewriteMethodsWithRenamedSignature(previous.neverInline);
-    this.keepConstantArguments =
-        lense.rewriteMethodsWithRenamedSignature(previous.keepConstantArguments);
-    this.keepUnusedArguments =
-        lense.rewriteMethodsWithRenamedSignature(previous.keepUnusedArguments);
-    assert lense.assertDefinitionsNotModified(
-        previous.neverMerge.stream()
-            .map(this::definitionFor)
-            .filter(Objects::nonNull)
-            .collect(Collectors.toList()));
-    this.neverClassInline = rewriteItems(previous.neverClassInline, lense::lookupType);
-    this.neverMerge = rewriteItems(previous.neverMerge, lense::lookupType);
-    this.neverPropagateValue = lense.rewriteReferencesConservatively(previous.neverPropagateValue);
-    this.identifierNameStrings =
-        lense.rewriteReferencesConservatively(previous.identifierNameStrings);
-    // Switchmap classes should never be affected by renaming.
-    assert lense.assertDefinitionsNotModified(
-        previous.switchMaps.keySet().stream()
-            .map(this::definitionFor)
-            .filter(Objects::nonNull)
-            .collect(Collectors.toList()));
-    this.switchMaps = rewriteReferenceKeys(previous.switchMaps, lense::lookupField);
-    this.ordinalsMaps = rewriteReferenceKeys(previous.ordinalsMaps, lense::lookupType);
-    // Sanity check sets after rewriting.
-    assert Sets.intersection(instanceFieldReads.keySet(), staticFieldReads.keySet()).isEmpty();
-    assert Sets.intersection(instanceFieldWrites.keySet(), staticFieldWrites.keySet()).isEmpty();
+  private static KeepInfoCollection extendPinnedItems(
+      AppInfoWithLiveness previous, Collection<DexReference> additionalPinnedItems) {
+    if (additionalPinnedItems == null || additionalPinnedItems.isEmpty()) {
+      return previous.keepInfo;
+    }
+    return previous.keepInfo.mutate(
+        collection -> {
+          for (DexReference reference : additionalPinnedItems) {
+            if (reference.isDexType()) {
+              DexProgramClass clazz =
+                  asProgramClassOrNull(previous.definitionFor(reference.asDexType()));
+              if (clazz != null) {
+                collection.pinClass(clazz);
+              }
+            } else if (reference.isDexMethod()) {
+              DexMethod method = reference.asDexMethod();
+              DexProgramClass clazz = asProgramClassOrNull(previous.definitionFor(method.holder));
+              if (clazz != null) {
+                DexEncodedMethod definition = clazz.lookupMethod(method);
+                if (definition != null) {
+                  collection.pinMethod(clazz, definition);
+                }
+              }
+            } else {
+              DexField field = reference.asDexField();
+              DexProgramClass clazz = asProgramClassOrNull(previous.definitionFor(field.holder));
+              if (clazz != null) {
+                DexEncodedField definition = clazz.lookupField(field);
+                if (definition != null) {
+                  collection.pinField(clazz, definition);
+                }
+              }
+            }
+          }
+        });
   }
 
   public AppInfoWithLiveness(
       AppInfoWithLiveness previous,
       Map<DexField, Int2ReferenceMap<DexField>> switchMaps,
-      Map<DexType, Reference2IntMap<DexField>> ordinalsMaps) {
+      EnumValueInfoMapCollection enumValueInfoMaps) {
     super(previous);
+    this.deadProtoTypes = previous.deadProtoTypes;
+    this.missingTypes = previous.missingTypes;
     this.liveTypes = previous.liveTypes;
-    this.instantiatedAnnotationTypes = previous.instantiatedAnnotationTypes;
     this.instantiatedAppServices = previous.instantiatedAppServices;
-    this.instantiatedTypes = previous.instantiatedTypes;
-    this.instantiatedLambdas = previous.instantiatedLambdas;
     this.targetedMethods = previous.targetedMethods;
+    this.failedResolutionTargets = previous.failedResolutionTargets;
     this.bootstrapMethods = previous.bootstrapMethods;
     this.methodsTargetedByInvokeDynamic = previous.methodsTargetedByInvokeDynamic;
     this.virtualMethodsTargetedByInvokeDirect = previous.virtualMethodsTargetedByInvokeDirect;
     this.liveMethods = previous.liveMethods;
-    this.instanceFieldReads = previous.instanceFieldReads;
-    this.instanceFieldWrites = previous.instanceFieldWrites;
-    this.staticFieldReads = previous.staticFieldReads;
-    this.staticFieldWrites = previous.staticFieldWrites;
-    this.fieldsRead = previous.fieldsRead;
-    this.fieldsWritten = previous.fieldsWritten;
-    this.staticFieldsWrittenOnlyInEnclosingStaticInitializer =
-        previous.staticFieldsWrittenOnlyInEnclosingStaticInitializer;
-    this.pinnedItems = previous.pinnedItems;
+    this.fieldAccessInfoCollection = previous.fieldAccessInfoCollection;
+    this.objectAllocationInfoCollection = previous.objectAllocationInfoCollection;
+    this.keepInfo = previous.keepInfo;
     this.mayHaveSideEffects = previous.mayHaveSideEffects;
     this.noSideEffects = previous.noSideEffects;
     this.assumedValues = previous.assumedValues;
@@ -528,38 +525,106 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
     this.directInvokes = previous.directInvokes;
     this.staticInvokes = previous.staticInvokes;
     this.callSites = previous.callSites;
-    this.brokenSuperInvokes = previous.brokenSuperInvokes;
     this.alwaysInline = previous.alwaysInline;
     this.forceInline = previous.forceInline;
     this.neverInline = previous.neverInline;
+    this.whyAreYouNotInlining = previous.whyAreYouNotInlining;
     this.keepConstantArguments = previous.keepConstantArguments;
     this.keepUnusedArguments = previous.keepUnusedArguments;
+    this.reprocess = previous.reprocess;
+    this.neverReprocess = previous.neverReprocess;
+    this.alwaysClassInline = previous.alwaysClassInline;
     this.neverClassInline = previous.neverClassInline;
     this.neverMerge = previous.neverMerge;
     this.neverPropagateValue = previous.neverPropagateValue;
     this.identifierNameStrings = previous.identifierNameStrings;
     this.prunedTypes = previous.prunedTypes;
     this.switchMaps = switchMaps;
-    this.ordinalsMaps = ordinalsMaps;
+    this.enumValueInfoMaps = enumValueInfoMaps;
+    this.constClassReferences = previous.constClassReferences;
+    this.initClassReferences = previous.initClassReferences;
     previous.markObsolete();
   }
 
-  public Collection<DexClass> computeReachableInterfaces(Set<DexCallSite> desugaredCallSites) {
+  public static AppInfoWithLivenessModifier modifier() {
+    return new AppInfoWithLivenessModifier();
+  }
+
+  @Override
+  public DexClass definitionFor(DexType type) {
+    DexClass definition = super.definitionFor(type);
+    assert definition != null
+            || deadProtoTypes.contains(type)
+            || missingTypes.contains(type)
+            // TODO(b/150693139): Remove these exceptions once fixed.
+            || InterfaceMethodRewriter.isCompanionClassType(type)
+            || InterfaceMethodRewriter.hasDispatchClassSuffix(type)
+            || InterfaceMethodRewriter.isEmulatedLibraryClassType(type)
+            || type.toDescriptorString().startsWith("L$r8$backportedMethods$")
+            || type.toDescriptorString().startsWith("Lj$/$r8$backportedMethods$")
+            || type.toDescriptorString().startsWith("Lj$/$r8$retargetLibraryMember$")
+            || TwrCloseResourceRewriter.isUtilityClassDescriptor(type)
+            // TODO(b/150736225): Not sure how to remove these.
+            || DesugaredLibraryAPIConverter.isVivifiedType(type)
+        : "Failed lookup of non-missing type: " + type;
+    return definition;
+  }
+
+  private int largestInputCfVersion = -1;
+
+  public boolean canUseConstClassInstructions(InternalOptions options) {
+    if (!options.isGeneratingClassFiles()) {
+      return true;
+    }
+    if (largestInputCfVersion == -1) {
+      computeLargestCfVersion();
+    }
+    return options.canUseConstClassInstructions(largestInputCfVersion);
+  }
+
+  private synchronized void computeLargestCfVersion() {
+    if (largestInputCfVersion != -1) {
+      return;
+    }
+    for (DexProgramClass clazz : classes()) {
+      // Skip synthetic classes which may not have a specified version.
+      if (clazz.hasClassFileVersion()) {
+        largestInputCfVersion = Math.max(largestInputCfVersion, clazz.getInitialClassFileVersion());
+      }
+    }
+    assert largestInputCfVersion != -1;
+  }
+
+  public boolean isLiveProgramClass(DexProgramClass clazz) {
+    return liveTypes.contains(clazz.type);
+  }
+
+  public boolean isLiveProgramType(DexType type) {
+    DexClass clazz = definitionFor(type);
+    return clazz != null && clazz.isProgramClass() && isLiveProgramClass(clazz.asProgramClass());
+  }
+
+  public boolean isNonProgramTypeOrLiveProgramType(DexType type) {
+    if (liveTypes.contains(type)) {
+      return true;
+    }
+    if (prunedTypes.contains(type)) {
+      return false;
+    }
+    DexClass clazz = definitionFor(type);
+    return clazz == null || !clazz.isProgramClass();
+  }
+
+  public Collection<DexClass> computeReachableInterfaces() {
     Set<DexClass> interfaces = Sets.newIdentityHashSet();
     Set<DexType> seen = Sets.newIdentityHashSet();
     Deque<DexType> worklist = new ArrayDeque<>();
     for (DexProgramClass clazz : classes()) {
       worklist.add(clazz.type);
     }
-    // TODO(b/129458850): Remove this once desugared classes are made part of the program classes.
-    for (DexCallSite callSite : desugaredCallSites) {
-      for (DexEncodedMethod method : lookupLambdaImplementedMethods(callSite)) {
-        worklist.add(method.method.holder);
-      }
-    }
     for (DexCallSite callSite : callSites) {
       for (DexEncodedMethod method : lookupLambdaImplementedMethods(callSite)) {
-        worklist.add(method.method.holder);
+        worklist.add(method.holder());
       }
     }
     while (!worklist.isEmpty()) {
@@ -582,164 +647,262 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
     return interfaces;
   }
 
+  /**
+   * Resolve the methods implemented by the lambda expression that created the {@code callSite}.
+   *
+   * <p>If {@code callSite} was not created as a result of a lambda expression (i.e. the metafactory
+   * is not {@code LambdaMetafactory}), the empty set is returned.
+   *
+   * <p>If the metafactory is neither {@code LambdaMetafactory} nor {@code StringConcatFactory}, a
+   * warning is issued.
+   *
+   * <p>The returned set of methods all have {@code callSite.methodName} as the method name.
+   *
+   * @param callSite Call site to resolve.
+   * @return Methods implemented by the lambda expression that created the {@code callSite}.
+   */
+  public Set<DexEncodedMethod> lookupLambdaImplementedMethods(DexCallSite callSite) {
+    assert checkIfObsolete();
+    List<DexType> callSiteInterfaces = LambdaDescriptor.getInterfaces(callSite, this);
+    if (callSiteInterfaces == null || callSiteInterfaces.isEmpty()) {
+      return Collections.emptySet();
+    }
+    Set<DexEncodedMethod> result = Sets.newIdentityHashSet();
+    Deque<DexType> worklist = new ArrayDeque<>(callSiteInterfaces);
+    Set<DexType> visited = Sets.newIdentityHashSet();
+    while (!worklist.isEmpty()) {
+      DexType iface = worklist.removeFirst();
+      if (!visited.add(iface)) {
+        // Already visited previously. May happen due to "diamond shapes" in the interface
+        // hierarchy.
+        continue;
+      }
+      DexClass clazz = definitionFor(iface);
+      if (clazz == null) {
+        // Skip this interface. If the lambda only implements missing library interfaces and not any
+        // program interfaces, then minification and tree shaking are not interested in this
+        // DexCallSite anyway, so skipping this interface is harmless. On the other hand, if
+        // minification is run on a program with a lambda interface that implements both a missing
+        // library interface and a present program interface, then we might minify the method name
+        // on the program interface even though it should be kept the same as the (missing) library
+        // interface method. That is a shame, but minification is not suited for incomplete programs
+        // anyway.
+        continue;
+      }
+      assert clazz.isInterface();
+      for (DexEncodedMethod method : clazz.virtualMethods()) {
+        if (method.method.name == callSite.methodName && method.accessFlags.isAbstract()) {
+          result.add(method);
+        }
+      }
+      Collections.addAll(worklist, clazz.interfaces.values);
+    }
+    return result;
+  }
+
+  /**
+   * Const-classes is a conservative set of types that may be lock-candidates and cannot be merged.
+   * When using synchronized blocks, we cannot ensure that const-class locks will not flow in. This
+   * can potentially cause incorrect behavior when merging classes. A conservative choice is to not
+   * merge any const-class classes. More info at b/142438687.
+   */
+  public boolean isLockCandidate(DexType type) {
+    return constClassReferences.contains(type);
+  }
+
   public AppInfoWithLiveness withoutStaticFieldsWrites(Set<DexField> noLongerWrittenFields) {
     assert checkIfObsolete();
     if (noLongerWrittenFields.isEmpty()) {
       return this;
     }
     AppInfoWithLiveness result = new AppInfoWithLiveness(this);
-    Predicate<DexField> isFieldWritten = field -> !noLongerWrittenFields.contains(field);
-    result.fieldsWritten = filter(fieldsWritten, isFieldWritten);
-    result.staticFieldsWrittenOnlyInEnclosingStaticInitializer =
-        filter(staticFieldsWrittenOnlyInEnclosingStaticInitializer, isFieldWritten);
+    result.fieldAccessInfoCollection.forEach(
+        info -> {
+          if (noLongerWrittenFields.contains(info.getField())) {
+            // Note that this implicitly mutates the current AppInfoWithLiveness, since the `info`
+            // instance is shared between the old and the new AppInfoWithLiveness. This should not
+            // lead to any problems, though, since the new AppInfo replaces the old AppInfo (we
+            // never use an obsolete AppInfo).
+            info.clearWrites();
+          }
+        });
     return result;
   }
 
-  private <T extends PresortedComparable<T>> SortedSet<T> filter(
-      Set<T> items, Predicate<T> predicate) {
-    return ImmutableSortedSet.copyOf(
-        PresortedComparable::slowCompareTo,
-        items.stream().filter(predicate).collect(Collectors.toList()));
+  public Set<DexType> getDeadProtoTypes() {
+    return deadProtoTypes;
   }
 
-  public Reference2IntMap<DexField> getOrdinalsMapFor(DexType enumClass) {
+  public Set<DexType> getMissingTypes() {
+    return missingTypes;
+  }
+
+  public EnumValueInfoMapCollection getEnumValueInfoMapCollection() {
     assert checkIfObsolete();
-    return ordinalsMaps.get(enumClass);
+    return enumValueInfoMaps;
   }
 
-  public Int2ReferenceMap<DexField> getSwitchMapFor(DexField field) {
+  public EnumValueInfoMap getEnumValueInfoMap(DexType enumType) {
+    assert checkIfObsolete();
+    return enumValueInfoMaps.getEnumValueInfoMap(enumType);
+  }
+
+  public Int2ReferenceMap<DexField> getSwitchMap(DexField field) {
     assert checkIfObsolete();
     return switchMaps.get(field);
   }
 
-  private boolean assertNoItemRemoved(Collection<DexReference> items, Collection<DexType> types) {
-    Set<DexType> typeSet = ImmutableSet.copyOf(types);
-    for (DexReference item : items) {
-      DexType typeToCheck;
-      if (item.isDexType()) {
-        typeToCheck = item.asDexType();
-      } else if (item.isDexMethod()) {
-        typeToCheck = item.asDexMethod().holder;
-      } else {
-        assert item.isDexField();
-        typeToCheck = item.asDexField().holder;
-      }
-      assert !typeSet.contains(typeToCheck);
-    }
-    return true;
+  /** This method provides immutable access to `fieldAccessInfoCollection`. */
+  public FieldAccessInfoCollection<? extends FieldAccessInfo> getFieldAccessInfoCollection() {
+    return fieldAccessInfoCollection;
   }
 
-  public boolean isInstantiatedDirectly(DexType type) {
+  FieldAccessInfoCollectionImpl getMutableFieldAccessInfoCollection() {
+    return fieldAccessInfoCollection;
+  }
+
+  /** This method provides immutable access to `objectAllocationInfoCollection`. */
+  public ObjectAllocationInfoCollection getObjectAllocationInfoCollection() {
+    return objectAllocationInfoCollection;
+  }
+
+  void mutateObjectAllocationInfoCollection(
+      Consumer<ObjectAllocationInfoCollectionImpl.Builder> mutator) {
+    objectAllocationInfoCollection.mutate(mutator, this);
+  }
+
+  void removeFromSingleTargetLookupCache(DexClass clazz) {
+    singleTargetLookupCache.removeInstantiatedType(clazz.type, this);
+  }
+
+  private boolean isInstantiatedDirectly(DexProgramClass clazz) {
     assert checkIfObsolete();
-    assert type.isClassType();
+    DexType type = clazz.type;
     return type.isD8R8SynthesizedClassType()
-        || instantiatedTypes.contains(type)
-        || instantiatedLambdas.contains(type)
-        || instantiatedAnnotationTypes.contains(type);
+        || (!clazz.isInterface() && objectAllocationInfoCollection.isInstantiatedDirectly(clazz))
+        // TODO(b/145344105): Model annotations in the object allocation info.
+        || (clazz.isAnnotation() && liveTypes.contains(type));
   }
 
-  public boolean isInstantiatedIndirectly(DexType type) {
+  public boolean isInstantiatedIndirectly(DexProgramClass clazz) {
     assert checkIfObsolete();
-    assert type.isClassType();
-    synchronized (indirectlyInstantiatedTypes) {
-      if (indirectlyInstantiatedTypes.containsKey(type)) {
-        return indirectlyInstantiatedTypes.get(type).booleanValue();
-      }
-      for (DexType directSubtype : allImmediateSubtypes(type)) {
-        if (isInstantiatedDirectlyOrIndirectly(directSubtype)) {
-          indirectlyInstantiatedTypes.put(type, Boolean.TRUE);
-          return true;
-        }
-      }
-      indirectlyInstantiatedTypes.put(type, Boolean.FALSE);
-      return false;
+    return objectAllocationInfoCollection.hasInstantiatedStrictSubtype(clazz);
+  }
+
+  public boolean isInstantiatedDirectlyOrIndirectly(DexProgramClass clazz) {
+    assert checkIfObsolete();
+    return isInstantiatedDirectly(clazz) || isInstantiatedIndirectly(clazz);
+  }
+
+  public boolean isFieldRead(DexEncodedField encodedField) {
+    assert checkIfObsolete();
+    DexField field = encodedField.field;
+    FieldAccessInfoImpl info = fieldAccessInfoCollection.get(field);
+    if (info != null && info.isRead()) {
+      return true;
     }
-  }
-
-  public boolean isInstantiatedDirectlyOrIndirectly(DexType type) {
-    assert checkIfObsolete();
-    assert type.isClassType();
-    return isInstantiatedDirectly(type) || isInstantiatedIndirectly(type);
-  }
-
-  public boolean isFieldRead(DexField field) {
-    assert checkIfObsolete();
-    return fieldsRead.contains(field)
-        || isPinned(field)
+    return keepInfo.isPinned(field, this)
         // Fields in the class that is synthesized by D8/R8 would be used soon.
         || field.holder.isD8R8SynthesizedClassType()
         // For library classes we don't know whether a field is read.
-        || isLibraryOrClasspathField(field);
+        || isLibraryOrClasspathField(encodedField);
   }
 
-  public boolean isFieldWritten(DexField field) {
+  public boolean isFieldWritten(DexEncodedField encodedField) {
     assert checkIfObsolete();
-    return fieldsWritten.contains(field)
-        || isPinned(field)
-        // Fields in the class that is synthesized by D8/R8 would be used soon.
-        || field.holder.isD8R8SynthesizedClassType()
-        // For library classes we don't know whether a field is rewritten.
-        || isLibraryOrClasspathField(field);
+    return isFieldWrittenByFieldPutInstruction(encodedField) || isPinned(encodedField.field);
   }
 
-  public boolean isStaticFieldWrittenOnlyInEnclosingStaticInitializer(DexField field) {
+  public boolean isFieldWrittenByFieldPutInstruction(DexEncodedField encodedField) {
     assert checkIfObsolete();
-    assert isFieldWritten(field);
-    return staticFieldsWrittenOnlyInEnclosingStaticInitializer.contains(field);
+    DexField field = encodedField.field;
+    FieldAccessInfoImpl info = fieldAccessInfoCollection.get(field);
+    if (info != null && info.isWritten()) {
+      // The field is written directly by the program itself.
+      return true;
+    }
+    if (field.holder.isD8R8SynthesizedClassType()) {
+      // Fields in the class that is synthesized by D8/R8 would be used soon.
+      return true;
+    }
+    if (isLibraryOrClasspathField(encodedField)) {
+      // For library classes we don't know whether a field is rewritten.
+      return true;
+    }
+    return false;
+  }
+
+  public boolean isFieldOnlyWrittenInMethod(DexEncodedField field, DexEncodedMethod method) {
+    assert checkIfObsolete();
+    assert isFieldWritten(field) : "Expected field `" + field.toSourceString() + "` to be written";
+    if (!isPinned(field.field)) {
+      FieldAccessInfo fieldAccessInfo = fieldAccessInfoCollection.get(field.field);
+      return fieldAccessInfo != null
+          && fieldAccessInfo.isWritten()
+          && !fieldAccessInfo.isWrittenOutside(method);
+    }
+    return false;
+  }
+
+  public boolean isInstanceFieldWrittenOnlyInInstanceInitializers(DexEncodedField field) {
+    assert checkIfObsolete();
+    assert isFieldWritten(field) : "Expected field `" + field.toSourceString() + "` to be written";
+    if (isPinned(field.field)) {
+      return false;
+    }
+    FieldAccessInfo fieldAccessInfo = fieldAccessInfoCollection.get(field.field);
+    if (fieldAccessInfo == null || !fieldAccessInfo.isWritten()) {
+      return false;
+    }
+    DexType holder = field.holder();
+    return fieldAccessInfo.isWrittenOnlyInMethodSatisfying(
+        method ->
+            method.getDefinition().isInstanceInitializer() && method.getHolderType() == holder);
+  }
+
+  public boolean isStaticFieldWrittenOnlyInEnclosingStaticInitializer(DexEncodedField field) {
+    assert checkIfObsolete();
+    assert isFieldWritten(field) : "Expected field `" + field.toSourceString() + "` to be written";
+    DexEncodedMethod staticInitializer =
+        definitionFor(field.holder()).asProgramClass().getClassInitializer();
+    return staticInitializer != null && isFieldOnlyWrittenInMethod(field, staticInitializer);
+  }
+
+  public boolean mayPropagateArgumentsTo(ProgramMethod method) {
+    DexMethod reference = method.getReference();
+    return method.getDefinition().hasCode()
+        && !method.getDefinition().isLibraryMethodOverride().isPossiblyTrue()
+        && !neverReprocess.contains(reference)
+        && !keepInfo.getMethodInfo(method).isPinned();
   }
 
   public boolean mayPropagateValueFor(DexReference reference) {
     assert checkIfObsolete();
-    return !neverPropagateValue.contains(reference);
+    return options().enableValuePropagation
+        && !isPinned(reference)
+        && !neverPropagateValue.contains(reference);
   }
 
-  private boolean isLibraryOrClasspathField(DexField field) {
-    DexClass holder = definitionFor(field.holder);
+  private boolean isLibraryOrClasspathField(DexEncodedField field) {
+    DexClass holder = definitionFor(field.holder());
     return holder == null || holder.isLibraryClass() || holder.isClasspathClass();
   }
 
-  private static <T extends PresortedComparable<T>> ImmutableSortedSet<T> rewriteItems(
-      Set<T> original, Function<T, T> rewrite) {
-    ImmutableSortedSet.Builder<T> builder =
-        new ImmutableSortedSet.Builder<>(PresortedComparable::slowCompare);
-    for (T item : original) {
-      builder.add(rewrite.apply(item));
-    }
-    return builder.build();
-  }
-
-  private static <T extends PresortedComparable<T>, S>
-      SortedMap<T, Set<S>> rewriteKeysWhileMergingValues(
-          Map<T, Set<S>> original, Function<T, T> rewrite) {
-    SortedMap<T, Set<S>> result = new TreeMap<>(PresortedComparable::slowCompare);
-    for (T item : original.keySet()) {
-      T rewrittenKey = rewrite.apply(item);
-      result
-          .computeIfAbsent(rewrittenKey, k -> Sets.newIdentityHashSet())
-          .addAll(original.get(item));
-    }
+  private static SortedMap<DexMethod, ProgramMethodSet> rewriteInvokesWithContexts(
+      Map<DexMethod, ProgramMethodSet> invokes, GraphLense lens) {
+    SortedMap<DexMethod, ProgramMethodSet> result = new TreeMap<>(PresortedComparable::slowCompare);
+    invokes.forEach(
+        (method, contexts) ->
+            result
+                .computeIfAbsent(
+                    lens.getRenamedMethodSignature(method), ignore -> ProgramMethodSet.create())
+                .addAll(contexts));
     return Collections.unmodifiableSortedMap(result);
   }
 
-  private static <T extends PresortedComparable<T>, S>
-      SortedMap<T, Set<S>> rewriteKeysConservativelyWhileMergingValues(
-          Map<T, Set<S>> original, Function<T, Set<T>> rewrite) {
-    SortedMap<T, Set<S>> result = new TreeMap<>(PresortedComparable::slowCompare);
-    for (T item : original.keySet()) {
-      Set<T> rewrittenKeys = rewrite.apply(item);
-      for (T rewrittenKey : rewrittenKeys) {
-        result
-            .computeIfAbsent(rewrittenKey, k -> Sets.newIdentityHashSet())
-            .addAll(original.get(item));
-      }
-    }
-    return Collections.unmodifiableSortedMap(result);
-  }
-
-  @Override
-  protected boolean hasAnyInstantiatedLambdas(DexType type) {
+  public boolean isInstantiatedInterface(DexProgramClass clazz) {
     assert checkIfObsolete();
-    return instantiatedLambdas.contains(type);
+    return objectAllocationInfoCollection.isInterfaceWithUnknownSubtypeHierarchy(clazz);
   }
 
   @Override
@@ -754,14 +917,36 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
     return this;
   }
 
-  public boolean isPinned(DexReference reference) {
-    assert checkIfObsolete();
-    return pinnedItems.contains(reference);
+  public boolean isMinificationAllowed(DexReference reference) {
+    return options().isMinificationEnabled()
+        && keepInfo.getInfo(reference, this).isMinificationAllowed(options());
   }
 
-  public Iterable<DexReference> getPinnedItems() {
+  public boolean isAccessModificationAllowed(DexReference reference) {
+    assert options().getProguardConfiguration().isAccessModificationAllowed();
+    return keepInfo.getInfo(reference, this).isAccessModificationAllowed(options());
+  }
+
+  public boolean isPinned(DexReference reference) {
     assert checkIfObsolete();
-    return pinnedItems;
+    return keepInfo.isPinned(reference, this);
+  }
+
+  public boolean hasPinnedInstanceInitializer(DexType type) {
+    assert type.isClassType();
+    DexProgramClass clazz = asProgramClassOrNull(definitionFor(type));
+    if (clazz != null) {
+      for (DexEncodedMethod method : clazz.directMethods()) {
+        if (method.isInstanceInitializer() && isPinned(method.method)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  public KeepInfoCollection getKeepInfo() {
+    return keepInfo;
   }
 
   /**
@@ -769,15 +954,88 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
    * DexApplication object.
    */
   public AppInfoWithLiveness prunedCopyFrom(
-      DexApplication application, Collection<DexType> removedClasses) {
+      DirectMappedDexApplication application,
+      Collection<DexType> removedClasses,
+      Collection<DexReference> additionalPinnedItems) {
     assert checkIfObsolete();
-    return new AppInfoWithLiveness(this, application, removedClasses);
+    if (!removedClasses.isEmpty()) {
+      // Rebuild the hierarchy.
+      objectAllocationInfoCollection.mutate(mutator -> {}, this);
+    }
+    return new AppInfoWithLiveness(this, application, removedClasses, additionalPinnedItems);
   }
 
-  public AppInfoWithLiveness rewrittenWithLense(
-      DirectMappedDexApplication application, GraphLense lense) {
+  public AppInfoWithLiveness rewrittenWithLens(
+      DirectMappedDexApplication application, NestedGraphLense lens) {
     assert checkIfObsolete();
-    return new AppInfoWithLiveness(this, application, lense);
+    // The application has already been rewritten with all of lens' parent lenses. Therefore, we
+    // temporarily replace lens' parent lens with an identity lens to avoid the overhead of
+    // traversing the entire lens chain upon each lookup during the rewriting.
+    return lens.withAlternativeParentLens(
+        GraphLense.getIdentityLense(), () -> createRewrittenAppInfoWithLiveness(application, lens));
+  }
+
+  private AppInfoWithLiveness createRewrittenAppInfoWithLiveness(
+      DirectMappedDexApplication application, NestedGraphLense lens) {
+    // Switchmap classes should never be affected by renaming.
+    assert lens.assertDefinitionsNotModified(
+        switchMaps.keySet().stream()
+            .map(this::resolveField)
+            .filter(FieldResolutionResult::isSuccessfulResolution)
+            .map(FieldResolutionResult::getResolvedField)
+            .collect(Collectors.toList()));
+
+    assert lens.assertDefinitionsNotModified(
+        neverMerge.stream()
+            .map(this::definitionFor)
+            .filter(AssertionUtils::assertNotNull)
+            .collect(Collectors.toList()));
+
+    return new AppInfoWithLiveness(
+        application,
+        deadProtoTypes,
+        missingTypes,
+        lens.rewriteTypes(liveTypes),
+        lens.rewriteTypes(instantiatedAppServices),
+        lens.rewriteMethods(targetedMethods),
+        lens.rewriteMethods(failedResolutionTargets),
+        lens.rewriteMethods(bootstrapMethods),
+        lens.rewriteMethods(methodsTargetedByInvokeDynamic),
+        lens.rewriteMethods(virtualMethodsTargetedByInvokeDirect),
+        lens.rewriteMethods(liveMethods),
+        fieldAccessInfoCollection.rewrittenWithLens(application, lens),
+        objectAllocationInfoCollection.rewrittenWithLens(application, lens),
+        rewriteInvokesWithContexts(virtualInvokes, lens),
+        rewriteInvokesWithContexts(interfaceInvokes, lens),
+        rewriteInvokesWithContexts(superInvokes, lens),
+        rewriteInvokesWithContexts(directInvokes, lens),
+        rewriteInvokesWithContexts(staticInvokes, lens),
+        // TODO(sgjesse): Rewrite call sites as well? Right now they are only used by minification
+        //   after second tree shaking.
+        callSites,
+        keepInfo.rewrite(lens),
+        lens.rewriteReferenceKeys(mayHaveSideEffects),
+        lens.rewriteReferenceKeys(noSideEffects),
+        lens.rewriteReferenceKeys(assumedValues),
+        lens.rewriteMethods(alwaysInline),
+        lens.rewriteMethods(forceInline),
+        lens.rewriteMethods(neverInline),
+        lens.rewriteMethods(whyAreYouNotInlining),
+        lens.rewriteMethods(keepConstantArguments),
+        lens.rewriteMethods(keepUnusedArguments),
+        lens.rewriteMethods(reprocess),
+        lens.rewriteMethods(neverReprocess),
+        alwaysClassInline.rewriteItems(lens::lookupType),
+        lens.rewriteTypes(neverClassInline),
+        lens.rewriteTypes(neverMerge),
+        lens.rewriteReferences(neverPropagateValue),
+        lens.rewriteReferenceKeys(identifierNameStrings),
+        // Don't rewrite pruned types - the removed types are identified by their original name.
+        prunedTypes,
+        lens.rewriteFieldKeys(switchMaps),
+        enumValueInfoMaps.rewrittenWithLens(lens),
+        lens.rewriteTypes(constClassReferences),
+        lens.rewriteTypeKeys(initClassReferences));
   }
 
   /**
@@ -794,7 +1052,11 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
     return prunedTypes;
   }
 
-  public DexEncodedMethod lookup(Type type, DexMethod target, DexType invocationContext) {
+  public DexEncodedMethod lookupSingleTarget(
+      Type type,
+      DexMethod target,
+      ProgramMethod context,
+      LibraryModeledPredicate modeledPredicate) {
     assert checkIfObsolete();
     DexType holder = target.holder;
     if (!holder.isClassType()) {
@@ -802,247 +1064,341 @@ public class AppInfoWithLiveness extends AppInfoWithSubtyping {
     }
     switch (type) {
       case VIRTUAL:
-        return lookupSingleVirtualTarget(target);
+        return lookupSingleVirtualTarget(target, context, false, modeledPredicate);
       case INTERFACE:
-        return lookupSingleInterfaceTarget(target);
+        return lookupSingleVirtualTarget(target, context, true, modeledPredicate);
       case DIRECT:
-        return lookupDirectTarget(target);
+        return lookupDirectTarget(target, context);
       case STATIC:
-        return lookupStaticTarget(target);
+        return lookupStaticTarget(target, context);
       case SUPER:
-        return lookupSuperTarget(target, invocationContext);
+        return lookupSuperTarget(target, context);
       default:
         return null;
     }
   }
 
+  public ProgramMethod lookupSingleProgramTarget(
+      Type type,
+      DexMethod target,
+      ProgramMethod context,
+      LibraryModeledPredicate modeledPredicate) {
+    return asProgramMethodOrNull(lookupSingleTarget(type, target, context, modeledPredicate), this);
+  }
+
   /** For mapping invoke virtual instruction to single target method. */
-  public DexEncodedMethod lookupSingleVirtualTarget(DexMethod method) {
+  public DexEncodedMethod lookupSingleVirtualTarget(
+      DexMethod method, ProgramMethod context, boolean isInterface) {
     assert checkIfObsolete();
-    return lookupSingleVirtualTarget(method, method.holder);
+    return lookupSingleVirtualTarget(
+        method, context, isInterface, type -> false, method.holder, null);
   }
 
-  public DexEncodedMethod lookupSingleVirtualTarget(DexMethod method, DexType refinedReceiverType) {
-    assert checkIfObsolete();
-    // This implements the logic from
-    // https://docs.oracle.com/javase/specs/jvms/se9/html/jvms-6.html#jvms-6.5.invokevirtual
-    assert method != null;
-    assert isSubtype(refinedReceiverType, method.holder);
-    if (method.holder.isArrayType()) {
-      // For javac output this will only be clone(), but in general the methods from Object can
-      // be invoked with an array type holder.
-      return null;
-    }
-    DexClass holder = definitionFor(method.holder);
-    if (holder == null || holder.isNotProgramClass() || holder.isInterface()) {
-      return null;
-    }
-    boolean refinedReceiverIsStrictSubType = refinedReceiverType != method.holder;
-    DexClass refinedHolder =
-        refinedReceiverIsStrictSubType ? definitionFor(refinedReceiverType) : holder;
-    assert refinedHolder != null;
-    assert refinedHolder.isProgramClass();
-    if (method.isSingleVirtualMethodCached(refinedReceiverType)) {
-      return method.getSingleVirtualMethodCache(refinedReceiverType);
-    }
-    // For kept types we cannot ensure a single target.
-    if (pinnedItems.contains(method.holder)) {
-      method.setSingleVirtualMethodCache(refinedReceiverType, null);
-      return null;
-    }
-    // First get the target for the holder type.
-    ResolutionResult topMethod = resolveMethod(method.holder, method);
-    // We might hit none or multiple targets. Both make this fail at runtime.
-    if (!topMethod.hasSingleTarget() || !topMethod.asSingleTarget().isVirtualMethod()) {
-      method.setSingleVirtualMethodCache(refinedReceiverType, null);
-      return null;
-    }
-    // Now, resolve the target with the refined receiver type.
-    if (refinedReceiverIsStrictSubType) {
-      topMethod = resolveMethod(refinedReceiverType, method);
-    }
-    DexEncodedMethod topSingleTarget = topMethod.asSingleTarget();
-    DexClass topHolder = definitionFor(topSingleTarget.method.holder);
-    // We need to know whether the top method is from an interface, as that would allow it to be
-    // shadowed by a default method from an interface further down.
-    boolean topIsFromInterface = topHolder.isInterface();
-    // Now look at all subtypes and search for overrides.
-    DexEncodedMethod result =
-        findSingleTargetFromSubtypes(
-            refinedReceiverType,
-            method,
-            topSingleTarget,
-            !refinedHolder.accessFlags.isAbstract(),
-            topIsFromInterface);
-    // Map the failure case of SENTINEL to null.
-    result = result == DexEncodedMethod.SENTINEL ? null : result;
-    method.setSingleVirtualMethodCache(refinedReceiverType, result);
-    return result;
-  }
-
-  /**
-   * Computes which methods overriding <code>method</code> are visible for the subtypes of type.
-   *
-   * <p><code>candidate</code> is the definition further up the hierarchy that is visible from the
-   * subtypes. If <code>candidateIsReachable</code> is true, the provided candidate is already a
-   * target for a type further up the chain, so anything found in subtypes is a conflict. If it is
-   * false, the target exists but is not reachable from a live type.
-   *
-   * <p>Returns <code>null</code> if the given type has no subtypes or all subtypes are abstract.
-   * Returns {@link DexEncodedMethod#SENTINEL} if multiple live overrides were found. Returns the
-   * single virtual target otherwise.
-   */
-  private DexEncodedMethod findSingleTargetFromSubtypes(
-      DexType type,
+  /** For mapping invoke virtual instruction to single target method. */
+  public DexEncodedMethod lookupSingleVirtualTarget(
       DexMethod method,
-      DexEncodedMethod candidate,
-      boolean candidateIsReachable,
-      boolean checkForInterfaceConflicts) {
-    // If the candidate is reachable, we already have a previous result.
-    DexEncodedMethod result = candidateIsReachable ? candidate : null;
-    if (pinnedItems.contains(type)) {
-      // For kept types we do not know all subtypes, so abort.
-      return DexEncodedMethod.SENTINEL;
+      ProgramMethod context,
+      boolean isInterface,
+      LibraryModeledPredicate modeledPredicate) {
+    assert checkIfObsolete();
+    return lookupSingleVirtualTarget(
+        method, context, isInterface, modeledPredicate, method.holder, null);
+  }
+
+  public DexEncodedMethod lookupSingleVirtualTarget(
+      DexMethod method,
+      ProgramMethod context,
+      boolean isInterface,
+      LibraryModeledPredicate modeledPredicate,
+      DexType refinedReceiverType,
+      ClassTypeElement receiverLowerBoundType) {
+    assert checkIfObsolete();
+    assert refinedReceiverType != null;
+    if (!refinedReceiverType.isClassType()) {
+      // The refined receiver is not of class type and we will not be able to find a single target
+      // (it is either primitive or array).
+      return null;
     }
-    for (DexType subtype : allExtendsSubtypes(type)) {
-      DexClass clazz = definitionFor(subtype);
-      DexEncodedMethod target = clazz.lookupVirtualMethod(method);
-      if (target != null && !target.isPrivateMethod()) {
-        // We found a method on this class. If this class is not abstract it is a runtime
-        // reachable override and hence a conflict.
-        if (!clazz.accessFlags.isAbstract()) {
-          if (result != null && result != target) {
-            // We found a new target on this subtype that does not match the previous one. Fail.
-            return DexEncodedMethod.SENTINEL;
-          }
-          // Add the first or matching target.
-          result = target;
+    DexClass initialResolutionHolder = definitionFor(method.holder);
+    if (initialResolutionHolder == null || initialResolutionHolder.isInterface() != isInterface) {
+      return null;
+    }
+    DexClass refinedReceiverClass = definitionFor(refinedReceiverType);
+    if (refinedReceiverClass == null) {
+      // The refined receiver is not defined in the program and we cannot determine the target.
+      return null;
+    }
+    if (receiverLowerBoundType == null
+        && singleTargetLookupCache.hasCachedItem(refinedReceiverType, method)) {
+      DexEncodedMethod cachedItem =
+          singleTargetLookupCache.getCachedItem(refinedReceiverType, method);
+      return cachedItem;
+    }
+    SingleResolutionResult resolution =
+        resolveMethodOn(initialResolutionHolder, method).asSingleResolution();
+    if (resolution == null
+        || resolution.isAccessibleForVirtualDispatchFrom(context.getHolder(), this).isFalse()) {
+      return null;
+    }
+    // If the method is modeled, return the resolution.
+    DexEncodedMethod resolvedMethod = resolution.getResolvedMethod();
+    if (modeledPredicate.isModeled(resolution.getResolvedHolder().type)) {
+      if (resolution.getResolvedHolder().isFinal()
+          || (resolvedMethod.isFinal() && resolvedMethod.accessFlags.isPublic())) {
+        singleTargetLookupCache.addToCache(refinedReceiverType, method, resolvedMethod);
+        return resolvedMethod;
+      }
+    }
+    DexEncodedMethod exactTarget =
+        getMethodTargetFromExactRuntimeInformation(
+            refinedReceiverType, receiverLowerBoundType, resolution, refinedReceiverClass);
+    if (exactTarget != null) {
+      // We are not caching single targets here because the cache does not include the
+      // lower bound dimension.
+      return exactTarget == DexEncodedMethod.SENTINEL ? null : exactTarget;
+    }
+    if (refinedReceiverClass.isNotProgramClass()) {
+      // The refined receiver is not defined in the program and we cannot determine the target.
+      singleTargetLookupCache.addToCache(refinedReceiverType, method, null);
+      return null;
+    }
+    DexClass resolvedHolder = resolution.getResolvedHolder();
+    // TODO(b/148769279): Disable lookup single target on lambda's for now.
+    if (resolvedHolder.isInterface()
+        && resolvedHolder.isProgramClass()
+        && objectAllocationInfoCollection.isImmediateInterfaceOfInstantiatedLambda(
+            resolvedHolder.asProgramClass())) {
+      singleTargetLookupCache.addToCache(refinedReceiverType, method, null);
+      return null;
+    }
+    DexEncodedMethod singleMethodTarget = null;
+    DexProgramClass refinedLowerBound = null;
+    if (receiverLowerBoundType != null) {
+      DexClass refinedLowerBoundClass = definitionFor(receiverLowerBoundType.getClassType());
+      if (refinedLowerBoundClass != null) {
+        refinedLowerBound = refinedLowerBoundClass.asProgramClass();
+        // TODO(b/154822960): Check if the lower bound is a subtype of the upper bound.
+        if (refinedLowerBound != null && !isSubtype(refinedLowerBound.type, refinedReceiverType)) {
+          refinedLowerBound = null;
         }
       }
-      if (checkForInterfaceConflicts) {
-        // We have to check whether there are any default methods in implemented interfaces.
-        if (interfacesMayHaveDefaultFor(clazz.interfaces, method)) {
+    }
+    LookupResultSuccess lookupResult =
+        resolution
+            .lookupVirtualDispatchTargets(
+                context.getHolder(), this, refinedReceiverClass.asProgramClass(), refinedLowerBound)
+            .asLookupResultSuccess();
+    if (lookupResult != null && !lookupResult.isIncomplete()) {
+      LookupTarget singleTarget = lookupResult.getSingleLookupTarget();
+      if (singleTarget != null && singleTarget.isMethodTarget()) {
+        singleMethodTarget = singleTarget.asMethodTarget().getDefinition();
+      }
+    }
+    if (receiverLowerBoundType == null) {
+      singleTargetLookupCache.addToCache(refinedReceiverType, method, singleMethodTarget);
+    }
+    return singleMethodTarget;
+  }
+
+  private DexEncodedMethod getMethodTargetFromExactRuntimeInformation(
+      DexType refinedReceiverType,
+      ClassTypeElement receiverLowerBoundType,
+      SingleResolutionResult resolution,
+      DexClass refinedReceiverClass) {
+    // If the lower-bound on the receiver type is the same as the upper-bound, then we have exact
+    // runtime type information. In this case, the invoke will dispatch to the resolution result
+    // from the runtime type of the receiver.
+    if (receiverLowerBoundType != null
+        && receiverLowerBoundType.getClassType() == refinedReceiverType) {
+      if (refinedReceiverClass.isProgramClass()) {
+        DexClassAndMethod clazzAndMethod =
+            resolution.lookupVirtualDispatchTarget(refinedReceiverClass.asProgramClass(), this);
+        if (clazzAndMethod == null || isPinned(clazzAndMethod.getDefinition().method)) {
+          // TODO(b/150640456): We should maybe only consider program methods.
           return DexEncodedMethod.SENTINEL;
         }
-      }
-      DexEncodedMethod newCandidate = target == null ? candidate : target;
-      // If we have a new target and did not fail, it is not an override of a reachable method.
-      // Whether the target is actually reachable depends on whether this class is abstract.
-      // If we did not find a new target, the candidate is reachable if it was before, or if this
-      // class is not abstract.
-      boolean newCandidateIsReachable =
-          !clazz.accessFlags.isAbstract() || ((target == null) && candidateIsReachable);
-      DexEncodedMethod subtypeTarget =
-          findSingleTargetFromSubtypes(
-              subtype, method, newCandidate, newCandidateIsReachable, checkForInterfaceConflicts);
-      if (subtypeTarget != null) {
-        // We found a target in the subclasses. If we already have a different result, fail.
-        if (result != null && result != subtypeTarget) {
-          return DexEncodedMethod.SENTINEL;
+        return clazzAndMethod.getDefinition();
+      } else {
+        // TODO(b/150640456): We should maybe only consider program methods.
+        // If we resolved to a method on the refined receiver in the library, then we report the
+        // method as a single target as well. This is a bit iffy since the library could change
+        // implementation, but we use this for library modelling.
+        DexEncodedMethod resolvedMethod = resolution.getResolvedMethod();
+        DexEncodedMethod targetOnReceiver =
+            refinedReceiverClass.lookupVirtualMethod(resolvedMethod.method);
+        if (targetOnReceiver != null && isOverriding(resolvedMethod, targetOnReceiver)) {
+          return targetOnReceiver;
         }
-        // Remember this new result.
-        result = subtypeTarget;
+        return DexEncodedMethod.SENTINEL;
       }
     }
-    return result;
+    return null;
   }
 
-  /**
-   * Checks whether any interface in the given list or their super interfaces implement a default
-   * method.
-   *
-   * <p>This method is conservative for unknown interfaces and interfaces from the library.
-   */
-  private boolean interfacesMayHaveDefaultFor(DexTypeList ifaces, DexMethod method) {
-    for (DexType iface : ifaces.values) {
-      DexClass clazz = definitionFor(iface);
-      if (clazz == null || clazz.isNotProgramClass()) {
-        return true;
-      }
-      DexEncodedMethod candidate = clazz.lookupMethod(method);
-      if (candidate != null && !candidate.accessFlags.isAbstract()) {
-        return true;
-      }
-      if (interfacesMayHaveDefaultFor(clazz.interfaces, method)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  public DexEncodedMethod lookupSingleInterfaceTarget(DexMethod method) {
-    assert checkIfObsolete();
-    return lookupSingleInterfaceTarget(method, method.holder);
-  }
-
-  public DexEncodedMethod lookupSingleInterfaceTarget(
-      DexMethod method, DexType refinedReceiverType) {
-    assert checkIfObsolete();
-    if (instantiatedLambdas.contains(method.holder)) {
-      return null;
-    }
-    DexClass holder = definitionFor(method.holder);
-    if ((holder == null) || holder.isNotProgramClass() || !holder.accessFlags.isInterface()) {
-      return null;
-    }
-    // First check that there is a target for this invoke-interface to hit. If there is none,
-    // this will fail at runtime.
-    ResolutionResult topTarget = resolveMethodOnInterface(method.holder, method);
-    if (topTarget.asResultOfResolve() == null) {
-      return null;
-    }
-    // For kept types we cannot ensure a single target.
-    if (pinnedItems.contains(method.holder)) {
-      return null;
-    }
-    DexEncodedMethod result = null;
-    // The loop will ignore abstract classes that are not kept as they should not be a target
-    // at runtime.
-    Iterable<DexType> subTypesToExplore =
-        refinedReceiverType == method.holder
-            ? subtypes(method.holder)
-            : Iterables.concat(
-                ImmutableList.of(refinedReceiverType), subtypes(refinedReceiverType));
-    for (DexType type : subTypesToExplore) {
-      if (instantiatedLambdas.contains(type)) {
-        return null;
-      }
-      if (pinnedItems.contains(type)) {
-        // For kept classes we cannot ensure a single target.
-        return null;
-      }
-      DexClass clazz = definitionFor(type);
-      if (clazz.isInterface()) {
-        // Default methods are looked up when looking at a specific subtype that does not
-        // override them, so we ignore interface methods here. Otherwise, we would look up
-        // default methods that are factually never used.
-      } else if (!clazz.accessFlags.isAbstract()) {
-        ResolutionResult resolutionResult = resolveMethodOnClass(type, method);
-        if (resolutionResult.hasSingleTarget()) {
-          if ((result != null) && (result != resolutionResult.asSingleTarget())) {
-            return null;
-          } else {
-            result = resolutionResult.asSingleTarget();
-          }
-        } else {
-          // This will fail at runtime.
-          return null;
-        }
-      }
-    }
-    return result == null || !result.isVirtualMethod() ? null : result;
-  }
-
-  public AppInfoWithLiveness addSwitchMaps(Map<DexField, Int2ReferenceMap<DexField>> switchMaps) {
+  public AppInfoWithLiveness withSwitchMaps(Map<DexField, Int2ReferenceMap<DexField>> switchMaps) {
     assert checkIfObsolete();
     assert this.switchMaps.isEmpty();
-    return new AppInfoWithLiveness(this, switchMaps, ordinalsMaps);
+    return new AppInfoWithLiveness(this, switchMaps, enumValueInfoMaps);
   }
 
-  public AppInfoWithLiveness addEnumOrdinalMaps(
-      Map<DexType, Reference2IntMap<DexField>> ordinalsMaps) {
+  public AppInfoWithLiveness withEnumValueInfoMaps(EnumValueInfoMapCollection enumValueInfoMaps) {
     assert checkIfObsolete();
-    assert this.ordinalsMaps.isEmpty();
-    return new AppInfoWithLiveness(this, switchMaps, ordinalsMaps);
+    assert this.enumValueInfoMaps.isEmpty();
+    return new AppInfoWithLiveness(this, switchMaps, enumValueInfoMaps);
+  }
+
+  /**
+   * Visit all class definitions of classpath classes that are referenced in the compilation unit.
+   *
+   * <p>TODO(b/139464956): Only traverse the classpath types referenced from the live program.
+   * Conservatively traces all classpath classes for now.
+   */
+  public void forEachReferencedClasspathClass(Consumer<DexClasspathClass> fn) {
+    app().asDirect().classpathClasses().forEach(fn);
+  }
+
+  /**
+   * Visits all class definitions that are a live program type or a type above it in the hierarchy.
+   *
+   * <p>Any given definition will be visited at most once. No guarantees are places on the order.
+   */
+  public void forEachTypeInHierarchyOfLiveProgramClasses(Consumer<DexClass> fn) {
+    forEachTypeInHierarchyOfLiveProgramClasses(
+        fn, ListUtils.map(liveTypes, t -> definitionFor(t).asProgramClass()), callSites, this);
+  }
+
+  // Split in a static method so it can be used during construction.
+  static void forEachTypeInHierarchyOfLiveProgramClasses(
+      Consumer<DexClass> fn,
+      Collection<DexProgramClass> liveProgramClasses,
+      Set<DexCallSite> callSites,
+      AppInfoWithClassHierarchy appInfo) {
+    Set<DexType> seen = Sets.newIdentityHashSet();
+    Deque<DexType> worklist = new ArrayDeque<>();
+    liveProgramClasses.forEach(c -> seen.add(c.type));
+    for (DexProgramClass liveProgramClass : liveProgramClasses) {
+      fn.accept(liveProgramClass);
+      DexType superType = liveProgramClass.superType;
+      if (superType != null && seen.add(superType)) {
+        worklist.add(superType);
+      }
+      for (DexType iface : liveProgramClass.interfaces.values) {
+        if (seen.add(iface)) {
+          worklist.add(iface);
+        }
+      }
+    }
+    for (DexCallSite callSite : callSites) {
+      List<DexType> interfaces = LambdaDescriptor.getInterfaces(callSite, appInfo);
+      if (interfaces != null) {
+        for (DexType iface : interfaces) {
+          if (seen.add(iface)) {
+            worklist.add(iface);
+          }
+        }
+      }
+    }
+    while (!worklist.isEmpty()) {
+      DexType type = worklist.pop();
+      DexClass clazz = appInfo.definitionFor(type);
+      if (clazz != null) {
+        fn.accept(clazz);
+        if (clazz.superType != null && seen.add(clazz.superType)) {
+          worklist.add(clazz.superType);
+        }
+        for (DexType iface : clazz.interfaces.values) {
+          if (seen.add(iface)) {
+            worklist.add(iface);
+          }
+        }
+      }
+    }
+  }
+
+  @Override
+  public void forEachInstantiatedSubType(
+      DexType type,
+      Consumer<DexProgramClass> subTypeConsumer,
+      Consumer<LambdaDescriptor> callSiteConsumer) {
+    objectAllocationInfoCollection.forEachInstantiatedSubType(
+        type, subTypeConsumer, callSiteConsumer, this);
+  }
+
+  public void forEachInstantiatedSubTypeInChain(
+      DexProgramClass refinedReceiverUpperBound,
+      DexProgramClass refinedReceiverLowerBound,
+      Consumer<DexProgramClass> subTypeConsumer,
+      Consumer<LambdaDescriptor> callSiteConsumer) {
+    List<DexProgramClass> subTypes =
+        computeProgramClassRelationChain(refinedReceiverLowerBound, refinedReceiverUpperBound);
+    for (DexProgramClass subType : subTypes) {
+      if (isInstantiatedOrPinned(subType)) {
+        subTypeConsumer.accept(subType);
+      }
+    }
+  }
+
+  private boolean isInstantiatedOrPinned(DexProgramClass clazz) {
+    return isInstantiatedDirectly(clazz) || isPinned(clazz.type) || isInstantiatedInterface(clazz);
+  }
+
+  public boolean isPinnedNotProgramOrLibraryOverride(DexDefinition definition) {
+    if (isPinned(definition.toReference())) {
+      return true;
+    }
+    if (definition.isDexEncodedMethod()) {
+      DexEncodedMethod method = definition.asDexEncodedMethod();
+      return !method.isProgramMethod(this) || method.isLibraryMethodOverride().isPossiblyTrue();
+    }
+    assert definition.isDexClass();
+    DexClass clazz = definition.asDexClass();
+    return clazz.isNotProgramClass() || isInstantiatedInterface(clazz.asProgramClass());
+  }
+
+  public SubtypingInfo computeSubtypingInfo() {
+    return new SubtypingInfo(app().asDirect().allClasses(), this);
+  }
+
+  public boolean mayHaveFinalizeMethodDirectlyOrIndirectly(ClassTypeElement type) {
+    // Special case for java.lang.Object.
+    if (type.getClassType() == dexItemFactory().objectType) {
+      if (type.getInterfaces().isEmpty()) {
+        // The type java.lang.Object could be any instantiated type. Assume a finalizer exists.
+        return true;
+      }
+      for (DexType iface : type.getInterfaces()) {
+        if (mayHaveFinalizer(iface)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    return mayHaveFinalizer(type.getClassType());
+  }
+
+  private boolean mayHaveFinalizer(DexType type) {
+    // A type may have an active finalizer if any derived instance has a finalizer.
+    return objectAllocationInfoCollection
+        .traverseInstantiatedSubtypes(
+            type,
+            clazz -> {
+              if (objectAllocationInfoCollection.isInterfaceWithUnknownSubtypeHierarchy(clazz)) {
+                return TraversalContinuation.BREAK;
+              } else {
+                SingleResolutionResult resolution =
+                    resolveMethodOn(clazz, dexItemFactory().objectMembers.finalize)
+                        .asSingleResolution();
+                if (resolution != null && resolution.getResolvedHolder().isProgramClass()) {
+                  return TraversalContinuation.BREAK;
+                }
+              }
+              return TraversalContinuation.CONTINUE;
+            },
+            lambda -> {
+              // Lambda classes do not have finalizers.
+              return TraversalContinuation.CONTINUE;
+            },
+            this)
+        .shouldBreak();
   }
 }

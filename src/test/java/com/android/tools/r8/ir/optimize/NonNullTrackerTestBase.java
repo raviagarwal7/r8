@@ -5,26 +5,13 @@ package com.android.tools.r8.ir.optimize;
 
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.ToolHelper;
-import com.android.tools.r8.dex.ApplicationReader;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
-import com.android.tools.r8.graph.AppServices;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexApplication;
-import com.android.tools.r8.utils.AndroidApp;
-import com.android.tools.r8.utils.InternalOptions;
-import com.android.tools.r8.utils.Timing;
 
 public abstract class NonNullTrackerTestBase extends TestBase {
 
-  protected AppView<? extends AppInfo> build(Class<?> mainClass) throws Exception {
-    Timing timing = new Timing(getClass().getSimpleName());
-    AndroidApp app = buildAndroidApp(ToolHelper.getClassAsBytes(mainClass));
-    InternalOptions options = new InternalOptions();
-    DexApplication dexApplication = new ApplicationReader(app, options, timing).read().toDirect();
-    AppView<? extends AppInfo> appView =
-        AppView.createForD8(new AppInfoWithSubtyping(dexApplication), options);
-    appView.setAppServices(AppServices.builder(appView).build());
-    return appView;
+  protected AppView<? extends AppInfoWithClassHierarchy> build(Class<?> mainClass)
+      throws Exception {
+    return computeAppViewWithSubtyping(buildAndroidApp(ToolHelper.getClassAsBytes(mainClass)));
   }
 }

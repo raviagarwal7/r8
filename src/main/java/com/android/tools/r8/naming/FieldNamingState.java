@@ -4,45 +4,44 @@
 
 package com.android.tools.r8.naming;
 
-import static com.android.tools.r8.naming.Minifier.MinifierMemberNamingStrategy.EMPTY_CHAR_ARRAY;
-
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexClass;
-import com.android.tools.r8.graph.DexEncodedField;
-import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramField;
 import com.android.tools.r8.naming.FieldNamingState.InternalState;
-import com.android.tools.r8.utils.StringUtils;
 import java.util.IdentityHashMap;
-import java.util.Iterator;
 import java.util.Map;
+import java.util.function.BiPredicate;
 
 public class FieldNamingState extends FieldNamingStateBase<InternalState> implements Cloneable {
 
   private final ReservedFieldNamingState reservedNames;
   private final MemberNamingStrategy strategy;
+  private final BiPredicate<DexString, ProgramField> isAvailable;
 
-  public FieldNamingState(AppView<? extends AppInfo> appView, MemberNamingStrategy strategy) {
+  public FieldNamingState(
+      AppView<? extends AppInfoWithClassHierarchy> appView, MemberNamingStrategy strategy) {
     this(appView, strategy, new ReservedFieldNamingState(appView));
   }
 
   public FieldNamingState(
-      AppView<? extends AppInfo> appView,
+      AppView<? extends AppInfoWithClassHierarchy> appView,
       MemberNamingStrategy strategy,
       ReservedFieldNamingState reservedNames) {
     this(appView, strategy, reservedNames, new IdentityHashMap<>());
   }
 
   private FieldNamingState(
-      AppView<? extends AppInfo> appView,
+      AppView<? extends AppInfoWithClassHierarchy> appView,
       MemberNamingStrategy strategy,
       ReservedFieldNamingState reservedNames,
       Map<DexType, InternalState> internalStates) {
     super(appView, internalStates);
     this.reservedNames = reservedNames;
     this.strategy = strategy;
+    this.isAvailable =
+        (newName, field) -> !reservedNames.isReserved(newName, field.getReference().type);
   }
 
   public FieldNamingState createChildState(ReservedFieldNamingState reservedNames) {
@@ -52,19 +51,13 @@ public class FieldNamingState extends FieldNamingStateBase<InternalState> implem
     return childState;
   }
 
-  public DexString getOrCreateNameFor(DexField field) {
-    DexEncodedField encodedField = appView.appInfo().resolveField(field);
-    if (encodedField != null) {
-      DexClass clazz = appView.definitionFor(encodedField.field.holder);
-      if (clazz == null || clazz.isLibraryClass()) {
-        return field.name;
-      }
-      if (!appView.options().getProguardConfiguration().hasApplyMappingFile()
-          && appView.rootSet().noObfuscation.contains(encodedField.field)) {
-        return field.name;
-      }
+  public DexString getOrCreateNameFor(ProgramField field) {
+    DexString reservedName = strategy.getReservedName(field.getDefinition(), field.getHolder());
+    if (reservedName != null) {
+      return reservedName;
     }
-    return getOrCreateInternalState(field).createNewName(field);
+    // TODO(b/133208730) If we cannot resolve the field, are we then allowed to rename it?
+    return getOrCreateInternalState(field.getReference()).createNewName(field);
   }
 
   public void includeReservations(ReservedFieldNamingState reservedNames) {
@@ -85,46 +78,45 @@ public class FieldNamingState extends FieldNamingStateBase<InternalState> implem
     return new FieldNamingState(appView, strategy, reservedNames, internalStatesClone);
   }
 
-  class InternalState implements Cloneable {
+  class InternalState implements InternalNamingState, Cloneable {
 
-    private final Iterator<String> dictionaryIterator;
+    private int dictionaryIndex;
     private int nextNameIndex;
 
     public InternalState() {
-      this(1, appView.options().getProguardConfiguration().getObfuscationDictionary().iterator());
+      this(1, 0);
     }
 
-    public InternalState(int nextNameIndex, Iterator<String> dictionaryIterator) {
-      this.dictionaryIterator = dictionaryIterator;
+    public InternalState(int nextNameIndex, int dictionaryIndex) {
+      this.dictionaryIndex = dictionaryIndex;
       this.nextNameIndex = nextNameIndex;
     }
 
-    public DexString createNewName(DexField field) {
-      DexString name;
-      do {
-        name = nextNameAccordingToStrategy(field);
-      } while (reservedNames.isReserved(name, field.type)
-          && !strategy.breakOnNotAvailable(field, name));
+    public DexString createNewName(ProgramField field) {
+      DexString name = strategy.next(field, this, isAvailable);
+      assert !reservedNames.isReserved(name, field.getReference().type);
       return name;
-    }
-
-    private DexString nextNameAccordingToStrategy(DexField field) {
-      if (!strategy.bypassDictionary() && dictionaryIterator.hasNext()) {
-        return appView.dexItemFactory().createString(dictionaryIterator.next());
-      } else {
-        return strategy.next(field, this);
-      }
-    }
-
-    public DexString nextNameAccordingToState() {
-      return appView
-          .dexItemFactory()
-          .createString(StringUtils.numberToIdentifier(EMPTY_CHAR_ARRAY, nextNameIndex++, false));
     }
 
     @Override
     public InternalState clone() {
-      return new InternalState(nextNameIndex, dictionaryIterator);
+      return new InternalState(nextNameIndex, dictionaryIndex);
+    }
+
+    @Override
+    public int getDictionaryIndex() {
+      return dictionaryIndex;
+    }
+
+    @Override
+    public int incrementDictionaryIndex() {
+      return dictionaryIndex++;
+    }
+
+    @Override
+    public int incrementNameIndex(boolean isDirectMethodCall) {
+      assert !isDirectMethodCall;
+      return nextNameIndex++;
     }
   }
 }

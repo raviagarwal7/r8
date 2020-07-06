@@ -5,9 +5,12 @@
 package com.android.tools.r8.utils;
 
 import static com.android.tools.r8.utils.FileUtils.CLASS_EXTENSION;
+import static com.android.tools.r8.utils.FileUtils.MODULES_PREFIX;
 
 import com.android.tools.r8.errors.CompilationError;
+import com.android.tools.r8.errors.InvalidDescriptorException;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.google.common.collect.ImmutableMap;
@@ -94,6 +97,23 @@ public class DescriptorUtils {
   }
 
   /**
+   * Produces an array descriptor having the number of dimensions specified and the
+   * baseTypeDescriptor as base.
+   *
+   * @param dimensions number of dimensions
+   * @param baseTypeDescriptor the base type
+   * @return the descriptor string
+   */
+  public static String toArrayDescriptor(int dimensions, String baseTypeDescriptor) {
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < dimensions; i++) {
+      sb.append('[');
+    }
+    sb.append(baseTypeDescriptor);
+    return sb.toString();
+  }
+
+  /**
    * Determine the given {@param typeName} is a valid jvms binary name or not (jvms 4.2.1).
    *
    * @param typeName the jvms binary name
@@ -157,6 +177,16 @@ public class DescriptorUtils {
   }
 
   /**
+   * Convert a descriptor to a classifier in Kotlin metadata
+   * @param descriptor like "Lorg/foo/bar/Baz$Nested;"
+   * @return className "org/foo/bar/Baz.Nested"
+   */
+  public static String descriptorToKotlinClassifier(String descriptor) {
+    return getBinaryNameFromDescriptor(descriptor)
+        .replace(INNER_CLASS_SEPARATOR, JAVA_PACKAGE_SEPARATOR);
+  }
+
+  /**
    * Convert a type descriptor to a Java type name. Will also deobfuscate class names if a
    * class mapper is provided.
    *
@@ -175,11 +205,38 @@ public class DescriptorUtils {
             classNameMapper == null ? clazz : classNameMapper.deobfuscateClassName(clazz);
         return originalName;
       case '[':
-        return descriptorToJavaType(descriptor.substring(1, descriptor.length()), classNameMapper)
-            + "[]";
+        return descriptorToJavaType(descriptor.substring(1), classNameMapper) + "[]";
       default:
         return primitiveDescriptorToJavaType(c);
     }
+  }
+
+  public static boolean isPrimitiveDescriptor(String descriptor) {
+    if (descriptor.length() != 1) {
+      return false;
+    }
+    return isPrimitiveType(descriptor.charAt(0));
+  }
+
+  public static boolean isPrimitiveType(char c) {
+    return c == 'Z' || c == 'B' || c == 'S' || c == 'C' || c == 'I' || c == 'F' || c == 'J'
+        || c == 'D';
+  }
+
+  public static boolean isArrayDescriptor(String descriptor) {
+    if (descriptor.length() < 2) {
+      return false;
+    }
+    if (descriptor.charAt(0) == '[') {
+      return isDescriptor(descriptor.substring(1));
+    }
+    return false;
+  }
+
+  public static boolean isDescriptor(String descriptor) {
+    return isClassDescriptor(descriptor)
+        || isPrimitiveDescriptor(descriptor)
+        || isArrayDescriptor(descriptor);
   }
 
   public static String primitiveDescriptorToJavaType(char primitive) {
@@ -281,6 +338,14 @@ public class DescriptorUtils {
     return className.replace(JAVA_PACKAGE_SEPARATOR, DESCRIPTOR_PACKAGE_SEPARATOR);
   }
 
+  public static String getJavaTypeFromBinaryName(String className) {
+    return className.replace(DESCRIPTOR_PACKAGE_SEPARATOR, JAVA_PACKAGE_SEPARATOR);
+  }
+
+  public static String getBinaryNameFromDescriptor(String classDescriptor) {
+    assert isClassDescriptor(classDescriptor);
+    return classDescriptor.substring(1, classDescriptor.length() - 1);
+  }
 
   /**
    * Convert a class binary name to a descriptor.
@@ -290,7 +355,18 @@ public class DescriptorUtils {
    */
   public static String getDescriptorFromClassBinaryName(String typeBinaryName) {
     assert typeBinaryName != null;
-    return ('L' + typeBinaryName + ';');
+    return 'L' + typeBinaryName + ';';
+  }
+
+  /**
+   * Convert a fully qualified name of a classifier in Kotlin metadata to a descriptor.
+   * @param className "org/foo/bar/Baz.Nested"
+   * @return a class descriptor like "Lorg/foo/bar/Baz$Nested;"
+   */
+  public static String getDescriptorFromKotlinClassifier(String className) {
+    assert className != null;
+    assert !className.contains("[") : className;
+    return 'L' + className.replace(JAVA_PACKAGE_SEPARATOR, INNER_CLASS_SEPARATOR) + ';';
   }
 
   /**
@@ -310,22 +386,28 @@ public class DescriptorUtils {
   }
 
   public static String computeInnerClassSeparator(
-      DexType outerClass, DexType innerClass, String innerName, InternalOptions options) {
-    String outerInternalRaw = outerClass.getInternalName();
-    String innerInternalRaw = innerClass.getInternalName();
+      DexType outerClass, DexType innerClass, DexString innerName) {
+    assert innerClass != null;
+    // Filter out non-member classes ahead.
+    if (outerClass == null || innerName == null) {
+      return String.valueOf(INNER_CLASS_SEPARATOR);
+    }
+    return computeInnerClassSeparator(
+        outerClass.getInternalName(), innerClass.getInternalName(), innerName.toString());
+  }
+
+  public static String computeInnerClassSeparator(
+      String outerDescriptor, String innerDescriptor, String innerName) {
+    assert innerName != null && !innerName.isEmpty();
     // outer-internal<separator>inner-name == inner-internal
-    if (outerInternalRaw.length() + innerName.length() > innerInternalRaw.length()) {
+    if (outerDescriptor.length() + innerName.length() > innerDescriptor.length()) {
       return null;
     }
     String separator =
-        innerInternalRaw.substring(
-            outerInternalRaw.length(), innerInternalRaw.length() - innerName.length());
+        innerDescriptor.substring(
+            outerDescriptor.length(), innerDescriptor.length() - innerName.length());
     // Any non-$ separator results in a runtime exception in getCanonicalName.
     if (!separator.startsWith(String.valueOf(INNER_CLASS_SEPARATOR))) {
-      // But, if the minification is enabled, we can choose $ separator.
-      if (options.isMinifying()) {
-        return String.valueOf(INNER_CLASS_SEPARATOR);
-      }
       return null;
     }
     return separator;
@@ -423,6 +505,51 @@ public class DescriptorUtils {
     return 'L' + descriptor + ';';
   }
 
+  public static boolean isValidBinaryName(String binaryName) {
+    return isValidJavaType(
+        binaryName.replace(DESCRIPTOR_PACKAGE_SEPARATOR, JAVA_PACKAGE_SEPARATOR));
+  }
+
+  public static class ModuleAndDescriptor {
+    private final String module;
+    private final String descriptor;
+
+    ModuleAndDescriptor(String module, String descriptor) {
+      this.module = module;
+      this.descriptor = descriptor;
+    }
+
+    public String getModule() {
+      return module;
+    }
+
+    public String getDescriptor() {
+      return descriptor;
+    }
+  }
+
+  /**
+   * Guess module and class descriptor from the location of a class file in a jrt file system.
+   *
+   * @param name the location in a jrt file system of the class file to convert to descriptor
+   * @return module and java class descriptor
+   */
+  public static ModuleAndDescriptor guessJrtModuleAndTypeDescriptor(String name) {
+    assert name != null;
+    assert name.endsWith(CLASS_EXTENSION)
+        : "Name " + name + " must have " + CLASS_EXTENSION + " suffix";
+    assert name.startsWith(MODULES_PREFIX)
+        : "Name " + name + " must have " + MODULES_PREFIX + " prefix";
+    assert name.charAt(MODULES_PREFIX.length()) == '/';
+    int moduleNameEnd = name.indexOf('/', MODULES_PREFIX.length() + 1);
+    String module = name.substring(MODULES_PREFIX.length() + 1, moduleNameEnd);
+    String descriptor = name.substring(moduleNameEnd + 1, name.length() - CLASS_EXTENSION.length());
+    if (descriptor.indexOf(JAVA_PACKAGE_SEPARATOR) != -1) {
+      throw new CompilationError("Unexpected class file name: " + name);
+    }
+    return new ModuleAndDescriptor(module, 'L' + descriptor + ';');
+  }
+
   public static String getPathFromDescriptor(String descriptor) {
     // We are quite loose on names here to support testing illegal names, too.
     assert descriptor.startsWith("L");
@@ -430,8 +557,99 @@ public class DescriptorUtils {
     return descriptor.substring(1, descriptor.length() - 1) + ".class";
   }
 
+  public static String getPathFromJavaType(Class<?> clazz) {
+    return getPathFromJavaType(clazz.getTypeName());
+  }
+
   public static String getPathFromJavaType(String typeName) {
     assert isValidJavaType(typeName);
     return typeName.replace(JAVA_PACKAGE_SEPARATOR, DESCRIPTOR_PACKAGE_SEPARATOR) + ".class";
+  }
+
+  public static String getClassFileName(String classDescriptor) {
+    assert classDescriptor != null && isClassDescriptor(classDescriptor);
+    return getClassBinaryNameFromDescriptor(classDescriptor) + CLASS_EXTENSION;
+  }
+
+  public static String getReturnTypeDescriptor(final String methodDescriptor) {
+    assert methodDescriptor.indexOf(')') != -1;
+    return methodDescriptor.substring(methodDescriptor.indexOf(')') + 1);
+  }
+
+  public static String getShortyDescriptor(String descriptor) {
+    if (descriptor.length() == 1) {
+      return descriptor;
+    }
+    assert descriptor.charAt(0) == 'L' || descriptor.charAt(0) == '[';
+    return "L";
+  }
+
+  public static String[] getArgumentTypeDescriptors(final String methodDescriptor) {
+    String[] argDescriptors = new String[getArgumentCount(methodDescriptor)];
+    int charIdx = 1;
+    char c;
+    int argIdx = 0;
+    int startType;
+    while ((c = methodDescriptor.charAt(charIdx)) != ')') {
+      switch (c) {
+        case 'V':
+          throw new InvalidDescriptorException(methodDescriptor);
+        case 'Z':
+        case 'C':
+        case 'B':
+        case 'S':
+        case 'I':
+        case 'F':
+        case 'J':
+        case 'D':
+          argDescriptors[argIdx++] = Character.toString(c);
+          break;
+        case '[':
+          startType = charIdx;
+          while (methodDescriptor.charAt(++charIdx) == '[')
+            ;
+          if (methodDescriptor.charAt(charIdx) == 'L') {
+            while (methodDescriptor.charAt(++charIdx) != ';')
+              ;
+          }
+          argDescriptors[argIdx++] = methodDescriptor.substring(startType, charIdx + 1);
+          break;
+        case 'L':
+          startType = charIdx;
+          while (methodDescriptor.charAt(++charIdx) != ';')
+            ;
+          argDescriptors[argIdx++] = methodDescriptor.substring(startType, charIdx + 1);
+          break;
+        default:
+          throw new InvalidDescriptorException(methodDescriptor);
+      }
+      charIdx++;
+    }
+    return argDescriptors;
+  }
+
+  public static int getArgumentCount(final String methodDescriptor) {
+    int length = methodDescriptor.length();
+    int charIdx = 1;
+    char c;
+    int argCount = 0;
+    while (charIdx < length && (c = methodDescriptor.charAt(charIdx++)) != ')') {
+      if (c == 'L') {
+        while (charIdx < length && methodDescriptor.charAt(charIdx++) != ';')
+          ;
+        // Check if the inner loop found ';' within the boundary.
+        if (charIdx >= length || methodDescriptor.charAt(charIdx - 1) != ';') {
+          throw new InvalidDescriptorException(methodDescriptor);
+        }
+        argCount++;
+      } else if (c != '[') {
+        argCount++;
+      }
+    }
+    // Check if the outer loop found ')' within the boundary.
+    if (charIdx >= length || methodDescriptor.charAt(charIdx - 1) != ')') {
+      throw new InvalidDescriptorException(methodDescriptor);
+    }
+    return argCount;
   }
 }

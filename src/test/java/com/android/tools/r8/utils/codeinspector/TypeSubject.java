@@ -40,6 +40,28 @@ public class TypeSubject extends Subject {
     return dexType == type.dexType;
   }
 
+  public boolean is(ClassSubject type) {
+    return dexType == type.getDexProgramClass().type;
+  }
+
+  @Override
+  public boolean equals(Object other) {
+    if (this == other) {
+      return true;
+    }
+    if (other instanceof TypeSubject) {
+      TypeSubject o = (TypeSubject) other;
+      assert codeInspector == o.codeInspector;
+      return codeInspector == o.codeInspector && dexType == o.dexType;
+    }
+    return false;
+  }
+
+  @Override
+  public int hashCode() {
+    return dexType.hashCode();
+  }
+
   public String toString() {
     return dexType.toSourceString();
   }

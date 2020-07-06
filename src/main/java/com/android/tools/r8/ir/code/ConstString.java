@@ -3,19 +3,24 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
+import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
+
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.cf.code.CfConstString;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexString;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
+import com.android.tools.r8.ir.analysis.value.AbstractValue;
+import com.android.tools.r8.ir.analysis.value.UnknownValue;
 import com.android.tools.r8.ir.code.BasicBlock.ThrowingInfo;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import java.io.UTFDataFormatException;
 
 public class ConstString extends ConstInstruction {
@@ -30,19 +35,23 @@ public class ConstString extends ConstInstruction {
   }
 
   @Override
+  public int opcode() {
+    return Opcodes.CONST_STRING;
+  }
+
+  @Override
   public <T> T accept(InstructionVisitor<T> visitor) {
     return visitor.visit(this);
   }
 
   public static ConstString copyOf(IRCode code, ConstString original) {
     Value newValue =
-        new Value(code.valueNumberGenerator.next(),
-            original.outValue().getTypeLattice(),
-            original.getLocalInfo());
+        new Value(code.valueNumberGenerator.next(), original.getOutType(), original.getLocalInfo());
     return copyOf(newValue, original);
   }
 
   public static ConstString copyOf(Value newValue, ConstString original) {
+    assert newValue != original.outValue();
     return new ConstString(newValue, original.getValue(), original.throwingInfo);
   }
 
@@ -52,6 +61,11 @@ public class ConstString extends ConstInstruction {
 
   public DexString getValue() {
     return value;
+  }
+
+  @Override
+  public boolean instructionTypeCanBeCanonicalized() {
+    return true;
   }
 
   @Override
@@ -120,9 +134,12 @@ public class ConstString extends ConstInstruction {
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
     // No side-effect, such as throwing an exception, in CF.
-    return appView.options().isGeneratingClassFiles() || !instructionInstanceCanThrow();
+    if (appView.options().isGeneratingClassFiles() || !instructionInstanceCanThrow()) {
+      return DeadInstructionResult.deadIfOutValueIsDead();
+    }
+    return DeadInstructionResult.notDead();
   }
 
   @Override
@@ -136,13 +153,34 @@ public class ConstString extends ConstInstruction {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return appView.dexItemFactory().stringType;
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.stringClassType(appView, Nullability.definitelyNotNull());
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.stringClassType(appView, definitelyNotNull());
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
+  }
+
+  @Override
+  public AbstractValue getAbstractValue(
+      AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    if (!instructionInstanceCanThrow()) {
+      return appView.abstractValueFactory().createSingleStringValue(value);
+    }
+    return UnknownValue.getInstance();
+  }
+
+  @Override
+  public boolean verifyTypes(AppView<?> appView) {
+    assert super.verifyTypes(appView);
+    TypeElement expectedType = TypeElement.stringClassType(appView, definitelyNotNull());
+    assert getOutType().equals(expectedType);
+    return true;
   }
 }

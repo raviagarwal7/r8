@@ -1,4 +1,4 @@
-// Copyright (c) 2018, the R8 project authors. Please see the AUTHORS file
+// Copyright (c) 2019, the R8 project authors. Please see the AUTHORS file
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
@@ -9,13 +9,11 @@ import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
 import com.android.tools.r8.TestRunResult;
-import com.android.tools.r8.ToolHelper;
 import com.android.tools.r8.ToolHelper.DexVm;
-import com.android.tools.r8.utils.FileUtils;
+import com.android.tools.r8.retrace.Retrace;
+import com.android.tools.r8.retrace.RetraceCommand;
 import com.android.tools.r8.utils.StringUtils;
 import com.google.common.base.Equivalence;
-import java.io.IOException;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Predicate;
@@ -24,12 +22,82 @@ import org.hamcrest.Description;
 import org.hamcrest.Matcher;
 import org.hamcrest.TypeSafeMatcher;
 
-class StackTrace {
+public class StackTrace {
 
   public static String AT_PREFIX = "at ";
   public static String TAB_AT_PREFIX = "\t" + AT_PREFIX;
 
-  static class StackTraceLine {
+  public static class Builder {
+
+    private List<StackTraceLine> stackTraceLines = new ArrayList<>();
+
+    private Builder() {}
+
+    public Builder add(StackTraceLine line) {
+      stackTraceLines.add(line);
+      return this;
+    }
+
+    public Builder addWithoutFileNameAndLineNumber(Class<?> clazz, String methodName) {
+      return addWithoutFileNameAndLineNumber(clazz.getTypeName(), methodName);
+    }
+
+    public Builder addWithoutFileNameAndLineNumber(String className, String methodName) {
+      stackTraceLines.add(
+          StackTraceLine.builder().setClassName(className).setMethodName(methodName).build());
+      return this;
+    }
+
+    public StackTrace build() {
+      return new StackTrace(
+          stackTraceLines,
+          StringUtils.join(
+              stackTraceLines.stream().map(StackTraceLine::toString).collect(Collectors.toList()),
+              "\n"));
+    }
+  }
+
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  public static class StackTraceLine {
+
+    public static class Builder {
+      private String className;
+      private String methodName;
+      private String fileName;
+      private int lineNumber = -1;
+
+      private Builder() {}
+
+      public Builder setClassName(String className) {
+        this.className = className;
+        return this;
+      }
+
+      public Builder setMethodName(String methodName) {
+        this.methodName = methodName;
+        return this;
+      }
+
+      public Builder setFileName(String fileName) {
+        this.fileName = fileName;
+        return this;
+      }
+
+      public Builder setLineNumber(int lineNumber) {
+        this.lineNumber = lineNumber;
+        return this;
+      }
+
+      public StackTraceLine build() {
+        String lineNumberPart = lineNumber >= 0 ? ":" + lineNumber : "";
+        String originalLine = className + '.' + methodName + '(' + fileName + lineNumberPart + ')';
+        return new StackTraceLine(originalLine, className, methodName, fileName, lineNumber);
+      }
+    }
+
     public final String originalLine;
     public final String className;
     public final String methodName;
@@ -43,6 +111,10 @@ class StackTrace {
       this.methodName = methodName;
       this.fileName = fileName;
       this.lineNumber = lineNumber;
+    }
+
+    public static Builder builder() {
+      return new Builder();
     }
 
     public boolean hasLineNumber() {
@@ -133,7 +205,11 @@ class StackTrace {
     return originalStderr;
   }
 
-  public static StackTrace extractFromArt(String stderr) {
+  public List<StackTraceLine> getStackTraceLines() {
+    return stackTraceLines;
+  }
+
+  public static StackTrace extractFromArt(String stderr, DexVm vm) {
     List<StackTraceLine> stackTraceLines = new ArrayList<>();
     List<String> stderrLines = StringUtils.splitLines(stderr);
 
@@ -157,17 +233,9 @@ class StackTrace {
     // \tat com.android.tools.r8.naming.retrace.Main.a(:150)
     // \tat com.android.tools.r8.naming.retrace.Main.a(:156)
     // \tat com.android.tools.r8.naming.retrace.Main.main(:162)
-    int last = stderrLines.size();
-    // Skip the bottom frame "dalvik.system.NativeStart.main" if present.
-    if (ToolHelper.getDexVm().isOlderThanOrEqual(DexVm.ART_4_4_4_HOST)
-        && stderrLines.get(last - 1).contains("dalvik.system.NativeStart.main")) {
-      last--;
-    }
-    // Take all lines from the bottom starting with "\tat ".
-    int first = last;
     // TODO(122940268): Remove test code when fixed.
     System.out.println("TOTAL STDERR LINES: " + stderrLines.size());
-    for (int i = 0; i < last; i++) {
+    for (int i = 0; i < stderrLines.size(); i++) {
       System.out.print("LINE " + i + ": " + stderrLines.get(i));
       if (stderrLines.get(i).length() > 3) {
         System.out.print(" (" + ((int) stderrLines.get(i).charAt(0)));
@@ -176,18 +244,21 @@ class StackTrace {
       } else {
         System.out.print(" (less than three chars)");
       }
-     if (stderrLines.get(i).startsWith(TAB_AT_PREFIX)) {
+      if (stderrLines.get(i).startsWith(TAB_AT_PREFIX)) {
         System.out.println(" IS STACKTRACE LINE");
       } else {
         System.out.println(" IS NOT STACKTRACE LINE");
       }
     }
-    while (first - 1 >= 0 && stderrLines.get(first - 1).startsWith(TAB_AT_PREFIX)) {
-      first--;
-    }
-    System.out.println("STACKTRACE LINES ARE " + first + " to " + (last - 1));
-    for (int i = first; i < last; i++) {
-      stackTraceLines.add(StackTraceLine.parse(stderrLines.get(i)));
+    for (int i = 0; i < stderrLines.size(); i++) {
+      String line = stderrLines.get(i);
+      // Find all lines starting with "\tat" except "dalvik.system.NativeStart.main" frame
+      // if present.
+      if (line.startsWith(TAB_AT_PREFIX)
+          && !(vm.isOlderThanOrEqual(DexVm.ART_4_4_4_HOST)
+              && line.contains("dalvik.system.NativeStart.main"))) {
+        stackTraceLines.add(StackTraceLine.parse(stderrLines.get(i)));
+      }
     }
     return new StackTrace(stackTraceLines, stderr);
   }
@@ -208,22 +279,27 @@ class StackTrace {
     return extractFromJvm(result.getStdErr());
   }
 
-  public StackTrace retrace(String map, Path tempFolder) throws IOException {
-    Path mapFile = tempFolder.resolve("map");
-    Path stackTraceFile = tempFolder.resolve("stackTrace");
-    FileUtils.writeTextFile(mapFile, map);
-    FileUtils.writeTextFile(
-        stackTraceFile,
-        stackTraceLines.stream().map(line -> line.originalLine).collect(Collectors.toList()));
+  public StackTrace retrace(String map) {
+    class Box {
+      List<String> result;
+    }
+    Box box = new Box();
+    Retrace.run(
+        RetraceCommand.builder()
+            .setProguardMapProducer(() -> map)
+            .setStackTrace(
+                stackTraceLines.stream()
+                    .map(line -> line.originalLine)
+                    .collect(Collectors.toList()))
+            .setRetracedStackTraceConsumer(retraced -> box.result = retraced)
+            .build());
     // Keep the original stderr in the retraced stacktrace.
-    return new StackTrace(
-        internalExtractFromJvm(ToolHelper.runRetrace(mapFile, stackTraceFile)), originalStderr);
+    return new StackTrace(internalExtractFromJvm(StringUtils.lines(box.result)), originalStderr);
   }
 
   public StackTrace filter(Predicate<StackTraceLine> filter) {
     return new StackTrace(
-        stackTraceLines.stream().filter(filter).collect(Collectors.toList()),
-        originalStderr);
+        stackTraceLines.stream().filter(filter).collect(Collectors.toList()), originalStderr);
   }
 
   @Override

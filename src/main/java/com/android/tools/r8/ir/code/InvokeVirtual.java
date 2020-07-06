@@ -3,31 +3,42 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
+import static com.android.tools.r8.ir.analysis.type.TypeAnalysis.toRefinedReceiverType;
+
 import com.android.tools.r8.cf.code.CfInvoke;
 import com.android.tools.r8.code.InvokeVirtualRange;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
-import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import java.util.Collection;
 import java.util.List;
-import org.objectweb.asm.Opcodes;
 
 public class InvokeVirtual extends InvokeMethodWithReceiver {
 
   public InvokeVirtual(DexMethod target, Value result, List<Value> arguments) {
     super(target, result, arguments);
+  }
+
+  @Override
+  public boolean getInterfaceBit() {
+    return false;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INVOKE_VIRTUAL;
   }
 
   @Override
@@ -85,64 +96,68 @@ public class InvokeVirtual extends InvokeMethodWithReceiver {
   }
 
   @Override
-  public DexEncodedMethod lookupSingleTarget(AppInfoWithLiveness appInfo,
-      DexType invocationContext) {
-    DexType refinedReceiverType = TypeAnalysis.getRefinedReceiverType(appInfo, this);
-    DexMethod method = getInvokedMethod();
-    return appInfo.lookupSingleVirtualTarget(method, refinedReceiverType);
+  public DexEncodedMethod lookupSingleTarget(
+      AppView<?> appView,
+      ProgramMethod context,
+      TypeElement receiverUpperBoundType,
+      ClassTypeElement receiverLowerBoundType) {
+    return lookupSingleTarget(
+        appView, context, receiverUpperBoundType, receiverLowerBoundType, getInvokedMethod());
   }
 
-  @Override
-  public Collection<DexEncodedMethod> lookupTargets(AppInfoWithSubtyping appInfo,
-      DexType invocationContext) {
-    return appInfo.lookupVirtualTargets(getInvokedMethod());
+  public static DexEncodedMethod lookupSingleTarget(
+      AppView<?> appView,
+      ProgramMethod context,
+      TypeElement receiverUpperBoundType,
+      ClassTypeElement receiverLowerBoundType,
+      DexMethod method) {
+    if (appView.appInfo().hasLiveness()) {
+      AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
+      return appViewWithLiveness
+          .appInfo()
+          .lookupSingleVirtualTarget(
+              method,
+              context,
+              false,
+              appView,
+              toRefinedReceiverType(receiverUpperBoundType, method, appViewWithLiveness),
+              receiverLowerBoundType);
+    }
+    // In D8, allow lookupSingleTarget() to be used for finding final library methods. This is used
+    // for library modeling.
+    DexType holder = method.holder;
+    if (holder.isClassType()) {
+      DexClass clazz = appView.definitionFor(holder);
+      if (clazz != null
+          && (clazz.isLibraryClass() || appView.libraryMethodOptimizer().isModeled(clazz.type))) {
+        DexEncodedMethod singleTargetCandidate = clazz.lookupMethod(method);
+        if (singleTargetCandidate != null && (clazz.isFinal() || singleTargetCandidate.isFinal())) {
+          return singleTargetCandidate;
+        }
+      }
+    }
+    return null;
   }
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInvokeVirtual(getInvokedMethod(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInvokeVirtual(getInvokedMethod(), context.getHolder());
   }
 
   @Override
   public void buildCf(CfBuilder builder) {
-    builder.add(new CfInvoke(Opcodes.INVOKEVIRTUAL, getInvokedMethod(), false));
+    builder.add(new CfInvoke(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, getInvokedMethod(), false));
   }
 
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forInvokeVirtual(
         this, clazz, context, appView, mode, assumption);
-  }
-
-  @Override
-  public boolean instructionMayHaveSideEffects(
-      AppView<? extends AppInfo> appView, DexType context) {
-    if (appView.options().debug) {
-      return true;
-    }
-
-    // Check if it could throw a NullPointerException as a result of the receiver being null.
-    Value receiver = getReceiver();
-    if (receiver.getTypeLattice().isNullable()) {
-      return true;
-    }
-
-    // Check if it is a call to one of java.lang.Class.get*Name().
-    if (appView.dexItemFactory().classMethods.isReflectiveNameLookup(getInvokedMethod())) {
-      return false;
-    }
-
-    return true;
-  }
-
-  @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    return !instructionMayHaveSideEffects(appView, code.method.method.holder);
   }
 }

@@ -11,7 +11,6 @@ import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.utils.ListUtils;
-import com.android.tools.r8.utils.Timing;
 import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.Collection;
@@ -31,13 +30,13 @@ public class MinifierTest extends NamingTestBase {
       String test,
       List<String> keepRulesFiles,
       BiConsumer<DexItemFactory, NamingLens> inspection) {
-    super(test, keepRulesFiles, inspection, new Timing("MinifierTest"));
+    super(test, keepRulesFiles, inspection);
   }
 
   @Test
   public void minifierTest() throws Exception {
     NamingLens naming = runMinifier(ListUtils.map(keepRulesFiles, Paths::get));
-    inspection.accept(dexItemFactory, naming);
+    inspection.accept(naming);
   }
 
   @Parameters(name = "test: {0} keep: {1}")

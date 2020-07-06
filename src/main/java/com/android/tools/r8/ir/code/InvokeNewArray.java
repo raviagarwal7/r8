@@ -8,11 +8,13 @@ import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.code.FilledNewArray;
 import com.android.tools.r8.code.FilledNewArrayRange;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AccessControl;
 import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -26,6 +28,11 @@ public class InvokeNewArray extends Invoke {
   public InvokeNewArray(DexType type, Value result, List<Value> arguments) {
     super(result, arguments);
     this.type = type;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INVOKE_NEW_ARRAY;
   }
 
   @Override
@@ -98,13 +105,13 @@ public class InvokeNewArray extends Invoke {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInvokeNewArray(type, invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInvokeNewArray(type, context.getHolder());
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.fromDexType(type, Nullability.definitelyNotNull(), appView);
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.fromDexType(type, Nullability.definitelyNotNull(), appView);
   }
 
   @Override
@@ -113,8 +120,7 @@ public class InvokeNewArray extends Invoke {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     throw cfUnsupported();
   }
 
@@ -130,5 +136,66 @@ public class InvokeNewArray extends Invoke {
 
   private static Unreachable cfUnsupported() {
     throw new Unreachable("InvokeNewArray (non-empty) not supported when compiling to classfiles.");
+  }
+
+  @Override
+  public boolean instructionInstanceCanThrow(AppView<?> appView, ProgramMethod context) {
+    DexType baseType = type.isArrayType() ? type.toBaseType(appView.dexItemFactory()) : type;
+    if (baseType.isPrimitiveType()) {
+      // Primitives types are known to be present and accessible.
+      assert !type.isWideType() : "The array's contents must be single-word";
+      return false;
+    }
+
+    assert baseType.isReferenceType();
+
+    if (baseType == context.getHolderType()) {
+      // The enclosing type is known to be present and accessible.
+      return false;
+    }
+
+    if (!appView.enableWholeProgramOptimizations()) {
+      // Conservatively bail-out in D8, because we require whole program knowledge to determine if
+      // the type is present and accessible.
+      return true;
+    }
+
+    // Check if the type is guaranteed to be present.
+    DexClass clazz = appView.definitionFor(baseType);
+    if (clazz == null) {
+      return true;
+    }
+
+    if (clazz.isLibraryClass()) {
+      if (!appView.dexItemFactory().libraryTypesAssumedToBePresent.contains(baseType)) {
+        return true;
+      }
+    }
+
+    // Check if the type is guaranteed to be accessible.
+    if (AccessControl.isClassAccessible(clazz, context, appView).isPossiblyFalse()) {
+      return true;
+    }
+
+    // Note: Implicitly assuming that all the arguments are of the right type, because the input
+    // code must be valid.
+    return false;
+  }
+
+  @Override
+  public boolean instructionMayHaveSideEffects(
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    // Check if the instruction has a side effect on the locals environment.
+    if (hasOutValue() && outValue().hasLocalInfo()) {
+      assert appView.options().debug;
+      return true;
+    }
+
+    return instructionInstanceCanThrow(appView, context);
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

@@ -11,6 +11,7 @@ import com.android.tools.r8.code.AputChar;
 import com.android.tools.r8.code.AputObject;
 import com.android.tools.r8.code.AputShort;
 import com.android.tools.r8.code.AputWide;
+import com.android.tools.r8.code.ArrayLength;
 import com.android.tools.r8.code.CheckCast;
 import com.android.tools.r8.code.Const;
 import com.android.tools.r8.code.Const16;
@@ -45,6 +46,8 @@ import com.android.tools.r8.code.IgetShort;
 import com.android.tools.r8.code.IgetWide;
 import com.android.tools.r8.code.InstanceOf;
 import com.android.tools.r8.code.Instruction;
+import com.android.tools.r8.code.InvokeCustom;
+import com.android.tools.r8.code.InvokeCustomRange;
 import com.android.tools.r8.code.InvokeDirect;
 import com.android.tools.r8.code.InvokeDirectRange;
 import com.android.tools.r8.code.InvokeInterface;
@@ -103,10 +106,18 @@ import com.android.tools.r8.ir.code.SingleConstant;
 import com.android.tools.r8.ir.code.WideConstant;
 
 public class DexInstructionSubject implements InstructionSubject {
-  protected final Instruction instruction;
 
-  public DexInstructionSubject(Instruction instruction) {
+  protected final Instruction instruction;
+  protected final MethodSubject method;
+
+  public DexInstructionSubject(Instruction instruction, MethodSubject method) {
     this.instruction = instruction;
+    this.method = method;
+  }
+
+  @Override
+  public DexInstructionSubject asDexInstruction() {
+    return this;
   }
 
   @Override
@@ -188,6 +199,15 @@ public class DexInstructionSubject implements InstructionSubject {
     return instruction instanceof InvokeStatic || instruction instanceof InvokeStaticRange;
   }
 
+  @Override
+  public boolean isInvokeSpecial() {
+    return false;
+  }
+
+  public boolean isInvokeCustom() {
+    return instruction instanceof InvokeCustom || instruction instanceof InvokeCustomRange;
+  }
+
   public boolean isInvokeSuper() {
     return instruction instanceof InvokeSuper || instruction instanceof InvokeSuperRange;
   }
@@ -221,20 +241,7 @@ public class DexInstructionSubject implements InstructionSubject {
 
   @Override
   public boolean isConstNumber(long value) {
-    if (!isConstNumber()) {
-      return false;
-    }
-    if (instruction instanceof Const
-        || instruction instanceof Const4
-        || instruction instanceof Const16
-        || instruction instanceof ConstHigh16) {
-      return ((SingleConstant) instruction).decodedValue() == value;
-    }
-    assert instruction instanceof ConstWide
-        || instruction instanceof ConstWide16
-        || instruction instanceof ConstWide32
-        || instruction instanceof ConstWideHigh16;
-    return ((WideConstant) instruction).decodedValue() == value;
+    return isConstNumber() && getConstNumber() == value;
   }
 
   @Override
@@ -255,6 +262,20 @@ public class DexInstructionSubject implements InstructionSubject {
         || (jumboStringMode == JumboStringMode.ALLOW
             && instruction instanceof ConstStringJumbo
             && ((ConstStringJumbo) instruction).BBBBBBBB.toSourceString().equals(value));
+  }
+
+  @Override
+  public boolean isJumboString() {
+    return instruction instanceof ConstStringJumbo;
+  }
+
+  @Override public long getConstNumber() {
+    assert isConstNumber();
+    if (instruction instanceof SingleConstant) {
+      return ((SingleConstant) instruction).decodedValue();
+    }
+    assert instruction instanceof WideConstant;
+    return ((WideConstant) instruction).decodedValue();
   }
 
   @Override
@@ -366,6 +387,11 @@ public class DexInstructionSubject implements InstructionSubject {
   }
 
   @Override
+  public boolean isSwitch() {
+    return isPackedSwitch() || isSparseSwitch();
+  }
+
+  @Override
   public boolean isPackedSwitch() {
     return instruction instanceof PackedSwitch;
   }
@@ -392,6 +418,11 @@ public class DexInstructionSubject implements InstructionSubject {
   @Override
   public boolean isNewArray() {
     return instruction instanceof NewArray;
+  }
+
+  @Override
+  public boolean isArrayLength() {
+    return instruction instanceof ArrayLength;
   }
 
   @Override
@@ -423,6 +454,11 @@ public class DexInstructionSubject implements InstructionSubject {
   @Override
   public InstructionOffsetSubject getOffset(MethodSubject methodSubject) {
     return new InstructionOffsetSubject(instruction.getOffset());
+  }
+
+  @Override
+  public MethodSubject getMethodSubject() {
+    return method;
   }
 
   @Override

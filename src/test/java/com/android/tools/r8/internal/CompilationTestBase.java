@@ -18,6 +18,7 @@ import com.android.tools.r8.ProgramResource;
 import com.android.tools.r8.R8Command;
 import com.android.tools.r8.R8RunArtTestsTest.CompilerUnderTest;
 import com.android.tools.r8.ResourceException;
+import com.android.tools.r8.TestBase;
 import com.android.tools.r8.ToolHelper;
 import com.android.tools.r8.naming.MemberNaming.FieldSignature;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
@@ -37,6 +38,9 @@ import com.android.tools.r8.utils.codeinspector.FoundFieldSubject;
 import com.android.tools.r8.utils.codeinspector.FoundMethodSubject;
 import com.google.common.io.ByteStreams;
 import com.google.common.io.Closer;
+import it.unimi.dsi.fastutil.ints.IntList;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.ints.IntSet;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -60,7 +64,7 @@ import org.junit.ComparisonFailure;
 import org.junit.Rule;
 import org.junit.rules.TemporaryFolder;
 
-public abstract class CompilationTestBase {
+public abstract class CompilationTestBase extends TestBase {
 
   protected KeepingDiagnosticHandler handler;
   protected Reporter reporter;
@@ -137,8 +141,15 @@ public abstract class CompilationTestBase {
       R8Command.Builder builder = R8Command.builder(reporter);
       builder.addProgramFiles(ListUtils.map(inputs, Paths::get));
       if (pgConfs != null) {
-        builder.addProguardConfigurationFiles(
-            pgConfs.stream().map(Paths::get).collect(Collectors.toList()));
+        // Sanitize libraries for apps relying on the Proguard behaviour of lookup in program
+        // classes before library classes. See tools/sanitize_libraries.py for more information.
+        LibrarySanitizer librarySanitizer =
+            new LibrarySanitizer(temp)
+                .addProguardConfigurationFiles(
+                    pgConfs.stream().map(Paths::get).collect(Collectors.toList()))
+                .sanitize();
+        builder.addLibraryFiles(librarySanitizer.getSanitizedLibrary());
+        builder.addProguardConfigurationFiles(librarySanitizer.getSanitizedProguardConfiguration());
       } else {
         builder.setDisableTreeShaking(true);
         builder.setDisableMinification(true);
@@ -203,16 +214,6 @@ public abstract class CompilationTestBase {
           "REFERENCE\n" + error.dump(theirs, false) + "\nEND REFERENCE",
           "PROCESSED\n" + error.dump(ours, true) + "\nEND PROCESSED");
     }
-  }
-
-  public int applicationSize(AndroidApp app) throws IOException, ResourceException {
-    int bytes = 0;
-    try (Closer closer = Closer.create()) {
-      for (ProgramResource dex : app.getDexProgramResourcesForTesting()) {
-        bytes += ByteStreams.toByteArray(closer.register(dex.getByteStream())).length;
-      }
-    }
-    return bytes;
   }
 
   public void assertIdenticalApplications(AndroidApp app1, AndroidApp app2)

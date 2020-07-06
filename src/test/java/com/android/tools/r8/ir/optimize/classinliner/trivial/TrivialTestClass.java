@@ -4,6 +4,7 @@
 
 package com.android.tools.r8.ir.optimize.classinliner.trivial;
 
+import com.android.tools.r8.AssumeMayHaveSideEffects;
 import com.android.tools.r8.NeverInline;
 
 public class TrivialTestClass {
@@ -30,7 +31,7 @@ public class TrivialTestClass {
   @NeverInline
   private void testInner() {
     Inner inner = new Inner("inner{", 123, next() + "}");
-    System.out.println(inner.toString() + " " + inner.getPrefix() + " = " + inner.prefix);
+    System.out.println(inner.myToString() + " " + inner.getPrefix() + " = " + inner.prefix);
   }
 
   @NeverInline
@@ -51,6 +52,7 @@ public class TrivialTestClass {
     System.out.println(o.getA() + o.getB() + o.getConcat());
   }
 
+  @AssumeMayHaveSideEffects
   @NeverInline
   private void testEmptyClass() {
     new EmptyClass();
@@ -104,8 +106,7 @@ public class TrivialTestClass {
       this.id = id;
     }
 
-    @Override
-    public String toString() {
+    public String myToString() {
       return prefix + id + suffix;
     }
 

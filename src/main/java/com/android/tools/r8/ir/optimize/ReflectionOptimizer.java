@@ -3,208 +3,216 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.optimize;
 
+import static com.android.tools.r8.graph.DexProgramClass.asProgramClassOrNull;
 import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
-import static com.android.tools.r8.utils.DescriptorUtils.getCanonicalNameFromDescriptor;
-import static com.android.tools.r8.utils.DescriptorUtils.getClassNameFromDescriptor;
-import static com.android.tools.r8.utils.DescriptorUtils.getUnqualifiedClassNameFromDescriptor;
 
-import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
-import com.android.tools.r8.graph.DexString;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
+import com.android.tools.r8.ir.analysis.type.TypeAnalysis;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
+import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.ConstClass;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.ir.code.Instruction;
-import com.android.tools.r8.ir.code.InstructionIterator;
+import com.android.tools.r8.ir.code.InstructionListIterator;
+import com.android.tools.r8.ir.code.InvokeStatic;
 import com.android.tools.r8.ir.code.InvokeVirtual;
 import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
-import com.android.tools.r8.ir.optimize.ReflectionOptimizer.ClassNameComputationInfo.ClassNameComputationOption;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import com.google.common.base.Strings;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.google.common.collect.Sets;
+import java.util.Set;
 
 public class ReflectionOptimizer {
 
-  public static class ClassNameComputationInfo {
-    public enum ClassNameComputationOption {
-      NONE,
-      NAME,           // getName()
-      TYPE_NAME,      // getTypeName()
-      CANONICAL_NAME, // getCanonicalName()
-      SIMPLE_NAME;    // getSimpleName()
-
-      boolean needsToComputeClassName() {
-        return this != NONE;
-      }
-
-      boolean needsToRegisterTypeReference() {
-        return this == SIMPLE_NAME;
-      }
+  // Rewrite getClass() to const-class if the type of the given instance is effectively final.
+  // Rewrite forName() to const-class if the type is resolvable, accessible and already initialized.
+  public static void rewriteGetClassOrForNameToConstClass(
+      AppView<AppInfoWithLiveness> appView, IRCode code) {
+    if (!appView.appInfo().canUseConstClassInstructions(appView.options())) {
+      return;
     }
-
-    private static final ClassNameComputationInfo DEFAULT_INSTANCE =
-        new ClassNameComputationInfo(ClassNameComputationOption.NONE);
-
-    final ClassNameComputationOption classNameComputationOption;
-    final int arrayDepth;
-
-    public ClassNameComputationInfo(ClassNameComputationOption classNameComputationOption) {
-      this(classNameComputationOption, 0);
-    }
-
-    public ClassNameComputationInfo(
-        ClassNameComputationOption classNameComputationOption, int arrayDepth) {
-      this.classNameComputationOption = classNameComputationOption;
-      this.arrayDepth = arrayDepth;
-    }
-
-    public static ClassNameComputationInfo none() {
-      return DEFAULT_INSTANCE;
-    }
-
-    public boolean needsToComputeClassName() {
-      return classNameComputationOption.needsToComputeClassName();
-    }
-
-    public boolean needsToRegisterTypeReference() {
-      return classNameComputationOption.needsToRegisterTypeReference();
-    }
-  }
-
-  // Rewrite getClass() call to const-class if the type of the given instance is effectively final.
-  public static void rewriteGetClass(AppView<AppInfoWithLiveness> appView, IRCode code) {
-    InstructionIterator it = code.instructionIterator();
-    DexItemFactory dexItemFactory = appView.dexItemFactory();
-    while (it.hasNext()) {
-      Instruction current = it.next();
+    Set<Value> affectedValues = Sets.newIdentityHashSet();
+    ProgramMethod context = code.context();
+    ClassInitializationAnalysis classInitializationAnalysis =
+        new ClassInitializationAnalysis(appView, code);
+    for (BasicBlock block : code.blocks) {
       // Conservatively bail out if the containing block has catch handlers.
       // TODO(b/118509730): unless join of all catch types is ClassNotFoundException ?
-      if (current.getBlock().hasCatchHandlers()) {
+      if (block.hasCatchHandlers()) {
         continue;
       }
-      if (!current.isInvokeVirtual()) {
-        continue;
-      }
-      InvokeVirtual invoke = current.asInvokeVirtual();
-      DexMethod invokedMethod = invoke.getInvokedMethod();
-      // Class<?> Object#getClass() is final and cannot be overridden.
-      if (invokedMethod != dexItemFactory.objectMethods.getClass) {
-        continue;
-      }
-      Value in = invoke.getReceiver();
-      if (in.hasLocalInfo()) {
-        continue;
-      }
-      TypeLatticeElement inType = in.getTypeLattice();
-      // Check the receiver is either class type or array type. Also make sure it is not nullable.
-      if (!(inType.isClassType() || inType.isArrayType())
-          || inType.isNullable()) {
-        continue;
-      }
-      DexType type =
-          inType.isClassType()
-              ? inType.asClassTypeLatticeElement().getClassType()
-              : inType.asArrayTypeLatticeElement().getArrayType(dexItemFactory);
-      DexType baseType = type.toBaseType(dexItemFactory);
-      // Make sure base type is a class type.
-      if (!baseType.isClassType()) {
-        continue;
-      }
-      // Only consider program class, e.g., platform can introduce sub types in different versions.
-      DexClass clazz = appView.definitionFor(baseType);
-      if (clazz == null || !clazz.isProgramClass()) {
-        continue;
-      }
-      // Only consider effectively final class. Exception: new Base().getClass().
-      if (!appView.appInfo().hasSubtypes(baseType)
-          || !appView.appInfo().isInstantiatedIndirectly(baseType)
-          || (!in.isPhi() && in.definition.isCreatingInstanceOrArray())) {
-        // Make sure the target (base) type is visible.
-        ConstraintWithTarget constraints =
-            ConstraintWithTarget.classIsVisible(code.method.method.holder, baseType, appView);
-        if (constraints == ConstraintWithTarget.NEVER) {
+      InstructionListIterator it = block.listIterator(code);
+      while (it.hasNext()) {
+        Instruction current = it.next();
+        if (!current.hasOutValue() || !current.outValue().isUsed()) {
           continue;
         }
-        TypeLatticeElement typeLattice =
-            TypeLatticeElement.classClassType(appView, definitelyNotNull());
-        Value value = code.createValue(typeLattice, invoke.getLocalInfo());
-        ConstClass constClass = new ConstClass(value, type);
-        it.replaceCurrentInstruction(constClass);
+        DexType type = null;
+        if (current.isInvokeVirtual()) {
+          type = getTypeForGetClass(appView, context, current.asInvokeVirtual());
+        } else if (current.isInvokeStatic()) {
+          type = getTypeForClassForName(
+              appView, classInitializationAnalysis, context, current.asInvokeStatic());
+        }
+        if (type != null) {
+          affectedValues.addAll(current.outValue().affectedValues());
+          TypeElement typeLattice = TypeElement.classClassType(appView, definitelyNotNull());
+          Value value = code.createValue(typeLattice, current.getLocalInfo());
+          ConstClass constClass = new ConstClass(value, type);
+          it.replaceCurrentInstruction(constClass);
+          if (appView.options().isGeneratingClassFiles()) {
+            code.method()
+                .upgradeClassFileVersion(
+                    appView.options().requiredCfVersionForConstClassInstructions());
+          }
+        }
       }
+    }
+    classInitializationAnalysis.finish();
+    // Newly introduced const-class is not null, and thus propagate that information.
+    if (!affectedValues.isEmpty()) {
+      new TypeAnalysis(appView).narrowing(affectedValues);
     }
     assert code.isConsistentSSA();
   }
 
-  public static DexString computeClassName(
-      DexString descriptor,
-      DexClass holder,
-      ClassNameComputationInfo classNameComputationInfo,
-      DexItemFactory dexItemFactory) {
-    return computeClassName(
-        descriptor.toString(),
-        holder,
-        classNameComputationInfo.classNameComputationOption,
-        dexItemFactory,
-        classNameComputationInfo.arrayDepth);
-  }
-
-  public static DexString computeClassName(
-      String descriptor,
-      DexClass holder,
-      ClassNameComputationOption classNameComputationOption,
-      DexItemFactory dexItemFactory) {
-    return computeClassName(descriptor, holder, classNameComputationOption, dexItemFactory, 0);
-  }
-
-  public static DexString computeClassName(
-      String descriptor,
-      DexClass holder,
-      ClassNameComputationOption classNameComputationOption,
-      DexItemFactory dexItemFactory,
-      int arrayDepth) {
-    String name;
-    switch (classNameComputationOption) {
-      case NAME:
-        name = getClassNameFromDescriptor(descriptor);
-        if (arrayDepth > 0) {
-          name = Strings.repeat("[", arrayDepth) + "L" + name + ";";
-        }
-        break;
-      case TYPE_NAME:
-        // TODO(b/119426668): desugar Type#getTypeName
-        throw new Unreachable("Type#getTypeName not supported yet");
-        // name = getClassNameFromDescriptor(descriptor);
-        // if (arrayDepth > 0) {
-        //   name = name + Strings.repeat("[]", arrayDepth);
-        // }
-        // break;
-      case CANONICAL_NAME:
-        name = getCanonicalNameFromDescriptor(descriptor);
-        if (arrayDepth > 0) {
-          name = name + Strings.repeat("[]", arrayDepth);
-        }
-        break;
-      case SIMPLE_NAME:
-        assert holder != null;
-        boolean renamed = !descriptor.equals(holder.type.toDescriptorString());
-        boolean needsToRetrieveInnerName = holder.isMemberClass() || holder.isLocalClass();
-        if (!renamed && needsToRetrieveInnerName) {
-          name = holder.getInnerClassAttributeForThisClass().getInnerName().toString();
-        } else {
-          name = getUnqualifiedClassNameFromDescriptor(descriptor);
-        }
-        if (arrayDepth > 0) {
-          name = name + Strings.repeat("[]", arrayDepth);
-        }
-        break;
-      default:
-        throw new Unreachable(
-            "Unexpected ClassNameComputationOption: '" + classNameComputationOption + "'");
+  private static DexType getTypeForGetClass(
+      AppView<AppInfoWithLiveness> appView, ProgramMethod context, InvokeVirtual invoke) {
+    DexItemFactory dexItemFactory = appView.dexItemFactory();
+    DexMethod invokedMethod = invoke.getInvokedMethod();
+    // Class<?> Object#getClass() is final and cannot be overridden.
+    if (invokedMethod != dexItemFactory.objectMembers.getClass) {
+      return null;
     }
-    return dexItemFactory.createString(name);
+    Value in = invoke.getReceiver();
+    if (in.hasLocalInfo()) {
+      return null;
+    }
+    TypeElement inType = in.getType();
+    // Check the receiver is either class type or array type. Also make sure it is not
+    // nullable.
+    if (!(inType.isClassType() || inType.isArrayType())
+        || inType.isNullable()) {
+      return null;
+    }
+    DexType type =
+        inType.isClassType()
+            ? inType.asClassType().getClassType()
+            : inType.asArrayType().toDexType(dexItemFactory);
+    DexType baseType = type.toBaseType(dexItemFactory);
+    // Make sure base type is a class type.
+    if (!baseType.isClassType()) {
+      return null;
+    }
+    // Only consider program class, e.g., platform can introduce subtypes in different
+    // versions.
+    DexProgramClass clazz = asProgramClassOrNull(appView.definitionFor(baseType));
+    if (clazz == null) {
+      return null;
+    }
+    // Only consider effectively final class. Exception: new Base().getClass().
+    if (!clazz.isEffectivelyFinal(appView)
+        && (in.isPhi() || !in.definition.isCreatingInstanceOrArray())) {
+      return null;
+    }
+    // Make sure the target (base) type is visible.
+    ConstraintWithTarget constraints =
+        ConstraintWithTarget.classIsVisible(context.getHolder(), baseType, appView);
+    if (constraints == ConstraintWithTarget.NEVER) {
+      return null;
+    }
+    return type;
+  }
+
+  private static DexType getTypeForClassForName(
+      AppView<AppInfoWithLiveness> appView,
+      ClassInitializationAnalysis classInitializationAnalysis,
+      ProgramMethod context,
+      InvokeStatic invoke) {
+    DexItemFactory dexItemFactory = appView.dexItemFactory();
+    DexMethod invokedMethod = invoke.getInvokedMethod();
+    // Class<?> Class#forName(String) is final and cannot be overridden.
+    if (invokedMethod != dexItemFactory.classMethods.forName) {
+      return null;
+    }
+    assert invoke.inValues().size() == 1;
+    Value in = invoke.inValues().get(0).getAliasedValue();
+    // Only consider const-string input without locals.
+    if (in.hasLocalInfo() || in.isPhi()) {
+      return null;
+    }
+    // Also, check if the result of forName() is updatable via locals.
+    Value out = invoke.outValue();
+    if (out != null && out.hasLocalInfo()) {
+      return null;
+    }
+    DexType type = null;
+    if (in.definition.isDexItemBasedConstString()) {
+      if (in.definition.asDexItemBasedConstString().getItem().isDexType()) {
+        type = in.definition.asDexItemBasedConstString().getItem().asDexType();
+      }
+    } else if (in.definition.isConstString()) {
+      String name = in.definition.asConstString().getValue().toString();
+      // Convert the name into descriptor if the given name is a valid java type.
+      String descriptor = DescriptorUtils.javaTypeToDescriptorIfValidJavaType(name);
+      // Otherwise, it may be an array's fully qualified name from Class<?>#getName().
+      if (descriptor == null && name.startsWith("[") && name.endsWith(";")) {
+        // E.g., [Lx.y.Z; -> [Lx/y/Z;
+        descriptor = name.replace(
+            DescriptorUtils.JAVA_PACKAGE_SEPARATOR,
+            DescriptorUtils.DESCRIPTOR_PACKAGE_SEPARATOR);
+      }
+      if (descriptor == null
+          || descriptor.indexOf(DescriptorUtils.JAVA_PACKAGE_SEPARATOR) > 0) {
+        return null;
+      }
+      type = dexItemFactory.createType(descriptor);
+      // Check if the given name refers to a reference type.
+      if (!type.isReferenceType()) {
+        return null;
+      }
+    } else {
+      // Bail out for non-deterministic input to Class<?>#forName(name).
+      return null;
+    }
+    if (type == null) {
+      return null;
+    }
+    // Make sure the (base) type is resolvable.
+    DexType baseType = type.toBaseType(dexItemFactory);
+    DexClass baseClazz = appView.appInfo().definitionForWithoutExistenceAssert(baseType);
+    if (baseClazz == null || !baseClazz.isResolvable(appView)) {
+      return null;
+    }
+
+    // Don't allow the instantiated class to be in a feature, if it is, we can get a
+    // NoClassDefFoundError from dalvik/art.
+    if (baseClazz.isProgramClass()
+        && appView.options().featureSplitConfiguration != null
+        && appView.options().featureSplitConfiguration.isInFeature(baseClazz.asProgramClass())) {
+      return null;
+    }
+    // Make sure the (base) type is visible.
+    ConstraintWithTarget constraints =
+        ConstraintWithTarget.classIsVisible(context.getHolder(), baseType, appView);
+    if (constraints == ConstraintWithTarget.NEVER) {
+      return null;
+    }
+    // Make sure the type is already initialized.
+    // Note that, if the given name refers to an array type, the corresponding Class<?> won't
+    // be initialized. So, it's okay to rewrite the instruction.
+    if (type.isClassType()
+        && !classInitializationAnalysis.isClassDefinitelyLoadedBeforeInstruction(type, invoke)) {
+      return null;
+    }
+    return type;
   }
 }

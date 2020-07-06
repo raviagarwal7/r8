@@ -22,6 +22,7 @@ import java.util.function.Supplier;
 import org.junit.Test;
 
 public class GenericSignatureParserTest extends TestBase {
+
   private static class ReGenerateGenericSignatureRewriter
       implements GenericSignatureAction<String> {
 
@@ -42,7 +43,7 @@ public class GenericSignatureParserTest extends TestBase {
     }
 
     @Override
-    public String parsedTypeName(String name) {
+    public String parsedTypeName(String name, ParserPosition parserPosition) {
       renamedSignature.append(name);
       return name;
     }
@@ -71,7 +72,7 @@ public class GenericSignatureParserTest extends TestBase {
       GenericSignatureParser<String> parser =
           new GenericSignatureParser<>(new ReGenerateGenericSignatureRewriter());
       parse.accept(parser, signature);
-      fail("Succesfully parsed " + signature);
+      fail("Successfully parsed " + signature);
     } catch (GenericSignatureFormatError e) {
       errorChecker.accept(e);
     }
@@ -101,7 +102,7 @@ public class GenericSignatureParserTest extends TestBase {
       try {
         if (validPrefixes == null || !validPrefixes.contains(i)) {
           parser.accept(signature.substring(0, i));
-          fail("Succesfully parsed " + signature.substring(0, i) + " (position " + i +")");
+          fail("Successfully parsed " + signature.substring(0, i) + " (position " + i +")");
         }
       } catch (GenericSignatureFormatError e) {
         assertTrue(e.getMessage().contains("at position " + (i + 1)));
@@ -389,7 +390,7 @@ public class GenericSignatureParserTest extends TestBase {
       }
 
       @Override
-      public String parsedTypeName(String name) {
+      public String parsedTypeName(String name, ParserPosition parserPosition) {
         throw exceptionSupplier.get();
       }
     }

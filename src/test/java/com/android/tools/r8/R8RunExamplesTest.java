@@ -22,8 +22,6 @@ import org.junit.runners.Parameterized.Parameters;
 @RunWith(Parameterized.class)
 public class R8RunExamplesTest extends R8RunExamplesCommon {
 
-  private static final boolean ONLY_RUN_CF_TESTS = false;
-
   @Parameters(name = "{0}_{1}_{2}_{3}_{5}_{6}")
   public static Collection<String[]> data() {
     String[] tests = {
@@ -50,7 +48,6 @@ public class R8RunExamplesTest extends R8RunExamplesCommon {
         "loadconst.LoadConst",
         "loop.UdpServer",
         "nestedtrycatches.NestedTryCatches",
-        "newarray.NewArray",
         "regalloc.RegAlloc",
         "returns.Returns",
         "staticfield.StaticField",
@@ -87,20 +84,18 @@ public class R8RunExamplesTest extends R8RunExamplesCommon {
 
     List<String[]> fullTestList = new ArrayList<>(tests.length * 2);
     for (String test : tests) {
-      if (!ONLY_RUN_CF_TESTS) {
-        fullTestList.add(makeTest(Input.JAVAC, CompilerUnderTest.D8, CompilationMode.DEBUG, test));
-        fullTestList.add(makeTest(Input.JAVAC_ALL, CompilerUnderTest.D8, CompilationMode.DEBUG,
-            test));
-        fullTestList.add(makeTest(Input.JAVAC_NONE, CompilerUnderTest.D8, CompilationMode.DEBUG,
-            test));
-        fullTestList.add(makeTest(Input.JAVAC_ALL, CompilerUnderTest.D8, CompilationMode.RELEASE,
-            test));
-        fullTestList.add(makeTest(Input.JAVAC_ALL, CompilerUnderTest.R8, CompilationMode.RELEASE,
-            test));
-        fullTestList.add(makeTest(Input.JAVAC_ALL, CompilerUnderTest.R8, CompilationMode.DEBUG,
-            test));
-        fullTestList.add(makeTest(Input.DX, CompilerUnderTest.R8, CompilationMode.RELEASE, test));
-      }
+      fullTestList.add(makeTest(Input.JAVAC, CompilerUnderTest.D8, CompilationMode.DEBUG, test));
+      fullTestList.add(
+          makeTest(Input.JAVAC_ALL, CompilerUnderTest.D8, CompilationMode.DEBUG, test));
+      fullTestList.add(
+          makeTest(Input.JAVAC_NONE, CompilerUnderTest.D8, CompilationMode.DEBUG, test));
+      fullTestList.add(
+          makeTest(Input.JAVAC_ALL, CompilerUnderTest.D8, CompilationMode.RELEASE, test));
+      fullTestList.add(
+          makeTest(Input.JAVAC_ALL, CompilerUnderTest.R8, CompilationMode.RELEASE, test));
+      fullTestList.add(
+          makeTest(Input.JAVAC_ALL, CompilerUnderTest.R8, CompilationMode.DEBUG, test));
+      fullTestList.add(makeTest(Input.DX, CompilerUnderTest.R8, CompilationMode.RELEASE, test));
       fullTestList.add(
           makeTest(
               Input.JAVAC_ALL, CompilerUnderTest.R8, CompilationMode.RELEASE, test, Output.CF));
@@ -110,7 +105,6 @@ public class R8RunExamplesTest extends R8RunExamplesCommon {
               CompilerUnderTest.R8,
               CompilationMode.RELEASE,
               test,
-              Frontend.CF,
               Output.CF));
       fullTestList.add(
           makeTest(
@@ -118,7 +112,6 @@ public class R8RunExamplesTest extends R8RunExamplesCommon {
               CompilerUnderTest.R8,
               CompilationMode.RELEASE,
               test,
-              Frontend.CF,
               Output.DEX));
     }
     return fullTestList;
@@ -130,9 +123,8 @@ public class R8RunExamplesTest extends R8RunExamplesCommon {
       String compiler,
       String mode,
       String mainClass,
-      String frontend,
       String output) {
-    super(pkg, input, compiler, mode, mainClass, frontend, output);
+    super(pkg, input, compiler, mode, mainClass, output);
   }
 
   @Override
@@ -156,23 +148,12 @@ public class R8RunExamplesTest extends R8RunExamplesCommon {
   @Override
   protected Set<String> getFailingRunCfToDex() {
     return new ImmutableSet.Builder<String>()
-        // TODO(b/109788783): Implement byte/boolean distinction for array load/store.
-        .add("arrayaccess.ArrayAccess")
-        .add("barray.BArray")
-        .add("filledarray.FilledArray")
         .build();
   }
 
   @Override
   protected Set<String> getFailingCompileCfToDex() {
     return new ImmutableSet.Builder<String>()
-        // TODO(b/109789541): Implement method synchronization for DEX backend.
-        .add("sync.Sync")
-        // TODO(b/109789539): Implement CfMultiANewArray.buildIR() for DEX backend.
-        .add("newarray.NewArray")
-        .add("trycatch.TryCatch")
-        .add("regress_70737019.Test")
-        .add("regress_72361252.Test")
         .build();
   }
 

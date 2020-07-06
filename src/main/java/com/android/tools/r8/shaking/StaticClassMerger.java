@@ -12,7 +12,6 @@ import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexString;
-import com.android.tools.r8.graph.GraphLense;
 import com.android.tools.r8.graph.GraphLense.NestedGraphLense;
 import com.android.tools.r8.logging.Log;
 import com.android.tools.r8.shaking.VerticalClassMerger.IllegalAccessDetector;
@@ -21,6 +20,7 @@ import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.MethodJavaSignatureEquivalence;
 import com.android.tools.r8.utils.MethodSignatureEquivalence;
 import com.android.tools.r8.utils.SingletonEquivalence;
+import com.android.tools.r8.utils.TraversalContinuation;
 import com.google.common.base.Equivalence;
 import com.google.common.base.Equivalence.Wrapper;
 import com.google.common.collect.BiMap;
@@ -31,6 +31,7 @@ import com.google.common.collect.Multiset.Entry;
 import com.google.common.collect.Streams;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -157,6 +158,8 @@ public class StaticClassMerger {
     private final HashMultiset<Wrapper<DexField>> fieldBuckets = HashMultiset.create();
     private final HashMultiset<Wrapper<DexMethod>> methodBuckets = HashMultiset.create();
 
+    private boolean hasSynchronizedMethods = false;
+
     public Representative(DexProgramClass clazz) {
       this.clazz = clazz;
       include(clazz);
@@ -168,10 +171,14 @@ public class StaticClassMerger {
         Wrapper<DexField> wrapper = fieldEquivalence.wrap(field.field);
         fieldBuckets.add(wrapper);
       }
+      boolean classHasSynchronizedMethods = false;
       for (DexEncodedMethod method : clazz.methods()) {
+        assert !hasSynchronizedMethods || !method.isSynchronized();
+        classHasSynchronizedMethods |= method.isSynchronized();
         Wrapper<DexMethod> wrapper = methodEquivalence.wrap(method.method);
         methodBuckets.add(wrapper);
       }
+      hasSynchronizedMethods |= classHasSynchronizedMethods;
     }
 
     // Returns true if this representative should no longer be used. The current heuristic is to
@@ -219,7 +226,7 @@ public class StaticClassMerger {
     this.mainDexClasses = mainDexClasses;
   }
 
-  public GraphLense run() {
+  public NestedGraphLense run() {
     for (DexProgramClass clazz : appView.appInfo().app().classesWithDeterministicOrder()) {
       MergeGroup group = satisfiesMergeCriteria(clazz);
       if (group != MergeGroup.DONT_MERGE) {
@@ -236,7 +243,7 @@ public class StaticClassMerger {
     return buildGraphLense();
   }
 
-  private GraphLense buildGraphLense() {
+  private NestedGraphLense buildGraphLense() {
     if (!fieldMapping.isEmpty() || !methodMapping.isEmpty()) {
       BiMap<DexField, DexField> originalFieldSignatures = fieldMapping.inverse();
       BiMap<DexMethod, DexMethod> originalMethodSignatures = methodMapping.inverse();
@@ -249,15 +256,19 @@ public class StaticClassMerger {
           appView.graphLense(),
           appView.dexItemFactory());
     }
-    return appView.graphLense();
+    return null;
   }
 
   private MergeGroup satisfiesMergeCriteria(DexProgramClass clazz) {
     if (appView.appInfo().neverMerge.contains(clazz.type)) {
       return MergeGroup.DONT_MERGE;
     }
-    if (clazz.staticFields().size() + clazz.directMethods().size() + clazz.virtualMethods().size()
-        == 0) {
+    if (appView.options().featureSplitConfiguration != null &&
+        appView.options().featureSplitConfiguration.isInFeature(clazz)) {
+      // TODO(b/141452765): Allow class merging between classes in features.
+      return MergeGroup.DONT_MERGE;
+    }
+    if (clazz.staticFields().size() + clazz.getMethodCollection().size() == 0) {
       return MergeGroup.DONT_MERGE;
     }
     if (clazz.instanceFields().size() > 0) {
@@ -267,10 +278,14 @@ public class StaticClassMerger {
         .anyMatch(field -> appView.appInfo().isPinned(field.field))) {
       return MergeGroup.DONT_MERGE;
     }
-    if (clazz.directMethods().stream().anyMatch(DexEncodedMethod::isInitializer)) {
+    if (clazz.getMethodCollection().hasDirectMethods(DexEncodedMethod::isInitializer)) {
       return MergeGroup.DONT_MERGE;
     }
-    if (!clazz.virtualMethods().stream().allMatch(DexEncodedMethod::isPrivateMethod)) {
+    if (clazz.getMethodCollection().hasVirtualMethods(method -> !method.isPrivateMethod())) {
+      return MergeGroup.DONT_MERGE;
+    }
+    if (clazz.isInANest()) {
+      // Breaks nest access control, abort merging.
       return MergeGroup.DONT_MERGE;
     }
     if (Streams.stream(clazz.methods())
@@ -284,7 +299,7 @@ public class StaticClassMerger {
                     || appView.appInfo().noSideEffects.keySet().contains(method.method))) {
       return MergeGroup.DONT_MERGE;
     }
-    if (clazz.classInitializationMayHaveSideEffects(appView.appInfo())) {
+    if (clazz.classInitializationMayHaveSideEffects(appView)) {
       // This could have a negative impact on inlining.
       //
       // See {@link com.android.tools.r8.ir.optimize.DefaultInliningOracle#canInlineStaticInvoke}
@@ -313,80 +328,47 @@ public class StaticClassMerger {
     assert satisfiesMergeCriteria(clazz) == group;
     assert group != MergeGroup.DONT_MERGE;
 
-    String pkg = clazz.type.getPackageDescriptor();
-    return mayMergeAcrossPackageBoundaries(clazz)
-        ? mergeGlobally(clazz, pkg, group)
-        : mergeInsidePackage(clazz, pkg, group);
+    return merge(
+        clazz,
+        mayMergeAcrossPackageBoundaries(clazz)
+            ? group.globalKey()
+            : group.key(clazz.type.getPackageDescriptor()));
   }
 
-  private boolean mergeGlobally(DexProgramClass clazz, String pkg, MergeGroup group) {
-    Representative globalRepresentative = representatives.get(group.globalKey());
-    if (globalRepresentative == null) {
-      if (isValidRepresentative(clazz)) {
-        // Make the current class the global representative.
-        setRepresentative(group.globalKey(), getOrCreateRepresentative(group.key(pkg), clazz));
-      } else {
-        clearRepresentative(group.globalKey());
-      }
-
-      // Do not attempt to merge this class inside its own package, because that could lead to
-      // an increase in the global representative, which is not desirable.
-      return false;
-    } else {
-      // Check if we can merge the current class into the current global representative.
-      globalRepresentative.include(clazz);
-
-      if (globalRepresentative.isFull()) {
-        if (isValidRepresentative(clazz)) {
-          // Make the current class the global representative instead.
-          setRepresentative(group.globalKey(), getOrCreateRepresentative(group.key(pkg), clazz));
-        } else {
-          clearRepresentative(group.globalKey());
-        }
-
-        // Do not attempt to merge this class inside its own package, because that could lead to
-        // an increase in the global representative, which is not desirable.
+  private boolean merge(DexProgramClass clazz, MergeGroup.Key key) {
+    Representative representative = representatives.get(key);
+    if (representative != null) {
+      if (representative.hasSynchronizedMethods && clazz.hasStaticSynchronizedMethods()) {
+        // We are not allowed to merge synchronized classes with synchronized methods.
         return false;
-      } else {
-        // Merge this class into the global representative.
-        moveMembersFromSourceToTarget(clazz, globalRepresentative.clazz);
-        return true;
       }
-    }
-  }
-
-  private boolean mergeInsidePackage(DexProgramClass clazz, String pkg, MergeGroup group) {
-    MergeGroup.Key key = group.key(pkg);
-    Representative packageRepresentative = representatives.get(key);
-    if (packageRepresentative != null) {
+      if (appView.appInfo().constClassReferences.contains(clazz.type)) {
+        // Since the type is const-class referenced (and the static merger does not create a lense
+        // to map the merged type) the class will likely remain and there is no gain from merging.
+        return false;
+      }
+      // Check if current candidate is a better choice depending on visibility. For package private
+      // or protected, the key is parameterized by the package name already, so we just have to
+      // check accessibility-flags. For global this is no-op.
       if (isValidRepresentative(clazz)
-          && clazz.accessFlags.isMoreVisibleThan(packageRepresentative.clazz.accessFlags)) {
-        // Use `clazz` as a representative for this package instead.
+          && !representative.clazz.accessFlags.isAtLeastAsVisibleAs(clazz.accessFlags)) {
+        assert clazz.type.getPackageDescriptor().equals(key.packageOrGlobal);
+        assert representative.clazz.type.getPackageDescriptor().equals(key.packageOrGlobal);
         Representative newRepresentative = getOrCreateRepresentative(key, clazz);
-        newRepresentative.include(packageRepresentative.clazz);
-
+        newRepresentative.include(representative.clazz);
         if (!newRepresentative.isFull()) {
-          setRepresentative(group.key(pkg), newRepresentative);
-          moveMembersFromSourceToTarget(packageRepresentative.clazz, clazz);
+          setRepresentative(key, newRepresentative);
+          moveMembersFromSourceToTarget(representative.clazz, clazz);
           return true;
         }
-
-        // We are not allowed to merge members into a class that is less visible.
-        return false;
-      }
-
-      // Merge current class into the representative of this package if it has room.
-      packageRepresentative.include(clazz);
-
-      // If there is room, then merge, otherwise fall-through to update the representative of this
-      // package.
-      if (!packageRepresentative.isFull()) {
-        moveMembersFromSourceToTarget(clazz, packageRepresentative.clazz);
-        return true;
+      } else {
+        representative.include(clazz);
+        if (!representative.isFull()) {
+          moveMembersFromSourceToTarget(clazz, representative.clazz);
+          return true;
+        }
       }
     }
-
-    // We were unable to use the current representative for this package (if any).
     if (isValidRepresentative(clazz)) {
       setRepresentative(key, getOrCreateRepresentative(key, clazz));
     }
@@ -445,12 +427,12 @@ public class StaticClassMerger {
       return false;
     }
     // Check that all of the members are private or public.
-    if (!clazz.directMethods().stream()
-        .allMatch(method -> method.accessFlags.isPrivate() || method.accessFlags.isPublic())) {
+    if (clazz
+        .getMethodCollection()
+        .hasDirectMethods(method -> !method.isPrivate() && !method.isPublic())) {
       return false;
     }
-    if (!clazz.staticFields().stream()
-        .allMatch(field -> field.accessFlags.isPrivate() || field.accessFlags.isPublic())) {
+    if (!clazz.staticFields().stream().allMatch(field -> field.isPrivate() || field.isPublic())) {
       return false;
     }
 
@@ -458,18 +440,21 @@ public class StaticClassMerger {
     // virtual methods are private. Therefore, we don't need to consider check if there are any
     // package-private or protected instance fields or virtual methods here.
     assert clazz.instanceFields().size() == 0;
-    assert clazz.virtualMethods().stream().allMatch(method -> method.accessFlags.isPrivate());
+    assert !clazz.getMethodCollection().hasVirtualMethods(method -> !method.isPrivate());
 
     // Check that no methods access package-private or protected members.
     IllegalAccessDetector registry = new IllegalAccessDetector(appView, clazz);
-    for (DexEncodedMethod method : clazz.methods()) {
-      registry.setContext(method);
-      method.registerCodeReferences(registry);
-      if (registry.foundIllegalAccess()) {
-        return false;
-      }
-    }
-    return true;
+    TraversalContinuation result =
+        clazz.traverseProgramMethods(
+            method -> {
+              registry.setContext(method);
+              method.registerCodeReferences(registry);
+              if (registry.foundIllegalAccess()) {
+                return TraversalContinuation.BREAK;
+              }
+              return TraversalContinuation.CONTINUE;
+            });
+    return result.shouldContinue();
   }
 
   private void moveMembersFromSourceToTarget(
@@ -482,16 +467,17 @@ public class StaticClassMerger {
           targetClass.type.toSourceString());
     }
 
+    // TODO(b/136457753) This check is a bit weird for protected, since it is moving access.
     assert targetClass.accessFlags.isAtLeastAsVisibleAs(sourceClass.accessFlags);
-    assert sourceClass.instanceFields().size() == 0;
-    assert targetClass.instanceFields().size() == 0;
+    assert sourceClass.instanceFields().isEmpty();
+    assert targetClass.instanceFields().isEmpty();
 
     numberOfMergedClasses++;
 
     // Move members from source to target.
-    targetClass.appendDirectMethods(
+    targetClass.addDirectMethods(
         mergeMethods(sourceClass.directMethods(), targetClass.directMethods(), targetClass));
-    targetClass.appendVirtualMethods(
+    targetClass.addVirtualMethods(
         mergeMethods(sourceClass.virtualMethods(), targetClass.virtualMethods(), targetClass));
     targetClass.setStaticFields(
         mergeFields(sourceClass.staticFields(), targetClass.staticFields(), targetClass));
@@ -503,20 +489,20 @@ public class StaticClassMerger {
   }
 
   private List<DexEncodedMethod> mergeMethods(
-      List<DexEncodedMethod> sourceMethods,
-      List<DexEncodedMethod> targetMethods,
+      Iterable<DexEncodedMethod> sourceMethods,
+      Iterable<DexEncodedMethod> targetMethods,
       DexProgramClass targetClass) {
     // Move source methods to result one by one, renaming them if needed.
     MethodSignatureEquivalence equivalence = MethodSignatureEquivalence.get();
-    Set<Wrapper<DexMethod>> existingMethods =
-        targetMethods.stream()
-            .map(targetMethod -> equivalence.wrap(targetMethod.method))
-            .collect(Collectors.toSet());
+    Set<Wrapper<DexMethod>> existingMethods = new HashSet<>();
+    for (DexEncodedMethod targetMethod : targetMethods) {
+      existingMethods.add(equivalence.wrap(targetMethod.method));
+    }
 
     Predicate<DexMethod> availableMethodSignatures =
         method -> !existingMethods.contains(equivalence.wrap(method));
 
-    List<DexEncodedMethod> newMethods = new ArrayList<>(sourceMethods.size());
+    List<DexEncodedMethod> newMethods = new ArrayList<>();
     for (DexEncodedMethod sourceMethod : sourceMethods) {
       DexEncodedMethod sourceMethodAfterMove =
           renameMethodIfNeeded(sourceMethod, targetClass, availableMethodSignatures);

@@ -17,6 +17,7 @@ import com.android.tools.r8.shaking.proxy.testclasses.SubClass;
 import com.android.tools.r8.shaking.proxy.testclasses.SubInterface;
 import com.android.tools.r8.shaking.proxy.testclasses.TestClass;
 import com.android.tools.r8.utils.StringUtils;
+import com.android.tools.r8.utils.ThrowingConsumer;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.android.tools.r8.utils.codeinspector.FoundMethodSubject;
 import com.android.tools.r8.utils.codeinspector.InstructionSubject;
@@ -25,7 +26,6 @@ import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Streams;
 import java.util.List;
-import java.util.function.Consumer;
 import java.util.function.Predicate;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -38,7 +38,7 @@ public class ProxiesTest extends TestBase {
 
   @Parameterized.Parameters(name = "{0}")
   public static TestParametersCollection data() {
-    return getTestParameters().withAllRuntimes().build();
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
   }
 
   public ProxiesTest(TestParameters parameters) {
@@ -46,7 +46,9 @@ public class ProxiesTest extends TestBase {
   }
 
   private void runTest(
-      List<String> additionalKeepRules, Consumer<CodeInspector> inspection, String expectedResult)
+      List<String> additionalKeepRules,
+      ThrowingConsumer<CodeInspector, RuntimeException> inspection,
+      String expectedResult)
       throws Exception {
     testForR8(parameters.getBackend())
         .addProgramFiles(ToolHelper.getClassFilesForTestPackage(Main.class.getPackage()))
@@ -69,7 +71,7 @@ public class ProxiesTest extends TestBase {
               o.inliningInstructionLimit = 4;
             })
         .noMinification()
-        .setMinApi(parameters.getRuntime())
+        .setMinApi(parameters.getApiLevel())
         .compile()
         .inspect(inspection)
         .run(parameters.getRuntime(), Main.class)

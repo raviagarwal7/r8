@@ -16,26 +16,36 @@ import com.android.tools.r8.code.IgetShort;
 import com.android.tools.r8.code.IgetWide;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexField;
-import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
-import org.objectweb.asm.Opcodes;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import java.util.Set;
 
-public class InstanceGet extends FieldInstruction {
+public class InstanceGet extends FieldInstruction implements InstanceFieldInstruction {
 
   public InstanceGet(Value dest, Value object, DexField field) {
     super(field, dest, object);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INSTANCE_GET;
+  }
+
+  @Override
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return getField().type.isBooleanType();
   }
 
   @Override
@@ -47,14 +57,22 @@ public class InstanceGet extends FieldInstruction {
     return outValue;
   }
 
+  @Override
   public Value object() {
     assert inValues.size() == 1;
     return inValues.get(0);
   }
 
   @Override
-  public boolean couldIntroduceAnAlias() {
-    return true;
+  public Value value() {
+    return outValue;
+  }
+
+  @Override
+  public boolean couldIntroduceAnAlias(AppView<?> appView, Value root) {
+    assert root != null && root.getType().isReferenceType();
+    assert outValue != null;
+    return outValue.getType().isReferenceType();
   }
 
   @Override
@@ -87,9 +105,6 @@ public class InstanceGet extends FieldInstruction {
       case SHORT:
         instruction = new IgetShort(destRegister, objectRegister, field);
         break;
-      case INT_OR_FLOAT:
-      case LONG_OR_DOUBLE:
-        throw new Unreachable("Unexpected imprecise type: " + getType());
       default:
         throw new Unreachable("Unexpected type: " + getType());
     }
@@ -103,21 +118,8 @@ public class InstanceGet extends FieldInstruction {
 
   @Override
   public boolean instructionMayHaveSideEffects(
-      AppView<? extends AppInfo> appView, DexType context) {
-    return instructionInstanceCanThrow(appView, context).isThrowing();
-  }
-
-  @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    // instance-get can be dead code as long as it cannot have any of the following:
-    // * NoSuchFieldError (resolution failure)
-    // * IncompatibleClassChangeError (instance-* instruction for static fields)
-    // * IllegalAccessError (not visible from the access context)
-    // * NullPointerException (null receiver)
-    boolean canBeDeadCode = !instructionMayHaveSideEffects(appView, code.method.method.holder);
-    assert appView.enableWholeProgramOptimizations() || !canBeDeadCode
-        : "Expected instance-get instruction to have side effects in D8";
-    return canBeDeadCode;
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    return instructionInstanceCanThrow(appView, context, assumption);
   }
 
   @Override
@@ -141,8 +143,18 @@ public class InstanceGet extends FieldInstruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInstanceGet(getField(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInstanceGet(getField(), context.getHolder());
+  }
+
+  @Override
+  public boolean isInstanceFieldInstruction() {
+    return true;
+  }
+
+  @Override
+  public InstanceFieldInstruction asInstanceFieldInstruction() {
+    return this;
   }
 
   @Override
@@ -161,13 +173,12 @@ public class InstanceGet extends FieldInstruction {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.fromDexType(getField().type, Nullability.maybeNull(), appView);
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.fromDexType(getField().type, Nullability.maybeNull(), appView);
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return getField().type;
   }
 
@@ -180,11 +191,12 @@ public class InstanceGet extends FieldInstruction {
   @Override
   public void buildCf(CfBuilder builder) {
     builder.add(
-        new CfFieldInstruction(Opcodes.GETFIELD, getField(), builder.resolveField(getField())));
+        new CfFieldInstruction(
+            org.objectweb.asm.Opcodes.GETFIELD, getField(), builder.resolveField(getField())));
   }
 
   @Override
-  public boolean throwsNpeIfValueIsNull(Value value, DexItemFactory dexItemFactory) {
+  public boolean throwsNpeIfValueIsNull(Value value, AppView<?> appView, ProgramMethod context) {
     return object() == value;
   }
 
@@ -201,11 +213,16 @@ public class InstanceGet extends FieldInstruction {
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forInstanceGet(
         this, clazz, appView, mode, assumption);
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    return false;
   }
 }

@@ -6,7 +6,7 @@ package com.android.tools.r8.utils.codeinspector;
 
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.DexEncodedMethod;
-import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.code.IRCode;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.naming.MemberNaming.Signature;
@@ -14,7 +14,7 @@ import com.android.tools.r8.naming.MemberNaming.Signature;
 public class AbsentMethodSubject extends MethodSubject {
 
   @Override
-  public IRCode buildIR(DexItemFactory dexItemFactory) {
+  public IRCode buildIR() {
     throw new Unreachable("Cannot build IR for an absent method");
   }
 
@@ -94,6 +94,11 @@ public class AbsentMethodSubject extends MethodSubject {
   }
 
   @Override
+  public ProgramMethod getProgramMethod() {
+    return null;
+  }
+
+  @Override
   public MethodSignature getOriginalSignature() {
     return null;
   }
@@ -119,6 +124,11 @@ public class AbsentMethodSubject extends MethodSubject {
   }
 
   @Override
+  public LocalVariableTable getLocalVariableTable() {
+    return null;
+  }
+
+  @Override
   public boolean hasLocalVariableTable() {
     throw new Unreachable("Cannot determine if an absent method has a local variable table");
   }
@@ -126,5 +136,15 @@ public class AbsentMethodSubject extends MethodSubject {
   @Override
   public AnnotationSubject annotation(String name) {
     return new AbsentAnnotationSubject();
+  }
+
+  @Override
+  public String getJvmMethodSignatureAsString() {
+    return null;
+  }
+
+  @Override
+  public MethodSubject toMethodOnCompanionClass() {
+    throw new Unreachable("Cannot determine companion class method");
   }
 }

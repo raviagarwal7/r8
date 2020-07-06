@@ -3,25 +3,29 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
-import static com.android.tools.r8.optimize.MemberRebindingAnalysis.isMemberVisibleFromOriginalContext;
-
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.cf.code.CfNew;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AccessControl;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexItemFactory;
+import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.google.common.collect.Sets;
 
 public class NewInstance extends Instruction {
 
@@ -32,6 +36,15 @@ public class NewInstance extends Instruction {
     super(dest);
     assert clazz != null;
     this.clazz = clazz;
+  }
+
+  public InvokeDirect getUniqueConstructorInvoke(DexItemFactory dexItemFactory) {
+    return IRCodeUtils.getUniqueConstructorInvoke(outValue(), dexItemFactory);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.NEW_INSTANCE;
   }
 
   @Override
@@ -88,8 +101,8 @@ public class NewInstance extends Instruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forNewInstance(clazz, invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forNewInstance(clazz, context.getHolder());
   }
 
   @Override
@@ -108,21 +121,20 @@ public class NewInstance extends Instruction {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return clazz;
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.fromDexType(clazz, Nullability.definitelyNotNull(), appView);
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.fromDexType(clazz, Nullability.definitelyNotNull(), appView);
   }
 
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forNewInstance(
@@ -131,10 +143,15 @@ public class NewInstance extends Instruction {
 
   @Override
   public boolean instructionMayHaveSideEffects(
-      AppView<? extends AppInfo> appView, DexType context) {
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    DexItemFactory dexItemFactory = appView.dexItemFactory();
     if (!appView.enableWholeProgramOptimizations()) {
-      return true;
+      return !(dexItemFactory.libraryTypesAssumedToBePresent.contains(clazz)
+          && dexItemFactory.libraryClassesWithoutStaticInitialization.contains(clazz));
     }
+
+    assert appView.appInfo().hasLiveness();
+    AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
 
     if (clazz.isPrimitiveType() || clazz.isArrayType()) {
       assert false : "Unexpected new-instance instruction with primitive or array type";
@@ -147,14 +164,12 @@ public class NewInstance extends Instruction {
     }
 
     if (definition.isLibraryClass()
-        && !appView.dexItemFactory().libraryTypesAssumedToBePresent.contains(clazz)) {
+        && !dexItemFactory.libraryTypesAssumedToBePresent.contains(clazz)) {
       return true;
     }
 
     // Verify that the instruction does not lead to an IllegalAccessError.
-    if (appView.appInfo().hasSubtyping()
-        && !isMemberVisibleFromOriginalContext(
-            appView, context, definition.type, definition.accessFlags)) {
+    if (AccessControl.isClassAccessible(definition, context, appView).isPossiblyFalse()) {
       return true;
     }
 
@@ -162,16 +177,25 @@ public class NewInstance extends Instruction {
     if (definition.classInitializationMayHaveSideEffects(
         appView,
         // Types that are a super type of `context` are guaranteed to be initialized already.
-        type -> appView.isSubtype(context, type).isTrue())) {
+        type -> appViewWithLiveness.appInfo().isSubtype(context.getHolderType(), type),
+        Sets.newIdentityHashSet())) {
       return true;
     }
 
-    return false;
-  }
+    // Verify that the object does not have a finalizer.
+    ResolutionResult finalizeResolutionResult =
+        appViewWithLiveness
+            .appInfo()
+            .resolveMethodOnClass(dexItemFactory.objectMembers.finalize, clazz);
+    if (finalizeResolutionResult.isSingleResolution()) {
+      DexMethod finalizeMethod = finalizeResolutionResult.getSingleTarget().method;
+      if (finalizeMethod != dexItemFactory.enumMethods.finalize
+          && finalizeMethod != dexItemFactory.objectMembers.finalize) {
+        return true;
+      }
+    }
 
-  @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    return !instructionMayHaveSideEffects(appView, code.method.method.holder);
+    return false;
   }
 
   public void markNoSpilling() {
@@ -180,5 +204,31 @@ public class NewInstance extends Instruction {
 
   public boolean isSpillingAllowed() {
     return allowSpilling;
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    if (appView.enableWholeProgramOptimizations()) {
+      // In R8, check if the class initialization of the holder or any of its ancestor types may
+      // have side effects.
+      return clazz.classInitializationMayHaveSideEffects(
+          appView,
+          // Types that are a super type of `context` are guaranteed to be initialized already.
+          type -> appView.isSubtype(context.getHolderType(), type).isTrue(),
+          Sets.newIdentityHashSet());
+    } else {
+      // In D8, this instruction may trigger class initialization if the holder of the field is
+      // different from the current context.
+      return clazz != context.getHolderType();
+    }
+  }
+
+  @Override
+  public boolean verifyTypes(AppView<?> appView) {
+    TypeElement type = getOutType();
+    assert type.isClassType();
+    assert type.asClassType().getClassType() == clazz || appView.options().testing.allowTypeErrors;
+    assert type.isDefinitelyNotNull();
+    return true;
   }
 }

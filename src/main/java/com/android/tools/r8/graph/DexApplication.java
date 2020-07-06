@@ -27,12 +27,12 @@ public abstract class DexApplication {
   public final ImmutableList<DataResourceProvider> dataResourceProviders;
 
   public final ImmutableSet<DexType> mainDexList;
-  public final String deadCode;
 
   private final ClassNameMapper proguardMap;
 
   public final Timing timing;
 
+  public final InternalOptions options;
   public final DexItemFactory dexItemFactory;
 
   // Information on the lexicographically largest string referenced from code.
@@ -43,15 +43,14 @@ public abstract class DexApplication {
       ClassNameMapper proguardMap,
       ImmutableList<DataResourceProvider> dataResourceProviders,
       ImmutableSet<DexType> mainDexList,
-      String deadCode,
-      DexItemFactory dexItemFactory,
+      InternalOptions options,
       DexString highestSortingString,
       Timing timing) {
     this.proguardMap = proguardMap;
     this.dataResourceProviders = dataResourceProviders;
     this.mainDexList = mainDexList;
-    this.deadCode = deadCode;
-    this.dexItemFactory = dexItemFactory;
+    this.options = options;
+    this.dexItemFactory = options.itemFactory;
     this.highestSortingString = highestSortingString;
     this.timing = timing;
   }
@@ -96,8 +95,12 @@ public abstract class DexApplication {
 
   public Iterable<DexProgramClass> classesWithDeterministicOrder() {
     List<DexProgramClass> classes = new ArrayList<>(programClasses());
-    // To keep the order deterministic, we sort the classes by their type, which is a unique key.
-    classes.sort((a, b) -> a.type.slowCompareTo(b.type));
+    // We never actually sort by anything but the DexType, this is just here in case we ever change
+    // that.
+    if (options.testing.deterministicSortingBasedOnDexType) {
+      // To keep the order deterministic, we sort the classes by their type, which is a unique key.
+      classes.sort((a, b) -> a.type.slowCompareTo(b.type));
+    }
     return classes;
   }
 
@@ -124,19 +127,19 @@ public abstract class DexApplication {
 
     final List<DataResourceProvider> dataResourceProviders = new ArrayList<>();
 
+    public final InternalOptions options;
     public final DexItemFactory dexItemFactory;
     ClassNameMapper proguardMap;
     final Timing timing;
 
     DexString highestSortingString;
-    String deadCode;
     final Set<DexType> mainDexList = Sets.newIdentityHashSet();
     private final Collection<DexProgramClass> synthesizedClasses;
 
-    public Builder(DexItemFactory dexItemFactory, Timing timing) {
-      this.dexItemFactory = dexItemFactory;
+    public Builder(InternalOptions options, Timing timing) {
+      this.options = options;
+      this.dexItemFactory = options.itemFactory;
       this.timing = timing;
-      this.deadCode = null;
       this.synthesizedClasses = new ArrayList<>();
     }
 
@@ -148,9 +151,9 @@ public abstract class DexApplication {
       proguardMap = application.getProguardMap();
       timing = application.timing;
       highestSortingString = application.highestSortingString;
+      options = application.options;
       dexItemFactory = application.dexItemFactory;
       mainDexList.addAll(application.mainDexList);
-      deadCode = application.deadCode;
       synthesizedClasses = new ArrayList<>();
     }
 
@@ -169,19 +172,6 @@ public abstract class DexApplication {
 
     public synchronized T addDataResourceProvider(DataResourceProvider provider) {
       dataResourceProviders.add(provider);
-      return self();
-    }
-
-    public T appendDeadCode(String deadCodeAtAnotherRound) {
-      if (deadCodeAtAnotherRound == null) {
-        return self();
-      }
-      if (this.deadCode == null) {
-        this.deadCode = deadCodeAtAnotherRound;
-        return self();
-      }
-      // Concatenate existing deadCode info with next round.
-      this.deadCode += deadCodeAtAnotherRound;
       return self();
     }
 
@@ -226,13 +216,14 @@ public abstract class DexApplication {
     public abstract DexApplication build();
   }
 
-  public static LazyLoadedDexApplication.Builder builder(DexItemFactory factory, Timing timing) {
-    return builder(factory, timing, ProgramClassCollection::resolveClassConflictImpl);
+  public static LazyLoadedDexApplication.Builder builder(InternalOptions options, Timing timing) {
+    return builder(
+        options, timing, ProgramClassCollection.defaultConflictResolver(options.reporter));
   }
 
   public static LazyLoadedDexApplication.Builder builder(
-      DexItemFactory factory, Timing timing, ProgramClassConflictResolver resolver) {
-    return new LazyLoadedDexApplication.Builder(resolver, factory, timing);
+      InternalOptions options, Timing timing, ProgramClassConflictResolver resolver) {
+    return new LazyLoadedDexApplication.Builder(resolver, options, timing);
   }
 
   public DirectMappedDexApplication asDirect() {
@@ -241,4 +232,6 @@ public abstract class DexApplication {
   }
 
   public abstract DirectMappedDexApplication toDirect();
+
+  public abstract boolean isDirect();
 }

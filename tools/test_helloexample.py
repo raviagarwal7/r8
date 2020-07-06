@@ -19,6 +19,7 @@ import zipfile
 
 import golem
 import jdk
+import proguard
 import utils
 
 HELLO_JAR = os.path.join(utils.BUILD, 'test', 'examples', 'hello.jar')
@@ -87,7 +88,7 @@ def parse_arguments():
   parser = argparse.ArgumentParser(
       description = 'Compile a hello world example program')
   parser.add_argument('--tool',
-                      choices = ['d8', 'r8', 'pg'],
+                      choices = ['d8', 'r8'] + proguard.getVersions(),
                       required = True,
                       help = 'Compiler tool to use.')
   parser.add_argument('--output-mode',
@@ -144,8 +145,12 @@ def Compile(tool, output_mode, lib, extra, output_dir, noopt, temp_dir):
   if tool == 'd8':
     if output_mode != 'dex':
       raise ValueError('Invalid output mode for D8')
+    classpath = []
+    for cp_entry in extra:
+      classpath.extend(['--classpath', cp_entry])
     return [
-      GetCompilerPrefix(tool, output_mode, output, HELLO_JAR, lib, extra, noopt)
+      GetCompilerPrefix(
+        tool, output_mode, output, HELLO_JAR, lib, classpath, noopt)
     ]
   # The compilation is either R8 or PG.
   # Write keep rules to a temporary file.
@@ -159,19 +164,17 @@ def Compile(tool, output_mode, lib, extra, output_dir, noopt, temp_dir):
     if output_mode == 'cf':
       cmd.append('--classfile')
     return [cmd]
-  if tool == 'pg':
+  if proguard.isValidVersion(tool):
     # Build PG invokation with additional rules to silence warnings.
     pg_out = output if output_mode == 'cf' \
       else os.path.join(output_dir, 'pgout.zip')
-    cmds = [[
-      jdk.GetJavaExecutable(),
-      '-jar', utils.PROGUARD_JAR,
+    cmds = [proguard.getCmd([
       '-injars', ':'.join([HELLO_JAR] + extra),
       '-libraryjars', lib,
       '-outjars', pg_out,
       '-dontwarn **',
       '@' + rules_file
-    ]]
+    ], version=tool)]
     if output_mode == 'dex':
       cmds.append(
           GetCompilerPrefix('d8', 'dex', output, pg_out, lib, [], noopt))
@@ -237,7 +240,7 @@ def Main():
     for cmd in cmds:
       fullcmd = cmd_prefix + cmd
       utils.PrintCmd(fullcmd)
-      subprocess.check_call(fullcmd)
+      subprocess.check_output(fullcmd)
     dt = time.time() - t0
 
     if args.print_memoryuse:

@@ -3,14 +3,6 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.graph;
 
-import com.android.tools.r8.graph.DexValue.DexValueDouble;
-import com.android.tools.r8.graph.DexValue.DexValueFloat;
-import com.android.tools.r8.graph.DexValue.DexValueInt;
-import com.android.tools.r8.graph.DexValue.DexValueLong;
-import com.android.tools.r8.graph.DexValue.DexValueMethodHandle;
-import com.android.tools.r8.graph.DexValue.DexValueMethodType;
-import com.android.tools.r8.graph.DexValue.DexValueString;
-import com.android.tools.r8.graph.DexValue.DexValueType;
 
 public abstract class UseRegistry {
 
@@ -25,6 +17,8 @@ public abstract class UseRegistry {
     this.factory = factory;
   }
 
+  public abstract boolean registerInitClass(DexType type);
+
   public abstract boolean registerInvokeVirtual(DexMethod method);
 
   public abstract boolean registerInvokeDirect(DexMethod method);
@@ -35,15 +29,31 @@ public abstract class UseRegistry {
 
   public abstract boolean registerInvokeSuper(DexMethod method);
 
+  public abstract boolean registerInstanceFieldRead(DexField field);
+
+  public boolean registerInstanceFieldReadFromMethodHandle(DexField field) {
+    return registerInstanceFieldRead(field);
+  }
+
   public abstract boolean registerInstanceFieldWrite(DexField field);
 
-  public abstract boolean registerInstanceFieldRead(DexField field);
+  public boolean registerInstanceFieldWriteFromMethodHandle(DexField field) {
+    return registerInstanceFieldWrite(field);
+  }
 
   public abstract boolean registerNewInstance(DexType type);
 
   public abstract boolean registerStaticFieldRead(DexField field);
 
+  public boolean registerStaticFieldReadFromMethodHandle(DexField field) {
+    return registerStaticFieldRead(field);
+  }
+
   public abstract boolean registerStaticFieldWrite(DexField field);
+
+  public boolean registerStaticFieldWriteFromMethodHandle(DexField field) {
+    return registerStaticFieldWrite(field);
+  }
 
   public abstract boolean registerTypeReference(DexType type);
 
@@ -55,20 +65,19 @@ public abstract class UseRegistry {
     return registerTypeReference(type);
   }
 
-  public void registerMethodHandle(
-      DexMethodHandle methodHandle, MethodHandleUse use) {
+  public void registerMethodHandle(DexMethodHandle methodHandle, MethodHandleUse use) {
     switch (methodHandle.type) {
       case INSTANCE_GET:
-        registerInstanceFieldRead(methodHandle.asField());
+        registerInstanceFieldReadFromMethodHandle(methodHandle.asField());
         break;
       case INSTANCE_PUT:
-        registerInstanceFieldWrite(methodHandle.asField());
+        registerInstanceFieldWriteFromMethodHandle(methodHandle.asField());
         break;
       case STATIC_GET:
-        registerStaticFieldRead(methodHandle.asField());
+        registerStaticFieldReadFromMethodHandle(methodHandle.asField());
         break;
       case STATIC_PUT:
-        registerStaticFieldWrite(methodHandle.asField());
+        registerStaticFieldWriteFromMethodHandle(methodHandle.asField());
         break;
       case INVOKE_INSTANCE:
         registerInvokeVirtual(methodHandle.asMethod());
@@ -99,8 +108,10 @@ public abstract class UseRegistry {
     boolean isLambdaMetaFactory =
         factory.isLambdaMetafactoryMethod(callSite.bootstrapMethod.asMethod());
 
-    registerMethodHandle(
-        callSite.bootstrapMethod, MethodHandleUse.NOT_ARGUMENT_TO_LAMBDA_METAFACTORY);
+    if (!isLambdaMetaFactory) {
+      registerMethodHandle(
+          callSite.bootstrapMethod, MethodHandleUse.NOT_ARGUMENT_TO_LAMBDA_METAFACTORY);
+    }
 
     // Lambda metafactory will use this type as the main SAM
     // interface for the dynamically created lambda class.
@@ -109,22 +120,27 @@ public abstract class UseRegistry {
     // Register bootstrap method arguments.
     // Only Type, MethodHandle, and MethodType need to be registered.
     for (DexValue arg : callSite.bootstrapArgs) {
-      if (arg instanceof DexValueType) {
-        registerTypeReference(((DexValueType) arg).value);
-      } else if (arg instanceof DexValueMethodHandle) {
-        DexMethodHandle handle = ((DexValueMethodHandle) arg).value;
-        MethodHandleUse use = isLambdaMetaFactory
-            ? MethodHandleUse.ARGUMENT_TO_LAMBDA_METAFACTORY
-            : MethodHandleUse.NOT_ARGUMENT_TO_LAMBDA_METAFACTORY;
-        registerMethodHandle(handle, use);
-      } else if (arg instanceof DexValueMethodType) {
-        registerProto(((DexValueMethodType) arg).value);
-      } else {
-        assert (arg instanceof DexValueInt)
-            || (arg instanceof DexValueLong)
-            || (arg instanceof DexValueFloat)
-            || (arg instanceof DexValueDouble)
-            || (arg instanceof DexValueString);
+      switch (arg.getValueKind()) {
+        case METHOD_HANDLE:
+          DexMethodHandle handle = arg.asDexValueMethodHandle().value;
+          MethodHandleUse use =
+              isLambdaMetaFactory
+                  ? MethodHandleUse.ARGUMENT_TO_LAMBDA_METAFACTORY
+                  : MethodHandleUse.NOT_ARGUMENT_TO_LAMBDA_METAFACTORY;
+          registerMethodHandle(handle, use);
+          break;
+        case METHOD_TYPE:
+          registerProto(arg.asDexValueMethodType().value);
+          break;
+        case TYPE:
+          registerTypeReference(arg.asDexValueType().value);
+          break;
+        default:
+          assert arg.isDexValueInt()
+              || arg.isDexValueLong()
+              || arg.isDexValueFloat()
+              || arg.isDexValueDouble()
+              || arg.isDexValueString();
       }
     }
   }

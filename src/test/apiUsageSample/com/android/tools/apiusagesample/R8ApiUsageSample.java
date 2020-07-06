@@ -5,6 +5,7 @@ package com.android.tools.apiusagesample;
 
 import com.android.tools.r8.ArchiveClassFileProvider;
 import com.android.tools.r8.ArchiveProgramResourceProvider;
+import com.android.tools.r8.AssertionsConfiguration;
 import com.android.tools.r8.CompilationFailedException;
 import com.android.tools.r8.CompilationMode;
 import com.android.tools.r8.DexIndexedConsumer;
@@ -15,6 +16,8 @@ import com.android.tools.r8.ProgramResourceProvider;
 import com.android.tools.r8.R8;
 import com.android.tools.r8.R8Command;
 import com.android.tools.r8.ResourceException;
+import com.android.tools.r8.StringConsumer;
+import com.android.tools.r8.Version;
 import com.android.tools.r8.origin.ArchiveEntryOrigin;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.origin.PathOrigin;
@@ -22,6 +25,8 @@ import com.android.tools.r8.utils.StringDiagnostic;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -58,6 +63,8 @@ public class R8ApiUsageSample {
    * </pre>
    */
   public static void main(String[] args) {
+    // Check version API
+    checkVersionApi();
     // Parse arguments with the commandline parser to make use of its API.
     R8Command.Builder cmd = R8Command.parse(args, origin);
     CompilationMode mode = cmd.getMode();
@@ -113,7 +120,49 @@ public class R8ApiUsageSample {
     useMainDexRules(minApiLevel, libraries, inputs, mainDexRules);
     useProguardConfigFiles(minApiLevel, libraries, inputs, mainDexList, pgConf);
     useProguardConfigLines(minApiLevel, libraries, inputs, mainDexList, pgConf);
+    useAssertionConfig(minApiLevel, libraries, inputs);
     useVArgVariants(minApiLevel, libraries, inputs, mainDexList, mainDexRules, pgConf);
+    useProguardConfigConsumers(minApiLevel, libraries, inputs, pgConf);
+  }
+
+  private static class InMemoryStringConsumer implements StringConsumer {
+    public String value = null;
+
+    @Override
+    public void accept(String string, DiagnosticsHandler handler) {
+      value = string;
+    }
+  }
+
+  private static void useProguardConfigConsumers(
+      int minApiLevel, Collection<Path> libraries, Collection<Path> inputs, List<Path> pgConf) {
+    InMemoryStringConsumer usageConsumer = new InMemoryStringConsumer();
+    InMemoryStringConsumer seedsConsumer = new InMemoryStringConsumer();
+    InMemoryStringConsumer configConsumer = new InMemoryStringConsumer();
+    try {
+      R8.run(
+          R8Command.builder(handler)
+              .setMinApiLevel(minApiLevel)
+              .setProgramConsumer(new EnsureOutputConsumer())
+              .addLibraryFiles(libraries)
+              .addProgramFiles(inputs)
+              .addProguardConfigurationFiles(pgConf)
+              .setProguardUsageConsumer(usageConsumer)
+              .setProguardSeedsConsumer(seedsConsumer)
+              .setProguardConfigurationConsumer(configConsumer)
+              .build());
+    } catch (CompilationFailedException e) {
+      throw new RuntimeException("Unexpected compilation exception", e);
+    }
+    if (usageConsumer.value == null) {
+      throw new RuntimeException("Expected usage info but had none");
+    }
+    if (seedsConsumer.value == null) {
+      throw new RuntimeException("Expected seeds info but had none");
+    }
+    if (configConsumer.value == null) {
+      throw new RuntimeException("Expected config info but had none");
+    }
   }
 
   // Check API support for compiling Java class-files from the file system.
@@ -357,6 +406,51 @@ public class R8ApiUsageSample {
     }
   }
 
+  private static void useAssertionConfig(
+      int minApiLevel, Collection<Path> libraries, Collection<Path> inputs) {
+    try {
+      R8.run(
+          R8Command.builder(handler)
+              .setDisableTreeShaking(true)
+              .setMinApiLevel(minApiLevel)
+              .setProgramConsumer(new EnsureOutputConsumer())
+              .addLibraryFiles(libraries)
+              .addProgramFiles(inputs)
+              .addAssertionsConfiguration(b -> b.setScopeAll().setEnable().build())
+              .addAssertionsConfiguration(b -> b.setScopeAll().setDisable().build())
+              .addAssertionsConfiguration(
+                  b -> b.setScopePackage("com.android.tools.apiusagesample").setEnable().build())
+              .addAssertionsConfiguration(
+                  b ->
+                      b.setScopePackage("com.android.tools.apiusagesample")
+                          .setPassthrough()
+                          .build())
+              .addAssertionsConfiguration(
+                  b -> b.setScopePackage("com.android.tools.apiusagesample").setDisable().build())
+              .addAssertionsConfiguration(
+                  b ->
+                      b.setScopeClass("com.android.tools.apiusagesample.D8ApiUsageSample")
+                          .setEnable()
+                          .build())
+              .addAssertionsConfiguration(
+                  b ->
+                      b.setScopeClass("com.android.tools.apiusagesample.D8ApiUsageSample")
+                          .setPassthrough()
+                          .build())
+              .addAssertionsConfiguration(
+                  b ->
+                      b.setScopeClass("com.android.tools.apiusagesample.D8ApiUsageSample")
+                          .setDisable()
+                          .build())
+              .addAssertionsConfiguration(AssertionsConfiguration.Builder::enableAllAssertions)
+              .addAssertionsConfiguration(AssertionsConfiguration.Builder::passthroughAllAssertions)
+              .addAssertionsConfiguration(AssertionsConfiguration.Builder::disableAllAssertions)
+              .build());
+    } catch (CompilationFailedException e) {
+      throw new RuntimeException("Unexpected compilation exceptions", e);
+    }
+  }
+
   // Check API support for all the varg variants.
   private static void useVArgVariants(
       int minApiLevel,
@@ -463,6 +557,47 @@ public class R8ApiUsageSample {
       if (!hasOutput) {
         handler.error(new StringDiagnostic("Expected to produce output but had none"));
       }
+    }
+  }
+
+  private static void checkVersionApi() {
+    String labelValue;
+    int labelAccess;
+    try {
+      Field field = Version.class.getDeclaredField("LABEL");
+      labelAccess = field.getModifiers();
+      labelValue = (String) field.get(Version.class);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+    if (!Modifier.isPublic(labelAccess)
+        || !Modifier.isStatic(labelAccess)
+        || !Modifier.isFinal(labelAccess)) {
+      throw new RuntimeException("Expected public static final LABEL");
+    }
+    if (labelValue.isEmpty()) {
+      throw new RuntimeException("Expected LABEL constant");
+    }
+    if (Version.LABEL.isEmpty()) {
+      throw new RuntimeException("Expected LABEL constant");
+    }
+    if (Version.getVersionString() == null) {
+      throw new RuntimeException("Expected getVersionString API");
+    }
+    if (Version.getMajorVersion() < -1) {
+      throw new RuntimeException("Expected getMajorVersion API");
+    }
+    if (Version.getMinorVersion() < -1) {
+      throw new RuntimeException("Expected getMinorVersion API");
+    }
+    if (Version.getPatchVersion() < -1) {
+      throw new RuntimeException("Expected getPatchVersion API");
+    }
+    if (Version.getPreReleaseString() == null && false) {
+      throw new RuntimeException("Expected getPreReleaseString API");
+    }
+    if (Version.isDevelopmentVersion() && false) {
+      throw new RuntimeException("Expected isDevelopmentVersion API");
     }
   }
 }

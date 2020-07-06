@@ -7,8 +7,8 @@ package com.android.tools.r8.ir.code;
 import com.android.tools.r8.errors.InternalCompilerError;
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.PrimitiveTypeLatticeElement;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.PrimitiveTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 
 public enum ValueType {
   OBJECT,
@@ -35,8 +35,7 @@ public enum ValueType {
 
   public static ValueType fromMemberType(MemberType type) {
     switch (type) {
-      case BOOLEAN:
-      case BYTE:
+      case BOOLEAN_OR_BYTE:
       case CHAR:
       case SHORT:
       case INT:
@@ -103,35 +102,35 @@ public enum ValueType {
     }
   }
 
-  public static ValueType fromTypeLattice(TypeLatticeElement typeLatticeElement) {
-    if (typeLatticeElement.isReference()) {
+  public static ValueType fromType(TypeElement type) {
+    if (type.isReferenceType()) {
       return OBJECT;
     }
-    if (typeLatticeElement.isInt()) {
+    if (type.isInt()) {
       return INT;
     }
-    if (typeLatticeElement.isFloat()) {
+    if (type.isFloat()) {
       return FLOAT;
     }
-    if (typeLatticeElement.isLong()) {
+    if (type.isLong()) {
       return LONG;
     }
-    if (typeLatticeElement.isDouble()) {
+    if (type.isDouble()) {
       return DOUBLE;
     }
-    throw new Unreachable("Unexpected conversion of imprecise type: " + typeLatticeElement);
+    throw new Unreachable("Unexpected conversion of imprecise type: " + type);
   }
 
-  public PrimitiveTypeLatticeElement toPrimitiveTypeLattice() {
+  public PrimitiveTypeElement toPrimitiveType() {
     switch (this) {
       case INT:
-        return TypeLatticeElement.INT;
+        return TypeElement.getInt();
       case FLOAT:
-        return TypeLatticeElement.FLOAT;
+        return TypeElement.getFloat();
       case LONG:
-        return TypeLatticeElement.LONG;
+        return TypeElement.getLong();
       case DOUBLE:
-        return TypeLatticeElement.DOUBLE;
+        return TypeElement.getDouble();
       default:
         throw new Unreachable("Unexpected type in conversion to primitive: " + this);
     }

@@ -36,10 +36,10 @@ import subprocess
 import sys
 import time
 import utils
+import run_on_app
 
 # How often the bot/tester should check state
 PULL_DELAY = 30
-BUCKET = 'r8-test-results'
 TEST_RESULT_DIR = 'internal'
 
 # Magic files
@@ -55,15 +55,102 @@ STDOUT = 'stdout'
 EXITCODE = 'exitcode'
 TIMED_OUT = 'timed_out'
 
-TEST_COMMANDS = [
-    # Run test.py internal testing.
-    ['tools/test.py', '--only_internal'],
-    # Ensure that all internal apps compile.
-    ['tools/run_on_app.py', '--ignore-java-version','--run-all', '--out=out']
+BENCHMARK_APPS = [
+    {
+        'app': 'r8',
+        'version': 'cf',
+        'find-xmx-min': 128,
+        'find-xmx-max': 400,
+        'find-xmx-range': 16,
+        'oom-threshold': 247,
+    },
+    {
+        'app': 'chrome',
+        'version': '180917',
+        'find-xmx-min': 256,
+        'find-xmx-max': 450,
+        'find-xmx-range': 16,
+        'oom-threshold': 340,
+    },
+    {
+        'app': 'youtube',
+        'version': '12.22',
+        'find-xmx-min': 750,
+        'find-xmx-max': 1150,
+        'find-xmx-range': 32,
+        'oom-threshold': 950,
+        # TODO(b/143431825): Youtube can OOM randomly in memory configurations
+        #  that should work.
+        'skip-find-xmx-max': True,
+    },
+    {
+        'app': 'iosched',
+        'version': '2019',
+        'find-xmx-min': 128,
+        'find-xmx-max': 1024,
+        'find-xmx-range': 16,
+        'oom-threshold': 267,
+    },
 ]
 
+def find_min_xmx_command(record):
+  assert record['find-xmx-min'] < record['find-xmx-max']
+  assert record['find-xmx-range'] < record['find-xmx-max'] - record['find-xmx-min']
+  return [
+      'tools/run_on_app.py',
+      '--compiler=r8',
+      '--compiler-build=lib',
+      '--app=%s' % record['app'],
+      '--version=%s' % record['version'],
+      '--no-debug',
+      '--no-build',
+      '--find-min-xmx',
+      '--find-min-xmx-min-memory=%s' % record['find-xmx-min'],
+      '--find-min-xmx-max-memory=%s' % record['find-xmx-max'],
+      '--find-min-xmx-range-size=%s' % record['find-xmx-range'],
+      '--find-min-xmx-archive']
+
+def compile_with_memory_max_command(record):
+  # TODO(b/152939233): Remove this special handling when fixed.
+  factor = 1.25 if record['app'] == 'chrome' else 1.15
+  return [] if 'skip-find-xmx-max' in record else [
+      'tools/run_on_app.py',
+      '--compiler=r8',
+      '--compiler-build=lib',
+      '--app=%s' % record['app'],
+      '--version=%s' % record['version'],
+      '--no-debug',
+      '--no-build',
+      '--max-memory=%s' % int(record['oom-threshold'] * factor)
+  ]
+
+def compile_with_memory_min_command(record):
+  return [
+      'tools/run_on_app.py',
+      '--compiler=r8',
+      '--compiler-build=lib',
+      '--app=%s' % record['app'],
+      '--version=%s' % record['version'],
+      '--no-debug',
+      '--no-build',
+      '--expect-oom',
+      '--max-memory=%s' % int(record['oom-threshold'] * 0.85)
+  ]
+
+TEST_COMMANDS = [
+    # Run test.py internal testing.
+    ['tools/test.py', '--only_internal', '--slow_tests',
+     '--java_max_memory_size=8G'],
+    # Ensure that all internal apps compile.
+    ['tools/run_on_app.py', '--run-all', '--out=out'],
+    # Find min xmx for selected benchmark apps
+    ['tools/gradle.py', 'r8lib'],
+] + (map(find_min_xmx_command, BENCHMARK_APPS)
+     + map(compile_with_memory_max_command, BENCHMARK_APPS)
+     + map(compile_with_memory_min_command, BENCHMARK_APPS))
+
 # Command timeout, in seconds.
-RUN_TIMEOUT = 3600 * 3
+RUN_TIMEOUT = 3600 * 6
 BOT_RUN_TIMEOUT = RUN_TIMEOUT * len(TEST_COMMANDS)
 
 def log(str):
@@ -116,33 +203,24 @@ def git_checkout(git_hash):
   ensure_git_clean()
   # Ensure that we are up to date to get the commit.
   git_pull()
-  subprocess.check_call(['git', 'checkout', git_hash])
+  exitcode = subprocess.call(['git', 'checkout', git_hash])
+  if exitcode != 0:
+    return None
   return utils.get_HEAD_sha1()
 
 def get_test_result_dir():
-  return os.path.join(BUCKET, TEST_RESULT_DIR)
+  return os.path.join(utils.R8_TEST_RESULTS_BUCKET, TEST_RESULT_DIR)
 
 def get_sha_destination(sha):
   return os.path.join(get_test_result_dir(), sha)
 
 def archive_status(failed):
   gs_destination = 'gs://%s' % get_sha_destination(utils.get_HEAD_sha1())
-  archive_value('status', gs_destination, failed)
+  utils.archive_value('status', gs_destination, failed)
 
 def get_status(sha):
   gs_destination = 'gs://%s/status' % get_sha_destination(sha)
   return utils.cat_file_on_cloud_storage(gs_destination)
-
-def archive_file(name, gs_dir, src_file):
-  gs_file = '%s/%s' % (gs_dir, name)
-  utils.upload_file_to_cloud_storage(src_file, gs_file, public_read=False)
-
-def archive_value(name, gs_dir, value):
-  with utils.TempDir() as temp:
-    tempfile = os.path.join(temp, name);
-    with open(tempfile, 'w') as f:
-      f.write(str(value))
-    archive_file(name, gs_dir, tempfile)
 
 def archive_log(stdout, stderr, exitcode, timed_out, cmd):
   sha = utils.get_HEAD_sha1()
@@ -151,10 +229,10 @@ def archive_log(stdout, stderr, exitcode, timed_out, cmd):
   gs_destination = 'gs://%s' % destination
   url = 'https://storage.cloud.google.com/%s' % destination
   log('Archiving logs to: %s' % gs_destination)
-  archive_value(EXITCODE, gs_destination, exitcode)
-  archive_value(TIMED_OUT, gs_destination, timed_out)
-  archive_file(STDOUT, gs_destination, stdout)
-  archive_file(STDERR, gs_destination, stderr)
+  utils.archive_value(EXITCODE, gs_destination, exitcode)
+  utils.archive_value(TIMED_OUT, gs_destination, timed_out)
+  utils.archive_file(STDOUT, gs_destination, stdout)
+  utils.archive_file(STDERR, gs_destination, stderr)
   log('Logs available at: %s' % url)
 
 def get_magic_file_base_path():
@@ -170,7 +248,7 @@ def delete_magic_file(name):
   utils.delete_file_from_cloud_storage(get_magic_file_gs_path(name))
 
 def put_magic_file(name, sha):
-  archive_value(name, get_magic_file_base_path(), sha)
+  utils.archive_value(name, get_magic_file_base_path(), sha)
 
 def get_magic_file_content(name, ignore_errors=False):
   return utils.cat_file_on_cloud_storage(get_magic_file_gs_path(name),
@@ -192,6 +270,8 @@ def fetch_and_print_logs(hash):
         gs_location = '%s%s' % (entry, to_print)
         value = utils.cat_file_on_cloud_storage(gs_location)
         print('\n\n%s had value:\n%s' % (to_print, value))
+  print("\n\nPrinting find-min-xmx ranges for apps")
+  run_on_app.print_min_xmx_ranges_for_hash(hash, 'r8', 'lib')
 
 def run_bot():
   print_magic_file_state()
@@ -225,7 +305,7 @@ def run_bot():
   log('Test status is: %s' % test_status)
   if test_status != '0':
     print('Tests failed, you can print the logs by running(googlers only):')
-    print('  tools/internal_tests.py --print_logs %s' % git_hash)
+    print('  tools/internal_test.py --print_logs %s' % git_hash)
     return 1
 
 def run_continuously():
@@ -237,6 +317,12 @@ def run_continuously():
     if get_magic_file_exists(READY_FOR_TESTING):
       git_hash = get_magic_file_content(READY_FOR_TESTING)
       checked_out = git_checkout(git_hash)
+      if not checked_out:
+        # Gerrit change, we don't run these on internal.
+        archive_status(0)
+        put_magic_file(TESTING_COMPLETE, git_hash)
+        delete_magic_file(READY_FOR_TESTING)
+        continue
       # If the script changed, we need to restart now to get correct commands
       # Note that we have not removed the READY_FOR_TESTING yet, so if we
       # execv we will pick up the same version.
@@ -250,8 +336,14 @@ def run_continuously():
       log('Running with hash: %s' % git_hash)
       exitcode = run_once(archive=True)
       log('Running finished with exit code %s' % exitcode)
-      put_magic_file(TESTING_COMPLETE, git_hash)
-      delete_magic_file(TESTING)
+      # If the bot timed out or something else triggered the bot to fail, don't
+      # put up the result (it will not be displayed anywhere, and we can't
+      # remove the magic file if the bot cleaned up).
+      if get_magic_file_exists(TESTING):
+        put_magic_file(TESTING_COMPLETE, git_hash)
+        # There is still a potential race here (we check, bot deletes, we try to
+        # delete) - this is unlikely and we ignore it (restart if it happens).
+        delete_magic_file(TESTING)
     time.sleep(PULL_DELAY)
 
 def handle_output(archive, stderr, stdout, exitcode, timed_out, cmd):
@@ -267,6 +359,9 @@ def handle_output(archive, stderr, stdout, exitcode, timed_out, cmd):
       print 'stdout: %s' % f.read()
 
 def execute(cmd, archive, env=None):
+  if cmd == []:
+    return
+
   utils.PrintCmd(cmd)
   with utils.TempDir() as temp:
     try:

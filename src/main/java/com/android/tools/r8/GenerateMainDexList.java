@@ -3,27 +3,32 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static com.android.tools.r8.utils.ExceptionUtils.unwrapExecutionException;
+
 import com.android.tools.r8.dex.ApplicationReader;
 import com.android.tools.r8.experimental.graphinfo.GraphConsumer;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppServices;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexApplication;
-import com.android.tools.r8.graph.DexReference;
-import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.shaking.DiscardedChecker;
+import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
+import com.android.tools.r8.graph.SubtypingInfo;
 import com.android.tools.r8.shaking.Enqueuer;
+import com.android.tools.r8.shaking.EnqueuerFactory;
 import com.android.tools.r8.shaking.MainDexClasses;
 import com.android.tools.r8.shaking.MainDexListBuilder;
 import com.android.tools.r8.shaking.RootSetBuilder;
 import com.android.tools.r8.shaking.RootSetBuilder.RootSet;
 import com.android.tools.r8.shaking.WhyAreYouKeepingConsumer;
 import com.android.tools.r8.utils.AndroidApp;
+import com.android.tools.r8.utils.Box;
 import com.android.tools.r8.utils.ExceptionUtils;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
@@ -42,14 +47,18 @@ public class GenerateMainDexList {
   private List<String> run(AndroidApp app, ExecutorService executor)
       throws IOException {
     try {
-      DexApplication application =
+      DirectMappedDexApplication application =
           new ApplicationReader(app, options, timing).read(executor).toDirect();
-      AppView<? extends AppInfoWithSubtyping> appView =
-          AppView.createForR8(new AppInfoWithSubtyping(application), options);
+      AppView<? extends AppInfoWithClassHierarchy> appView =
+          AppView.createForR8(new AppInfoWithClassHierarchy(application));
       appView.setAppServices(AppServices.builder(appView).build());
 
+      MainDexListBuilder.checkForAssumedLibraryTypes(appView.appInfo());
+
+      SubtypingInfo subtypingInfo = new SubtypingInfo(application.allClasses(), application);
+
       RootSet mainDexRootSet =
-          new RootSetBuilder(appView, application, options.mainDexKeepRules).run(executor);
+          new RootSetBuilder(appView, subtypingInfo, options.mainDexKeepRules).run(executor);
 
       GraphConsumer graphConsumer = options.mainDexKeptGraphConsumer;
       WhyAreYouKeepingConsumer whyAreYouKeepingConsumer = null;
@@ -58,8 +67,9 @@ public class GenerateMainDexList {
         graphConsumer = whyAreYouKeepingConsumer;
       }
 
-      Enqueuer enqueuer = new Enqueuer(appView, options, graphConsumer);
-      Set<DexType> liveTypes = enqueuer.traceMainDex(mainDexRootSet, executor, timing);
+      Enqueuer enqueuer =
+          EnqueuerFactory.createForMainDexTracing(appView, subtypingInfo, graphConsumer);
+      Set<DexProgramClass> liveTypes = enqueuer.traceMainDex(mainDexRootSet, executor, timing);
       // LiveTypes is the result.
       MainDexClasses mainDexClasses = new MainDexListBuilder(liveTypes, application).run();
 
@@ -71,22 +81,35 @@ public class GenerateMainDexList {
 
       if (options.mainDexListConsumer != null) {
         options.mainDexListConsumer.accept(String.join("\n", result), options.reporter);
+        options.mainDexListConsumer.finished(options.reporter);
       }
 
-      if (!mainDexRootSet.checkDiscarded.isEmpty()) {
-        new DiscardedChecker(mainDexRootSet, mainDexClasses.getClasses(), appView).run();
-      }
-      // Print -whyareyoukeeping results if any.
-      if (whyAreYouKeepingConsumer != null) {
-        for (DexReference reference : mainDexRootSet.reasonAsked) {
-          whyAreYouKeepingConsumer.printWhyAreYouKeeping(
-              enqueuer.getGraphNode(reference), System.out);
-        }
-      }
+      R8.processWhyAreYouKeepingAndCheckDiscarded(
+          mainDexRootSet,
+          () -> {
+            ArrayList<DexProgramClass> classes = new ArrayList<>();
+            // TODO(b/131668850): This is not a deterministic order!
+            mainDexClasses
+                .getClasses()
+                .forEach(
+                    type -> {
+                      DexClass clazz = appView.definitionFor(type);
+                      assert clazz.isProgramClass();
+                      classes.add(clazz.asProgramClass());
+                    });
+            return classes;
+          },
+          whyAreYouKeepingConsumer,
+          appView,
+          enqueuer,
+          true,
+          options,
+          timing,
+          executor);
 
       return result;
     } catch (ExecutionException e) {
-      throw R8.unwrapExecutionException(e);
+      throw unwrapExecutionException(e);
     }
   }
 
@@ -129,22 +152,17 @@ public class GenerateMainDexList {
       throws CompilationFailedException {
     AndroidApp app = command.getInputApp();
     InternalOptions options = command.getInternalOptions();
-    ResultBox result = new ResultBox();
-
+    Box<List<String>> result = new Box<>();
     ExceptionUtils.withMainDexListHandler(
         command.getReporter(),
         () -> {
           try {
-            result.content = new GenerateMainDexList(options).run(app, executor);
+            result.set(new GenerateMainDexList(options).run(app, executor));
           } finally {
             executor.shutdown();
           }
         });
-    return result.content;
-  }
-
-  private static class ResultBox {
-    List<String> content;
+    return result.get();
   }
 
   public static void main(String[] args) throws CompilationFailedException {

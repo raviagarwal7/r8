@@ -10,11 +10,11 @@ import static junit.framework.TestCase.assertNull;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.ToolHelper;
 import com.android.tools.r8.dex.ApplicationReader;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
-import com.android.tools.r8.graph.DexApplication;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.DescriptorUtils;
 import com.android.tools.r8.utils.InternalOptions;
@@ -29,37 +29,42 @@ public class ArrayTargetLookupTest extends TestBase {
 
   @Test
   public void testArrays() throws IOException, ExecutionException {
-    Timing timing = new Timing(ArrayTargetLookupTest.class.getCanonicalName());
+    Timing timing = Timing.empty();
     InternalOptions options = new InternalOptions();
     AndroidApp app =
         AndroidApp.builder()
             .addLibraryFile(ToolHelper.getDefaultAndroidJar())
             .addProgramFiles(ToolHelper.getClassFileForTestClass(Foo.class))
             .build();
-    DexApplication application = new ApplicationReader(app, options, timing).read().toDirect();
-    AppInfoWithSubtyping appInfo = new AppInfoWithSubtyping(application);
+    DirectMappedDexApplication application =
+        new ApplicationReader(app, options, timing).read().toDirect();
+    AppInfoWithClassHierarchy appInfo = new AppInfoWithClassHierarchy(application);
     DexItemFactory factory = options.itemFactory;
     DexType fooType =
         factory.createType(DescriptorUtils.javaTypeToDescriptor(Foo.class.getTypeName()));
     DexType[] arrayTypes =
         new DexType[] {
-          factory.createType("[I"),
+          factory.intArrayType,
           factory.stringArrayType,
           factory.objectArrayType,
           factory.createArrayType(2, fooType)
         };
     DexEncodedMethod langObjectNotifyMethod =
-        appInfo.lookupVirtualTarget(
-            fooType,
-            factory.createMethod(fooType, factory.createProto(factory.voidType), "notify"));
+        appInfo
+            .resolveMethodOnClass(
+                factory.createMethod(fooType, factory.createProto(factory.voidType), "notify"))
+            .getSingleTarget();
     for (DexType arrType : arrayTypes) {
       assertNull(
-          appInfo.lookupVirtualTarget(
-              arrType, factory.createMethod(arrType, factory.createProto(arrType), "clone")));
+          appInfo
+              .resolveMethodOnClass(
+                  factory.createMethod(arrType, factory.createProto(arrType), "clone"))
+              .getSingleTarget());
       DexEncodedMethod target =
-          appInfo.lookupVirtualTarget(
-              arrType,
-              factory.createMethod(arrType, factory.createProto(factory.voidType), "notify"));
+          appInfo
+              .resolveMethodOnClass(
+                  factory.createMethod(arrType, factory.createProto(factory.voidType), "notify"))
+              .getSingleTarget();
       assertEquals(langObjectNotifyMethod, target);
     }
   }

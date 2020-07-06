@@ -7,12 +7,12 @@ import com.android.tools.r8.naming.MemberNaming.FieldSignature;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.naming.MemberNaming.Signature;
 import com.android.tools.r8.naming.MemberNaming.Signature.SignatureKind;
+import com.android.tools.r8.utils.ChainableStringConsumer;
 import com.android.tools.r8.utils.ThrowingConsumer;
 import com.google.common.collect.ImmutableMap;
-import java.io.IOException;
-import java.io.StringWriter;
-import java.io.Writer;
+import com.google.common.collect.Maps;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -30,9 +30,10 @@ public class ClassNamingForNameMapper implements ClassNaming {
   public static class Builder extends ClassNaming.Builder {
     private final String originalName;
     private final String renamedName;
-    private final Map<MethodSignature, MemberNaming> methodMembers = new HashMap<>();
-    private final Map<FieldSignature, MemberNaming> fieldMembers = new HashMap<>();
-    private final Map<String, List<MappedRange>> mappedRangesByName = new HashMap<>();
+    private final Map<MethodSignature, MemberNaming> methodMembers = Maps.newHashMap();
+    private final Map<FieldSignature, MemberNaming> fieldMembers = Maps.newHashMap();
+    private final Map<String, List<MappedRange>> mappedRangesByName = Maps.newHashMap();
+    private final Map<String, List<MemberNaming>> mappedNamingsByName = Maps.newHashMap();
 
     private Builder(String renamedName, String originalName) {
       this.originalName = originalName;
@@ -46,6 +47,9 @@ public class ClassNamingForNameMapper implements ClassNaming {
       } else {
         fieldMembers.put((FieldSignature) entry.getRenamedSignature(), entry);
       }
+      mappedNamingsByName
+          .computeIfAbsent(entry.getRenamedName(), m -> new ArrayList<>())
+          .add(entry);
       return this;
     }
 
@@ -63,7 +67,7 @@ public class ClassNamingForNameMapper implements ClassNaming {
       }
 
       return new ClassNamingForNameMapper(
-          renamedName, originalName, methodMembers, fieldMembers, map);
+          renamedName, originalName, methodMembers, fieldMembers, map, mappedNamingsByName);
     }
 
     /** The parameters are forwarded to MappedRange constructor, see explanation there. */
@@ -83,7 +87,7 @@ public class ClassNamingForNameMapper implements ClassNaming {
   public static class MappedRangesOfName {
     private final List<MappedRange> mappedRanges;
 
-    MappedRangesOfName(List<MappedRange> mappedRanges) {
+    public MappedRangesOfName(List<MappedRange> mappedRanges) {
       this.mappedRanges = mappedRanges;
     }
 
@@ -114,11 +118,23 @@ public class ClassNamingForNameMapper implements ClassNaming {
      * MappedRange ("a() -> b") if no concrete mapping found or empty list if nothing found.
      */
     public List<MappedRange> allRangesForLine(int line) {
+      return allRangesForLine(line, true);
+    }
+
+    /**
+     * Search for a MappedRange where the minified range contains the specified {@code line} and
+     * return that and the subsequent MappedRanges with the same minified range.
+     *
+     * @param line The line number to find the range for
+     * @param takeFirstWithNoLineRange Specify if no range is found, to take a general one that.
+     * @return The list with all ranges for line.
+     */
+    public List<MappedRange> allRangesForLine(int line, boolean takeFirstWithNoLineRange) {
       MappedRange noLineRange = null;
       for (int i = 0; i < mappedRanges.size(); ++i) {
         MappedRange rangeI = mappedRanges.get(i);
         if (rangeI.minifiedRange == null) {
-          if (noLineRange == null) {
+          if (noLineRange == null && takeFirstWithNoLineRange) {
             // This is an "a() -> b" mapping (no concrete line numbers), remember this if there'll
             // be no better one.
             noLineRange = rangeI;
@@ -135,6 +151,10 @@ public class ClassNamingForNameMapper implements ClassNaming {
         }
       }
       return noLineRange == null ? Collections.emptyList() : Collections.singletonList(noLineRange);
+    }
+
+    public List<MappedRange> getMappedRanges() {
+      return mappedRanges;
     }
 
     @Override
@@ -162,7 +182,7 @@ public class ClassNamingForNameMapper implements ClassNaming {
   }
 
   public final String originalName;
-  private final String renamedName;
+  public final String renamedName;
 
   /**
    * Mapping from the renamed signature to the naming information for a member.
@@ -176,17 +196,25 @@ public class ClassNamingForNameMapper implements ClassNaming {
   /** Map of renamed name -> MappedRangesOfName */
   public final Map<String, MappedRangesOfName> mappedRangesByRenamedName;
 
+  public final Map<String, List<MemberNaming>> mappedNamingsByName;
+
   private ClassNamingForNameMapper(
       String renamedName,
       String originalName,
       Map<MethodSignature, MemberNaming> methodMembers,
       Map<FieldSignature, MemberNaming> fieldMembers,
-      Map<String, MappedRangesOfName> mappedRangesByRenamedName) {
+      Map<String, MappedRangesOfName> mappedRangesByRenamedName,
+      Map<String, List<MemberNaming>> mappedNamingsByName) {
     this.renamedName = renamedName;
     this.originalName = originalName;
     this.methodMembers = ImmutableMap.copyOf(methodMembers);
     this.fieldMembers = ImmutableMap.copyOf(fieldMembers);
     this.mappedRangesByRenamedName = mappedRangesByRenamedName;
+    this.mappedNamingsByName = mappedNamingsByName;
+  }
+
+  public MappedRangesOfName getMappedRangesForRenamedName(String renamedName) {
+    return mappedRangesByRenamedName.get(renamedName);
   }
 
   @Override
@@ -251,6 +279,10 @@ public class ClassNamingForNameMapper implements ClassNaming {
     }
   }
 
+  public Collection<MemberNaming> allFieldNamings() {
+    return fieldMembers.values();
+  }
+
   @Override
   public <T extends Throwable> void forAllMethodNaming(
       ThrowingConsumer<MemberNaming, T> consumer) throws T {
@@ -259,19 +291,15 @@ public class ClassNamingForNameMapper implements ClassNaming {
     }
   }
 
-  void write(Writer writer) throws IOException {
-    writer.append(originalName);
-    writer.append(" -> ");
-    writer.append(renamedName);
-    writer.append(":\n");
+  public Collection<MemberNaming> allMethodNamings() {
+    return methodMembers.values();
+  }
 
-    // First print non-method MemberNamings.
-    forAllMemberNaming(
-        m -> {
-          if (!m.isMethodNaming()) {
-            writer.append("    ").append(m.toString()).append('\n');
-          }
-        });
+  void write(ChainableStringConsumer consumer) {
+    consumer.accept(originalName).accept(" -> ").accept(renamedName).accept(":\n");
+
+    // First print field member namings.
+    forAllFieldNaming(m -> consumer.accept("    ").accept(m.toString()).accept("\n"));
 
     // Sort MappedRanges by sequence number to restore construction order (original Proguard-map
     // input).
@@ -281,19 +309,15 @@ public class ClassNamingForNameMapper implements ClassNaming {
     }
     mappedRangesSorted.sort(Comparator.comparingInt(range -> range.sequenceNumber));
     for (MappedRange range : mappedRangesSorted) {
-      writer.append("    ").append(range.toString()).append('\n');
+      consumer.accept("    ").accept(range.toString()).accept("\n");
     }
   }
 
   @Override
   public String toString() {
-    try {
-      StringWriter writer = new StringWriter();
-      write(writer);
-      return writer.toString();
-    } catch (IOException e) {
-      return e.toString();
-    }
+    StringBuilder builder = new StringBuilder();
+    write(ChainableStringConsumer.wrap(builder::append));
+    return builder.toString();
   }
 
   @Override
@@ -390,7 +414,22 @@ public class ClassNamingForNameMapper implements ClassNaming {
       } else {
         // "x:y:a():u:v -> b"
         assert originalRange instanceof Range;
-        return ((Range) originalRange).from + lineNumberAfterMinification - minifiedRange.from;
+        Range originalRange = (Range) this.originalRange;
+        if (originalRange.to == originalRange.from) {
+          // This is a single line mapping which we should report as the actual line.
+          return originalRange.to;
+        }
+        return originalRange.from + lineNumberAfterMinification - minifiedRange.from;
+      }
+    }
+
+    public int getFirstLineNumberOfOriginalRange() {
+      if (originalRange == null) {
+        return 0;
+      } else if (originalRange instanceof Integer) {
+        return (int) originalRange;
+      } else {
+        return ((Range) originalRange).from;
       }
     }
 

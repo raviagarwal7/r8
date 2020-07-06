@@ -5,11 +5,13 @@ package com.android.tools.r8.utils.codeinspector;
 
 import static org.junit.Assert.assertTrue;
 
+import com.android.tools.r8.DexIndexedConsumer;
 import com.android.tools.r8.StringResource;
 import com.android.tools.r8.cf.code.CfInstruction;
 import com.android.tools.r8.cf.code.CfTryCatch;
 import com.android.tools.r8.code.Instruction;
 import com.android.tools.r8.dex.ApplicationReader;
+import com.android.tools.r8.dex.Marker;
 import com.android.tools.r8.errors.Unimplemented;
 import com.android.tools.r8.graph.CfCode;
 import com.android.tools.r8.graph.Code;
@@ -25,7 +27,7 @@ import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexValue;
 import com.android.tools.r8.graph.DexValue.DexValueArray;
-import com.android.tools.r8.graph.DexValue.DexValueString;
+import com.android.tools.r8.ir.desugar.InterfaceMethodRewriter;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.naming.ClassNamingForNameMapper;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
@@ -36,6 +38,8 @@ import com.android.tools.r8.references.ClassReference;
 import com.android.tools.r8.references.FieldReference;
 import com.android.tools.r8.references.MethodReference;
 import com.android.tools.r8.references.Reference;
+import com.android.tools.r8.retrace.RetraceBase;
+import com.android.tools.r8.retrace.RetraceBaseImpl;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.BiMapContainer;
 import com.android.tools.r8.utils.DescriptorUtils;
@@ -44,14 +48,15 @@ import com.android.tools.r8.utils.Timing;
 import com.android.tools.r8.utils.codeinspector.InstructionSubject.JumboStringMode;
 import com.google.common.collect.ImmutableList;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutionException;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -68,21 +73,25 @@ public class CodeInspector {
   public static MethodSignature MAIN =
       new MethodSignature("main", "void", new String[] {"java.lang.String[]"});
 
-  public CodeInspector(Path file, String mappingFile) throws IOException, ExecutionException {
+  public CodeInspector(String path) throws IOException {
+    this(Paths.get(path));
+  }
+
+  public CodeInspector(Path file, String mappingFile) throws IOException {
     this(Collections.singletonList(file), mappingFile, null);
   }
 
-  public CodeInspector(Path file) throws IOException, ExecutionException {
+  public CodeInspector(Path file) throws IOException {
     this(Collections.singletonList(file), null, null);
   }
 
-  public CodeInspector(List<Path> files) throws IOException, ExecutionException {
+  public CodeInspector(Collection<Path> files) throws IOException {
     this(files, null, null);
   }
 
   public CodeInspector(
-      List<Path> files, String mappingFile, Consumer<InternalOptions> optionsConsumer)
-      throws IOException, ExecutionException {
+      Collection<Path> files, String mappingFile, Consumer<InternalOptions> optionsConsumer)
+      throws IOException {
     Path mappingPath = mappingFile != null ? Paths.get(mappingFile) : null;
     if (mappingPath != null && Files.exists(mappingPath)) {
       mapping = ClassNameMapper.mapperFromFile(mappingPath);
@@ -94,50 +103,47 @@ public class CodeInspector {
       originalToObfuscatedMapping = null;
       obfuscatedToOriginalMapping = null;
     }
-    Timing timing = new Timing("CodeInspector");
-    InternalOptions options = new InternalOptions();
-    options.enableCfFrontend = true;
-    if (optionsConsumer != null) {
-      optionsConsumer.accept(options);
-    }
+    Timing timing = Timing.empty();
+    InternalOptions options = runOptionsConsumer(optionsConsumer);
     dexItemFactory = options.itemFactory;
     AndroidApp input = AndroidApp.builder().addProgramFiles(files).build();
     application = new ApplicationReader(input, options, timing).read();
   }
 
-  public CodeInspector(AndroidApp app) throws IOException, ExecutionException {
+  public CodeInspector(AndroidApp app) throws IOException {
     this(
-        new ApplicationReader(app, runOptionsConsumer(null), new Timing("CodeInspector"))
+        new ApplicationReader(app, runOptionsConsumer(null), Timing.empty())
             .read(app.getProguardMapOutputData()));
   }
 
   public CodeInspector(AndroidApp app, Consumer<InternalOptions> optionsConsumer)
-      throws IOException, ExecutionException {
+      throws IOException {
     this(
-        new ApplicationReader(app, runOptionsConsumer(optionsConsumer), new Timing("CodeInspector"))
+        new ApplicationReader(app, runOptionsConsumer(optionsConsumer), Timing.empty())
             .read(app.getProguardMapOutputData()));
   }
 
   private static InternalOptions runOptionsConsumer(Consumer<InternalOptions> optionsConsumer) {
     InternalOptions internalOptions = new InternalOptions();
-    internalOptions.enableCfFrontend = true;
     if (optionsConsumer != null) {
       optionsConsumer.accept(internalOptions);
+    }
+    if (internalOptions.programConsumer == null) {
+      // The inspector allows building IR for a method. An output type must be defined for that.
+      internalOptions.programConsumer = DexIndexedConsumer.emptyConsumer();
     }
     return internalOptions;
   }
 
-  public CodeInspector(AndroidApp app, Path proguardMapFile)
-      throws IOException, ExecutionException {
+  public CodeInspector(AndroidApp app, Path proguardMapFile) throws IOException {
     this(
-        new ApplicationReader(app, runOptionsConsumer(null), new Timing("CodeInspector"))
+        new ApplicationReader(app, runOptionsConsumer(null), Timing.empty())
             .read(StringResource.fromFile(proguardMapFile)));
   }
 
-  public CodeInspector(AndroidApp app, String proguardMapContent)
-      throws IOException, ExecutionException {
+  public CodeInspector(AndroidApp app, String proguardMapContent) throws IOException {
     this(
-        new ApplicationReader(app, runOptionsConsumer(null), new Timing("CodeInspector"))
+        new ApplicationReader(app, runOptionsConsumer(null), Timing.empty())
             .read(StringResource.fromString(proguardMapContent, Origin.unknown())));
   }
 
@@ -167,6 +173,11 @@ public class CodeInspector {
     return dexItemFactory.createType(DescriptorUtils.javaTypeToDescriptorIgnorePrimitives(string));
   }
 
+  public TypeSubject getTypeSubject(String string) {
+    return new TypeSubject(
+        this, dexItemFactory.createType(DescriptorUtils.javaTypeToDescriptor(string)));
+  }
+
   String mapType(Map<String, String> mapping, String typeName) {
     final String ARRAY_POSTFIX = "[]";
     int arrayCount = 0;
@@ -185,7 +196,7 @@ public class CodeInspector {
   }
 
   static <S, T extends Subject> void forAll(
-      List<? extends S> items,
+      Iterable<? extends S> items,
       BiFunction<S, FoundClassSubject, ? extends T> constructor,
       FoundClassSubject clazz,
       Consumer<T> consumer) {
@@ -219,13 +230,12 @@ public class CodeInspector {
     }
     assert annotation.annotation.elements.length == 1;
     DexAnnotationElement element = annotation.annotation.elements[0];
-    assert element.value instanceof DexValueArray;
+    assert element.value.isDexValueArray();
     StringBuilder builder = new StringBuilder();
-    DexValueArray valueArray = (DexValueArray) element.value;
+    DexValueArray valueArray = element.value.asDexValueArray();
     for (DexValue value : valueArray.getValues()) {
-      assertTrue(value instanceof DexValueString);
-      DexValueString s = (DexValueString) value;
-      builder.append(s.getValue());
+      assertTrue(value.isDexValueString());
+      builder.append(value.asDexValueString().getValue());
     }
     return builder.toString();
   }
@@ -243,7 +253,7 @@ public class CodeInspector {
     return rewriter.getSignature();
   }
 
-  public ClassSubject clazz(Class clazz) {
+  public ClassSubject clazz(Class<?> clazz) {
     return clazz(Reference.classFromClass(clazz));
   }
 
@@ -271,9 +281,15 @@ public class CodeInspector {
     }
     DexClass clazz = application.definitionFor(toDexTypeIgnorePrimitives(name));
     if (clazz == null) {
-      return new AbsentClassSubject();
+      return new AbsentClassSubject(this, reference);
     }
-    return new FoundClassSubject(this, clazz, naming);
+    return new FoundClassSubject(this, clazz, naming, reference);
+  }
+
+  public ClassSubject companionClassFor(Class<?> clazz) {
+    return clazz(
+        Reference.classFromTypeName(
+            clazz.getTypeName() + InterfaceMethodRewriter.COMPANION_CLASS_NAME_SUFFIX));
   }
 
   public void forAllClasses(Consumer<FoundClassSubject> inspection) {
@@ -291,6 +307,10 @@ public class CodeInspector {
     ImmutableList.Builder<FoundClassSubject> builder = ImmutableList.builder();
     forAllClasses(builder::add);
     return builder.build();
+  }
+
+  public FieldSubject field(Field field) {
+    return field(Reference.fieldFromField(field));
   }
 
   public FieldSubject field(FieldReference field) {
@@ -329,31 +349,35 @@ public class CodeInspector {
     return originalTypeName != null ? originalTypeName : minifiedTypeName;
   }
 
-  InstructionSubject createInstructionSubject(Instruction instruction) {
-    DexInstructionSubject dexInst = new DexInstructionSubject(instruction);
+  InstructionSubject createInstructionSubject(Instruction instruction, MethodSubject method) {
+    DexInstructionSubject dexInst = new DexInstructionSubject(instruction, method);
     if (dexInst.isInvoke()) {
-      return new InvokeDexInstructionSubject(this, instruction);
+      return new InvokeDexInstructionSubject(this, instruction, method);
     } else if (dexInst.isFieldAccess()) {
-      return new FieldAccessDexInstructionSubject(this, instruction);
+      return new FieldAccessDexInstructionSubject(this, instruction, method);
     } else if (dexInst.isNewInstance()) {
-      return new NewInstanceDexInstructionSubject(instruction);
+      return new NewInstanceDexInstructionSubject(instruction, method);
     } else if (dexInst.isConstString(JumboStringMode.ALLOW)) {
-      return new ConstStringDexInstructionSubject(instruction);
+      return new ConstStringDexInstructionSubject(instruction, method);
+    } else if (dexInst.isCheckCast()) {
+      return new CheckCastDexInstructionSubject(instruction, method);
     } else {
       return dexInst;
     }
   }
 
-  InstructionSubject createInstructionSubject(CfInstruction instruction) {
-    CfInstructionSubject cfInst = new CfInstructionSubject(instruction);
+  InstructionSubject createInstructionSubject(CfInstruction instruction, MethodSubject method) {
+    CfInstructionSubject cfInst = new CfInstructionSubject(instruction, method);
     if (cfInst.isInvoke()) {
-      return new InvokeCfInstructionSubject(this, instruction);
+      return new InvokeCfInstructionSubject(this, instruction, method);
     } else if (cfInst.isFieldAccess()) {
-      return new FieldAccessCfInstructionSubject(this, instruction);
+      return new FieldAccessCfInstructionSubject(this, instruction, method);
     } else if (cfInst.isNewInstance()) {
-      return new NewInstanceCfInstructionSubject(instruction);
+      return new NewInstanceCfInstructionSubject(instruction, method);
     } else if (cfInst.isConstString(JumboStringMode.ALLOW)) {
-      return new ConstStringCfInstructionSubject(instruction);
+      return new ConstStringCfInstructionSubject(instruction, method);
+    } else if (cfInst.isCheckCast()) {
+      return new CheckCastCfInstructionSubject(instruction, method);
     } else {
       return cfInst;
     }
@@ -372,11 +396,11 @@ public class CodeInspector {
   }
 
   TryCatchSubject createTryCatchSubject(DexCode code, Try tryElement, TryHandler tryHandler) {
-    return new DexTryCatchSubject(code, tryElement, tryHandler);
+    return new DexTryCatchSubject(this, code, tryElement, tryHandler);
   }
 
   TryCatchSubject createTryCatchSubject(CfCode code, CfTryCatch tryCatch) {
-    return new CfTryCatchSubject(code, tryCatch);
+    return new CfTryCatchSubject(this, code, tryCatch);
   }
 
   TryCatchIterator createTryCatchIterator(MethodSubject method) {
@@ -389,6 +413,10 @@ public class CodeInspector {
     } else {
       throw new Unimplemented("TryCatchIterator is implemented for DexCode and CfCode only.");
     }
+  }
+
+  public Collection<Marker> getMarkers() {
+    return dexItemFactory.extractMarkers();
   }
 
   // Build the generic signature using the current mapping if any.
@@ -411,7 +439,7 @@ public class CodeInspector {
     }
 
     @Override
-    public String parsedTypeName(String name) {
+    public String parsedTypeName(String name, ParserPosition parserPosition) {
       String type = name;
       if (obfuscatedToOriginalMapping != null) {
         String original = mapType(obfuscatedToOriginalMapping, name);
@@ -451,5 +479,9 @@ public class CodeInspector {
     public void stop() {
       // nothing to do
     }
+  }
+
+  public RetraceBase retrace() {
+    return RetraceBaseImpl.create(mapping);
   }
 }

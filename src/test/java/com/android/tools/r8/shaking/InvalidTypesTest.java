@@ -7,6 +7,7 @@ package com.android.tools.r8.shaking;
 import static org.hamcrest.CoreMatchers.allOf;
 import static org.hamcrest.CoreMatchers.anyOf;
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.core.IsNot.not;
 
 import com.android.tools.r8.D8TestRunResult;
@@ -15,8 +16,7 @@ import com.android.tools.r8.ProguardTestRunResult;
 import com.android.tools.r8.R8TestRunResult;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.TestRunResult;
-import com.android.tools.r8.ToolHelper;
-import com.android.tools.r8.ToolHelper.DexVm.Version;
+import com.android.tools.r8.TestRuntime;
 import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.jasmin.JasminBuilder;
 import com.android.tools.r8.jasmin.JasminBuilder.ClassBuilder;
@@ -40,29 +40,114 @@ public class InvalidTypesTest extends JasminTestBase {
     D8,
     JAVAC,
     PROGUARD,
-    R8
+    R8,
+    R8_ENABLE_UNININSTANTATED_TYPE_OPTIMIZATION_FOR_INTERFACES
   }
 
   private enum Mode {
-    NO_INVOKE,
-    INVOKE_UNVERIFIABLE_METHOD,
-    INVOKE_VERIFIABLE_METHOD_ON_UNVERIFIABLE_CLASS;
+    NO_INVOKE {
 
-    public String instruction() {
-      switch (this) {
-        case NO_INVOKE:
-          return "";
-
-        case INVOKE_UNVERIFIABLE_METHOD:
-          return "invokestatic UnverifiableClass/unverifiableMethod()V";
-
-        case INVOKE_VERIFIABLE_METHOD_ON_UNVERIFIABLE_CLASS:
-          return "invokestatic UnverifiableClass/verifiableMethod()V";
-
-        default:
-          throw new Unreachable();
+      @Override
+      public String getExpectedOutput(
+          Compiler compiler, TestRuntime runtime, boolean useInterface) {
+        return StringUtils.joinLines("Hello!", "Goodbye!", "");
       }
-    }
+
+      @Override
+      public String instruction() {
+        return "";
+      }
+    },
+    INVOKE_UNVERIFIABLE_METHOD {
+
+      @Override
+      public String getExpectedOutput(
+          Compiler compiler, TestRuntime runtime, boolean useInterface) {
+        if (!useInterface) {
+          return StringUtils.joinLines("Hello!", "");
+        }
+
+        switch (compiler) {
+          case D8:
+          case DX:
+            switch (runtime.asDex().getVm().getVersion()) {
+              case V4_0_4:
+              case V4_4_4:
+              case V10_0_0:
+                return StringUtils.joinLines("Hello!", "Goodbye!", "");
+
+              case V7_0_0:
+                return StringUtils.joinLines(
+                    "Hello!",
+                    "Unexpected outcome of checkcast",
+                    "Unexpected outcome of instanceof",
+                    "Goodbye!",
+                    "");
+
+              default:
+                // Fallthrough.
+            }
+
+          case R8:
+          case PROGUARD:
+            return StringUtils.joinLines(
+                "Hello!", "Unexpected outcome of checkcast", "Goodbye!", "");
+
+          case R8_ENABLE_UNININSTANTATED_TYPE_OPTIMIZATION_FOR_INTERFACES:
+            return StringUtils.joinLines(
+                "Hello!",
+                "Unexpected outcome of getstatic",
+                "Unexpected outcome of checkcast",
+                "Goodbye!",
+                "");
+
+          case JAVAC:
+            return StringUtils.joinLines("Hello!", "Goodbye!", "");
+
+          default:
+            throw new Unreachable();
+        }
+      }
+
+      @Override
+      public String instruction() {
+          return "invokestatic UnverifiableClass/unverifiableMethod()V";
+      }
+    },
+    INVOKE_VERIFIABLE_METHOD_ON_UNVERIFIABLE_CLASS {
+
+      @Override
+      public String getExpectedOutput(
+          Compiler compiler, TestRuntime runtime, boolean useInterface) {
+        if (useInterface) {
+          return StringUtils.joinLines("Hello!", "In verifiable method!", "Goodbye!", "");
+        }
+
+        switch (compiler) {
+          case R8:
+          case R8_ENABLE_UNININSTANTATED_TYPE_OPTIMIZATION_FOR_INTERFACES:
+          case PROGUARD:
+            // The unverifiable method has been removed as a result of tree shaking, so the code
+            // does not fail with a verification error when trying to load class UnverifiableClass.
+            return StringUtils.joinLines("Hello!", "In verifiable method!", "Goodbye!", "");
+
+          default:
+            // The code fails with a verification error because the verifiableMethod() is being
+            // called on UnverifiableClass, which does not verify due to unverifiableMethod().
+            return StringUtils.joinLines("Hello!", "");
+        }
+      }
+
+      @Override
+      public String instruction() {
+        return "invokestatic UnverifiableClass/verifiableMethod()V";
+      }
+    };
+
+    public abstract String getExpectedOutput(
+        Compiler compiler, TestRuntime runtime, boolean useInterface);
+
+    public abstract String instruction();
   }
 
   private final TestParameters parameters;
@@ -78,7 +163,9 @@ public class InvalidTypesTest extends JasminTestBase {
   @Parameters(name = "{0}, mode: {1}, use interface: {2}")
   public static Collection<Object[]> parameters() {
     return buildParameters(
-        getTestParameters().withAllRuntimes().build(), Mode.values(), BooleanUtils.values());
+        getTestParameters().withAllRuntimesAndApiLevels().build(),
+        Mode.values(),
+        BooleanUtils.values());
   }
 
   @Test
@@ -170,7 +257,8 @@ public class InvalidTypesTest extends JasminTestBase {
     jasminBuilder.writeJar(inputJar);
 
     if (parameters.isCfRuntime()) {
-      TestRunResult<?> jvmResult = testForJvm().addClasspath(inputJar).run(mainClass.name);
+      TestRunResult<?> jvmResult =
+          testForJvm().addClasspath(inputJar).run(parameters.getRuntime(), mainClass.name);
       checkTestRunResult(jvmResult, Compiler.JAVAC);
 
       ProguardTestRunResult proguardResult =
@@ -183,10 +271,18 @@ public class InvalidTypesTest extends JasminTestBase {
     } else {
       assert parameters.isDexRuntime();
 
-      DXTestRunResult dxResult = testForDX().addProgramFiles(inputJar).run(mainClass.name);
+      DXTestRunResult dxResult =
+          testForDX()
+              .addProgramFiles(inputJar)
+              .setMinApi(parameters.getApiLevel())
+              .run(parameters.getRuntime(), mainClass.name);
       checkTestRunResult(dxResult, Compiler.DX);
 
-      D8TestRunResult d8Result = testForD8().addProgramFiles(inputJar).run(mainClass.name);
+      D8TestRunResult d8Result =
+          testForD8()
+              .addProgramFiles(inputJar)
+              .setMinApi(parameters.getApiLevel())
+              .run(parameters.getRuntime(), mainClass.name);
       checkTestRunResult(d8Result, Compiler.D8);
     }
 
@@ -197,16 +293,51 @@ public class InvalidTypesTest extends JasminTestBase {
             .addKeepRules(
                 "-keep class TestClass { public static I g; }",
                 "-neverinline class TestClass { public static void m(); }")
+            .enableProguardTestOptions()
             .addOptionsModification(
                 options -> {
                   if (mode == Mode.INVOKE_UNVERIFIABLE_METHOD) {
                     options.testing.allowTypeErrors = true;
                   }
                 })
-            .enableInliningAnnotations()
-            .setMinApi(parameters.getRuntime())
+            .allowDiagnosticWarningMessages(
+                mode == Mode.INVOKE_UNVERIFIABLE_METHOD && !useInterface)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .assertAllWarningMessagesMatch(
+                equalTo(
+                    "The method `void UnverifiableClass.unverifiableMethod()` does not type check"
+                        + " and will be assumed to be unreachable."))
             .run(parameters.getRuntime(), mainClass.name);
     checkTestRunResult(r8Result, Compiler.R8);
+
+    R8TestRunResult r8ResultWithUninstantiatedTypeOptimizationForInterfaces =
+        testForR8(parameters.getBackend())
+            .addProgramFiles(inputJar)
+            .addKeepMainRule(mainClass.name)
+            .addKeepRules(
+                "-keep class TestClass { public static I g; }",
+                "-neverinline class TestClass { public static void m(); }")
+            .enableProguardTestOptions()
+            .addOptionsModification(
+                options -> {
+                  if (mode == Mode.INVOKE_UNVERIFIABLE_METHOD) {
+                    options.testing.allowTypeErrors = true;
+                  }
+                  options.enableUninstantiatedTypeOptimizationForInterfaces = true;
+                })
+            .allowDiagnosticWarningMessages(
+                mode == Mode.INVOKE_UNVERIFIABLE_METHOD && !useInterface)
+            .setMinApi(parameters.getApiLevel())
+            .compile()
+            .assertAllWarningMessagesMatch(
+                equalTo(
+                    "The method `void UnverifiableClass.unverifiableMethod()` does not type check"
+                        + " and will be assumed to be unreachable."))
+            .run(parameters.getRuntime(), mainClass.name);
+    checkTestRunResult(
+        r8ResultWithUninstantiatedTypeOptimizationForInterfaces,
+        Compiler.R8_ENABLE_UNININSTANTATED_TYPE_OPTIMIZATION_FOR_INTERFACES);
   }
 
   private void checkTestRunResult(TestRunResult<?> result, Compiler compiler) {
@@ -219,7 +350,9 @@ public class InvalidTypesTest extends JasminTestBase {
         if (useInterface) {
           result.assertSuccessWithOutput(getExpectedOutput(compiler));
         } else {
-          if (compiler == Compiler.R8 || compiler == Compiler.PROGUARD) {
+          if (compiler == Compiler.R8
+              || compiler == Compiler.R8_ENABLE_UNININSTANTATED_TYPE_OPTIMIZATION_FOR_INTERFACES
+              || compiler == Compiler.PROGUARD) {
             result.assertSuccessWithOutput(getExpectedOutput(compiler));
           } else {
             result
@@ -233,7 +366,8 @@ public class InvalidTypesTest extends JasminTestBase {
         if (useInterface) {
           result.assertSuccessWithOutput(getExpectedOutput(compiler));
         } else {
-          if (compiler == Compiler.R8) {
+          if (compiler == Compiler.R8
+              || compiler == Compiler.R8_ENABLE_UNININSTANTATED_TYPE_OPTIMIZATION_FOR_INTERFACES) {
             result
                 .assertFailureWithOutput(getExpectedOutput(compiler))
                 .assertFailureWithErrorThatMatches(
@@ -254,56 +388,7 @@ public class InvalidTypesTest extends JasminTestBase {
   }
 
   private String getExpectedOutput(Compiler compiler) {
-    if (mode == Mode.NO_INVOKE) {
-      return StringUtils.joinLines("Hello!", "Goodbye!", "");
-    }
-    if (mode == Mode.INVOKE_VERIFIABLE_METHOD_ON_UNVERIFIABLE_CLASS) {
-      if (useInterface) {
-        return StringUtils.joinLines("Hello!", "In verifiable method!", "Goodbye!", "");
-      } else {
-        if (compiler == Compiler.R8 || compiler == Compiler.PROGUARD) {
-          // The unverifiable method has been removed as a result of tree shaking, so the code does
-          // not fail with a verification error when trying to load class `UnverifiableClass`.
-          return StringUtils.joinLines("Hello!", "In verifiable method!", "Goodbye!", "");
-        } else {
-          // The code fails with a verification error because the verifiableMethod() is being called
-          // on `UnverifiableClass`, which does not verify due to unverifiableMethod().
-          return StringUtils.joinLines("Hello!", "");
-        }
-      }
-    }
-    assert mode == Mode.INVOKE_UNVERIFIABLE_METHOD;
-    if (useInterface) {
-      if (compiler == Compiler.R8) {
-        return StringUtils.joinLines(
-            "Hello!",
-            "Unexpected outcome of getstatic",
-            "Unexpected outcome of checkcast",
-            "Goodbye!",
-            "");
-      } else if (compiler == Compiler.PROGUARD) {
-        return StringUtils.joinLines("Hello!", "Unexpected outcome of checkcast", "Goodbye!", "");
-      } else if (compiler == Compiler.DX || compiler == Compiler.D8) {
-        if (ToolHelper.getDexVm().getVersion() == Version.V4_0_4
-            || ToolHelper.getDexVm().getVersion() == Version.V4_4_4) {
-          return StringUtils.joinLines("Hello!", "Goodbye!", "");
-        } else if (ToolHelper.getDexVm().getVersion() == Version.V7_0_0) {
-          return StringUtils.joinLines(
-              "Hello!",
-              "Unexpected outcome of checkcast",
-              "Unexpected outcome of instanceof",
-              "Goodbye!",
-              "");
-        } else {
-          return StringUtils.joinLines("Hello!", "Unexpected outcome of checkcast", "Goodbye!", "");
-        }
-      } else {
-        assert compiler == Compiler.JAVAC;
-        return StringUtils.joinLines("Hello!", "Goodbye!", "");
-      }
-    } else {
-      return StringUtils.joinLines("Hello!", "");
-    }
+    return mode.getExpectedOutput(compiler, parameters.getRuntime(), useInterface);
   }
 
   private Matcher<String> getMatcherForExpectedError() {

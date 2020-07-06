@@ -3,99 +3,42 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
-import com.android.tools.r8.ProgramResource.Kind;
 import com.android.tools.r8.ToolHelper.ProcessResult;
 import com.android.tools.r8.debug.CfDebugTestConfig;
 import com.android.tools.r8.debug.DebugTestConfig;
 import com.android.tools.r8.errors.Unimplemented;
-import com.android.tools.r8.origin.Origin;
-import com.android.tools.r8.origin.PathOrigin;
+import com.android.tools.r8.testing.AndroidBuildVersion;
 import com.android.tools.r8.utils.AndroidApp;
-import com.android.tools.r8.utils.DescriptorUtils;
 import com.android.tools.r8.utils.FileUtils;
-import com.android.tools.r8.utils.ListUtils;
+import com.google.common.collect.ObjectArrays;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.List;
-import java.util.Set;
 
 public class JvmTestBuilder extends TestBuilder<JvmTestRunResult, JvmTestBuilder> {
 
-  private static class ClassFileResource implements ProgramResource {
-
-    private final Path file;
-    private final String descriptor;
-    private final Origin origin;
-
-    ClassFileResource(Class<?> clazz) {
-      this(
-          ToolHelper.getClassFileForTestClass(clazz),
-          DescriptorUtils.javaTypeToDescriptor(clazz.getTypeName()));
-    }
-
-    ClassFileResource(Path file, String descriptor) {
-      this.file = file;
-      this.descriptor = descriptor;
-      origin = new PathOrigin(file);
-    }
-
-    @Override
-    public Kind getKind() {
-      return Kind.CF;
-    }
-
-    @Override
-    public InputStream getByteStream() throws ResourceException {
-      try {
-        return Files.newInputStream(file);
-      } catch (IOException e) {
-        throw new ResourceException(getOrigin(), e);
-      }
-    }
-
-    @Override
-    public Set<String> getClassDescriptors() {
-      return Collections.singleton(descriptor);
-    }
-
-    @Override
-    public Origin getOrigin() {
-      return origin;
-    }
-  }
-
-  private static class ClassFileResourceProvider implements ProgramResourceProvider {
-
-    private final List<ProgramResource> resources;
-
-    public ClassFileResourceProvider(List<ProgramResource> resources) {
-      this.resources = resources;
-    }
-
-    @Override
-    public Collection<ProgramResource> getProgramResources() throws ResourceException {
-      return resources;
-    }
-
-    @Override
-    public DataResourceProvider getDataResourceProvider() {
-      return null;
-    }
-  }
-
   // Ordered list of classpath entries.
   private List<Path> classpath = new ArrayList<>();
+  private List<String> vmArguments = new ArrayList<>();
 
   private AndroidApp.Builder builder = AndroidApp.builder();
 
   private JvmTestBuilder(TestState state) {
     super(state);
+  }
+
+  private Path writeClassesToJar(Collection<Class<?>> classes) {
+    try {
+      Path archive = getState().getNewTempFolder().resolve("out.jar");
+      TestBase.writeClassesToJar(archive, classes);
+      return archive;
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   public static JvmTestBuilder create(TestState state) {
@@ -108,15 +51,19 @@ public class JvmTestBuilder extends TestBuilder<JvmTestRunResult, JvmTestBuilder
   }
 
   @Override
+  @Deprecated
   public JvmTestRunResult run(String mainClass) throws IOException {
-    ProcessResult result = ToolHelper.runJava(classpath, mainClass);
-    return new JvmTestRunResult(builder.build(), result);
+    return run(TestRuntime.getDefaultJavaRuntime(), mainClass);
   }
 
-  public JvmTestRunResult run(TestRuntime runtime, String mainClass) throws IOException {
+  @Override
+  public JvmTestRunResult run(TestRuntime runtime, String mainClass, String... args)
+      throws IOException {
     assert runtime.isCf();
-    ProcessResult result = ToolHelper.runJava(runtime.asCf().getVm(), classpath, mainClass);
-    return new JvmTestRunResult(builder.build(), result);
+    ProcessResult result =
+        ToolHelper.runJava(
+            runtime.asCf(), vmArguments, classpath, ObjectArrays.concat(mainClass, args));
+    return new JvmTestRunResult(builder.build(), runtime, result);
   }
 
   @Override
@@ -135,27 +82,54 @@ public class JvmTestBuilder extends TestBuilder<JvmTestRunResult, JvmTestBuilder
   }
 
   @Override
+  public JvmTestBuilder addClasspathClasses(Collection<Class<?>> classes) {
+    return addClasspath(writeClassesToJar(classes));
+  }
+
+  @Override
+  public JvmTestBuilder addClasspathFiles(Collection<Path> files) {
+    return addClasspath(files);
+  }
+
+  @Override
+  public JvmTestBuilder addRunClasspathFiles(Collection<Path> files) {
+    return addClasspath(files);
+  }
+
+  @Override
   public JvmTestBuilder addProgramClasses(Collection<Class<?>> classes) {
-    addProgramResources(ListUtils.map(classes, ClassFileResource::new));
-    return self();
+    return addProgramFiles(writeClassesToJar(classes));
   }
 
   @Override
   public JvmTestBuilder addProgramFiles(Collection<Path> files) {
-    throw new Unimplemented(
-        "No support for adding paths directly (we need to compute the descriptor)");
+    for (Path file : files) {
+      if (FileUtils.isArchive(file)) {
+        classpath.add(file);
+        builder.addProgramFiles(file);
+      } else if (FileUtils.isClassFile(file)) {
+        try {
+          addProgramClassFileData(Files.readAllBytes(file));
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      } else {
+        throw new Unimplemented("No support for adding file: " + file);
+      }
+    }
+    return self();
   }
 
   @Override
   public JvmTestBuilder addProgramClassFileData(Collection<byte[]> files) {
-    addProgramResources(
-        ListUtils.map(files, data ->
-            ProgramResource.fromBytes(
-                Origin.unknown(),
-                Kind.CF,
-                data,
-                Collections.singleton(TestBase.extractClassDescriptor(data)))));
-    return self();
+    try {
+      Path out = getState().getNewTempFolder().resolve("out.jar");
+      TestBase.writeClassFileDataToJar(out, files);
+      addProgramFiles(out);
+      return self();
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   @Override
@@ -167,7 +141,7 @@ public class JvmTestBuilder extends TestBuilder<JvmTestRunResult, JvmTestBuilder
     return addClasspath(Arrays.asList(paths));
   }
 
-  public JvmTestBuilder addClasspath(List<Path> paths) {
+  public JvmTestBuilder addClasspath(Collection<Path> paths) {
     for (Path path : paths) {
       assert Files.isDirectory(path) || FileUtils.isArchive(path);
       classpath.add(path);
@@ -179,21 +153,17 @@ public class JvmTestBuilder extends TestBuilder<JvmTestRunResult, JvmTestBuilder
     return addClasspath(ToolHelper.getClassPathForTests());
   }
 
-  // Adding a collection of resources will build a jar of exactly those classes so that no other
-  // classes are made available via a too broad classpath directory.
-  private void addProgramResources(List<ProgramResource> resources) {
-    AndroidApp build =
-        AndroidApp.builder()
-            .addProgramResourceProvider(new ClassFileResourceProvider(resources))
-            .build();
-    Path out;
-    try {
-      out = getState().getNewTempFolder().resolve("out.zip");
-      build.writeToZip(out, OutputMode.ClassFile);
-    } catch (IOException e) {
-      throw new RuntimeException(e);
-    }
-    classpath.add(out);
-    builder.addProgramFiles(out);
+  public JvmTestBuilder addVmArguments(Collection<String> arguments) {
+    vmArguments.addAll(arguments);
+    return self();
+  }
+
+  public JvmTestBuilder addVmArguments(String... arguments) {
+    return addVmArguments(Arrays.asList(arguments));
+  }
+
+  public JvmTestBuilder addAndroidBuildVersion() {
+    addVmArguments("-D" + AndroidBuildVersion.PROPERTY + "=10000");
+    return addProgramClasses(AndroidBuildVersion.class);
   }
 }

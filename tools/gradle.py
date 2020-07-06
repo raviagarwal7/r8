@@ -26,13 +26,22 @@ else:
 
 def ParseOptions():
   parser = argparse.ArgumentParser(description = 'Call gradle.')
+  parser.add_argument('--no-internal', '--no_internal',
+      help='Do not build with support for Google internal tests.',
+      default=False, action='store_true')
   parser.add_argument('--java-home', '--java_home',
       help='Use a custom java version to run gradle.')
+  parser.add_argument('--worktree',
+                      help='Gradle is running in a worktree and may lock up '
+                           'the gradle caches.',
+                      action='store_true',
+                      default=False)
   return parser.parse_known_args()
 
 def GetJavaEnv(env):
   java_env = dict(env if env else os.environ, JAVA_HOME = jdk.GetJdkHome())
   java_env['PATH'] = java_env['PATH'] + os.pathsep + os.path.join(jdk.GetJdkHome(), 'bin')
+  java_env['GRADLE_OPTS'] = '-Xmx1g'
   return java_env
 
 def PrintCmd(s):
@@ -96,6 +105,10 @@ def Main():
   (options, args) = ParseOptions()
   if options.java_home:
     args.append('-Dorg.gradle.java.home=' + options.java_home)
+  if options.no_internal:
+    args.append('-Pno_internal')
+  if options.worktree:
+    args.append('-g=' + os.path.join(utils.REPO_ROOT, ".gradle_user_home"))
   return RunGradle(args)
 
 if __name__ == '__main__':

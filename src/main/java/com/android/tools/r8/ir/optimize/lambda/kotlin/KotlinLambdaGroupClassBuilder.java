@@ -4,11 +4,16 @@
 
 package com.android.tools.r8.ir.optimize.lambda.kotlin;
 
+import static com.android.tools.r8.ir.analysis.type.Nullability.definitelyNotNull;
+
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.ClassAccessFlags;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexAnnotationSet;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
+import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexProto;
@@ -20,7 +25,9 @@ import com.android.tools.r8.graph.EnclosingMethodAttribute;
 import com.android.tools.r8.graph.InnerClassAttribute;
 import com.android.tools.r8.graph.MethodAccessFlags;
 import com.android.tools.r8.graph.ParameterAnnotationsList;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
 import com.android.tools.r8.ir.code.Position;
+import com.android.tools.r8.ir.optimize.info.OptimizationFeedback;
 import com.android.tools.r8.ir.optimize.lambda.LambdaGroupClassBuilder;
 import com.android.tools.r8.ir.synthetic.SynthesizedCode;
 import com.android.tools.r8.ir.synthetic.SyntheticSourceCode;
@@ -105,14 +112,6 @@ abstract class KotlinLambdaGroupClassBuilder<T extends KotlinLambdaGroup>
         // anyways and our new method is a product of inlining.
         MethodAccessFlags accessFlags = MAIN_METHOD_FLAGS.copy();
 
-        // Mark all the impl methods for force inlining
-        // LambdaGroupVirtualMethodSourceCode relies on.
-        for (DexEncodedMethod implMethod : implMethods) {
-          if (implMethod != null) {
-            implMethod.getMutableOptimizationInfo().markForceInline();
-          }
-        }
-
         DexMethod method = factory.createMethod(group.getGroupClassType(), methodProto, methodName);
         result.add(
             new DexEncodedMethod(
@@ -128,7 +127,8 @@ abstract class KotlinLambdaGroupClassBuilder<T extends KotlinLambdaGroup>
                             method,
                             group.getLambdaIdField(factory),
                             implMethods,
-                            callerPosition))));
+                            callerPosition)),
+                true));
       }
     }
 
@@ -178,7 +178,8 @@ abstract class KotlinLambdaGroupClassBuilder<T extends KotlinLambdaGroup>
             new SynthesizedCode(
                 callerPosition ->
                     createInstanceInitializerSourceCode(
-                        groupClassType, initializerMethod, callerPosition)));
+                        groupClassType, initializerMethod, callerPosition)),
+            true);
 
     // Static class initializer for stateless lambdas.
     if (needsSingletonInstances) {
@@ -195,7 +196,8 @@ abstract class KotlinLambdaGroupClassBuilder<T extends KotlinLambdaGroup>
               ParameterAnnotationsList.empty(),
               new SynthesizedCode(
                   callerPosition ->
-                      new ClassInitializerSourceCode(method, factory, group, callerPosition)));
+                      new ClassInitializerSourceCode(method, factory, group, callerPosition)),
+              true);
     }
 
     return result;
@@ -220,18 +222,30 @@ abstract class KotlinLambdaGroupClassBuilder<T extends KotlinLambdaGroup>
   }
 
   @Override
-  protected DexEncodedField[] buildStaticFields() {
+  protected DexEncodedField[] buildStaticFields(
+      AppView<? extends AppInfoWithClassHierarchy> appView, OptimizationFeedback feedback) {
     if (!group.isStateless()) {
       return DexEncodedField.EMPTY_ARRAY;
     }
     // One field for each singleton lambda in the group.
     List<DexEncodedField> result = new ArrayList<>(group.size());
-    group.forEachLambda(info -> {
-      if (group.isSingletonLambda(info.clazz.type)) {
-        result.add(new DexEncodedField(group.getSingletonInstanceField(factory, info.id),
-            SINGLETON_FIELD_FLAGS, DexAnnotationSet.empty(), DexValueNull.NULL));
-      }
-    });
+    group.forEachLambda(
+        info -> {
+          if (group.isSingletonLambda(info.clazz.type)) {
+            DexField field = group.getSingletonInstanceField(factory, info.id);
+            DexEncodedField encodedField =
+                new DexEncodedField(
+                    field, SINGLETON_FIELD_FLAGS, DexAnnotationSet.empty(), DexValueNull.NULL);
+            result.add(encodedField);
+
+            // Record that the field is definitely not null. It is guaranteed to be assigned in the
+            // class initializer of the enclosing class before it is read.
+            ClassTypeElement exactType =
+                ClassTypeElement.create(field.type, definitelyNotNull(), appView);
+            feedback.markFieldHasDynamicLowerBoundType(encodedField, exactType);
+            feedback.markFieldHasDynamicUpperBoundType(encodedField, exactType);
+          }
+        });
     assert result.isEmpty() == !group.hasAnySingletons();
     return result.toArray(DexEncodedField.EMPTY_ARRAY);
   }

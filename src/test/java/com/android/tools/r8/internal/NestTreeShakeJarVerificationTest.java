@@ -26,6 +26,7 @@ public class NestTreeShakeJarVerificationTest extends NestCompilationBase {
         null,
         ImmutableList.of(BASE + DEPLOY_JAR));
     assertEquals(0, filterKotlinMetadata(handler.warnings).count());
+    // TODO(b/155536535): We find bad descriptors. See if we can still resolve them.
     assertEquals(0, filterKotlinMetadata(handler.infos).count());
   }
 

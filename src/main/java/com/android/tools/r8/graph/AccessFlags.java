@@ -83,12 +83,26 @@ public abstract class AccessFlags<T extends AccessFlags<T>> {
     return originalFlags | modifiedFlags;
   }
 
-  public boolean isMoreVisibleThan(AccessFlags other) {
-    return visibilityOrdinal() > other.visibilityOrdinal();
+  public boolean isMoreVisibleThan(
+      AccessFlags other, String packageNameThis, String packageNameOther) {
+    int visibilityOrdinal = visibilityOrdinal();
+    if (visibilityOrdinal > other.visibilityOrdinal()) {
+      return true;
+    }
+    if (visibilityOrdinal == other.visibilityOrdinal()
+        && isVisibilityDependingOnPackage()
+        && !packageNameThis.equals(packageNameOther)) {
+      return true;
+    }
+    return false;
   }
 
   public boolean isAtLeastAsVisibleAs(AccessFlags other) {
     return visibilityOrdinal() >= other.visibilityOrdinal();
+  }
+
+  public boolean isSameVisibility(AccessFlags other) {
+    return visibilityOrdinal() == other.visibilityOrdinal();
   }
 
   private int visibilityOrdinal() {
@@ -104,6 +118,14 @@ public abstract class AccessFlags<T extends AccessFlags<T>> {
     }
     // Package-private
     return 1;
+  }
+
+  public boolean isVisibilityDependingOnPackage() {
+    return visibilityOrdinal() == 1 || visibilityOrdinal() == 2;
+  }
+
+  public boolean isPackagePrivate() {
+    return !isPublic() && !isPrivate() && !isProtected();
   }
 
   public boolean isPublic() {
@@ -153,6 +175,10 @@ public abstract class AccessFlags<T extends AccessFlags<T>> {
     set(Constants.ACC_STATIC);
   }
 
+  public boolean isOpen() {
+    return !isFinal();
+  }
+
   public boolean isFinal() {
     return isSet(Constants.ACC_FINAL);
   }
@@ -175,6 +201,10 @@ public abstract class AccessFlags<T extends AccessFlags<T>> {
 
   public void unsetSynthetic() {
     unset(Constants.ACC_SYNTHETIC);
+  }
+
+  public void demoteFromSynthetic() {
+    demote(Constants.ACC_SYNTHETIC);
   }
 
   public void promoteToFinal() {

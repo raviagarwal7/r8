@@ -6,22 +6,53 @@ package com.android.tools.r8.graph;
 import com.android.tools.r8.dex.IndexedItemCollection;
 import com.android.tools.r8.errors.CompilationError;
 import com.android.tools.r8.naming.NamingLens;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
-public class DexField extends Descriptor<DexEncodedField, DexField> implements
-    PresortedComparable<DexField> {
+public class DexField extends DexMember<DexEncodedField, DexField> {
 
-  public final DexType holder;
   public final DexType type;
   public final DexString name;
 
   DexField(DexType holder, DexType type, DexString name, boolean skipNameValidationForTesting) {
-    this.holder = holder;
+    super(holder);
     this.type = type;
     this.name = name;
     if (!skipNameValidationForTesting && !name.isValidFieldName()) {
       throw new CompilationError(
           "Field name '" + name.toString() + "' cannot be represented in dex format.");
     }
+  }
+
+  @Override
+  public DexEncodedField lookupOnClass(DexClass clazz) {
+    return clazz != null ? clazz.lookupField(this) : null;
+  }
+
+  @Override
+  public <T> T apply(
+      Function<DexType, T> classConsumer,
+      Function<DexField, T> fieldConsumer,
+      Function<DexMethod, T> methodConsumer) {
+    return fieldConsumer.apply(this);
+  }
+
+  @Override
+  public void accept(
+      Consumer<DexType> classConsumer,
+      Consumer<DexField> fieldConsumer,
+      Consumer<DexMethod> methodConsumer) {
+    fieldConsumer.accept(this);
+  }
+
+  @Override
+  public <T> void accept(
+      BiConsumer<DexType, T> classConsumer,
+      BiConsumer<DexField, T> fieldConsumer,
+      BiConsumer<DexMethod, T> methodConsumer,
+      T arg) {
+    fieldConsumer.accept(this, arg);
   }
 
   @Override
@@ -74,11 +105,6 @@ public class DexField extends Descriptor<DexEncodedField, DexField> implements
   }
 
   @Override
-  public int compareTo(DexField other) {
-    return sortedCompareTo(other.getSortedIndex());
-  }
-
-  @Override
   public int slowCompareTo(DexField other) {
     int result = holder.slowCompareTo(other.holder);
     if (result != 0) {
@@ -105,21 +131,13 @@ public class DexField extends Descriptor<DexEncodedField, DexField> implements
   }
 
   @Override
-  public int layeredCompareTo(DexField other, NamingLens namingLens) {
-    int result = holder.compareTo(other.holder);
-    if (result != 0) {
-      return result;
-    }
-    result = namingLens.lookupName(this).compareTo(namingLens.lookupName(other));
-    if (result != 0) {
-      return result;
-    }
-    return type.compareTo(other.type);
+  public boolean match(DexField field) {
+    return field.name == name && field.type == type;
   }
 
   @Override
-  public boolean match(DexEncodedField entry) {
-    return entry.field.name == name && entry.field.type == type;
+  public boolean match(DexEncodedField encodedField) {
+    return match(encodedField.field);
   }
 
   public String qualifiedName() {

@@ -8,7 +8,6 @@ import com.android.tools.r8.code.MoveResultObject;
 import com.android.tools.r8.code.MoveResultWide;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexItem;
 import com.android.tools.r8.graph.DexItemFactory;
@@ -17,9 +16,10 @@ import com.android.tools.r8.graph.DexMethodHandle.MethodHandleType;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import java.util.List;
+import java.util.Set;
 
 public abstract class Invoke extends Instruction {
 
@@ -61,6 +61,7 @@ public abstract class Invoke extends Instruction {
     super(result, arguments);
   }
 
+  @Deprecated
   public static Invoke create(
       Type type, DexItem target, DexProto proto, Value result, List<Value> arguments) {
     return create(type, target, proto, result, arguments, false);
@@ -101,6 +102,10 @@ public abstract class Invoke extends Instruction {
 
   public List<Value> arguments() {
     return inValues;
+  }
+
+  public Value getArgument(int index) {
+    return arguments().get(index);
   }
 
   public int requiredArgumentRegisters() {
@@ -163,14 +168,14 @@ public abstract class Invoke extends Instruction {
   protected void addInvokeAndMoveResult(
       com.android.tools.r8.code.Instruction instruction, DexBuilder builder) {
     if (outValue != null && outValue.needsRegister()) {
-      TypeLatticeElement moveType = outValue.getTypeLattice();
+      TypeElement moveType = outValue.getType();
       int register = builder.allocatedRegister(outValue, getNumber());
       com.android.tools.r8.code.Instruction moveResult;
-      if (moveType.isSingle()) {
+      if (moveType.isSinglePrimitive()) {
         moveResult = new MoveResult(register);
-      } else if (moveType.isWide()) {
+      } else if (moveType.isWidePrimitive()) {
         moveResult = new MoveResultWide(register);
-      } else if (moveType.isReference()) {
+      } else if (moveType.isReferenceType()) {
         moveResult = new MoveResultObject(register);
       } else {
         throw new Unreachable("Unexpected result type " + outType());
@@ -182,8 +187,28 @@ public abstract class Invoke extends Instruction {
   }
 
   @Override
-  public boolean couldIntroduceAnAlias() {
-    return outValue() != null;
+  public boolean couldIntroduceAnAlias(AppView<?> appView, Value root) {
+    assert root != null && root.getType().isReferenceType();
+    if (outValue == null) {
+      return false;
+    }
+    TypeElement outType = outValue.getType();
+    if (outType.isPrimitiveType()) {
+      return false;
+    }
+    if (appView.appInfo().hasLiveness()) {
+      if (outType.isClassType()
+          && root.getType().isClassType()
+          && appView
+              .appInfo()
+              .withLiveness()
+              .inDifferentHierarchy(
+                  outType.asClassType().getClassType(),
+                  root.getType().asClassType().getClassType())) {
+        return false;
+      }
+    }
+    return outType.isReferenceType();
   }
 
   @Override
@@ -263,11 +288,16 @@ public abstract class Invoke extends Instruction {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
+  public TypeElement evaluate(AppView<?> appView) {
     DexType returnType = getReturnType();
     if (returnType.isVoidType()) {
       throw new Unreachable("void methods have no type.");
     }
-    return TypeLatticeElement.fromDexType(returnType, Nullability.maybeNull(), appView);
+    return TypeElement.fromDexType(returnType, Nullability.maybeNull(), appView);
+  }
+
+  @Override
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return getReturnType().isBooleanType();
   }
 }

@@ -4,17 +4,23 @@
 package com.android.tools.r8.cf.code;
 
 import com.android.tools.r8.cf.CfPrinter;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ClasspathMethod;
+import com.android.tools.r8.graph.DexClassAndMethod;
+import com.android.tools.r8.graph.DexProgramClass;
+import com.android.tools.r8.graph.InitClassLens;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.graph.UseRegistry;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.IRBuilder;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
 import org.objectweb.asm.MethodVisitor;
 
 public abstract class CfInstruction {
 
-  public abstract void write(MethodVisitor visitor, NamingLens lens);
+  public abstract void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens);
 
   public abstract void print(CfPrinter printer);
 
@@ -25,7 +31,15 @@ public abstract class CfInstruction {
     return printer.toString();
   }
 
-  public void registerUse(UseRegistry registry, DexType clazz) {
+  public void registerUse(UseRegistry registry, ProgramMethod context) {
+    internalRegisterUse(registry, context);
+  }
+
+  public void registerUseForDesugaring(UseRegistry registry, ClasspathMethod context) {
+    internalRegisterUse(registry, context);
+  }
+
+  void internalRegisterUse(UseRegistry registry, DexClassAndMethod context) {
     // Intentionally empty.
   }
 
@@ -38,6 +52,86 @@ public abstract class CfInstruction {
   }
 
   public boolean isConstString() {
+    return false;
+  }
+
+  public CfFieldInstruction asFieldInstruction() {
+    return null;
+  }
+
+  public boolean isFieldInstruction() {
+    return false;
+  }
+
+  public CfGoto asGoto() {
+    return null;
+  }
+
+  public boolean isGoto() {
+    return false;
+  }
+
+  public CfInvoke asInvoke() {
+    return null;
+  }
+
+  public boolean isInvoke() {
+    return false;
+  }
+
+  public CfLabel asLabel() {
+    return null;
+  }
+
+  public boolean isLabel() {
+    return false;
+  }
+
+  public CfFrame asFrame() {
+    return null;
+  }
+
+  public boolean isFrame() {
+    return false;
+  }
+
+  public CfPosition asPosition() {
+    return null;
+  }
+
+  public boolean isPosition() {
+    return false;
+  }
+
+  public CfLoad asLoad() {
+    return null;
+  }
+
+  public boolean isLoad() {
+    return false;
+  }
+
+  public CfStore asStore() {
+    return null;
+  }
+
+  public boolean isInstanceOf() {
+    return false;
+  }
+
+  public CfInstanceOf asInstanceOf() {
+    return null;
+  }
+
+  public boolean isStore() {
+    return false;
+  }
+
+  public CfSwitch asSwitch() {
+    return null;
+  }
+
+  public boolean isSwitch() {
     return false;
   }
 
@@ -59,6 +153,12 @@ public abstract class CfInstruction {
     return false;
   }
 
+  /** Return true if this instruction is CfIf, CfIfCmp, CfSwitch, CfGoto, CfThrow,
+   * CfReturn or CfReturnVoid. */
+  public boolean isJump() {
+    return false;
+  }
+
   /** Return true if this instruction or its DEX equivalent can throw. */
   public boolean canThrow() {
     return false;
@@ -70,4 +170,7 @@ public abstract class CfInstruction {
   public boolean emitsIR() {
     return true;
   }
+
+  public abstract ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context);
 }

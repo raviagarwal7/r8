@@ -28,6 +28,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipException;
 import java.util.zip.ZipFile;
@@ -53,7 +54,8 @@ public class ArchiveResourceProvider implements ProgramResourceProvider, DataRes
   private List<ProgramResource> readArchive() throws IOException {
     List<ProgramResource> dexResources = new ArrayList<>();
     List<ProgramResource> classResources = new ArrayList<>();
-    try (ZipFile zipFile = new ZipFile(archive.getPath().toFile(), StandardCharsets.UTF_8)) {
+    try (ZipFile zipFile =
+        FileUtils.createZipFile(archive.getPath().toFile(), StandardCharsets.UTF_8)) {
       final Enumeration<? extends ZipEntry> entries = zipFile.entries();
       while (entries.hasMoreElements()) {
         ZipEntry entry = entries.nextElement();
@@ -109,7 +111,8 @@ public class ArchiveResourceProvider implements ProgramResourceProvider, DataRes
 
   @Override
   public void accept(Visitor resourceBrowser) throws ResourceException {
-    try (ZipFile zipFile = new ZipFile(archive.getPath().toFile(), StandardCharsets.UTF_8)) {
+    try (ZipFile zipFile =
+        FileUtils.createZipFile(archive.getPath().toFile(), StandardCharsets.UTF_8)) {
       final Enumeration<? extends ZipEntry> entries = zipFile.entries();
       while (entries.hasMoreElements()) {
         ZipEntry entry = entries.nextElement();
@@ -133,5 +136,44 @@ public class ArchiveResourceProvider implements ProgramResourceProvider, DataRes
 
   private boolean isProgramResourceName(String name) {
     return ZipUtils.isClassFile(name) || (ZipUtils.isDexFile(name) && !ignoreDexInArchive);
+  }
+
+  public void accept(Consumer<ProgramResource> visitor) throws ResourceException {
+    try (ZipFile zipFile =
+        FileUtils.createZipFile(archive.getPath().toFile(), StandardCharsets.UTF_8)) {
+      final Enumeration<? extends ZipEntry> entries = zipFile.entries();
+      while (entries.hasMoreElements()) {
+        ZipEntry entry = entries.nextElement();
+        String name = entry.getName();
+        if (archive.matchesFile(name) && isProgramResourceName(name)) {
+          Origin entryOrigin = new ArchiveEntryOrigin(name, origin);
+          try (InputStream stream = zipFile.getInputStream(entry)) {
+            if (ZipUtils.isDexFile(name)) {
+              OneShotByteResource resource =
+                  OneShotByteResource.create(
+                      Kind.DEX, entryOrigin, ByteStreams.toByteArray(stream), null);
+              visitor.accept(resource);
+            } else if (ZipUtils.isClassFile(name)) {
+              OneShotByteResource resource =
+                  OneShotByteResource.create(
+                      Kind.CF,
+                      entryOrigin,
+                      ByteStreams.toByteArray(stream),
+                      Collections.singleton(DescriptorUtils.guessTypeDescriptor(name)));
+              visitor.accept(resource);
+            }
+          }
+        }
+      }
+    } catch (ZipException e) {
+      throw new ResourceException(
+          origin,
+          new CompilationError("Zip error while reading '" + archive + "': " + e.getMessage(), e));
+    } catch (IOException e) {
+      throw new ResourceException(
+          origin,
+          new CompilationError(
+              "I/O exception while reading '" + archive + "': " + e.getMessage(), e));
+    }
   }
 }

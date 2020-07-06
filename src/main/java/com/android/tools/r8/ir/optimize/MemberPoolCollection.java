@@ -3,12 +3,13 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.optimize;
 
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.Descriptor;
 import com.android.tools.r8.graph.DexClass;
+import com.android.tools.r8.graph.DexMember;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.SubtypingInfo;
 import com.android.tools.r8.graph.TopDownClassHierarchyTraversal;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.Timing;
 import com.google.common.base.Equivalence;
@@ -28,16 +29,20 @@ import java.util.concurrent.Future;
 import java.util.function.Predicate;
 
 // Per-class collection of member signatures.
-public abstract class MemberPoolCollection<T extends Descriptor> {
+public abstract class MemberPoolCollection<R extends DexMember<?, R>> {
 
-  final Equivalence<T> equivalence;
-  final AppView<? extends AppInfoWithSubtyping> appView;
-  final Map<DexClass, MemberPool<T>> memberPools = new ConcurrentHashMap<>();
+  final Equivalence<R> equivalence;
+  final AppView<AppInfoWithLiveness> appView;
+  final SubtypingInfo subtypingInfo;
+  final Map<DexClass, MemberPool<R>> memberPools = new ConcurrentHashMap<>();
 
   MemberPoolCollection(
-      AppView<? extends AppInfoWithSubtyping> appView, Equivalence<T> equivalence) {
+      AppView<AppInfoWithLiveness> appView,
+      Equivalence<R> equivalence,
+      SubtypingInfo subtypingInfo) {
     this.appView = appView;
     this.equivalence = equivalence;
+    this.subtypingInfo = subtypingInfo;
   }
 
   public void buildAll(ExecutorService executorService, Timing timing) throws ExecutionException {
@@ -57,7 +62,7 @@ public abstract class MemberPoolCollection<T extends Descriptor> {
     }
   }
 
-  public MemberPool<T> buildForHierarchy(
+  public MemberPool<R> buildForHierarchy(
       DexClass clazz, ExecutorService executorService, Timing timing) throws ExecutionException {
     timing.begin("Building member pool collection");
     try {
@@ -76,14 +81,14 @@ public abstract class MemberPoolCollection<T extends Descriptor> {
     return memberPools.containsKey(clazz);
   }
 
-  public MemberPool<T> get(DexClass clazz) {
+  public MemberPool<R> get(DexClass clazz) {
     assert hasPool(clazz);
     return memberPools.get(clazz);
   }
 
-  public boolean markIfNotSeen(DexClass clazz, T reference) {
-    MemberPool<T> memberPool = get(clazz);
-    Wrapper<T> key = equivalence.wrap(reference);
+  public boolean markIfNotSeen(DexClass clazz, R reference) {
+    MemberPool<R> memberPool = get(clazz);
+    Wrapper<R> key = equivalence.wrap(reference);
     if (memberPool.hasSeen(key)) {
       return true;
     }
@@ -106,7 +111,6 @@ public abstract class MemberPoolCollection<T extends Descriptor> {
 
   abstract Runnable computeMemberPoolForClass(DexClass clazz);
 
-  // TODO(jsjeon): maybe be part of AppInfoWithSubtyping?
   private Set<DexClass> getAllSuperTypesInclusive(
       DexClass subject, Predicate<DexClass> stoppingCriterion) {
     Set<DexClass> superTypes = new HashSet<>();
@@ -129,33 +133,24 @@ public abstract class MemberPoolCollection<T extends Descriptor> {
     return superTypes;
   }
 
-  // TODO(jsjeon): maybe be part of AppInfoWithSubtyping?
   private Set<DexClass> getAllSubTypesExclusive(
       DexClass subject, Predicate<DexClass> stoppingCriterion) {
     Set<DexClass> subTypes = new HashSet<>();
     Deque<DexClass> worklist = new ArrayDeque<>();
-    appView
-        .appInfo()
-        .forAllExtendsSubtypes(
-            subject.type, type -> addNonNull(worklist, appView.definitionFor(type)));
-    appView
-        .appInfo()
-        .forAllImplementsSubtypes(
-            subject.type, type -> addNonNull(worklist, appView.definitionFor(type)));
+    subtypingInfo.forAllImmediateExtendsSubtypes(
+        subject.type, type -> addNonNull(worklist, appView.definitionFor(type)));
+    subtypingInfo.forAllImmediateImplementsSubtypes(
+        subject.type, type -> addNonNull(worklist, appView.definitionFor(type)));
     while (!worklist.isEmpty()) {
       DexClass clazz = worklist.pop();
       if (stoppingCriterion.test(clazz)) {
         continue;
       }
       if (subTypes.add(clazz)) {
-        appView
-            .appInfo()
-            .forAllExtendsSubtypes(
-                clazz.type, type -> addNonNull(worklist, appView.definitionFor(type)));
-        appView
-            .appInfo()
-            .forAllImplementsSubtypes(
-                clazz.type, type -> addNonNull(worklist, appView.definitionFor(type)));
+        subtypingInfo.forAllImmediateExtendsSubtypes(
+            clazz.type, type -> addNonNull(worklist, appView.definitionFor(type)));
+        subtypingInfo.forAllImmediateImplementsSubtypes(
+            clazz.type, type -> addNonNull(worklist, appView.definitionFor(type)));
       }
     }
     return subTypes;
@@ -222,7 +217,9 @@ public abstract class MemberPoolCollection<T extends Descriptor> {
     }
 
     private boolean hasSeenBelow(Wrapper<T> member, boolean inclusive) {
-      if (inclusive && hasSeenDirectly(member)) {
+      if (inclusive
+          && (hasSeenDirectly(member)
+              || interfaces.stream().anyMatch(itf -> itf.hasSeenAbove(member, true)))) {
         return true;
       }
       return subTypes.stream().anyMatch(subType -> subType.hasSeenBelow(member, true));

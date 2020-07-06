@@ -3,6 +3,7 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.cf;
 
+import static com.google.common.base.Predicates.alwaysTrue;
 import static org.junit.Assert.assertEquals;
 
 import com.android.tools.r8.ClassFileConsumer;
@@ -13,9 +14,9 @@ import com.android.tools.r8.cf.code.CfTryCatch;
 import com.android.tools.r8.errors.Unimplemented;
 import com.android.tools.r8.graph.CfCode;
 import com.android.tools.r8.graph.Code;
-import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexCode;
 import com.android.tools.r8.graph.DexCode.Try;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -71,8 +72,8 @@ public class IdenticalCatchHandlerTest extends TestBase {
 
   private int countCatchHandlers(AndroidApp inputApp) throws Exception {
     CodeInspector inspector = new CodeInspector(inputApp);
-    DexClass dexClass = inspector.clazz(TestClass.class).getDexClass();
-    Code code = dexClass.virtualMethods().get(0).getCode();
+    DexProgramClass dexClass = inspector.clazz(TestClass.class).getDexProgramClass();
+    Code code = dexClass.lookupVirtualMethod(alwaysTrue()).getCode();
     if (code.isCfCode()) {
       CfCode cfCode = code.asCfCode();
       Set<CfLabel> targets = Sets.newIdentityHashSet();

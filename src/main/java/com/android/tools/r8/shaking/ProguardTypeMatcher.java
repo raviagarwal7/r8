@@ -5,17 +5,20 @@ package com.android.tools.r8.shaking;
 
 import static com.android.tools.r8.utils.DescriptorUtils.javaTypeToDescriptor;
 
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.shaking.ProguardConfigurationParser.IdentifierPatternWithWildcards;
 import com.android.tools.r8.shaking.ProguardWildcard.BackReference;
 import com.android.tools.r8.shaking.ProguardWildcard.Pattern;
+import com.android.tools.r8.utils.DescriptorUtils;
+import com.android.tools.r8.utils.StringUtils;
 import com.google.common.collect.ImmutableList;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceOpenHashMap;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 
 public abstract class ProguardTypeMatcher {
 
@@ -33,12 +36,16 @@ public abstract class ProguardTypeMatcher {
     TYPE
   }
 
+  public MatchSpecificType asSpecificTypeMatcher() {
+    return null;
+  }
+
   // Evaluates this matcher on the given type.
   public abstract boolean matches(DexType type);
 
   // Evaluates this matcher on the given type, and on all types that have been merged into the given
   // type, if any.
-  public final boolean matches(DexType type, AppView<? extends AppInfo> appView) {
+  public final boolean matches(DexType type, AppView<?> appView) {
     if (matches(type)) {
       return true;
     }
@@ -56,8 +63,28 @@ public abstract class ProguardTypeMatcher {
     return typeMatcher == null ? Collections::emptyIterator : typeMatcher.getWildcards();
   }
 
-  protected ProguardTypeMatcher materialize() {
+  static Iterable<ProguardWildcard> getWildcardsOrEmpty(List<ProguardTypeMatcher> typeMatchers) {
+    List<ProguardWildcard> result = new ArrayList<>();
+    for (ProguardTypeMatcher typeMatcher : typeMatchers) {
+      typeMatcher.getWildcards().forEach(result::add);
+    }
+    return result;
+  }
+
+  protected ProguardTypeMatcher materialize(DexItemFactory dexItemFactory) {
     return this;
+  }
+
+  public static List<ProguardTypeMatcher> materializeList(
+      List<ProguardTypeMatcher> matchers, DexItemFactory dexItemFactory) {
+    if (matchers.isEmpty()) {
+      return Collections.emptyList();
+    }
+    ImmutableList.Builder<ProguardTypeMatcher> builder = ImmutableList.builder();
+    for (ProguardTypeMatcher matcher : matchers) {
+      builder.add(matcher.materialize(dexItemFactory));
+    }
+    return builder.build();
   }
 
   @Override
@@ -108,6 +135,10 @@ public abstract class ProguardTypeMatcher {
   @Override
   public abstract int hashCode();
 
+  public boolean hasSpecificType() {
+    return false;
+  }
+
   public DexType getSpecificType() {
     return null;
   }
@@ -142,7 +173,7 @@ public abstract class ProguardTypeMatcher {
     }
 
     @Override
-    protected MatchAllTypes materialize() {
+    protected MatchAllTypes materialize(DexItemFactory dexItemFactory) {
       return new MatchAllTypes(wildcard.materialize());
     }
 
@@ -227,7 +258,7 @@ public abstract class ProguardTypeMatcher {
     }
 
     @Override
-    protected MatchClassTypes materialize() {
+    protected MatchClassTypes materialize(DexItemFactory dexItemFactory) {
       return new MatchClassTypes(pattern, wildcard.materialize());
     }
 
@@ -276,7 +307,7 @@ public abstract class ProguardTypeMatcher {
     }
 
     @Override
-    protected MatchBasicTypes materialize() {
+    protected MatchBasicTypes materialize(DexItemFactory dexItemFactory) {
       return new MatchBasicTypes(wildcard.materialize());
     }
 
@@ -305,6 +336,11 @@ public abstract class ProguardTypeMatcher {
     }
 
     @Override
+    public MatchSpecificType asSpecificTypeMatcher() {
+      return this;
+    }
+
+    @Override
     public boolean matches(DexType type) {
       return this.type == type;
     }
@@ -325,6 +361,11 @@ public abstract class ProguardTypeMatcher {
     @Override
     public int hashCode() {
       return type.hashCode();
+    }
+
+    @Override
+    public boolean hasSpecificType() {
+      return true;
     }
 
     @Override
@@ -363,12 +404,88 @@ public abstract class ProguardTypeMatcher {
     }
 
     @Override
-    protected MatchTypePattern materialize() {
-      List<ProguardWildcard> materializedWildcards =
-          wildcards.stream().map(ProguardWildcard::materialize).collect(Collectors.toList());
+    protected ProguardTypeMatcher materialize(DexItemFactory dexItemFactory) {
+      Int2ReferenceMap<String> materializedBackReferences = new Int2ReferenceOpenHashMap<>();
+      List<ProguardWildcard> materializedWildcards = new ArrayList<>();
+      for (ProguardWildcard wildcard : wildcards) {
+        ProguardWildcard materializedWildcard = wildcard.materialize();
+        if (materializedWildcard.isBackReference()) {
+          BackReference materializedBackReference = materializedWildcard.asBackReference();
+          materializedBackReferences.put(
+              materializedBackReference.referenceIndex, materializedBackReference.getCaptured());
+        } else {
+          materializedWildcards.add(materializedWildcard);
+        }
+      }
+
+      if (!materializedBackReferences.isEmpty()) {
+        String newPattern =
+            removeMaterializedBackReferencesFromPattern(pattern, materializedBackReferences);
+        if (!newPattern.contains("*")) {
+          String descriptor = DescriptorUtils.javaTypeToDescriptor(newPattern);
+          DexType type = dexItemFactory.createType(descriptor);
+          return new MatchSpecificType(type);
+        }
+
+        IdentifierPatternWithWildcards identifierPatternWithMaterializedWildcards =
+            new IdentifierPatternWithWildcards(newPattern, materializedWildcards);
+        return new MatchTypePattern(identifierPatternWithMaterializedWildcards, kind);
+      }
+
       IdentifierPatternWithWildcards identifierPatternWithMaterializedWildcards =
           new IdentifierPatternWithWildcards(pattern, materializedWildcards);
       return new MatchTypePattern(identifierPatternWithMaterializedWildcards, kind);
+    }
+
+    private static String removeMaterializedBackReferencesFromPattern(
+        String pattern, Int2ReferenceMap<String> materializedBackReferences) {
+      StringBuilder builder = new StringBuilder();
+      int startIndex = 0;
+      int currentIndex = 0;
+      for (; currentIndex < pattern.length(); currentIndex++) {
+        char c = pattern.charAt(currentIndex);
+        if (c == '<') {
+          int backReferenceEndIndex = currentIndex + 1;
+          while (backReferenceEndIndex < pattern.length()
+              && pattern.charAt(backReferenceEndIndex) != '>') {
+            backReferenceEndIndex++;
+          }
+          if (backReferenceEndIndex == pattern.length()) {
+            // Reached the end of the string without finding '>'.
+            break;
+          }
+
+          String reference = pattern.substring(currentIndex + 1, backReferenceEndIndex);
+          if (reference.isEmpty() || !StringUtils.onlyContainsDigits(reference)) {
+            continue;
+          }
+
+          String captured = materializedBackReferences.get(Integer.valueOf(reference).intValue());
+          if (captured == null) {
+            continue;
+          }
+
+          // Flush everything up until the back reference.
+          String before = pattern.substring(startIndex, currentIndex);
+          builder.append(before);
+
+          // Output the captured value.
+          builder.append(captured);
+
+          // Continue from the character that follows '>'.
+          startIndex = backReferenceEndIndex + 1;
+          currentIndex = backReferenceEndIndex;
+        }
+      }
+
+      assert currentIndex == pattern.length();
+
+      // Output everything that follows the last back reference.
+      if (startIndex < currentIndex) {
+        builder.append(pattern.substring(startIndex));
+      }
+
+      return builder.toString();
     }
 
     private static boolean matchClassOrTypeNameImpl(

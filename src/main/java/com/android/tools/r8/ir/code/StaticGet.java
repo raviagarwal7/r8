@@ -15,25 +15,43 @@ import com.android.tools.r8.code.SgetShort;
 import com.android.tools.r8.code.SgetWide;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
-import org.objectweb.asm.Opcodes;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
+import com.google.common.collect.Sets;
+import java.util.Set;
 
-public class StaticGet extends FieldInstruction {
+public class StaticGet extends FieldInstruction implements StaticFieldInstruction {
 
   public StaticGet(Value dest, DexField field) {
     super(field, dest, (Value) null);
+  }
+
+  public static StaticGet copyOf(IRCode code, StaticGet original) {
+    Value newValue =
+        new Value(code.valueNumberGenerator.next(), original.getOutType(), original.getLocalInfo());
+    return copyOf(newValue, original);
+  }
+
+  public static StaticGet copyOf(Value newValue, StaticGet original) {
+    assert newValue != original.outValue();
+    return new StaticGet(newValue, original.getField());
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.STATIC_GET;
   }
 
   @Override
@@ -46,8 +64,31 @@ public class StaticGet extends FieldInstruction {
   }
 
   @Override
-  public boolean couldIntroduceAnAlias() {
-    return true;
+  public Value value() {
+    return outValue;
+  }
+
+  @Override
+  public boolean couldIntroduceAnAlias(AppView<?> appView, Value root) {
+    assert root != null && root.getType().isReferenceType();
+    assert outValue != null;
+    TypeElement outType = outValue.getType();
+    if (outType.isPrimitiveType()) {
+      return false;
+    }
+    if (appView.appInfo().hasLiveness()) {
+      if (outType.isClassType()
+          && root.getType().isClassType()
+          && appView
+              .appInfo()
+              .withLiveness()
+              .inDifferentHierarchy(
+                  outType.asClassType().getClassType(),
+                  root.getType().asClassType().getClassType())) {
+        return false;
+      }
+    }
+    return outType.isReferenceType();
   }
 
   @Override
@@ -79,13 +120,15 @@ public class StaticGet extends FieldInstruction {
       case SHORT:
         instruction = new SgetShort(dest, field);
         break;
-      case INT_OR_FLOAT:
-      case LONG_OR_DOUBLE:
-        throw new Unreachable("Unexpected imprecise type: " + getType());
       default:
         throw new Unreachable("Unexpected type: " + getType());
     }
     builder.add(this, instruction);
+  }
+
+  @Override
+  public boolean instructionTypeCanBeCanonicalized() {
+    return true;
   }
 
   @Override
@@ -95,22 +138,14 @@ public class StaticGet extends FieldInstruction {
   }
 
   @Override
-  public boolean instructionMayHaveSideEffects(
-      AppView<? extends AppInfo> appView, DexType context) {
-    return instructionInstanceCanThrow(appView, context).isThrowing();
+  public boolean instructionMayHaveSideEffects(AppView<?> appView, ProgramMethod context) {
+    return instructionMayHaveSideEffects(appView, context, SideEffectAssumption.NONE);
   }
 
   @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    // static-get can be dead as long as it cannot have any of the following:
-    // * NoSuchFieldError (resolution failure)
-    // * IncompatibleClassChangeError (static-* instruction for instance fields)
-    // * IllegalAccessError (not visible from the access context)
-    // * side-effects in <clinit>
-    boolean canBeDeadCode = !instructionMayHaveSideEffects(appView, code.method.method.holder);
-    assert appView.enableWholeProgramOptimizations() || !canBeDeadCode
-        : "Expected static-get instruction to have side effects in D8";
-    return canBeDeadCode;
+  public boolean instructionMayHaveSideEffects(
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
+    return instructionInstanceCanThrow(appView, context, assumption);
   }
 
   @Override
@@ -134,13 +169,18 @@ public class StaticGet extends FieldInstruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forStaticGet(getField(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forStaticGet(getField(), context.getHolder());
   }
 
   @Override
   public String toString() {
     return super.toString() + "; field: " + getField().toSourceString();
+  }
+
+  @Override
+  public boolean isStaticFieldInstruction() {
+    return true;
   }
 
   @Override
@@ -161,28 +201,51 @@ public class StaticGet extends FieldInstruction {
   @Override
   public void buildCf(CfBuilder builder) {
     builder.add(
-        new CfFieldInstruction(Opcodes.GETSTATIC, getField(), builder.resolveField(getField())));
+        new CfFieldInstruction(
+            org.objectweb.asm.Opcodes.GETSTATIC, getField(), builder.resolveField(getField())));
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     return getField().type;
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.fromDexType(getField().type, Nullability.maybeNull(), appView);
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.fromDexType(getField().type, Nullability.maybeNull(), appView);
   }
 
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forStaticGet(
         this, clazz, appView, mode, assumption);
+  }
+
+  @Override
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return getField().type.isBooleanType();
+  }
+
+  @Override
+  public boolean instructionMayTriggerMethodInvocation(AppView<?> appView, ProgramMethod context) {
+    DexType holder = getField().holder;
+    if (appView.enableWholeProgramOptimizations()) {
+      // In R8, check if the class initialization of the holder or any of its ancestor types may
+      // have side effects.
+      return holder.classInitializationMayHaveSideEffects(
+          appView,
+          // Types that are a super type of `context` are guaranteed to be initialized already.
+          type -> appView.isSubtype(context.getHolderType(), type).isTrue(),
+          Sets.newIdentityHashSet());
+    } else {
+      // In D8, this instruction may trigger class initialization if the holder of the field is
+      // different from the current context.
+      return holder != context.getHolderType();
+    }
   }
 }

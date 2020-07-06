@@ -6,7 +6,6 @@ package com.android.tools.r8.ir.code;
 import static com.android.tools.r8.ir.code.IRCode.INSTRUCTION_NUMBER_DELTA;
 
 import com.android.tools.r8.errors.CompilationError;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DebugLocalInfo;
 import com.android.tools.r8.graph.DebugLocalInfo.PrintLevel;
@@ -14,7 +13,7 @@ import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.GraphLense;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Phi.RegisterReadType;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.conversion.IRBuilder;
@@ -27,6 +26,7 @@ import com.google.common.base.Equivalence;
 import com.google.common.base.Equivalence.Wrapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntList;
@@ -42,6 +42,7 @@ import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.function.Consumer;
@@ -80,7 +81,7 @@ public class BasicBlock {
     return true;
   }
 
-  public boolean verifyTypes(AppView<? extends AppInfo> appView) {
+  public boolean verifyTypes(AppView<?> appView) {
     assert instructions.stream().allMatch(instruction -> instruction.verifyTypes(appView));
     return true;
   }
@@ -93,8 +94,8 @@ public class BasicBlock {
     return localsAtEntry;
   }
 
-  public void replaceLastInstruction(Instruction instruction) {
-    InstructionListIterator iterator = listIterator(getInstructions().size());
+  public void replaceLastInstruction(Instruction instruction, IRCode code) {
+    InstructionListIterator iterator = listIterator(code, getInstructions().size());
     iterator.previous();
     iterator.replaceCurrentInstruction(instruction);
   }
@@ -183,6 +184,28 @@ public class BasicBlock {
     onControlFlowEdgesMayChangeListeners.add(listener);
   }
 
+  public boolean hasUniqueSuccessor() {
+    return successors.size() == 1;
+  }
+
+  public boolean hasUniqueNormalSuccessor() {
+    return numberOfNormalSuccessors() == 1;
+  }
+
+  public boolean hasUniqueNormalSuccessorWithUniquePredecessor() {
+    return hasUniqueNormalSuccessor() && getUniqueNormalSuccessor().getPredecessors().size() == 1;
+  }
+
+  public BasicBlock getUniqueSuccessor() {
+    assert hasUniqueSuccessor();
+    return successors.get(0);
+  }
+
+  public BasicBlock getUniqueNormalSuccessor() {
+    assert hasUniqueNormalSuccessor();
+    return ListUtils.last(successors);
+  }
+
   public List<BasicBlock> getSuccessors() {
     return Collections.unmodifiableList(successors);
   }
@@ -199,18 +222,51 @@ public class BasicBlock {
     return true;
   }
 
+  public void forEachNormalSuccessor(Consumer<BasicBlock> consumer) {
+    for (int i = successors.size() - numberOfNormalSuccessors(); i < successors.size(); i++) {
+      consumer.accept(successors.get(i));
+    }
+  }
+
+  public boolean hasNormalSuccessor(BasicBlock block) {
+    for (int i = successors.size() - numberOfNormalSuccessors(); i < successors.size(); i++) {
+      if (successors.get(i) == block) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public List<BasicBlock> getNormalSuccessors() {
     if (!hasCatchHandlers()) {
       return successors;
     }
-    Set<Integer> handlers = catchHandlers.getUniqueTargets();
     ImmutableList.Builder<BasicBlock> normals = ImmutableList.builder();
-    for (int i = 0; i < successors.size(); i++) {
-      if (!handlers.contains(i)) {
-        normals.add(successors.get(i));
-      }
-    }
+    forEachNormalSuccessor(normals::add);
     return normals.build();
+  }
+
+  public int numberOfNormalSuccessors() {
+    if (hasCatchHandlers()) {
+      return successors.size() - catchHandlers.getUniqueTargets().size();
+    }
+    return successors.size();
+  }
+
+  public int numberOfExceptionalSuccessors() {
+    if (hasCatchHandlers()) {
+      return catchHandlers.getUniqueTargets().size();
+    }
+    return 0;
+  }
+
+  public boolean hasUniquePredecessor() {
+    return predecessors.size() == 1;
+  }
+
+  public BasicBlock getUniquePredecessor() {
+    assert hasUniquePredecessor();
+    return predecessors.get(0);
   }
 
   public List<BasicBlock> getPredecessors() {
@@ -245,7 +301,7 @@ public class BasicBlock {
     removeSuccessorsByIndex(new IntArrayList(new int[] {index}));
   }
 
-  public void removePredecessor(BasicBlock block) {
+  public void removePredecessor(BasicBlock block, Set<Value> affectedValues) {
     int index = predecessors.indexOf(block);
     assert index >= 0 : "removePredecessor did not find the predecessor to remove";
     getMutablePredecessors().remove(index);
@@ -258,11 +314,29 @@ public class BasicBlock {
       for (Phi phi : getPhis()) {
         if (phi.isTrivialPhi()) {
           trivials.add(phi);
+          if (affectedValues != null) {
+            affectedValues.addAll(phi.affectedValues());
+          }
         }
       }
       for (Phi phi : trivials) {
-        phi.removeTrivialPhi();
+        phi.removeTrivialPhi(null, affectedValues);
       }
+    }
+  }
+
+  public void removeAllNormalSuccessors() {
+    if (hasCatchHandlers()) {
+      IntList successorsToRemove = new IntArrayList();
+      Set<Integer> handlers = catchHandlers.getUniqueTargets();
+      for (int i = 0; i < successors.size(); i++) {
+        if (!handlers.contains(i)) {
+          successorsToRemove.add(i);
+        }
+      }
+      removeSuccessorsByIndex(successorsToRemove);
+    } else {
+      successors.clear();
     }
   }
 
@@ -373,6 +447,8 @@ public class BasicBlock {
             indices[i] = indices[i] - 1;
           }
         }
+      } else {
+        assert exit().isReturn() || exit().isThrow();
       }
 
       // Remove the replaced successor.
@@ -486,8 +562,25 @@ public class BasicBlock {
     }
   }
 
+  public boolean hasPhis() {
+    return !phis.isEmpty();
+  }
+
+  public boolean hasDeadPhi(AppView<?> appView, IRCode code) {
+    for (Phi phi : phis) {
+      if (phi.isDead(appView, code)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public List<Phi> getPhis() {
     return phis;
+  }
+
+  public boolean isEntry() {
+    return getPredecessors().isEmpty();
   }
 
   public boolean isFilled() {
@@ -529,8 +622,54 @@ public class BasicBlock {
     return instructions;
   }
 
+  public Iterable<Instruction> instructionsAfter(Instruction instruction) {
+    return () -> iterator(instruction);
+  }
+
+  public Iterable<Instruction> instructionsBefore(Instruction instruction) {
+    return () ->
+        new Iterator<Instruction>() {
+
+          private InstructionIterator iterator = iterator();
+          private Instruction next = advance();
+
+          private Instruction advance() {
+            if (iterator.hasNext()) {
+              Instruction next = iterator.next();
+              if (next != instruction) {
+                return next;
+              }
+            }
+            return null;
+          }
+
+          @Override
+          public boolean hasNext() {
+            return next != null;
+          }
+
+          @Override
+          public Instruction next() {
+            Instruction result = next;
+            if (result == null) {
+              throw new NoSuchElementException();
+            }
+            next = advance();
+            return result;
+          }
+        };
+  }
+
   public boolean isEmpty() {
     return instructions.isEmpty();
+  }
+
+  public int size() {
+    return instructions.size();
+  }
+
+  public boolean isReturnBlock() {
+    return exit().isReturn();
   }
 
   public Instruction entry() {
@@ -545,7 +684,7 @@ public class BasicBlock {
 
   public Instruction exceptionalExit() {
     assert hasCatchHandlers();
-    ListIterator<Instruction> it = listIterator(instructions.size());
+    InstructionIterator it = iterator(instructions.size());
     while (it.hasPrevious()) {
       Instruction instruction = it.previous();
       if (instruction.instructionTypeCanThrow()) {
@@ -615,9 +754,14 @@ public class BasicBlock {
         : "Attempt to remove Phi " + phi + " which is present in currentDefinitions";
   }
 
-  public void add(Instruction next) {
+  public void add(Instruction next, IRCode code) {
+    add(next, code.metadata());
+  }
+
+  public void add(Instruction next, IRMetadata metadata) {
     assert !isFilled();
     instructions.add(next);
+    metadata.record(next);
     next.setBlock(this);
   }
 
@@ -754,13 +898,15 @@ public class BasicBlock {
     getMutableSuccessors().clear();
   }
 
-  public List<BasicBlock> unlink(BasicBlock successor, DominatorTree dominator) {
+  public List<BasicBlock> unlink(
+      BasicBlock successor, DominatorTree dominator, Set<Value> affectedValues) {
+    assert affectedValues != null;
     assert successors.contains(successor);
     assert successor.predecessors.size() == 1; // There are no critical edges.
     assert successor.predecessors.get(0) == this;
     List<BasicBlock> removedBlocks = new ArrayList<>();
     for (BasicBlock dominated : dominator.dominatedBlocks(successor)) {
-      dominated.cleanForRemoval();
+      affectedValues.addAll(dominated.cleanForRemoval());
       removedBlocks.add(dominated);
     }
     assert blocksClean(removedBlocks);
@@ -768,9 +914,10 @@ public class BasicBlock {
   }
 
   public Set<Value> cleanForRemoval() {
-    ImmutableSet.Builder<Value> affectValuesBuilder = ImmutableSet.builder();
+    Set<Value> affectedValues = Sets.newIdentityHashSet();
     for (BasicBlock block : successors) {
-      block.removePredecessor(this);
+      affectedValues.addAll(block.getPhis());
+      block.removePredecessor(this, affectedValues);
     }
     getMutableSuccessors().clear();
     for (BasicBlock block : predecessors) {
@@ -778,7 +925,7 @@ public class BasicBlock {
     }
     getMutablePredecessors().clear();
     for (Phi phi : getPhis()) {
-      affectValuesBuilder.addAll(phi.affectedValues());
+      affectedValues.addAll(phi.affectedValues());
       for (Value operand : phi.getOperands()) {
         operand.removePhiUser(phi);
       }
@@ -786,7 +933,7 @@ public class BasicBlock {
     getPhis().clear();
     for (Instruction instruction : getInstructions()) {
       if (instruction.outValue() != null) {
-        affectValuesBuilder.addAll(instruction.outValue().affectedValues());
+        affectedValues.addAll(instruction.outValue().affectedValues());
         instruction.outValue().clearUsers();
         instruction.setOutValue(null);
       }
@@ -797,7 +944,7 @@ public class BasicBlock {
         value.removeDebugUser(instruction);
       }
     }
-    return affectValuesBuilder.build();
+    return affectedValues;
   }
 
   public void linkCatchSuccessors(List<DexType> guards, List<BasicBlock> targets) {
@@ -813,11 +960,40 @@ public class BasicBlock {
     catchHandlers = new CatchHandlers<>(guards, successorIndexes);
   }
 
-  public void addCatchHandler(BasicBlock rethrowBlock, DexType guard) {
-    assert !hasCatchHandlers();
-    getMutableSuccessors().add(0, rethrowBlock);
-    rethrowBlock.getMutablePredecessors().add(this);
-    catchHandlers = new CatchHandlers<>(ImmutableList.of(guard), ImmutableList.of(0));
+  public void appendCatchHandler(BasicBlock target, DexType guard) {
+    if (!canThrow()) {
+      // Nothing to catch.
+      return;
+    }
+    if (hasCatchHandlers()) {
+      if (catchHandlers.getGuards().contains(guard)) {
+        // Subsumed by an existing catch handler.
+        return;
+      }
+      int targetIndex = successors.indexOf(target);
+      if (targetIndex < 0) {
+        List<BasicBlock> successors = getMutableSuccessors();
+        int numberOfSuccessors = successors.size();
+        int numberOfNormalSuccessors = numberOfNormalSuccessors();
+        if (numberOfNormalSuccessors > 0) {
+          // Increase the size of the successor list by 1, and increase the index of each normal
+          // successor by 1.
+          targetIndex = numberOfSuccessors - numberOfNormalSuccessors;
+          successors.add(targetIndex, target);
+        } else {
+          // If there are no normal successors we can simply add the new catch handler.
+          targetIndex = successors.size();
+          successors.add(target);
+        }
+        target.getMutablePredecessors().add(this);
+      }
+      catchHandlers = catchHandlers.appendGuard(guard, targetIndex);
+    } else {
+      assert instructions.stream().filter(Instruction::instructionTypeCanThrow).count() == 1;
+      getMutableSuccessors().add(0, target);
+      target.getMutablePredecessors().add(this);
+      catchHandlers = new CatchHandlers<>(ImmutableList.of(guard), ImmutableList.of(0));
+    }
   }
 
   /**
@@ -1116,34 +1292,15 @@ public class BasicBlock {
       builder.append(": ");
       builder.append(instruction.toString());
       if (DebugLocalInfo.PRINT_LEVEL != PrintLevel.NONE) {
-        List<Value> localEnds = new ArrayList<>(instruction.getDebugValues().size());
-        List<Value> localStarts = new ArrayList<>(instruction.getDebugValues().size());
-        List<Value> localLive = new ArrayList<>(instruction.getDebugValues().size());
-        for (Value value : instruction.getDebugValues()) {
-          if (value.getDebugLocalEnds().contains(instruction)) {
-            localEnds.add(value);
-          } else if (value.getDebugLocalStarts().contains(instruction)) {
-            localStarts.add(value);
-          } else {
-            assert value.debugUsers().contains(instruction);
-            localLive.add(value);
-          }
+        if (!instruction.getDebugValues().isEmpty()) {
+          builder.append(" [end: ");
+          StringUtils.append(builder, instruction.getDebugValues(), ", ", BraceType.NONE);
+          builder.append("]");
         }
-        printDebugValueSet("live", localLive, builder);
-        printDebugValueSet("end", localEnds, builder);
-        printDebugValueSet("start", localStarts, builder);
       }
       builder.append("\n");
     }
     return builder.toString();
-  }
-
-  private void printDebugValueSet(String header, List<Value> locals, StringBuilder builder) {
-    if (!locals.isEmpty()) {
-      builder.append(" [").append(header).append(": ");
-      StringUtils.append(builder, locals, ", ", BraceType.NONE);
-      builder.append("]");
-    }
   }
 
   public void print(CfgPrinter printer) {
@@ -1240,8 +1397,9 @@ public class BasicBlock {
    * @param blockNumber the block number of the goto block
    * @param target the target of the goto block
    */
-  public static BasicBlock createGotoBlock(int blockNumber, Position position, BasicBlock target) {
-    BasicBlock block = createGotoBlock(blockNumber, position);
+  public static BasicBlock createGotoBlock(
+      int blockNumber, Position position, IRMetadata metadata, BasicBlock target) {
+    BasicBlock block = createGotoBlock(blockNumber, position, metadata);
     block.getMutableSuccessors().add(target);
     return block;
   }
@@ -1253,9 +1411,10 @@ public class BasicBlock {
    *
    * @param blockNumber the block number of the goto block
    */
-  public static BasicBlock createGotoBlock(int blockNumber, Position position) {
+  public static BasicBlock createGotoBlock(
+      int blockNumber, Position position, IRMetadata metadata) {
     BasicBlock block = new BasicBlock();
-    block.add(new Goto());
+    block.add(new Goto(), metadata);
     block.close(null);
     block.setNumber(blockNumber);
     block.entry().setPosition(position);
@@ -1270,9 +1429,9 @@ public class BasicBlock {
    * @param blockNumber the block number of the block
    * @param theIf the if instruction
    */
-  public static BasicBlock createIfBlock(int blockNumber, If theIf) {
+  public static BasicBlock createIfBlock(int blockNumber, If theIf, IRMetadata metadata) {
     BasicBlock block = new BasicBlock();
-    block.add(theIf);
+    block.add(theIf, metadata);
     block.close(null);
     block.setNumber(blockNumber);
     return block;
@@ -1285,29 +1444,33 @@ public class BasicBlock {
    *
    * @param blockNumber the block number of the block
    * @param theIf the if instruction
-   * @param instruction the instruction to place before the if instruction
+   * @param instructions the instructions to place before the if instruction
    */
-  public static BasicBlock createIfBlock(int blockNumber, If theIf, Instruction instruction) {
+  public static BasicBlock createIfBlock(
+      int blockNumber, If theIf, IRMetadata metadata, Instruction... instructions) {
     BasicBlock block = new BasicBlock();
-    block.add(instruction);
-    block.add(theIf);
+    for (Instruction instruction : instructions) {
+      block.add(instruction, metadata);
+    }
+    block.add(theIf, metadata);
     block.close(null);
     block.setNumber(blockNumber);
     return block;
   }
 
-  public static BasicBlock createSwitchBlock(int blockNumber, Switch theSwitch) {
+  public static BasicBlock createSwitchBlock(
+      int blockNumber, IntSwitch theSwitch, IRMetadata metadata) {
     BasicBlock block = new BasicBlock();
-    block.add(theSwitch);
+    block.add(theSwitch, metadata);
     block.close(null);
     block.setNumber(blockNumber);
     return block;
   }
 
   public static BasicBlock createRethrowBlock(
-      IRCode code, Position position, DexType guard, AppView<? extends AppInfo> appView) {
-    TypeLatticeElement guardTypeLattice =
-        TypeLatticeElement.fromDexType(guard, Nullability.definitelyNotNull(), appView);
+      IRCode code, Position position, DexType guard, AppView<?> appView) {
+    TypeElement guardTypeLattice =
+        TypeElement.fromDexType(guard, Nullability.definitelyNotNull(), appView);
     BasicBlock block = new BasicBlock();
     MoveException moveException =
         new MoveException(
@@ -1317,8 +1480,8 @@ public class BasicBlock {
     moveException.setPosition(position);
     Throw throwInstruction = new Throw(moveException.outValue);
     throwInstruction.setPosition(position);
-    block.add(moveException);
-    block.add(throwInstruction);
+    block.add(moveException, code);
+    block.add(throwInstruction, code);
     block.close(null);
     block.setNumber(code.getHighestBlockNumber() + 1);
     return block;
@@ -1326,6 +1489,25 @@ public class BasicBlock {
 
   public boolean isTrivialGoto() {
     return instructions.size() == 1 && exit().isGoto();
+  }
+
+  // Go backwards in the control flow graph until a block that is not a trivial goto block is found,
+  // or a block that does not have a unique predecessor is found. Returns null if the goto chain is
+  // cyclic.
+  public BasicBlock startOfGotoChain() {
+    // See Floyd's cycle-finding algorithm for reference.
+    BasicBlock hare = this;
+    BasicBlock tortuous = this;
+    boolean advance = false;
+    while (hare.isTrivialGoto() && hare.hasUniquePredecessor()) {
+      hare = hare.getUniquePredecessor();
+      tortuous = advance ? tortuous.getUniquePredecessor() : tortuous;
+      advance = !advance;
+      if (hare == tortuous) {
+        return null;
+      }
+    }
+    return hare;
   }
 
   // Find the final target from this goto block. Returns null if the goto chain is cyclic.
@@ -1437,7 +1619,7 @@ public class BasicBlock {
   // visible to exceptional successors.
   private boolean verifyNoValuesAfterThrowingInstruction() {
     if (hasCatchHandlers()) {
-      ListIterator<Instruction> iterator = listIterator(instructions.size());
+      InstructionIterator iterator = iterator(instructions.size());
       while (iterator.hasPrevious()) {
         Instruction instruction = iterator.previous();
         if (instruction.instructionTypeCanThrow()) {
@@ -1453,23 +1635,35 @@ public class BasicBlock {
     return new BasicBlockInstructionIterator(this);
   }
 
-  public InstructionListIterator listIterator() {
-    return new BasicBlockInstructionIterator(this);
+  public InstructionIterator iterator(int index) {
+    return new BasicBlockInstructionIterator(this, index);
   }
 
-  public InstructionListIterator listIterator(int index) {
-    return new BasicBlockInstructionIterator(this, index);
+  public InstructionIterator iterator(Instruction instruction) {
+    return new BasicBlockInstructionIterator(this, instruction);
+  }
+
+  public InstructionListIterator listIterator(IRCode code) {
+    return listIterator(code.metadata());
+  }
+
+  public InstructionListIterator listIterator(IRMetadata metadata) {
+    return new BasicBlockInstructionListIterator(metadata, this);
+  }
+
+  public InstructionListIterator listIterator(IRCode code, int index) {
+    return new BasicBlockInstructionListIterator(code.metadata(), this, index);
   }
 
   /**
    * Creates an instruction list iterator starting at <code>instruction</code>.
    *
-   * The cursor will be positioned after <code>instruction</code>. Calling <code>next</code> on
+   * <p>The cursor will be positioned after <code>instruction</code>. Calling <code>next</code> on
    * the returned iterator will return the instruction after <code>instruction</code>. Calling
    * <code>previous</code> will return <code>instruction</code>.
    */
-  public InstructionListIterator listIterator(Instruction instruction) {
-    return new BasicBlockInstructionIterator(this, instruction);
+  public InstructionListIterator listIterator(IRCode code, Instruction instruction) {
+    return new BasicBlockInstructionListIterator(code.metadata(), this, instruction);
   }
 
   /**
@@ -1522,7 +1716,7 @@ public class BasicBlock {
     List<BasicBlock> catchSuccessors = appendCatchHandlers(fromBlock);
     for (BasicBlock successor : catchSuccessors) {
       fromBlock.getMutableSuccessors().remove(successor);
-      successor.removePredecessor(fromBlock);
+      successor.removePredecessor(fromBlock, null);
     }
     fromBlock.catchHandlers = CatchHandlers.EMPTY_INDICES;
   }
@@ -1551,42 +1745,36 @@ public class BasicBlock {
     // one new phi to merge the two exception values, and all other phis don't need
     // to be changed.
     for (BasicBlock catchSuccessor : catchSuccessors) {
-      catchSuccessor.splitCriticalExceptionEdges(
-          code.getHighestBlockNumber() + 1,
-          code.valueNumberGenerator,
-          blockIterator::add,
-          options);
+      catchSuccessor.splitCriticalExceptionEdges(code, blockIterator::add, options);
     }
   }
 
   /**
-   * Assumes that `this` block is a catch handler target (note that it does not have to
-   * start with MoveException instruction, since the instruction can be removed by
-   * optimizations like dead code remover.
+   * Assumes that `this` block is a catch handler target (note that it does not have to start with
+   * MoveException instruction, since the instruction can be removed by optimizations like dead code
+   * remover.
    *
-   * Introduces new blocks on all incoming edges and clones MoveException instruction to
-   * these blocks if it exists. All exception values introduced in newly created blocks
-   * are combined in a phi added to `this` block.
+   * <p>Introduces new blocks on all incoming edges and clones MoveException instruction to these
+   * blocks if it exists. All exception values introduced in newly created blocks are combined in a
+   * phi added to `this` block.
    *
-   * Note that if there are any other phis defined on this block, they remain valid, since
-   * this method does not affect incoming edges in any way, and just adds new blocks with
-   * MoveException and Goto.
+   * <p>Note that if there are any other phis defined on this block, they remain valid, since this
+   * method does not affect incoming edges in any way, and just adds new blocks with MoveException
+   * and Goto.
    */
   public int splitCriticalExceptionEdges(
-      int nextBlockNumber,
-      ValueNumberGenerator valueNumberGenerator,
-      Consumer<BasicBlock> onNewBlock,
-      InternalOptions options) {
+      IRCode code, Consumer<BasicBlock> onNewBlock, InternalOptions options) {
+    int nextBlockNumber = code.getHighestBlockNumber() + 1;
     List<BasicBlock> predecessors = getMutablePredecessors();
     boolean hasMoveException = entry().isMoveException();
-    TypeLatticeElement exceptionTypeLattice = null;
+    TypeElement exceptionTypeLattice = null;
     DexType exceptionType = null;
     MoveException move = null;
     Position position = entry().getPosition();
     if (hasMoveException) {
       // Remove the move-exception instruction.
       move = entry().asMoveException();
-      exceptionTypeLattice = move.outValue().getTypeLattice();
+      exceptionTypeLattice = move.getOutType();
       exceptionType = move.getExceptionType();
       assert move.getDebugValues().isEmpty();
       getInstructions().remove(0);
@@ -1603,18 +1791,16 @@ public class BasicBlock {
       newBlock.setNumber(nextBlockNumber++);
       newPredecessors.add(newBlock);
       if (hasMoveException) {
-        Value value = new Value(
-            valueNumberGenerator.next(),
-            exceptionTypeLattice,
-            move.getLocalInfo());
+        Value value =
+            new Value(code.valueNumberGenerator.next(), exceptionTypeLattice, move.getLocalInfo());
         values.add(value);
         MoveException newMove = new MoveException(value, exceptionType, options);
-        newBlock.add(newMove);
+        newBlock.add(newMove, code);
         newMove.setPosition(position);
       }
       Goto next = new Goto();
       next.setPosition(position);
-      newBlock.add(next);
+      newBlock.add(next, code);
       newBlock.close(null);
       newBlock.getMutableSuccessors().add(this);
       newBlock.getMutablePredecessors().add(predecessor);
@@ -1629,7 +1815,7 @@ public class BasicBlock {
     if (hasMoveException) {
       Phi phi =
           new Phi(
-              valueNumberGenerator.next(),
+              code.valueNumberGenerator.next(),
               this,
               exceptionTypeLattice,
               move.getLocalInfo(),
@@ -1681,13 +1867,11 @@ public class BasicBlock {
     for (int i = 0; i < prevCatchTargets.size(); i++) {
       int prevCatchTarget = prevCatchTargets.get(i);
       DexType prevCatchGuard = prevCatchGuards.get(i);
-      // TODO(sgjesse): Check sub-types of guards. Will require AppInfoWithSubtyping.
       if (newCatchGuards.contains(prevCatchGuard)) {
         continue;
       }
       BasicBlock catchSuccessor = fromBlock.successors.get(prevCatchTarget);
-      // We assume that all the catch handlers targets has only one
-      // predecessor and, thus, no phis.
+      // We assume that all the catch handlers targets has only one predecessor and, thus, no phis.
       assert catchSuccessor.getPredecessors().size() == 1;
       assert catchSuccessor.getPhis().isEmpty();
 
@@ -1737,7 +1921,7 @@ public class BasicBlock {
    * {@code target} is the same block than the current {@link BasicBlock}.
    */
   public boolean hasPathTo(BasicBlock target) {
-    List<BasicBlock> visitedBlocks = new ArrayList<>();
+    Set<BasicBlock> visitedBlocks = Sets.newIdentityHashSet();
     ArrayDeque<BasicBlock> blocks = new ArrayDeque<>();
     blocks.push(this);
 
@@ -1787,15 +1971,34 @@ public class BasicBlock {
       Phi phi = phiIt.next();
       Wrapper<Phi> key = equivalence.wrap(phi);
       Phi replacement = wrapper2phi.get(key);
-      if (replacement != null) {
-        phi.replaceUsers(replacement);
-        for (Value operand : phi.getOperands()) {
-          operand.removePhiUser(phi);
-        }
-        phiIt.remove();
-      } else {
+      if (replacement == null) {
         wrapper2phi.put(key, phi);
+        continue;
       }
+      // Two phis may be duplicates but still differ in debug info.
+      // For example, it may be that the one phi denotes the result of a local pre-increment, while
+      // the other phi represents the modified local, e.g., cond ? ++x : x will give rise to:
+      //  v2 <- phi(v0(x), v1(x))
+      //  v3(x) <- phi(v0(x), v1(x))
+      // where v2 is used as the result of the expression and v3 is the local slot value of x.
+      // This should be replaced by a single phi.
+      if (phi.getLocalInfo() != replacement.getLocalInfo()) {
+        if (replacement.getLocalInfo() == null) {
+          // The replacement must take over the debug info.
+          replacement.setLocalInfo(phi.getLocalInfo());
+        } else if (phi.getLocalInfo() == null) {
+          // The replacement already owns debug info.
+        } else {
+          // The phis define two distinct locals and cannot be de-duped.
+          assert phi.hasLocalInfo() && replacement.hasLocalInfo();
+          continue;
+        }
+      }
+      phi.replaceUsers(replacement);
+      for (Value operand : phi.getOperands()) {
+        operand.removePhiUser(phi);
+      }
+      phiIt.remove();
     }
   }
 }

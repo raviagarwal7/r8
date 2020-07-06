@@ -16,17 +16,20 @@ import com.android.tools.r8.code.ConstWide16;
 import com.android.tools.r8.code.ConstWide32;
 import com.android.tools.r8.code.ConstWideHigh16;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.constant.Bottom;
 import com.android.tools.r8.ir.analysis.constant.ConstLatticeElement;
 import com.android.tools.r8.ir.analysis.constant.LatticeElement;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
+import com.android.tools.r8.ir.analysis.value.AbstractValue;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.InternalOutputMode;
 import com.android.tools.r8.utils.NumberUtils;
+import java.util.Set;
 import java.util.function.Function;
 
 public class ConstNumber extends ConstInstruction {
@@ -42,20 +45,28 @@ public class ConstNumber extends ConstInstruction {
     this.value = value;
   }
 
+  public static ConstNumber asConstNumberOrNull(Instruction instruction) {
+    return (ConstNumber) instruction;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.CONST_NUMBER;
+  }
+
   @Override
   public <T> T accept(InstructionVisitor<T> visitor) {
     return visitor.visit(this);
   }
 
   public static ConstNumber copyOf(IRCode code, ConstNumber original) {
-    Value newValue = new Value(
-        code.valueNumberGenerator.next(),
-        original.outValue().getTypeLattice(),
-        original.getLocalInfo());
+    Value newValue =
+        new Value(code.valueNumberGenerator.next(), original.getOutType(), original.getLocalInfo());
     return copyOf(newValue, original);
   }
 
   public static ConstNumber copyOf(Value newValue, ConstNumber original) {
+    assert newValue != original.outValue();
     return new ConstNumber(newValue, original.getRawValue());
   }
 
@@ -110,6 +121,11 @@ public class ConstNumber extends ConstInstruction {
       return getIntValue() == -1;
     }
     return getLongValue() == -1;
+  }
+
+  @Override
+  public boolean instructionTypeCanBeCanonicalized() {
+    return true;
   }
 
   @Override
@@ -238,7 +254,7 @@ public class ConstNumber extends ConstInstruction {
   @Override
   public String toString() {
     if (outValue != null) {
-      return super.toString() + " " + value + " (" + outValue().getTypeLattice() + ")";
+      return super.toString() + " " + value + " (" + getOutType() + ")";
     } else {
       return super.toString() + " " + value + " (dead)";
     }
@@ -288,8 +304,7 @@ public class ConstNumber extends ConstInstruction {
   }
 
   @Override
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
     assert outType().isObject();
     return appView.dexItemFactory().nullValueType;
   }
@@ -303,17 +318,25 @@ public class ConstNumber extends ConstInstruction {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return outValue().getTypeLattice();
+  public TypeElement evaluate(AppView<?> appView) {
+    return getOutType();
   }
 
   @Override
-  public boolean verifyTypes(AppView<? extends AppInfo> appView) {
+  public boolean verifyTypes(AppView<?> appView) {
     assert super.verifyTypes(appView);
-    assert !isZero()
-        || outValue().getTypeLattice().isPrimitive()
-        || outValue().getTypeLattice().isNullType();
+    assert !isZero() || getOutType().isPrimitiveType() || getOutType().isNullType();
     return true;
   }
 
+  @Override
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return this.value == 0 || this.value == 1;
+  }
+
+  @Override
+  public AbstractValue getAbstractValue(
+      AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    return appView.abstractValueFactory().createSingleNumberValue(value);
+  }
 }

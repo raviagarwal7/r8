@@ -6,13 +6,15 @@ package com.android.tools.r8.ir.optimize.inliner;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.CoreMatchers.not;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import com.android.tools.r8.R8TestCompileResult;
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.TestParameters;
 import com.android.tools.r8.TestParametersCollection;
+import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
@@ -31,7 +33,7 @@ public class InlineInvokeWithNullableReceiverTest extends TestBase {
 
   @Parameters(name = "{0}")
   public static TestParametersCollection params() {
-    return getTestParameters().withAllRuntimes().build();
+    return getTestParameters().withAllRuntimesAndApiLevels().build();
   }
 
   public InlineInvokeWithNullableReceiverTest(TestParameters parameters) {
@@ -44,7 +46,7 @@ public class InlineInvokeWithNullableReceiverTest extends TestBase {
         testForR8(parameters.getBackend())
             .addInnerClasses(InlineInvokeWithNullableReceiverTest.class)
             .addKeepMainRule(TestClass.class)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .compile()
             .inspect(this::verifyMethodHasBeenInlined);
 
@@ -66,16 +68,32 @@ public class InlineInvokeWithNullableReceiverTest extends TestBase {
     assertThat(methodSubject, isPresent());
 
     // A `throw` instruction should have been synthesized into main().
-    // TODO(b/130202534): Allow inlining.
-    assertFalse(methodSubject.streamInstructions().anyMatch(InstructionSubject::isThrow));
+    if (canUseRequireNonNull()) {
+      assertTrue(methodSubject.streamInstructions().anyMatch(InstructionSubject::isInvokeStatic));
+    } else {
+      assertTrue(
+          methodSubject
+              .streamInstructions()
+              .filter(InstructionSubject::isInvokeVirtual)
+              .anyMatch(
+                  method ->
+                      method
+                          .getMethod()
+                          .toSourceString()
+                          .equals("java.lang.Class java.lang.Object.getClass()")));
+    }
 
     // Class A is still present because the instance flows into a phi that has a null-check.
     ClassSubject otherClassSubject = inspector.clazz(A.class);
     assertThat(otherClassSubject, isPresent());
 
     // Method A.m() should no longer be present due to inlining.
-    // TODO(b/130202534): Allow inlining.
-    assertThat(otherClassSubject.uniqueMethodWithName("m"), isPresent());
+    assertThat(otherClassSubject.uniqueMethodWithName("m"), not(isPresent()));
+  }
+
+  private boolean canUseRequireNonNull() {
+    return parameters.isDexRuntime()
+        && parameters.getApiLevel().isGreaterThanOrEqualTo(AndroidApiLevel.K);
   }
 
   static class TestClass {

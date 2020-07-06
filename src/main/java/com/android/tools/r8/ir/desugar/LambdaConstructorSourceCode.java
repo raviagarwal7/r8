@@ -22,15 +22,17 @@ final class LambdaConstructorSourceCode extends SynthesizedLambdaSourceCode {
   @Override
   protected void prepareInstructions() {
     // Super constructor call (always java.lang.Object.<init>()).
-    DexMethod objectInitMethod = lambda.rewriter.objectInitMethod;
+    DexMethod objectInitMethod = factory().objectMembers.constructor;
     add(
-        builder ->
-            builder.addInvoke(
-                Invoke.Type.DIRECT,
-                objectInitMethod,
-                objectInitMethod.proto,
-                Collections.singletonList(getReceiverValue()),
-                false /* isInterface */));
+        builder -> {
+          assert builder.getReceiverValue() != null;
+          builder.addInvoke(
+              Invoke.Type.DIRECT,
+              objectInitMethod,
+              objectInitMethod.proto,
+              Collections.singletonList(builder.getReceiverValue()),
+              false /* isInterface */);
+        });
 
     // Assign capture fields.
     DexType[] capturedTypes = captures();
@@ -53,7 +55,8 @@ final class LambdaConstructorSourceCode extends SynthesizedLambdaSourceCode {
     // be treated as equal, since it only has one call to super constructor,
     // which is always java.lang.Object.<init>().
     return captures().length == 0
-        ? System.identityHashCode(lambda.rewriter.objectInitMethod) : super.hashCode();
+        ? System.identityHashCode(factory().objectMembers.constructor)
+        : super.hashCode();
   }
 
   @Override

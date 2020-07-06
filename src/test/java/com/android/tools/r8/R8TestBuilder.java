@@ -3,13 +3,18 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static org.hamcrest.CoreMatchers.containsString;
+
 import com.android.tools.r8.R8Command.Builder;
 import com.android.tools.r8.TestBase.Backend;
+import com.android.tools.r8.desugar.desugaredlibrary.DesugaredLibraryTestBase.KeepRuleConsumer;
+import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.experimental.graphinfo.GraphConsumer;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.shaking.CollectingGraphConsumer;
 import com.android.tools.r8.shaking.ProguardConfiguration;
 import com.android.tools.r8.shaking.ProguardConfigurationRule;
+import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.FileUtils;
 import com.android.tools.r8.utils.InternalOptions;
@@ -21,23 +26,40 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import org.hamcrest.core.IsAnything;
 
 public abstract class R8TestBuilder<T extends R8TestBuilder<T>>
     extends TestShrinkerBuilder<R8Command, Builder, R8TestCompileResult, R8TestRunResult, T> {
+
+  enum AllowedDiagnosticMessages {
+    ALL,
+    ERROR,
+    INFO,
+    NONE,
+    WARNING
+  }
 
   R8TestBuilder(TestState state, Builder builder, Backend backend) {
     super(state, builder, backend);
   }
 
-  private boolean enableInliningAnnotations = false;
-  private boolean enableClassInliningAnnotations = false;
-  private boolean enableMergeAnnotations = false;
-  private boolean enableMemberValuePropagationAnnotations = false;
+  private AllowedDiagnosticMessages allowedDiagnosticMessages = AllowedDiagnosticMessages.NONE;
+  private boolean allowUnusedProguardConfigurationRules = false;
+  private boolean enableAssumeNoSideEffectsAnnotations = false;
   private boolean enableConstantArgumentAnnotations = false;
-  private boolean enableUnusedArgumentAnnotations = false;
+  private boolean enableInliningAnnotations = false;
+  private boolean enableMemberValuePropagationAnnotations = false;
+  private boolean enableMergeAnnotations = false;
+  private boolean enableNeverClassInliningAnnotations = false;
+  private boolean enableNeverReprocessClassInitializerAnnotations = false;
+  private boolean enableNeverReprocessMethodAnnotations = false;
+  private boolean enableReprocessClassInitializerAnnotations = false;
+  private boolean enableReprocessMethodAnnotations = false;
   private boolean enableSideEffectAnnotations = false;
+  private boolean enableUnusedArgumentAnnotations = false;
   private CollectingGraphConsumer graphConsumer = null;
   private List<String> keepRules = new ArrayList<>();
   private List<Path> mainDexRulesFiles = new ArrayList<>();
@@ -47,13 +69,17 @@ public abstract class R8TestBuilder<T extends R8TestBuilder<T>>
   R8TestCompileResult internalCompile(
       Builder builder, Consumer<InternalOptions> optionsConsumer, Supplier<AndroidApp> app)
       throws CompilationFailedException {
-    if (enableInliningAnnotations
-        || enableClassInliningAnnotations
-        || enableMergeAnnotations
+    if (enableConstantArgumentAnnotations
+        || enableInliningAnnotations
         || enableMemberValuePropagationAnnotations
-        || enableConstantArgumentAnnotations
-        || enableUnusedArgumentAnnotations
-        || enableSideEffectAnnotations) {
+        || enableMergeAnnotations
+        || enableNeverClassInliningAnnotations
+        || enableNeverReprocessClassInitializerAnnotations
+        || enableNeverReprocessMethodAnnotations
+        || enableReprocessClassInitializerAnnotations
+        || enableReprocessMethodAnnotations
+        || enableSideEffectAnnotations
+        || enableUnusedArgumentAnnotations) {
       ToolHelper.allowTestProguardOptions(builder);
     }
     if (!keepRules.isEmpty()) {
@@ -63,7 +89,18 @@ public abstract class R8TestBuilder<T extends R8TestBuilder<T>>
     StringBuilder proguardMapBuilder = new StringBuilder();
     builder.setDisableTreeShaking(!enableTreeShaking);
     builder.setDisableMinification(!enableMinification);
-    builder.setProguardMapConsumer((string, ignore) -> proguardMapBuilder.append(string));
+    builder.setProguardMapConsumer(
+        new StringConsumer() {
+          @Override
+          public void accept(String string, DiagnosticsHandler handler) {
+            proguardMapBuilder.append(string);
+          }
+
+          @Override
+          public void finished(DiagnosticsHandler handler) {
+            // Nothing to do.
+          }
+        });
 
     if (!applyMappingMaps.isEmpty()) {
       try {
@@ -91,14 +128,66 @@ public abstract class R8TestBuilder<T extends R8TestBuilder<T>>
         builder.build(),
         optionsConsumer.andThen(
             options -> box.proguardConfiguration = options.getProguardConfiguration()));
-    return new R8TestCompileResult(
-        getState(),
-        backend,
-        app.get(),
-        box.proguardConfiguration,
-        box.syntheticProguardRules,
-        proguardMapBuilder.toString(),
-        graphConsumer);
+    R8TestCompileResult compileResult =
+        new R8TestCompileResult(
+            getState(),
+            getOutputMode(),
+            app.get(),
+            box.proguardConfiguration,
+            box.syntheticProguardRules,
+            proguardMapBuilder.toString(),
+            graphConsumer,
+            builder.getMinApiLevel());
+    switch (allowedDiagnosticMessages) {
+      case ALL:
+        compileResult.assertDiagnosticThatMatches(new IsAnything<>());
+        break;
+      case ERROR:
+        compileResult.assertOnlyErrors();
+        break;
+      case INFO:
+        compileResult.assertOnlyInfos();
+        break;
+      case NONE:
+        if (allowUnusedProguardConfigurationRules) {
+          compileResult
+              .assertAllInfoMessagesMatch(
+                  containsString("Proguard configuration rule does not match anything"))
+              .assertNoErrorMessages()
+              .assertNoWarningMessages();
+        } else {
+          compileResult.assertNoMessages();
+        }
+        break;
+      case WARNING:
+        compileResult.assertOnlyWarnings();
+        break;
+      default:
+        throw new Unreachable();
+    }
+    if (allowUnusedProguardConfigurationRules) {
+      compileResult.assertInfoMessageThatMatches(
+          containsString("Proguard configuration rule does not match anything"));
+    } else {
+      compileResult.assertNoInfoMessageThatMatches(
+          containsString("Proguard configuration rule does not match anything"));
+    }
+    return compileResult;
+  }
+
+  public Builder getBuilder() {
+    return builder;
+  }
+
+  public T addProgramResourceProviders(Collection<ProgramResourceProvider> providers) {
+    for (ProgramResourceProvider provider : providers) {
+      builder.addProgramResourceProvider(provider);
+    }
+    return self();
+  }
+
+  public T addProgramResourceProviders(ProgramResourceProvider... providers) {
+    return addProgramResourceProviders(Arrays.asList(providers));
   }
 
   @Override
@@ -168,19 +257,144 @@ public abstract class R8TestBuilder<T extends R8TestBuilder<T>>
     return self();
   }
 
-  public T enableInliningAnnotations() {
-    if (!enableInliningAnnotations) {
-      enableInliningAnnotations = true;
-      addInternalKeepRules(
-          "-forceinline class * { @com.android.tools.r8.ForceInline *; }",
-          "-neverinline class * { @com.android.tools.r8.NeverInline *; }");
+  public T allowClassInlinerGracefulExit() {
+    return addOptionsModification(options -> options.testing.allowClassInlinerGracefulExit = true);
+  }
+
+  /**
+   * Allow info, warning, and error diagnostics.
+   *
+   * <p>This should only be used if a test has any of these diagnostic messages. Therefore, it is a
+   * failure if no such diagnostics are reported.
+   */
+  public T allowDiagnosticMessages() {
+    assert allowedDiagnosticMessages == AllowedDiagnosticMessages.NONE;
+    allowedDiagnosticMessages = AllowedDiagnosticMessages.ALL;
+    return self();
+  }
+
+  public T allowDiagnosticInfoMessages() {
+    return allowDiagnosticInfoMessages(true);
+  }
+
+  /**
+   * Allow info diagnostics if {@param condition} is true.
+   *
+   * <p>This should only be used if a test has at least one diagnostic info message. Therefore, it
+   * is a failure if no such diagnostics are reported.
+   */
+  public T allowDiagnosticInfoMessages(boolean condition) {
+    if (condition) {
+      assert allowedDiagnosticMessages == AllowedDiagnosticMessages.NONE;
+      allowedDiagnosticMessages = AllowedDiagnosticMessages.INFO;
     }
     return self();
   }
 
-  public T enableClassInliningAnnotations() {
-    if (!enableClassInliningAnnotations) {
-      enableClassInliningAnnotations = true;
+  public T allowDiagnosticWarningMessages() {
+    return allowDiagnosticWarningMessages(true);
+  }
+
+  /**
+   * Allow warning diagnostics if {@param condition} is true.
+   *
+   * <p>This should only be used if a test has at least one diagnostic warning message. Therefore,
+   * it is a failure if no such diagnostics are reported.
+   */
+  public T allowDiagnosticWarningMessages(boolean condition) {
+    if (condition) {
+      assert allowedDiagnosticMessages == AllowedDiagnosticMessages.NONE;
+      allowedDiagnosticMessages = AllowedDiagnosticMessages.WARNING;
+    }
+    return self();
+  }
+
+  public T allowDiagnosticErrorMessages() {
+    return allowDiagnosticErrorMessages(true);
+  }
+
+  /**
+   * Allow error diagnostics if {@param condition} is true.
+   *
+   * <p>This should only be used if a test has at least one diagnostic error message. Therefore, it
+   * is a failure if no such diagnostics are reported.
+   */
+  public T allowDiagnosticErrorMessages(boolean condition) {
+    if (condition) {
+      assert allowedDiagnosticMessages == AllowedDiagnosticMessages.NONE;
+      allowedDiagnosticMessages = AllowedDiagnosticMessages.ERROR;
+    }
+    return self();
+  }
+
+  public T allowUnusedProguardConfigurationRules() {
+    return allowUnusedProguardConfigurationRules(true);
+  }
+
+  public T allowUnusedProguardConfigurationRules(boolean condition) {
+    if (condition) {
+      allowUnusedProguardConfigurationRules = true;
+    }
+    return self();
+  }
+
+  public T enableAlwaysInliningAnnotations() {
+    return enableAlwaysInliningAnnotations(AlwaysInline.class.getPackage().getName());
+  }
+
+  public T enableAlwaysInliningAnnotations(String annotationPackageName) {
+    if (!enableInliningAnnotations) {
+      enableInliningAnnotations = true;
+      addInternalKeepRules(
+          "-alwaysinline class * { @" + annotationPackageName + ".AlwaysInline *; }");
+    }
+    return self();
+  }
+
+  public T enableAssumeNoSideEffectsAnnotations() {
+    return enableAssumeNoSideEffectsAnnotations(AssumeNoSideEffects.class.getPackage().getName());
+  }
+
+  public T enableAssumeNoSideEffectsAnnotations(String annotationPackageName) {
+    if (!enableAssumeNoSideEffectsAnnotations) {
+      enableAssumeNoSideEffectsAnnotations = true;
+      addInternalKeepRules(
+          "-assumenosideeffects class * { @"
+              + annotationPackageName
+              + ".AssumeNoSideEffects <methods>; }");
+    }
+    return self();
+  }
+
+  public T enableInliningAnnotations() {
+    return enableInliningAnnotations(NeverInline.class.getPackage().getName());
+  }
+
+  public T enableInliningAnnotations(String annotationPackageName) {
+    if (!enableInliningAnnotations) {
+      enableInliningAnnotations = true;
+      addInternalKeepRules(
+          "-neverinline class * { @" + annotationPackageName + ".NeverInline *; }");
+    }
+    return self();
+  }
+
+  public T enableForceInliningAnnotations() {
+    return enableForceInliningAnnotations(ForceInline.class.getPackage().getName());
+  }
+
+  public T enableForceInliningAnnotations(String annotationPackageName) {
+    if (!enableInliningAnnotations) {
+      enableInliningAnnotations = true;
+      addInternalKeepRules(
+          "-forceinline class * { @" + annotationPackageName + ".ForceInline *; }");
+    }
+    return self();
+  }
+
+  public T enableNeverClassInliningAnnotations() {
+    if (!enableNeverClassInliningAnnotations) {
+      enableNeverClassInliningAnnotations = true;
       addInternalKeepRules("-neverclassinline @com.android.tools.r8.NeverClassInline class *");
     }
     return self();
@@ -203,6 +417,57 @@ public abstract class R8TestBuilder<T extends R8TestBuilder<T>>
     return self();
   }
 
+  public T enableReprocessClassInitializerAnnotations() {
+    if (!enableReprocessClassInitializerAnnotations) {
+      enableReprocessClassInitializerAnnotations = true;
+      addInternalKeepRules(
+          "-reprocessclassinitializer @com.android.tools.r8.ReprocessClassInitializer class *");
+    }
+    return self();
+  }
+
+  public T enableNeverReprocessClassInitializerAnnotations() {
+    if (!enableNeverReprocessClassInitializerAnnotations) {
+      enableNeverReprocessClassInitializerAnnotations = true;
+      addInternalKeepRules(
+          "-neverreprocessclassinitializer @com.android.tools.r8.NeverReprocessClassInitializer"
+              + " class *");
+    }
+    return self();
+  }
+
+  public T enableReprocessMethodAnnotations() {
+    if (!enableReprocessMethodAnnotations) {
+      enableReprocessMethodAnnotations = true;
+      addInternalKeepRules(
+          "-reprocessmethod class * {", "  @com.android.tools.r8.ReprocessMethod <methods>;", "}");
+    }
+    return self();
+  }
+
+  public T enableNeverReprocessMethodAnnotations() {
+    if (!enableNeverReprocessMethodAnnotations) {
+      enableNeverReprocessMethodAnnotations = true;
+      addInternalKeepRules(
+          "-neverreprocessmethod class * {",
+          "  @com.android.tools.r8.NeverReprocessMethod <methods>;",
+          "}");
+    }
+    return self();
+  }
+
+  public T enableProtoShrinking() {
+    return enableProtoShrinking(true);
+  }
+
+  public T enableProtoShrinking(boolean traverseOneOfAndRepeatedProtoFields) {
+    if (traverseOneOfAndRepeatedProtoFields) {
+      addOptionsModification(
+          options -> options.protoShrinking().traverseOneOfAndRepeatedProtoFields = true);
+    }
+    return addKeepRules("-shrinkunusedprotofields");
+  }
+
   public T enableSideEffectAnnotations() {
     if (!enableSideEffectAnnotations) {
       enableSideEffectAnnotations = true;
@@ -223,19 +488,35 @@ public abstract class R8TestBuilder<T extends R8TestBuilder<T>>
   }
 
   public T enableConstantArgumentAnnotations() {
-    if (!enableConstantArgumentAnnotations) {
-      enableConstantArgumentAnnotations = true;
-      addInternalKeepRules(
-          "-keepconstantarguments class * { @com.android.tools.r8.KeepConstantArguments *; }");
+    return enableConstantArgumentAnnotations(true);
+  }
+
+  public T enableConstantArgumentAnnotations(boolean value) {
+    if (value) {
+      if (!enableConstantArgumentAnnotations) {
+        enableConstantArgumentAnnotations = true;
+        addInternalKeepRules(
+            "-keepconstantarguments class * { @com.android.tools.r8.KeepConstantArguments *; }");
+      }
+    } else {
+      assert !enableConstantArgumentAnnotations;
     }
     return self();
   }
 
   public T enableUnusedArgumentAnnotations() {
-    if (!enableUnusedArgumentAnnotations) {
-      enableUnusedArgumentAnnotations = true;
-      addInternalKeepRules(
-          "-keepunusedarguments class * { @com.android.tools.r8.KeepUnusedArguments *; }");
+    return enableUnusedArgumentAnnotations(true);
+  }
+
+  public T enableUnusedArgumentAnnotations(boolean value) {
+    if (value) {
+      if (!enableUnusedArgumentAnnotations) {
+        enableUnusedArgumentAnnotations = true;
+        addInternalKeepRules(
+            "-keepunusedarguments class * { @com.android.tools.r8.KeepUnusedArguments *; }");
+      }
+    } else {
+      assert !enableUnusedArgumentAnnotations;
     }
     return self();
   }
@@ -276,5 +557,20 @@ public abstract class R8TestBuilder<T extends R8TestBuilder<T>>
   private void addInternalKeepRules(String... rules) {
     // We don't add these to the keep-rule set for other test provided rules.
     builder.addProguardConfiguration(Arrays.asList(rules), Origin.unknown());
+  }
+
+  @Override
+  public T enableCoreLibraryDesugaring(
+      AndroidApiLevel minApiLevel, KeepRuleConsumer keepRuleConsumer) {
+    if (minApiLevel.getLevel() < AndroidApiLevel.O.getLevel()) {
+      super.enableCoreLibraryDesugaring(minApiLevel, keepRuleConsumer);
+      builder.setDesugaredLibraryKeepRuleConsumer(keepRuleConsumer);
+    }
+    return self();
+  }
+
+  public T addFeatureSplit(Function<FeatureSplit.Builder, FeatureSplit> featureSplitBuilder) {
+    builder.addFeatureSplit(featureSplitBuilder);
+    return self();
   }
 }

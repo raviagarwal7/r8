@@ -4,9 +4,9 @@
 package com.android.tools.r8.naming.b123068484;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.ToolHelper;
@@ -55,7 +55,7 @@ public class FieldRenamingTest extends TestBase {
   @Test
   public void testProguard() throws Exception {
     Path inJar = temp.newFile("input.jar").toPath().toAbsolutePath();
-    writeToJar(inJar, CLASSES);
+    writeClassFilesToJar(inJar, CLASSES);
     testForProguard()
         .addProgramFiles(inJar)
         .addKeepMainRule(MAIN)

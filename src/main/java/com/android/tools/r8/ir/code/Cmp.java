@@ -11,12 +11,11 @@ import com.android.tools.r8.code.CmplDouble;
 import com.android.tools.r8.code.CmplFloat;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.ir.analysis.constant.Bottom;
 import com.android.tools.r8.ir.analysis.constant.ConstLatticeElement;
 import com.android.tools.r8.ir.analysis.constant.LatticeElement;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.utils.LongInterval;
@@ -35,6 +34,11 @@ public class Cmp extends Binop {
   public Cmp(NumericType type, Bias bias, Value dest, Value left, Value right) {
     super(type, dest, left, right);
     this.bias = bias;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.CMP;
   }
 
   @Override
@@ -182,7 +186,7 @@ public class Cmp extends Binop {
           result = (int) Math.signum(left - right);
         }
       }
-      Value value = code.createValue(TypeLatticeElement.INT, getLocalInfo());
+      Value value = code.createValue(TypeElement.getInt(), getLocalInfo());
       ConstNumber newConst = new ConstNumber(value, result);
       return new ConstLatticeElement(newConst);
     } else if (leftLattice.isValueRange() && rightLattice.isConst()) {
@@ -210,7 +214,7 @@ public class Cmp extends Binop {
       return Bottom.getInstance();
     }
     int result = Integer.signum(Long.compare(leftRange.getMin(), rightRange.getMin()));
-    Value value = code.createValue(TypeLatticeElement.INT, getLocalInfo());
+    Value value = code.createValue(TypeElement.getInt(), getLocalInfo());
     ConstNumber newConst = new ConstNumber(value, result);
     return new ConstLatticeElement(newConst);
   }
@@ -231,8 +235,8 @@ public class Cmp extends Binop {
   }
 
   @Override
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
-    return TypeLatticeElement.INT;
+  public TypeElement evaluate(AppView<?> appView) {
+    return TypeElement.getInt();
   }
 
 }

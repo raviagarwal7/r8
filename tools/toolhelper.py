@@ -3,20 +3,25 @@
 # BSD-style license that can be found in the LICENSE file.
 
 import glob
-import gradle
-import jdk
 import subprocess
 from threading import Timer
+
+import gradle
+import jdk
 import utils
+
 
 def run(tool, args, build=None, debug=True,
         profile=False, track_memory_file=None, extra_args=None,
-        stderr=None, stdout=None, return_stdout=False, timeout=0):
+        stderr=None, stdout=None, return_stdout=False, timeout=0, quiet=False,
+        cmd_prefix=None):
+  cmd = []
+  if cmd_prefix:
+    cmd.extend(cmd_prefix)
   if build is None:
     build, args = extract_build_from_args(args)
   if build:
     gradle.RunGradle(['r8lib' if tool.startswith('r8lib') else 'r8'])
-  cmd = []
   if track_memory_file:
     cmd.extend(['tools/track_memory.sh', track_memory_file])
   cmd.append(jdk.GetJavaExecutable())
@@ -36,7 +41,7 @@ def run(tool, args, build=None, debug=True,
   if lib:
     cmd.extend(["--lib", lib])
   cmd.extend(args)
-  utils.PrintCmd(cmd)
+  utils.PrintCmd(cmd, quiet=quiet)
   if timeout > 0:
     kill = lambda process: process.kill()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

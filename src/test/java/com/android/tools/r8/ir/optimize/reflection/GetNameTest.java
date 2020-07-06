@@ -21,6 +21,7 @@ import com.android.tools.r8.utils.codeinspector.MethodSubject;
 import com.google.common.collect.ImmutableList;
 import java.nio.file.Path;
 import java.util.Collection;
+import org.junit.Ignore;
 import org.junit.Test;
 
 class GetName0Class {
@@ -218,7 +219,7 @@ public class GetNameTest extends GetNameTestBase {
   @Test
   public void testJVMOutput() throws Exception {
     assumeTrue(
-        "Only run JVM reference once (for CF backend)",
+        "Only run JVM reference on CF runtimes",
         parameters.isCfRuntime() && !enableMinification);
     testForJvm()
         .addTestClasspath()
@@ -243,7 +244,7 @@ public class GetNameTest extends GetNameTestBase {
         testForD8()
             .debug()
             .addProgramFiles(classPaths)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
@@ -253,7 +254,7 @@ public class GetNameTest extends GetNameTestBase {
         testForD8()
             .release()
             .addProgramFiles(classPaths)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
@@ -262,18 +263,18 @@ public class GetNameTest extends GetNameTestBase {
   }
 
   @Test
+  @Ignore("b/154813140: Invalidly assumes that getClass on kept classes can be optimized")
   public void testR8_pinning() throws Exception {
     // Pinning the test class.
     R8TestRunResult result =
         testForR8(parameters.getBackend())
             .addProgramFiles(classPaths)
-            .enableInliningAnnotations()
             .addKeepMainRule(MAIN)
             .addKeepRules("-keep class **.GetName0*")
             .addKeepRules("-keepattributes InnerClasses,EnclosingMethod")
             .addKeepRules("-printmapping " + createNewMappingPath().toAbsolutePath().toString())
             .minification(enableMinification)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN)
             .assertSuccessWithOutput(JAVA_OUTPUT);
@@ -281,18 +282,18 @@ public class GetNameTest extends GetNameTestBase {
   }
 
   @Test
+  @Ignore("b/154813140: Invalidly assumes that getClass on kept classes can be optimized")
   public void testR8_shallow_pinning() throws Exception {
     // Shallow pinning the test class.
     R8TestRunResult result =
         testForR8(parameters.getBackend())
             .addProgramFiles(classPaths)
-            .enableInliningAnnotations()
             .addKeepMainRule(MAIN)
             .addKeepRules("-keep,allowobfuscation class **.GetName0*")
             .addKeepRules("-keepattributes InnerClasses,EnclosingMethod")
             .addKeepRules("-printmapping " + createNewMappingPath().toAbsolutePath().toString())
             .minification(enableMinification)
-            .setMinApi(parameters.getRuntime())
+            .setMinApi(parameters.getApiLevel())
             .addOptionsModification(this::configure)
             .run(parameters.getRuntime(), MAIN);
     if (enableMinification) {

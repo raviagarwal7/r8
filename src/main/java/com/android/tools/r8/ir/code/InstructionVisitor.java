@@ -24,7 +24,7 @@ public interface InstructionVisitor<T> {
 
   T visit(ArrayPut instruction);
 
-  T visit(Assume<?> instruction);
+  T visit(Assume instruction);
 
   T visit(CheckCast instruction);
 
@@ -63,6 +63,8 @@ public interface InstructionVisitor<T> {
   T visit(If instruction);
 
   T visit(Inc instruction);
+
+  T visit(InitClass instruction);
 
   T visit(InstanceGet instruction);
 
@@ -132,7 +134,9 @@ public interface InstructionVisitor<T> {
 
   T visit(Swap instruction);
 
-  T visit(Switch instruction);
+  T visit(IntSwitch instruction);
+
+  T visit(StringSwitch instruction);
 
   T visit(Throw instruction);
 

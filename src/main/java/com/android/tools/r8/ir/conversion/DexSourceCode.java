@@ -36,14 +36,10 @@ import com.android.tools.r8.graph.DexCode.TryHandler;
 import com.android.tools.r8.graph.DexCode.TryHandler.TypeAddrPair;
 import com.android.tools.r8.graph.DexDebugEntry;
 import com.android.tools.r8.graph.DexDebugInfo;
-import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.graph.GraphLense.RewrittenPrototypeDescription.RemovedArgumentInfo;
-import com.android.tools.r8.graph.GraphLense.RewrittenPrototypeDescription.RemovedArgumentsInfo;
-import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.code.CanonicalPositions;
 import com.android.tools.r8.ir.code.CatchHandlers;
 import com.android.tools.r8.ir.code.Position;
@@ -51,7 +47,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiConsumer;
@@ -59,7 +54,7 @@ import java.util.function.BiConsumer;
 public class DexSourceCode implements SourceCode {
 
   private final DexCode code;
-  private final DexEncodedMethod method;
+  private final ProgramMethod method;
 
   // Mapping from instruction offset to instruction index in the DexCode instruction array.
   private final Map<Integer, Integer> offsetToInstructionIndex = new HashMap<>();
@@ -80,7 +75,7 @@ public class DexSourceCode implements SourceCode {
   private final DexMethod originalMethod;
 
   public DexSourceCode(
-      DexCode code, DexEncodedMethod method, DexMethod originalMethod, Position callerPosition) {
+      DexCode code, ProgramMethod method, DexMethod originalMethod, Position callerPosition) {
     this.code = code;
     this.method = method;
     this.originalMethod = originalMethod;
@@ -142,48 +137,14 @@ public class DexSourceCode implements SourceCode {
     if (code.incomingRegisterSize == 0) {
       return;
     }
+    builder.buildArgumentsWithRewrittenPrototypeChanges(
+        code.registerSize - code.incomingRegisterSize,
+        method.getDefinition(),
+        DexSourceCode::doNothingWriteConsumer);
+  }
 
-    RemovedArgumentsInfo removedArgumentsInfo = builder.prototypeChanges.getRemovedArgumentsInfo();
-    ListIterator<RemovedArgumentInfo> removedArgumentIterator = removedArgumentsInfo.iterator();
-    RemovedArgumentInfo nextRemovedArgument =
-        removedArgumentIterator.hasNext() ? removedArgumentIterator.next() : null;
-
-    // Fill in the Argument instructions (incomingRegisterSize last registers) in the argument
-    // block.
-    int argumentIndex = 0;
-
-    int register = code.registerSize - code.incomingRegisterSize;
-    if (!method.isStatic()) {
-      builder.addThisArgument(register);
-      ++argumentIndex;
-      ++register;
-    }
-
-    int numberOfArguments =
-        method.method.proto.parameters.values.length
-            + removedArgumentsInfo.numberOfRemovedArguments()
-            + (method.isStatic() ? 0 : 1);
-
-    for (int usedArgumentIndex = 0; argumentIndex < numberOfArguments; ++argumentIndex) {
-      TypeLatticeElement type;
-      if (nextRemovedArgument != null && nextRemovedArgument.getArgumentIndex() == argumentIndex) {
-        type =
-            TypeLatticeElement.fromDexType(
-                nextRemovedArgument.getType(), Nullability.maybeNull(), builder.appView);
-        builder.addConstantOrUnusedArgument(register);
-        nextRemovedArgument =
-            removedArgumentIterator.hasNext() ? removedArgumentIterator.next() : null;
-      } else {
-        type =
-            TypeLatticeElement.fromDexType(
-                method.method.proto.parameters.values[usedArgumentIndex++],
-                Nullability.maybeNull(),
-                builder.appView);
-        builder.addNonThisArgument(register, type);
-      }
-      register += type.requiredRegisters();
-    }
-    builder.flushArgumentInstructions();
+  public static void doNothingWriteConsumer(Integer register, DexType type) {
+    // Intentionally empty.
   }
 
   @Override
@@ -408,7 +369,7 @@ public class DexSourceCode implements SourceCode {
       // Close the block if the instruction is a throw, otherwise the block remains open.
       return dex instanceof Throw ? index : -1;
     }
-    if (dex.isSwitch()) {
+    if (dex.isIntSwitch()) {
       // TODO(zerny): Remove this from block computation.
       switchPayloadResolver.addPayloadUser(dex);
 

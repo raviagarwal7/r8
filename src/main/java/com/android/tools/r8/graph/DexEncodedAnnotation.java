@@ -63,7 +63,7 @@ public class DexEncodedAnnotation extends DexItem {
       assert sorted == sortedHashCode();
       return;
     }
-    Arrays.sort(elements, (a, b) -> a.name.compareTo(b.name));
+    Arrays.sort(elements, (a, b) -> a.name.slowCompareTo(b.name));
     for (DexAnnotationElement element : elements) {
       element.value.sort();
     }
@@ -83,9 +83,6 @@ public class DexEncodedAnnotation extends DexItem {
         ArrayUtils.map(DexAnnotationElement[].class, elements, elementRewriter);
     if (rewrittenType == type && rewrittenElements == elements) {
       return this;
-    }
-    if (rewrittenElements.length == 0) {
-      return null;
     }
     return new DexEncodedAnnotation(rewrittenType, rewrittenElements);
   }

@@ -7,36 +7,41 @@ import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.TypeVerificationHelper;
 import com.android.tools.r8.errors.Unimplemented;
 import com.android.tools.r8.errors.Unreachable;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DebugLocalInfo;
-import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.AbstractError;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
 import com.android.tools.r8.ir.analysis.constant.Bottom;
 import com.android.tools.r8.ir.analysis.constant.ConstRangeLatticeElement;
 import com.android.tools.r8.ir.analysis.constant.LatticeElement;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
-import com.android.tools.r8.ir.code.Assume.NonNullAssumption;
+import com.android.tools.r8.ir.analysis.fieldvalueanalysis.AbstractFieldSet;
+import com.android.tools.r8.ir.analysis.fieldvalueanalysis.EmptyFieldSet;
+import com.android.tools.r8.ir.analysis.fieldvalueanalysis.UnknownFieldSet;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
+import com.android.tools.r8.ir.analysis.value.AbstractValue;
+import com.android.tools.r8.ir.analysis.value.UnknownValue;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DeadCodeRemover.DeadInstructionResult;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.ir.regalloc.RegisterAllocator;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.CfgPrinter;
 import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.StringUtils.BraceType;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
-public abstract class Instruction implements InstructionOrPhi {
+public abstract class Instruction implements InstructionOrPhi, TypeAndLocalInfoSupplier {
 
   protected Value outValue = null;
   protected final List<Value> inValues = new ArrayList<>();
@@ -63,7 +68,13 @@ public abstract class Instruction implements InstructionOrPhi {
     setOutValue(outValue);
   }
 
+  public abstract int opcode();
+
   public abstract <T> T accept(InstructionVisitor<T> visitor);
+
+  final boolean hasPosition() {
+    return position != null;
+  }
 
   public final Position getPosition() {
     assert position != null;
@@ -94,8 +105,12 @@ public abstract class Instruction implements InstructionOrPhi {
   }
 
   public boolean hasInValueWithLocalInfo() {
-    for (Value inValue : inValues()) {
-      if (inValue.hasLocalInfo()) {
+    return hasInValueThatMatches(Value::hasLocalInfo);
+  }
+
+  public boolean hasInValueThatMatches(Predicate<Value> predicate) {
+    for (Value value : inValues()) {
+      if (predicate.test(value)) {
         return true;
       }
     }
@@ -128,14 +143,26 @@ public abstract class Instruction implements InstructionOrPhi {
     return oldOutValue;
   }
 
+  public AbstractValue getAbstractValue(
+      AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    assert hasOutValue();
+    return UnknownValue.getInstance();
+  }
+
+  @Override
+  public TypeElement getOutType() {
+    if (hasOutValue()) {
+      return outValue().getType();
+    }
+    return null;
+  }
+
   public void addDebugValue(Value value) {
     assert value.hasLocalInfo();
     if (debugValues == null) {
-      debugValues = new HashSet<>();
+      debugValues = Sets.newIdentityHashSet();
     }
-    if (debugValues.add(value)) {
-      value.addDebugUser(this);
-    }
+    debugValues.add(value);
   }
 
   public static void clearUserInfo(Instruction instruction) {
@@ -174,17 +201,19 @@ public abstract class Instruction implements InstructionOrPhi {
   }
 
   public void replaceDebugValue(Value oldValue, Value newValue) {
-    if (debugValues.remove(oldValue)) {
-      // TODO(mathiasr): Enable this assertion when BasicBlock has current position so trivial phi
-      // removal can take local info into account.
-      // assert newValue.getLocalInfo() == oldValue.getLocalInfo()
-      //     : "Replacing debug values with inconsistent locals " +
-      //       oldValue.getLocalInfo() + " and " + newValue.getLocalInfo() +
-      //       ". This is likely a code transformation bug " +
-      //       "that has not taken local information into account";
-      if (newValue.hasLocalInfo()) {
-        addDebugValue(newValue);
-      }
+    assert oldValue.hasLocalInfo();
+    assert newValue.hasLocalInfo();
+    assert newValue.getLocalInfo() == oldValue.getLocalInfo()
+        : "Replacing debug values with inconsistent locals "
+            + oldValue.getLocalInfo()
+            + " and "
+            + newValue.getLocalInfo()
+            + ". This is likely a code transformation bug "
+            + "that has not taken local information into account";
+    boolean removed = debugValues.remove(oldValue);
+    assert removed;
+    if (removed && newValue.hasLocalInfo()) {
+      newValue.addDebugLocalEnd(this);
     }
   }
 
@@ -196,12 +225,6 @@ public abstract class Instruction implements InstructionOrPhi {
       value.replaceDebugUser(this, target);
     }
     debugValues.clear();
-  }
-
-  public void moveDebugValue(Value value, Instruction target) {
-    assert debugValues.contains(value);
-    value.replaceDebugUser(this, target);
-    debugValues.remove(value);
   }
 
   public void removeDebugValue(Value value) {
@@ -243,6 +266,7 @@ public abstract class Instruction implements InstructionOrPhi {
   /**
    * Returns the basic block containing this instruction.
    */
+  @Override
   public BasicBlock getBlock() {
     assert block != null;
     return block;
@@ -264,12 +288,12 @@ public abstract class Instruction implements InstructionOrPhi {
     block = null;
   }
 
-  public void removeOrReplaceByDebugLocalRead() {
-    getBlock().listIterator(this).removeOrReplaceByDebugLocalRead();
+  public void removeOrReplaceByDebugLocalRead(IRCode code) {
+    getBlock().listIterator(code, this).removeOrReplaceByDebugLocalRead();
   }
 
-  public void replace(Instruction newInstruction) {
-    getBlock().listIterator(this).replaceCurrentInstruction(newInstruction);
+  public void replace(Instruction newInstruction, IRCode code) {
+    getBlock().listIterator(code, this).replaceCurrentInstruction(newInstruction);
   }
 
   /**
@@ -335,6 +359,10 @@ public abstract class Instruction implements InstructionOrPhi {
   public void setNumber(int number) {
     assert number != -1;
     this.number = number;
+  }
+
+  public void clearNumber() {
+    this.number = -1;
   }
 
   /**
@@ -499,6 +527,38 @@ public abstract class Instruction implements InstructionOrPhi {
     return true;
   }
 
+  public boolean isAllowedAfterThrowingInstruction() {
+    return false;
+  }
+
+  public boolean isBlockLocalInstructionWithoutSideEffects(
+      AppView<?> appView, ProgramMethod context) {
+    return definesBlockLocalValue() && !instructionMayHaveSideEffects(appView, context);
+  }
+
+  private boolean definesBlockLocalValue() {
+    return !definesValueWithNonLocalUsages();
+  }
+
+  private boolean definesValueWithNonLocalUsages() {
+    if (hasOutValue()) {
+      Value outValue = outValue();
+      if (outValue.numberOfPhiUsers() > 0) {
+        return true;
+      }
+      for (Instruction user : outValue.uniqueUsers()) {
+        if (user.getBlock() != getBlock()) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  public boolean instructionTypeCanBeCanonicalized() {
+    return false;
+  }
+
   /**
    * Returns true if this instruction may throw an exception.
    */
@@ -510,21 +570,43 @@ public abstract class Instruction implements InstructionOrPhi {
     return instructionTypeCanThrow();
   }
 
+  public boolean instructionMayHaveSideEffects(AppView<?> appView, ProgramMethod context) {
+    return instructionMayHaveSideEffects(appView, context, SideEffectAssumption.NONE);
+  }
+
   public boolean instructionMayHaveSideEffects(
-      AppView<? extends AppInfo> appView, DexType context) {
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
     return instructionInstanceCanThrow();
   }
 
-  public AbstractError instructionInstanceCanThrow(
-      AppView<? extends AppInfo> appView, DexType context) {
-    return instructionInstanceCanThrow() ? AbstractError.top() : AbstractError.bottom();
+  /**
+   * Returns true if this instruction may trigger another method to execute either directly or
+   * indirectly (e.g., via class initialization).
+   */
+  public abstract boolean instructionMayTriggerMethodInvocation(
+      AppView<?> appView, ProgramMethod context);
+
+  public boolean instructionInstanceCanThrow(AppView<?> appView, ProgramMethod context) {
+    return instructionInstanceCanThrow();
   }
 
   /** Returns true is this instruction can be treated as dead code if its outputs are not used. */
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    // TODO(b/129530569): instructions with fine-grained side effect analysis may use:
-    // return !instructionMayHaveSideEffects(appView, code.method.method.holder);
-    return !instructionInstanceCanThrow();
+  public DeadInstructionResult canBeDeadCode(AppView<?> appView, IRCode code) {
+    return instructionMayHaveSideEffects(appView, code.context())
+        ? DeadInstructionResult.notDead()
+        : DeadInstructionResult.deadIfOutValueIsDead();
+  }
+
+  /**
+   * Returns an abstraction of the set of fields that may possibly be read as a result of executing
+   * this instruction.
+   */
+  public AbstractFieldSet readSet(AppView<AppInfoWithLiveness> appView, ProgramMethod context) {
+    if (instructionMayTriggerMethodInvocation(appView, context)
+        && instructionMayHaveSideEffects(appView, context)) {
+      return UnknownFieldSet.getInstance();
+    }
+    return EmptyFieldSet.getInstance();
   }
 
   /**
@@ -560,6 +642,7 @@ public abstract class Instruction implements InstructionOrPhi {
 
   public abstract int maxOutValueRegister();
 
+  @Override
   public DebugLocalInfo getLocalInfo() {
     return outValue == null ? null : outValue.getLocalInfo();
   }
@@ -571,6 +654,19 @@ public abstract class Instruction implements InstructionOrPhi {
   @Override
   public boolean isInstruction() {
     return true;
+  }
+
+  @Override
+  public Instruction asInstruction() {
+    return this;
+  }
+
+  public boolean isArrayAccess() {
+    return false;
+  }
+
+  public ArrayAccess asArrayAccess() {
+    return null;
   }
 
   public boolean isArrayGet() {
@@ -617,16 +713,16 @@ public abstract class Instruction implements InstructionOrPhi {
     return false;
   }
 
-  public Assume<?> asAssume() {
+  public Assume asAssume() {
     return null;
   }
 
-  public boolean isAssumeNonNull() {
-    return false;
+  public final boolean isAssumeWithDynamicTypeAssumption() {
+    return isAssume() && asAssume().hasDynamicTypeAssumption();
   }
 
-  public Assume<NonNullAssumption> asAssumeNonNull() {
-    return null;
+  public final boolean isAssumeWithNonNullAssumption() {
+    return isAssume() && asAssume().hasNonNullAssumption();
   }
 
   public boolean isBinop() {
@@ -773,6 +869,30 @@ public abstract class Instruction implements InstructionOrPhi {
     return null;
   }
 
+  public boolean isIntSwitch() {
+    return false;
+  }
+
+  public IntSwitch asIntSwitch() {
+    return null;
+  }
+
+  public boolean isStringSwitch() {
+    return false;
+  }
+
+  public StringSwitch asStringSwitch() {
+    return null;
+  }
+
+  public boolean isInstanceFieldInstruction() {
+    return false;
+  }
+
+  public InstanceFieldInstruction asInstanceFieldInstruction() {
+    return null;
+  }
+
   public boolean isInstanceGet() {
     return false;
   }
@@ -787,6 +907,10 @@ public abstract class Instruction implements InstructionOrPhi {
 
   public InstanceOf asInstanceOf() {
     return null;
+  }
+
+  public final boolean isFieldGet() {
+    return isInstanceGet() || isStaticGet();
   }
 
   public final boolean isFieldPut() {
@@ -810,6 +934,10 @@ public abstract class Instruction implements InstructionOrPhi {
   }
 
   public boolean isMonitor() {
+    return false;
+  }
+
+  public boolean isMonitorEnter() {
     return false;
   }
 
@@ -889,6 +1017,10 @@ public abstract class Instruction implements InstructionOrPhi {
     return null;
   }
 
+  public boolean isStaticFieldInstruction() {
+    return false;
+  }
+
   public boolean isStaticGet() {
     return false;
   }
@@ -902,6 +1034,14 @@ public abstract class Instruction implements InstructionOrPhi {
   }
 
   public StaticPut asStaticPut() {
+    return null;
+  }
+
+  public boolean isInitClass() {
+    return false;
+  }
+
+  public InitClass asInitClass() {
     return null;
   }
 
@@ -1012,6 +1152,7 @@ public abstract class Instruction implements InstructionOrPhi {
   public boolean isDebugInstruction() {
     return isDebugPosition()
         || isDebugLocalsChange()
+        || isDebugLocalRead()
         || isDebugLocalWrite()
         || isDebugLocalUninitialized();
   }
@@ -1046,6 +1187,10 @@ public abstract class Instruction implements InstructionOrPhi {
 
   public DebugLocalWrite asDebugLocalWrite() {
     return null;
+  }
+
+  public boolean isInvokeMethodWithDynamicDispatch() {
+    return isInvokeInterface() || isInvokeVirtual();
   }
 
   public boolean isInvokeMethod() {
@@ -1185,7 +1330,7 @@ public abstract class Instruction implements InstructionOrPhi {
    * <p>This is a conservative version of {@link #isIntroducingAnAlias()} so that other analyses,
    * e.g., escape analysis, can propagate or track aliased values in a conservative manner.
    */
-  public boolean couldIntroduceAnAlias() {
+  public boolean couldIntroduceAnAlias(AppView<?> appView, Value root) {
     return false;
   }
 
@@ -1200,12 +1345,15 @@ public abstract class Instruction implements InstructionOrPhi {
     return null;
   }
 
-  public boolean isCreatingInstanceOrArray() {
-    return isNewInstance()
-        || isNewArrayEmpty()
+  public boolean isCreatingArray() {
+    return isNewArrayEmpty()
         || isNewArrayFilledData()
         || isInvokeNewArray()
         || isInvokeMultiNewArray();
+  }
+
+  public boolean isCreatingInstanceOrArray() {
+    return isNewInstance() || isCreatingArray();
   }
 
   /**
@@ -1214,13 +1362,12 @@ public abstract class Instruction implements InstructionOrPhi {
    * <p>The type is used to judge visibility constraints and also for dispatch decisions.
    */
   public abstract ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context);
 
   public abstract void insertLoadAndStores(InstructionListIterator it, LoadStoreHelper helper);
 
-  public DexType computeVerificationType(
-      AppView<? extends AppInfo> appView, TypeVerificationHelper helper) {
-    assert outValue == null || !outValue.getTypeLattice().isReference();
+  public DexType computeVerificationType(AppView<?> appView, TypeVerificationHelper helper) {
+    assert outValue == null || !outValue.getType().isReferenceType();
     throw new Unreachable("Instruction without object outValue cannot compute verification type");
   }
 
@@ -1234,25 +1381,25 @@ public abstract class Instruction implements InstructionOrPhi {
   }
 
   // TODO(b/72693244): maybe rename to computeOutType once TypeVerificationHelper is gone?
-  public TypeLatticeElement evaluate(AppView<? extends AppInfo> appView) {
+  public TypeElement evaluate(AppView<?> appView) {
     assert outValue == null;
     throw new Unimplemented(
         "Implement type lattice evaluation for: " + getInstructionName());
   }
 
-  public boolean verifyTypes(AppView<? extends AppInfo> appView) {
+  public boolean verifyTypes(AppView<?> appView) {
     // TODO(b/72693244): for instructions with invariant out type, we can verify type directly here.
     if (outValue != null) {
-      TypeLatticeElement outTypeLatticeElement = outValue.getTypeLattice();
-      if (outTypeLatticeElement.isArrayType()) {
+      TypeElement outTypeElement = outValue.getType();
+      if (outTypeElement.isArrayType()) {
         DexType outBaseType =
-            outTypeLatticeElement
-                .asArrayTypeLatticeElement()
-                .getArrayType(appView.dexItemFactory())
+            outTypeElement
+                .asArrayType()
+                .toDexType(appView.dexItemFactory())
                 .toBaseType(appView.dexItemFactory());
         assert appView.graphLense().lookupType(outBaseType) == outBaseType;
-      } else if (outTypeLatticeElement.isClassType()) {
-        DexType outType = outTypeLatticeElement.asClassTypeLatticeElement().getClassType();
+      } else if (outTypeElement.isClassType()) {
+        DexType outType = outTypeElement.asClassType().getClassType();
         assert appView.graphLense().lookupType(outType) == outType;
       }
     }
@@ -1264,11 +1411,12 @@ public abstract class Instruction implements InstructionOrPhi {
    * given value is null at runtime execution.
    *
    * @param value the value representing an object that may be null at runtime execution.
-   * @param dexItemFactory where pre-defined descriptors are retrieved
+   * @param appView where pre-defined descriptors are retrieved
+   * @param context
    * @return true if the instruction throws NullPointerException if value is null at runtime, false
    *     otherwise.
    */
-  public boolean throwsNpeIfValueIsNull(Value value, DexItemFactory dexItemFactory) {
+  public boolean throwsNpeIfValueIsNull(Value value, AppView<?> appView, ProgramMethod context) {
     return false;
   }
 
@@ -1296,8 +1444,8 @@ public abstract class Instruction implements InstructionOrPhi {
    */
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return false;
@@ -1306,7 +1454,82 @@ public abstract class Instruction implements InstructionOrPhi {
   public boolean verifyValidPositionInfo(boolean debug) {
     assert position != null;
     assert !debug || getPosition().isSome();
-    assert !instructionTypeCanThrow() || getPosition().isSome() || getPosition().isSyntheticNone();
+    assert !instructionTypeCanThrow()
+        || isConstString()
+        || isDexItemBasedConstString()
+        || getPosition().isSome()
+        || getPosition().isSyntheticNone();
     return true;
+  }
+
+  public boolean outTypeKnownToBeBoolean(Set<Phi> seen) {
+    return false;
+  }
+
+  public static class SideEffectAssumption {
+
+    public static final SideEffectAssumption NONE = new SideEffectAssumption();
+
+    public static final SideEffectAssumption CLASS_ALREADY_INITIALIZED =
+        new SideEffectAssumption() {
+
+          @Override
+          public boolean canAssumeClassIsAlreadyInitialized() {
+            return true;
+          }
+        };
+
+    public static final SideEffectAssumption INVOKED_METHOD_DOES_NOT_HAVE_SIDE_EFFECTS =
+        new SideEffectAssumption() {
+
+          @Override
+          public boolean canAssumeInvokedMethodDoesNotHaveSideEffects() {
+            return true;
+          }
+        };
+
+    public static final SideEffectAssumption RECEIVER_NOT_NULL =
+        new SideEffectAssumption() {
+
+          @Override
+          public boolean canAssumeReceiverIsNotNull() {
+            return true;
+          }
+        };
+
+    public boolean canAssumeClassIsAlreadyInitialized() {
+      return false;
+    }
+
+    public boolean canAssumeInvokedMethodDoesNotHaveSideEffects() {
+      return false;
+    }
+
+    public boolean canAssumeReceiverIsNotNull() {
+      return false;
+    }
+
+    public SideEffectAssumption join(SideEffectAssumption other) {
+      return new SideEffectAssumption() {
+
+        @Override
+        public boolean canAssumeClassIsAlreadyInitialized() {
+          return SideEffectAssumption.this.canAssumeClassIsAlreadyInitialized()
+              || other.canAssumeClassIsAlreadyInitialized();
+        }
+
+        @Override
+        public boolean canAssumeInvokedMethodDoesNotHaveSideEffects() {
+          return SideEffectAssumption.this.canAssumeInvokedMethodDoesNotHaveSideEffects()
+              || other.canAssumeInvokedMethodDoesNotHaveSideEffects();
+        }
+
+        @Override
+        public boolean canAssumeReceiverIsNotNull() {
+          return SideEffectAssumption.this.canAssumeInvokedMethodDoesNotHaveSideEffects()
+              || other.canAssumeInvokedMethodDoesNotHaveSideEffects();
+        }
+      };
+    }
   }
 }

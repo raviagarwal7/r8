@@ -11,6 +11,7 @@ import java.util.List;
 public class ClassInlineRule extends ProguardConfigurationRule {
 
   public enum Type {
+    ALWAYS,
     NEVER
   }
 
@@ -38,13 +39,13 @@ public class ClassInlineRule extends ProguardConfigurationRule {
           origin,
           getPosition(),
           source,
-          classAnnotation,
+          buildClassAnnotations(),
           classAccessFlags,
           negatedClassAccessFlags,
           classTypeNegated,
           classType,
           classNames,
-          inheritanceAnnotation,
+          buildInheritanceAnnotations(),
           inheritanceClassName,
           inheritanceIsExtends,
           memberRules,
@@ -58,13 +59,13 @@ public class ClassInlineRule extends ProguardConfigurationRule {
       Origin origin,
       Position position,
       String source,
-      ProguardTypeMatcher classAnnotation,
+      List<ProguardTypeMatcher> classAnnotations,
       ProguardAccessFlags classAccessFlags,
       ProguardAccessFlags negatedClassAccessFlags,
       boolean classTypeNegated,
       ProguardClassType classType,
       ProguardClassNameList classNames,
-      ProguardTypeMatcher inheritanceAnnotation,
+      List<ProguardTypeMatcher> inheritanceAnnotations,
       ProguardTypeMatcher inheritanceClassName,
       boolean inheritanceIsExtends,
       List<ProguardMemberRule> memberRules,
@@ -73,13 +74,13 @@ public class ClassInlineRule extends ProguardConfigurationRule {
         origin,
         position,
         source,
-        classAnnotation,
+        classAnnotations,
         classAccessFlags,
         negatedClassAccessFlags,
         classTypeNegated,
         classType,
         classNames,
-        inheritanceAnnotation,
+        inheritanceAnnotations,
         inheritanceClassName,
         inheritanceIsExtends,
         memberRules);
@@ -95,8 +96,20 @@ public class ClassInlineRule extends ProguardConfigurationRule {
   }
 
   @Override
+  public boolean isClassInlineRule() {
+    return true;
+  }
+
+  @Override
+  public ClassInlineRule asClassInlineRule() {
+    return this;
+  }
+
+  @Override
   String typeString() {
     switch (type) {
+      case ALWAYS:
+        return "alwaysclassinline";
       case NEVER:
         return "neverclassinline";
     }

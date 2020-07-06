@@ -4,18 +4,19 @@
 package com.android.tools.r8.shaking;
 
 import com.android.tools.r8.errors.CompilationError;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.DexAnnotation;
-import com.android.tools.r8.graph.DexApplication;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexProto;
 import com.android.tools.r8.graph.DexType;
-import com.google.common.collect.Maps;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
+import com.android.tools.r8.utils.SetUtils;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * Calculate the list of classes required in the main dex to allow legacy multidex loading.
@@ -27,21 +28,12 @@ import java.util.stream.Collectors;
 public class MainDexListBuilder {
 
   private final Set<DexType> roots;
-  private final AppInfoWithSubtyping appInfo;
+  private final AppInfoWithClassHierarchy appInfo;
   private final Map<DexType, Boolean> annotationTypeContainEnum;
-  private final DexApplication dexApplication;
+  private final DirectMappedDexApplication dexApplication;
   private final MainDexClasses.Builder mainDexClassesBuilder;
 
-  /**
-   * @param roots Classes which code may be executed before secondary dex files loading.
-   * @param application the dex appplication.
-   */
-  public MainDexListBuilder(Set<DexType> roots, DexApplication application) {
-    this.dexApplication = application;
-    this.appInfo = new AppInfoWithSubtyping(dexApplication);
-    // Only consider program classes for the root set.
-    this.roots = roots.stream().filter(this::isProgramClass).collect(Collectors.toSet());
-    mainDexClassesBuilder = MainDexClasses.builder(appInfo).addRoots(this.roots);
+  public static void checkForAssumedLibraryTypes(AppInfo appInfo) {
     DexClass enumType = appInfo.definitionFor(appInfo.dexItemFactory().enumType);
     if (enumType == null) {
       throw new CompilationError("Tracing for legacy multi dex is not possible without all"
@@ -52,9 +44,19 @@ public class MainDexListBuilder {
       throw new CompilationError("Tracing for legacy multi dex is not possible without all"
           + " classpath libraries (java.lang.annotation.Annotation is missing)");
     }
-    annotationTypeContainEnum =
-        Maps.newHashMapWithExpectedSize(
-            appInfo.subtypes(appInfo.dexItemFactory().annotationType).size());
+  }
+
+  /**
+   * @param roots Classes which code may be executed before secondary dex files loading.
+   * @param application the dex appplication.
+   */
+  public MainDexListBuilder(Set<DexProgramClass> roots, DirectMappedDexApplication application) {
+    this.dexApplication = application;
+    this.appInfo = new AppInfoWithClassHierarchy(dexApplication);
+    // Only consider program classes for the root set.
+    this.roots = SetUtils.mapIdentityHashSet(roots, DexProgramClass::getType);
+    mainDexClassesBuilder = MainDexClasses.builder(appInfo).addRoots(this.roots);
+    annotationTypeContainEnum = new IdentityHashMap<>();
   }
 
   public MainDexClasses run() {
@@ -101,12 +103,14 @@ public class MainDexListBuilder {
           DexProto proto = method.method.proto;
           if (proto.parameters.isEmpty()) {
             DexType valueType = proto.returnType.toBaseType(appInfo.dexItemFactory());
-            if (isEnum(valueType)) {
-              value = true;
-              break;
-            } else if (isAnnotation(valueType) && isAnnotationWithEnum(valueType)) {
-              value = true;
-              break;
+            if (valueType.isClassType()) {
+              if (isEnum(valueType)) {
+                value = true;
+                break;
+              } else if (isAnnotation(valueType) && isAnnotationWithEnum(valueType)) {
+                value = true;
+                break;
+              }
             }
           }
         }
@@ -117,16 +121,12 @@ public class MainDexListBuilder {
   }
 
   private boolean isEnum(DexType valueType) {
-    return appInfo.isSubtype(valueType, appInfo.dexItemFactory().enumType);
+    return valueType.isClassType()
+        && appInfo.isSubtype(valueType, appInfo.dexItemFactory().enumType);
   }
 
   private boolean isAnnotation(DexType valueType) {
     return appInfo.isSubtype(valueType, appInfo.dexItemFactory().annotationType);
-  }
-
-  private boolean isProgramClass(DexType dexType) {
-    DexClass clazz = appInfo.definitionFor(dexType);
-    return clazz != null && clazz.isProgramClass();
   }
 
   private void traceMainDexDirectDependencies() {

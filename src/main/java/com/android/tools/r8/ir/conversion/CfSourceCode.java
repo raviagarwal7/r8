@@ -3,7 +3,7 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.conversion;
 
-import static it.unimi.dsi.fastutil.ints.Int2ObjectSortedMaps.emptyMap;
+import static it.unimi.dsi.fastutil.ints.Int2ReferenceSortedMaps.emptyMap;
 
 import com.android.tools.r8.cf.code.CfFrame;
 import com.android.tools.r8.cf.code.CfFrame.FrameType;
@@ -15,28 +15,30 @@ import com.android.tools.r8.cf.code.CfPosition;
 import com.android.tools.r8.cf.code.CfSwitch;
 import com.android.tools.r8.cf.code.CfThrow;
 import com.android.tools.r8.cf.code.CfTryCatch;
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.errors.InvalidDebugInfoException;
+import com.android.tools.r8.errors.Unreachable;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.CfCode;
 import com.android.tools.r8.graph.CfCode.LocalVariableInfo;
 import com.android.tools.r8.graph.DebugLocalInfo;
+import com.android.tools.r8.graph.DebugLocalInfo.PrintLevel;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.ProgramMethod;
 import com.android.tools.r8.ir.code.CanonicalPositions;
 import com.android.tools.r8.ir.code.CatchHandlers;
+import com.android.tools.r8.ir.code.Monitor;
 import com.android.tools.r8.ir.code.Position;
+import com.android.tools.r8.ir.code.ValueType;
+import com.android.tools.r8.ir.conversion.CfState.Slot;
 import com.android.tools.r8.ir.conversion.CfState.Snapshot;
 import com.android.tools.r8.ir.conversion.IRBuilder.BlockInfo;
 import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.InternalOutputMode;
-import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
-import it.unimi.dsi.fastutil.ints.Int2ObjectMap.Entry;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceMap.Entry;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceSortedMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -49,11 +51,17 @@ import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
 import it.unimi.dsi.fastutil.objects.ReferenceSet;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.stream.Collectors;
 
 public class CfSourceCode implements SourceCode {
 
   private BlockInfo currentBlockInfo;
   private boolean hasExitingInstruction = false;
+
+  private static final int EXCEPTIONAL_SYNC_EXIT_OFFSET = -2;
+  private final boolean needsGeneratedMethodSynchronization;
+  private boolean currentlyGeneratingMethodSynchronization = false;
+  private Monitor monitorEnter = null;
 
   private static class TryHandlerList {
 
@@ -82,12 +90,14 @@ public class CfSourceCode implements SourceCode {
         int instructionOffset,
         List<CfTryCatch> tryCatchRanges,
         Reference2IntMap<CfLabel> labelOffsets,
+        boolean needsGeneratedMethodSynchronization,
         DexItemFactory factory) {
-      int startOffset = Integer.MIN_VALUE;
+      int startOffset = 0;
       int endOffset = Integer.MAX_VALUE;
       List<DexType> guards = new ArrayList<>();
       IntList offsets = new IntArrayList();
       ReferenceSet<DexType> seen = new ReferenceOpenHashSet<>();
+      boolean seenCatchAll = false;
       for (CfTryCatch tryCatch : tryCatchRanges) {
         int start = labelOffsets.getInt(tryCatch.start);
         int end = labelOffsets.getInt(tryCatch.end);
@@ -100,7 +110,6 @@ public class CfSourceCode implements SourceCode {
         }
         startOffset = Math.max(startOffset, start);
         endOffset = Math.min(endOffset, end);
-        boolean seenCatchAll = false;
         for (int i = 0; i < tryCatch.guards.size() && !seenCatchAll; i++) {
           DexType guard = tryCatch.guards.get(i);
           if (seen.add(guard)) {
@@ -113,6 +122,10 @@ public class CfSourceCode implements SourceCode {
           break;
         }
       }
+      if (needsGeneratedMethodSynchronization && !seenCatchAll) {
+        guards.add(factory.throwableType);
+        offsets.add(EXCEPTIONAL_SYNC_EXIT_OFFSET);
+      }
       return new TryHandlerList(startOffset, endOffset, guards, offsets);
     }
   }
@@ -122,10 +135,10 @@ public class CfSourceCode implements SourceCode {
     public static final LocalVariableList EMPTY = new LocalVariableList(0, 0, emptyMap());
     public final int startOffset;
     public final int endOffset;
-    public final Int2ObjectMap<DebugLocalInfo> locals;
+    public final Int2ReferenceMap<DebugLocalInfo> locals;
 
     private LocalVariableList(
-        int startOffset, int endOffset, Int2ObjectMap<DebugLocalInfo> locals) {
+        int startOffset, int endOffset, Int2ReferenceMap<DebugLocalInfo> locals) {
       this.startOffset = startOffset;
       this.endOffset = endOffset;
       this.locals = locals;
@@ -137,7 +150,7 @@ public class CfSourceCode implements SourceCode {
         Reference2IntMap<CfLabel> labelOffsets) {
       int startOffset = Integer.MIN_VALUE;
       int endOffset = Integer.MAX_VALUE;
-      Int2ObjectMap<DebugLocalInfo> currentLocals = null;
+      Int2ReferenceMap<DebugLocalInfo> currentLocals = null;
       for (LocalVariableInfo local : locals) {
         int start = labelOffsets.getInt(local.getStart());
         int end = labelOffsets.getInt(local.getEnd());
@@ -149,7 +162,7 @@ public class CfSourceCode implements SourceCode {
           continue;
         }
         if (currentLocals == null) {
-          currentLocals = new Int2ObjectOpenHashMap<>();
+          currentLocals = new Int2ReferenceOpenHashMap<>();
         }
         startOffset = Math.max(startOffset, start);
         endOffset = Math.min(endOffset, end);
@@ -167,17 +180,17 @@ public class CfSourceCode implements SourceCode {
       return locals.get(register);
     }
 
-    public Int2ObjectOpenHashMap<DebugLocalInfo> merge(LocalVariableList other) {
+    public Int2ReferenceOpenHashMap<DebugLocalInfo> merge(LocalVariableList other) {
       return merge(this, other);
     }
 
-    private static Int2ObjectOpenHashMap<DebugLocalInfo> merge(
+    private static Int2ReferenceOpenHashMap<DebugLocalInfo> merge(
         LocalVariableList a, LocalVariableList b) {
       if (a.locals.size() > b.locals.size()) {
         return merge(b, a);
       }
-      Int2ObjectOpenHashMap<DebugLocalInfo> result = new Int2ObjectOpenHashMap<>();
-      for (Entry<DebugLocalInfo> local : a.locals.int2ObjectEntrySet()) {
+      Int2ReferenceOpenHashMap<DebugLocalInfo> result = new Int2ReferenceOpenHashMap<>();
+      for (Entry<DebugLocalInfo> local : a.locals.int2ReferenceEntrySet()) {
         if (local.getValue().equals(b.getLocal(local.getIntKey()))) {
           result.put(local.getIntKey(), local.getValue());
         }
@@ -187,31 +200,36 @@ public class CfSourceCode implements SourceCode {
   }
 
   private CfState state;
+  private final List<CfCode.LocalVariableInfo> localVariables;
   private final CfCode code;
-  private final DexEncodedMethod method;
+  private final ProgramMethod method;
   private final Origin origin;
+  private final AppView<?> appView;
 
   private final Reference2IntMap<CfLabel> labelOffsets = new Reference2IntOpenHashMap<>();
   private TryHandlerList cachedTryHandlerList;
   private LocalVariableList cachedLocalVariableList;
   private int currentInstructionIndex;
   private boolean inPrelude;
-  private Int2ObjectMap<DebugLocalInfo> incomingLocals;
-  private Int2ObjectMap<DebugLocalInfo> outgoingLocals;
+  private Int2ReferenceMap<DebugLocalInfo> incomingLocals;
+  private Int2ReferenceMap<DebugLocalInfo> outgoingLocals;
   private Int2ReferenceMap<CfState.Snapshot> incomingState = new Int2ReferenceOpenHashMap<>();
   private final CanonicalPositions canonicalPositions;
   private final InternalOutputMode internalOutputMode;
 
   public CfSourceCode(
       CfCode code,
-      DexEncodedMethod method,
+      List<CfCode.LocalVariableInfo> localVariables,
+      ProgramMethod method,
       DexMethod originalMethod,
       Position callerPosition,
       Origin origin,
-      InternalOutputMode internalOutputMode) {
+      AppView<?> appView) {
     this.code = code;
+    this.localVariables = localVariables;
     this.method = method;
     this.origin = origin;
+    this.appView = appView;
     int cfPositionCount = 0;
     for (int i = 0; i < code.getInstructions().size(); i++) {
       CfInstruction instruction = code.getInstructions().get(i);
@@ -224,7 +242,24 @@ public class CfSourceCode implements SourceCode {
     }
     this.state = new CfState(origin);
     canonicalPositions = new CanonicalPositions(callerPosition, cfPositionCount, originalMethod);
-    this.internalOutputMode = internalOutputMode;
+    internalOutputMode = appView.options().getInternalOutputMode();
+
+    needsGeneratedMethodSynchronization =
+        !getMethod().isProcessed()
+            && internalOutputMode.isGeneratingDex()
+            && getMethod().isSynchronized();
+  }
+
+  private DexEncodedMethod getMethod() {
+    return method.getDefinition();
+  }
+
+  public Origin getOrigin() {
+    return origin;
+  }
+
+  public DexType getOriginalHolder() {
+    return code.getOriginalHolder();
   }
 
   @Override
@@ -267,7 +302,7 @@ public class CfSourceCode implements SourceCode {
   @Override
   public int traceInstruction(int instructionIndex, IRBuilder builder) {
     CfInstruction instruction = code.getInstructions().get(instructionIndex);
-    AppView<? extends AppInfo> appView = builder.appView;
+    AppView<?> appView = builder.appView;
     assert appView.options().isGeneratingClassFiles()
         == internalOutputMode.isGeneratingClassFiles();
     if (canThrowHelper(instruction)) {
@@ -304,7 +339,11 @@ public class CfSourceCode implements SourceCode {
     if (cachedTryHandlerList == null || !cachedTryHandlerList.validFor(instructionOffset)) {
       cachedTryHandlerList =
           TryHandlerList.computeTryHandlers(
-              instructionOffset, code.getTryCatchRanges(), labelOffsets, factory);
+              instructionOffset,
+              code.getTryCatchRanges(),
+              labelOffsets,
+              needsGeneratedMethodSynchronization,
+              factory);
     }
     return cachedTryHandlerList;
   }
@@ -312,7 +351,7 @@ public class CfSourceCode implements SourceCode {
   private LocalVariableList getLocalVariables(int instructionOffset) {
     if (cachedLocalVariableList == null || !cachedLocalVariableList.validFor(instructionOffset)) {
       cachedLocalVariableList =
-          LocalVariableList.compute(instructionOffset, code.getLocalVariables(), labelOffsets);
+          LocalVariableList.compute(instructionOffset, localVariables, labelOffsets);
     }
     return cachedLocalVariableList;
   }
@@ -342,7 +381,7 @@ public class CfSourceCode implements SourceCode {
       return new int[] {targetIndex};
     }
     assert instruction.isConditionalJump();
-    return new int[] {instructionIndex + 1, targetIndex};
+    return new int[] {targetIndex, instructionIndex + 1};
   }
 
   @Override
@@ -351,62 +390,99 @@ public class CfSourceCode implements SourceCode {
     inPrelude = true;
     state.buildPrelude(canonicalPositions.getPreamblePosition());
     setLocalVariableLists();
-    buildArgumentInstructions(builder);
+    builder.buildArgumentsWithRewrittenPrototypeChanges(0, getMethod(), state::write);
+    // Add debug information for all locals at the initial label.
+    Int2ReferenceMap<DebugLocalInfo> locals = getLocalVariables(0).locals;
+    if (!locals.isEmpty()) {
+      int firstLocalIndex = 0;
+      if (!getMethod().isStatic()) {
+        firstLocalIndex++;
+      }
+      for (DexType value : getMethod().proto().parameters.values) {
+        firstLocalIndex++;
+        if (value.isLongType() || value.isDoubleType()) {
+          firstLocalIndex++;
+        }
+      }
+      for (Entry<DebugLocalInfo> entry : locals.int2ReferenceEntrySet()) {
+        if (firstLocalIndex <= entry.getIntKey()) {
+          builder.addDebugLocalStart(entry.getIntKey(), entry.getValue());
+        }
+      }
+    }
+    if (needsGeneratedMethodSynchronization) {
+      buildMethodEnterSynchronization(builder);
+    }
     recordStateForTarget(0, state.getSnapshot());
-    // TODO(b/109789541): Generate method synchronization for DEX backend.
     inPrelude = false;
   }
 
-  private void buildArgumentInstructions(IRBuilder builder) {
-    int argumentRegister = 0;
-    if (!isStatic()) {
-      DexType type = method.method.holder;
-      state.write(argumentRegister, type);
-      builder.addThisArgument(argumentRegister++);
-    }
-    for (DexType type : method.method.proto.parameters.values) {
-      state.write(argumentRegister, type);
-      if (type.isBooleanType()) {
-        builder.addBooleanNonThisArgument(argumentRegister++);
-      } else {
-        TypeLatticeElement typeLattice =
-            TypeLatticeElement.fromDexType(type, Nullability.maybeNull(), builder.appView);
-        builder.addNonThisArgument(argumentRegister, typeLattice);
-        argumentRegister += typeLattice.requiredRegisters();
-      }
-    }
-    builder.flushArgumentInstructions();
+  private boolean isCurrentlyGeneratingMethodSynchronization() {
+    return currentlyGeneratingMethodSynchronization;
   }
 
-  private boolean isStatic() {
-    return method.accessFlags.isStatic();
+  private boolean isExceptionalExitForMethodSynchronization(int instructionIndex) {
+    return instructionIndex == EXCEPTIONAL_SYNC_EXIT_OFFSET;
+  }
+
+  private void buildMethodEnterSynchronization(IRBuilder builder) {
+    assert needsGeneratedMethodSynchronization;
+    currentlyGeneratingMethodSynchronization = true;
+    DexType type = method.getHolderType();
+    int monitorRegister;
+    if (getMethod().isStatic()) {
+      monitorRegister = state.push(type).register;
+      state.pop();
+      builder.addConstClass(monitorRegister, type);
+    } else {
+      monitorRegister = state.read(0).register;
+    }
+    // Build the monitor enter and save it for when generating exits later.
+    monitorEnter = builder.addMonitor(Monitor.Type.ENTER, monitorRegister);
+    currentlyGeneratingMethodSynchronization = false;
+  }
+
+  private void buildExceptionalExitMethodSynchronization(IRBuilder builder) {
+    assert needsGeneratedMethodSynchronization;
+    currentlyGeneratingMethodSynchronization = true;
+    state.setPosition(getCanonicalDebugPositionAtOffset(EXCEPTIONAL_SYNC_EXIT_OFFSET));
+    builder.add(new Monitor(Monitor.Type.EXIT, monitorEnter.inValues().get(0)));
+    builder.addThrow(getMoveExceptionRegister(0));
+    currentlyGeneratingMethodSynchronization = false;
   }
 
   @Override
   public void buildPostlude(IRBuilder builder) {
-    // TODO(b/109789541): Generate method synchronization for DEX backend.
+    if (needsGeneratedMethodSynchronization) {
+      currentlyGeneratingMethodSynchronization = true;
+      builder.add(new Monitor(Monitor.Type.EXIT, monitorEnter.inValues().get(0)));
+      currentlyGeneratingMethodSynchronization = false;
+    }
   }
 
   @Override
   public void buildBlockTransfer(
       IRBuilder builder, int predecessorOffset, int successorOffset, boolean isExceptional) {
-    if (predecessorOffset == IRBuilder.INITIAL_BLOCK_OFFSET) {
+    if (predecessorOffset == IRBuilder.INITIAL_BLOCK_OFFSET
+        || isExceptionalExitForMethodSynchronization(successorOffset)) {
       return;
     }
-    // The transfer has not yet taken place, so the current position is that of the predecessor.
-    state.setPosition(getCanonicalDebugPositionAtOffset(predecessorOffset));
+    // The transfer has not yet taken place, so the current position is that of the predecessor,
+    // except for exceptional edges where the transfer has already taken place.
+    state.setPosition(
+        getCanonicalDebugPositionAtOffset(isExceptional ? successorOffset : predecessorOffset));
 
     // Manually compute the local variable change for the block transfer.
-    Int2ObjectMap<DebugLocalInfo> atSource = getLocalVariables(predecessorOffset).locals;
-    Int2ObjectMap<DebugLocalInfo> atTarget = getLocalVariables(successorOffset).locals;
+    Int2ReferenceMap<DebugLocalInfo> atSource = getLocalVariables(predecessorOffset).locals;
+    Int2ReferenceMap<DebugLocalInfo> atTarget = getLocalVariables(successorOffset).locals;
     if (!isExceptional) {
-      for (Entry<DebugLocalInfo> entry : atSource.int2ObjectEntrySet()) {
+      for (Entry<DebugLocalInfo> entry : atSource.int2ReferenceEntrySet()) {
         if (atTarget.get(entry.getIntKey()) != entry.getValue()) {
           builder.addDebugLocalEnd(entry.getIntKey(), entry.getValue());
         }
       }
     }
-    for (Entry<DebugLocalInfo> entry : atTarget.int2ObjectEntrySet()) {
+    for (Entry<DebugLocalInfo> entry : atTarget.int2ReferenceEntrySet()) {
       if (atSource.get(entry.getIntKey()) != entry.getValue()) {
         builder.addDebugLocalStart(entry.getIntKey(), entry.getValue());
       }
@@ -419,7 +495,7 @@ public class CfSourceCode implements SourceCode {
     // back-edge will explicitly keep locals live at that point.
     if (!hasExitingInstruction && code.getInstructions().get(predecessorOffset) instanceof CfGoto) {
       assert !isExceptional;
-      for (Entry<DebugLocalInfo> entry : atSource.int2ObjectEntrySet()) {
+      for (Entry<DebugLocalInfo> entry : atSource.int2ReferenceEntrySet()) {
         if (atTarget.get(entry.getIntKey()) == entry.getValue()) {
           builder.addDebugLocalEnd(entry.getIntKey(), entry.getValue());
         }
@@ -430,6 +506,10 @@ public class CfSourceCode implements SourceCode {
   @Override
   public void buildInstruction(
       IRBuilder builder, int instructionIndex, boolean firstBlockInstruction) {
+    if (isExceptionalExitForMethodSynchronization(instructionIndex)) {
+      buildExceptionalExitMethodSynchronization(builder);
+      return;
+    }
     CfInstruction instruction = code.getInstructions().get(instructionIndex);
     currentInstructionIndex = instructionIndex;
     if (firstBlockInstruction) {
@@ -438,8 +518,12 @@ public class CfSourceCode implements SourceCode {
         // If the entry block is also a target the actual entry block is at offset -1.
         currentBlockInfo = builder.getCFG().get(IRBuilder.INITIAL_BLOCK_OFFSET);
       }
-      state.reset(incomingState.get(instructionIndex), instructionIndex == 0);
+      state.reset(
+          incomingState.get(instructionIndex),
+          instructionIndex == 0,
+          getCanonicalDebugPositionAtOffset(instructionIndex));
     }
+
     assert currentBlockInfo != null;
     setLocalVariableLists();
 
@@ -468,7 +552,7 @@ public class CfSourceCode implements SourceCode {
         for (int successorOffset : currentBlockInfo.exceptionalSuccessors) {
           live.putAll(getLocalVariables(successorOffset).locals);
         }
-        for (Entry<DebugLocalInfo> entry : incomingLocals.int2ObjectEntrySet()) {
+        for (Entry<DebugLocalInfo> entry : incomingLocals.int2ReferenceEntrySet()) {
           if (live.get(entry.getIntKey()) != entry.getValue()) {
             builder.addDebugLocalEnd(entry.getIntKey(), entry.getValue());
           }
@@ -550,7 +634,7 @@ public class CfSourceCode implements SourceCode {
       return ((CfNew) instruction).getType();
     }
     if (type.isUninitializedThis()) {
-      return method.method.holder;
+      return method.getHolderType();
     }
     assert type.isTop();
     return null;
@@ -571,11 +655,14 @@ public class CfSourceCode implements SourceCode {
 
   @Override
   public DebugLocalInfo getIncomingLocal(int register) {
-    return incomingLocals.get(register);
+    return isCurrentlyGeneratingMethodSynchronization() ? null : incomingLocals.get(register);
   }
 
   @Override
   public DebugLocalInfo getOutgoingLocal(int register) {
+    if (isCurrentlyGeneratingMethodSynchronization()) {
+      return null;
+    }
     if (inPrelude) {
       return getIncomingLocal(register);
     }
@@ -603,7 +690,7 @@ public class CfSourceCode implements SourceCode {
 
   private void endLocals(IRBuilder builder) {
     assert localsChanged();
-    for (Entry<DebugLocalInfo> entry : incomingLocals.int2ObjectEntrySet()) {
+    for (Entry<DebugLocalInfo> entry : incomingLocals.int2ReferenceEntrySet()) {
       if (!entry.getValue().equals(outgoingLocals.get(entry.getIntKey()))) {
         builder.addDebugLocalEnd(entry.getIntKey(), entry.getValue());
       }
@@ -612,10 +699,35 @@ public class CfSourceCode implements SourceCode {
 
   private void startLocals(IRBuilder builder) {
     assert localsChanged();
-    for (Entry<DebugLocalInfo> entry : outgoingLocals.int2ObjectEntrySet()) {
+    for (Entry<DebugLocalInfo> entry : outgoingLocals.int2ReferenceEntrySet()) {
       if (!entry.getValue().equals(incomingLocals.get(entry.getIntKey()))) {
+        Slot slot = state.read(entry.getIntKey());
+        if (slot != null && slot.type != ValueType.fromDexType(entry.getValue().type)) {
+          throw new InvalidDebugInfoException(
+              "Attempt to define local of type "
+                  + prettyType(slot.type)
+                  + " as "
+                  + entry.getValue().toString(PrintLevel.FULL));
+        }
         builder.addDebugLocalStart(entry.getIntKey(), entry.getValue());
       }
+    }
+  }
+
+  private String prettyType(ValueType type) {
+    switch (type) {
+      case OBJECT:
+        return "reference";
+      case INT:
+        return "int";
+      case FLOAT:
+        return "float";
+      case LONG:
+        return "long";
+      case DOUBLE:
+        return "double";
+      default:
+        throw new Unreachable();
     }
   }
 
@@ -628,6 +740,9 @@ public class CfSourceCode implements SourceCode {
 
   @Override
   public CatchHandlers<Integer> getCurrentCatchHandlers(IRBuilder builder) {
+    if (isCurrentlyGeneratingMethodSynchronization()) {
+      return null;
+    }
     TryHandlerList tryHandlers =
         getTryHandlers(
             instructionOffset(currentInstructionIndex), builder.appView.dexItemFactory());
@@ -644,7 +759,8 @@ public class CfSourceCode implements SourceCode {
 
   @Override
   public boolean verifyCurrentInstructionCanThrow() {
-    return canThrowHelper(code.getInstructions().get(currentInstructionIndex));
+    return isCurrentlyGeneratingMethodSynchronization()
+        || canThrowHelper(code.getInstructions().get(currentInstructionIndex));
   }
 
   @Override
@@ -654,6 +770,16 @@ public class CfSourceCode implements SourceCode {
 
   @Override
   public Position getCanonicalDebugPositionAtOffset(int offset) {
+    if (offset == EXCEPTIONAL_SYNC_EXIT_OFFSET) {
+      return canonicalPositions.getExceptionalExitPosition(
+          appView.options().debug,
+          () ->
+              code.instructions.stream()
+                  .filter(insn -> insn instanceof CfPosition)
+                  .map(insn -> ((CfPosition) insn).getPosition())
+                  .collect(Collectors.toList()),
+          method.getReference());
+    }
     while (offset + 1 < code.getInstructions().size()) {
       CfInstruction insn = code.getInstructions().get(offset);
       if (!(insn instanceof CfLabel) && !(insn instanceof CfFrame)) {

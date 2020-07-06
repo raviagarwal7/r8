@@ -22,6 +22,7 @@ import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.ArtErrorParser;
 import com.android.tools.r8.utils.ArtErrorParser.ArtErrorInfo;
 import com.android.tools.r8.utils.FileUtils;
+import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.InternalOptions.LineNumberOptimization;
 import com.android.tools.r8.utils.ListUtils;
 import com.android.tools.r8.utils.TestDescriptionWatcher;
@@ -52,6 +53,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 import java.util.stream.Collectors;
@@ -100,7 +102,8 @@ public abstract class R8RunArtTestsTest {
       DexVm.Version.V6_0_1,
       DexVm.Version.V7_0_0,
       DexVm.Version.V8_1_0,
-      DexVm.Version.V9_0_0);
+      DexVm.Version.V9_0_0,
+      DexVm.Version.V10_0_0);
 
   // Input jar for jctf tests.
   private static final String JCTF_COMMON_JAR = "build/libs/jctfCommon.jar";
@@ -118,6 +121,8 @@ public abstract class R8RunArtTestsTest {
   private static Map<String, AndroidApiLevel> needMinSdkVersion =
       new ImmutableMap.Builder<String, AndroidApiLevel>()
           .put("004-JniTest", AndroidApiLevel.N)
+          // Has a non-abstract class with an abstract method.
+          .put("800-smali", AndroidApiLevel.L)
           // Android O
           .put("952-invoke-custom", AndroidApiLevel.O)
           .put("952-invoke-custom-kinds", AndroidApiLevel.O)
@@ -164,7 +169,8 @@ public abstract class R8RunArtTestsTest {
   private static final Multimap<String, TestCondition> timeoutOrSkipRunWithArt =
       new ImmutableListMultimap.Builder<String, TestCondition>()
           // Loops on art - timeout.
-          .put("109-suspend-check",
+          .put(
+              "109-suspend-check",
               TestCondition.match(TestCondition.runtimes(DexVm.Version.V5_1_1)))
           // Flaky loops on art.
           .put("129-ThreadGetId", TestCondition.match(TestCondition.runtimes(DexVm.Version.V5_1_1)))
@@ -172,8 +178,13 @@ public abstract class R8RunArtTestsTest {
           // tests on 5.1.1 makes our buildbot cycles time too long.
           .put("800-smali", TestCondition.match(TestCondition.runtimes(DexVm.Version.V5_1_1)))
           // Hangs on dalvik.
-          .put("802-deoptimization",
+          .put(
+              "802-deoptimization",
               TestCondition.match(TestCondition.runtimesUpTo(DexVm.Version.V4_4_4)))
+          // TODO(b/144975341): Triage
+          .put(
+              "134-reg-promotion",
+              TestCondition.match(TestCondition.runtimes(DexVm.Version.V10_0_0)))
           .build();
 
   // Tests that are flaky with the Art version we currently use.
@@ -197,6 +208,9 @@ public abstract class R8RunArtTestsTest {
           // printWeakReference on lines Main.java:78-79. An expected flaky
           // result contains: "but was:<wimp: [null]".
           .put("036-finalizer", TestCondition.any())
+          // The test waits for a maximum of 500 ms which is unreliable when running on buildbots:
+          // Elapsed time was too long: elapsed=552 max=550
+          .put("053-wait-some", TestCondition.any())
           // Failed on buildbot with: terminate called after throwing an instance
           // of '__gnu_cxx::recursive_init_error'
           .put("096-array-copy-concurrent-gc",
@@ -471,6 +485,14 @@ public abstract class R8RunArtTestsTest {
   static {
     ImmutableMap.Builder<DexVm.Version, List<String>> builder = ImmutableMap.builder();
     builder
+        .put(DexVm.Version.V10_0_0, ImmutableList.of(
+            // TODO(b/144975341): Triage, Verif error.
+            "518-null-array-get",
+            // TODO(b/144975341): Triage, Linking error.
+            "457-regs",
+            "543-env-long-ref",
+            "454-get-vreg"
+        ))
         .put(DexVm.Version.V9_0_0, ImmutableList.of(
             // TODO(120400625): Triage.
             "454-get-vreg",
@@ -491,9 +513,6 @@ public abstract class R8RunArtTestsTest {
             // Addition of checks for super-class-initialization cause this to abort on non-ToT art.
             "008-exceptions",
 
-            // Fails due to non-matching Exception messages.
-            "201-built-in-except-detail-messages",
-
             // Generally fails on non-R8/D8 running.
             "156-register-dex-file-multi-loader",
             "412-new-array",
@@ -503,9 +522,6 @@ public abstract class R8RunArtTestsTest {
             // Addition of checks for super-class-initialization cause this to abort on non-ToT art.
             "008-exceptions",
 
-            // Fails due to non-matching Exception messages.
-            "201-built-in-except-detail-messages",
-
             // Generally fails on non-R8/D8 running.
             "004-checker-UnsafeTest18",
             "005-annotations",
@@ -514,7 +530,6 @@ public abstract class R8RunArtTestsTest {
             "099-vmdebug",
             "156-register-dex-file-multi-loader",
             "412-new-array",
-            "530-checker-lse2",
             "580-checker-round",
             "594-invoke-super",
             "625-checker-licm-regressions",
@@ -522,9 +537,6 @@ public abstract class R8RunArtTestsTest {
         .put(DexVm.Version.V5_1_1, ImmutableList.of(
             // Addition of checks for super-class-initialization cause this to abort on non-ToT art.
             "008-exceptions",
-
-            // Fails due to non-matching Exception messages.
-            "201-built-in-except-detail-messages",
 
             // Generally fails on non R8/D8 running.
             "004-checker-UnsafeTest18",
@@ -535,7 +547,6 @@ public abstract class R8RunArtTestsTest {
             "099-vmdebug",
             "143-string-value",
             "156-register-dex-file-multi-loader",
-            "530-checker-lse2",
             "536-checker-intrinsic-optimization",
             "552-invoke-non-existent-super",
             "580-checker-round",
@@ -547,9 +558,6 @@ public abstract class R8RunArtTestsTest {
             // Addition of checks for super-class-initialization cause this to abort on non-ToT art.
             "008-exceptions",
 
-            // Fails due to non-matching Exception messages.
-            "201-built-in-except-detail-messages",
-
             // Generally fails on non R8/D8 running.
             "004-checker-UnsafeTest18",
             "004-NativeAllocations",
@@ -559,7 +567,6 @@ public abstract class R8RunArtTestsTest {
             "099-vmdebug",
             "143-string-value",
             "156-register-dex-file-multi-loader",
-            "530-checker-lse2",
             "536-checker-intrinsic-optimization",
             "552-invoke-non-existent-super",
             "580-checker-round",
@@ -571,9 +578,6 @@ public abstract class R8RunArtTestsTest {
             // Addition of checks for super-class-initialization cause this to abort on non-ToT art.
             "008-exceptions",
 
-            // Fails due to non-matching Exception messages.
-            "201-built-in-except-detail-messages",
-
             // Generally fails on non R8/D8 running.
             "004-checker-UnsafeTest18",
             "004-NativeAllocations",
@@ -583,7 +587,6 @@ public abstract class R8RunArtTestsTest {
             "099-vmdebug",
             "143-string-value",
             "156-register-dex-file-multi-loader",
-            "530-checker-lse2",
             "536-checker-intrinsic-optimization",
             "552-invoke-non-existent-super",
             "580-checker-round",
@@ -632,6 +635,13 @@ public abstract class R8RunArtTestsTest {
               TestCondition.match(
                   TestCondition.D8_COMPILER,
                   TestCondition.runtimesUpTo(DexVm.Version.V4_4_4)))
+          // Fails because the code has to be desugared to run on art <= 6.0.1
+          // When running from dx code we don't desugar.
+          .put("530-checker-lse2",
+              TestCondition.match(
+                  TestCondition.tools(DexTool.DX),
+                  TestCondition.D8_COMPILER,
+                  TestCondition.runtimesUpTo(DexVm.Version.V6_0_1)))
           .put("534-checker-bce-deoptimization",
               TestCondition
                   .match(TestCondition.D8_COMPILER, TestCondition.runtimes(DexVm.Version.V6_0_1)))
@@ -731,6 +741,10 @@ public abstract class R8RunArtTestsTest {
   // checked into the Art repo.
   private static final Multimap<String, TestCondition> failingRunWithArtOutput =
       new ImmutableListMultimap.Builder<String, TestCondition>()
+          // This test assumes that class-retention annotations are preserved by the compiler and
+          // then checks for backwards compatibility with M where they could incorrectly be observed
+          // by the program at runtime.
+          .put("005-annotations", TestCondition.match(TestCondition.D8_COMPILER))
           // On Art 4.4.4 we have fewer refs than expected (except for d8 when compiled with dx).
           .put("072-precise-gc",
               TestCondition.match(
@@ -764,6 +778,7 @@ public abstract class R8RunArtTestsTest {
           .match(TestCondition
               .runtimes(DexVm.Version.V4_0_4, DexVm.Version.V4_4_4, DexVm.Version.V5_1_1,
                   DexVm.Version.V6_0_1));
+  // TODO(herhut): Change to V8_0_0 once we have a new art VM.
   private static final TestCondition beforeAndroidO =
       TestCondition.match(TestCondition.runtimesUpTo(DexVm.Version.V7_0_0));
   // TODO(herhut): Change to V8_0_0 once we have a new art VM.
@@ -791,6 +806,24 @@ public abstract class R8RunArtTestsTest {
           .put("138-duplicate-classes-check", TestCondition.any())
           // Array index out of bounds exception.
           .put("150-loadlibrary", TestCondition.any())
+          // Fails due to non-matching Exception messages.
+          .put(
+              "201-built-in-except-detail-messages",
+              TestCondition.or(
+                  TestCondition.match(
+                      TestCondition.compilers(
+                          CompilerUnderTest.D8, CompilerUnderTest.D8_AFTER_R8CF),
+                      TestCondition.runtimes(
+                          DexVm.Version.V4_0_4,
+                          DexVm.Version.V4_4_4,
+                          DexVm.Version.V5_1_1,
+                          DexVm.Version.V6_0_1,
+                          DexVm.Version.V7_0_0)),
+                  TestCondition.match(
+                      TestCondition.compilers(
+                          CompilerUnderTest.R8,
+                          CompilerUnderTest.R8CF,
+                          CompilerUnderTest.R8_AFTER_D8))))
           // Uses dex file version 37 and therefore only runs on Android N and above.
           .put(
               "370-dex-v37",
@@ -912,6 +945,32 @@ public abstract class R8RunArtTestsTest {
                           CompilerUnderTest.D8_AFTER_R8CF),
                       TestCondition.runtimes(DexVm.Version.V4_0_4, DexVm.Version.V4_4_4))))
           .put("979-const-method-handle", beforeAndroidP)
+          // Missing class junit.framework.Assert (see JunitAvailabilityInHostArtTest).
+          // TODO(120884788): Add this again.
+          /*
+          .put(
+              "021-string2",
+              TestCondition.or(
+                  TestCondition.match(
+                      TestCondition.compilers(CompilerUnderTest.D8_AFTER_R8CF),
+                      TestCondition.runtimesFrom(DexVm.Version.V7_0_0)),
+                  TestCondition.match(
+                      TestCondition.compilers(CompilerUnderTest.D8_AFTER_R8CF),
+                      TestCondition.runtimes(DexVm.Version.V4_0_4, DexVm.Version.V4_4_4))))
+          */
+          // Missing class junit.framework.Assert (see JunitAvailabilityInHostArtTest).
+          // TODO(120884788): Add this again.
+          /*
+          .put(
+              "082-inline-execute",
+              TestCondition.or(
+                  TestCondition.match(
+                      TestCondition.compilers(CompilerUnderTest.D8_AFTER_R8CF),
+                      TestCondition.runtimesFrom(DexVm.Version.V7_0_0)),
+                  TestCondition.match(
+                      TestCondition.compilers(CompilerUnderTest.D8_AFTER_R8CF),
+                      TestCondition.runtimes(DexVm.Version.V4_0_4, DexVm.Version.V4_4_4))))
+          */
           .build();
 
   // Tests where code generation fails.
@@ -923,19 +982,17 @@ public abstract class R8RunArtTestsTest {
           // also contains an iput on a static field.
           .put("600-verifier-fails", TestCondition.match(TestCondition.R8DEX_COMPILER))
           // Contains a method that falls off the end without a return.
-          .put("606-erroneous-class", TestCondition.match(
-              TestCondition.tools(DexTool.DX),
-              TestCondition.R8_NOT_AFTER_D8_COMPILER,
-              LEGACY_RUNTIME))
+          .put(
+              "606-erroneous-class",
+              TestCondition.match(
+                  TestCondition.tools(DexTool.DX),
+                  TestCondition.R8_NOT_AFTER_D8_COMPILER,
+                  LEGACY_RUNTIME))
           // Dex input contains an illegal InvokeSuper in Z.foo() to Y.foo()
           // that R8 will fail to compile.
-          .put("594-invoke-super", TestCondition.match(TestCondition.R8DEX_COMPILER))
           .put("974-verify-interface-super", TestCondition.match(TestCondition.R8DEX_COMPILER))
           // R8 generates too large code in Goto.bigGoto(). b/74327727
           .put("003-omnibus-opcodes", TestCondition.match(TestCondition.D8_AFTER_R8CF_COMPILER))
-          // Contains a subset of JUnit which collides with library definitions of JUnit.
-          .put("021-string2", TestCondition.match(TestCondition.D8_AFTER_R8CF_COMPILER))
-          .put("082-inline-execute", TestCondition.match(TestCondition.D8_AFTER_R8CF_COMPILER))
           .build();
 
   // Tests that are invalid dex files and on which R8/D8 fails and that is OK.
@@ -1065,13 +1122,20 @@ public abstract class R8RunArtTestsTest {
           // When running R8 on dex input (D8, DX) this test non-deterministically fails
           // with a compiler exception, due to invoke-virtual on an interface, or it completes but
           // the output when run on Art is not as expected. b/65233869
-          .put("162-method-resolution",
+          .put(
+              "162-method-resolution",
               TestCondition.match(
-                  TestCondition.tools(DexTool.DX, DexTool.NONE),
-                  TestCondition.R8_COMPILER))
+                  TestCondition.tools(DexTool.DX, DexTool.NONE), TestCondition.R8_COMPILER))
           // Produces wrong output when compiled in release mode, which we cannot express.
-          .put("015-switch",
-              TestCondition.match(TestCondition.runtimes(DexVm.Version.V4_0_4)))
+          .put("015-switch", TestCondition.match(TestCondition.runtimes(DexVm.Version.V4_0_4)))
+          // To prevent "Dex file with version '37' cannot be used with min sdk level '21'", which
+          // would otherwise happen because D8 passes through the DEX code from DX.
+          .put(
+              "800-smali",
+              TestCondition.match(
+                  TestCondition.tools(DexTool.DX),
+                  TestCondition.D8_COMPILER,
+                  TestCondition.runtimesFrom(DexVm.Version.V5_1_1)))
           .build();
 
   public static List<String> requireInliningToBeDisabled =
@@ -1109,13 +1173,6 @@ public abstract class R8RunArtTestsTest {
       "435-new-instance"
   );
 
-  private static List<String> requireUninstantiatedTypeOptimizationToBeDisabled = ImmutableList.of(
-      // This test inspects the message of the exception that is thrown when calling a virtual
-      // method with a null-receiver. This message changes when the invocation is rewritten to
-      // "throw null".
-      "201-built-in-except-detail-messages"
-  );
-
   private static List<String> hasMissingClasses = ImmutableList.of(
       "091-override-package-private-method",
       "003-omnibus-opcodes",
@@ -1128,7 +1185,15 @@ public abstract class R8RunArtTestsTest {
       "958-methodhandle-stackframe"
   );
 
-  private static Map<String, List<String>> keepRules = ImmutableMap.of();
+  private static Map<String, List<String>> keepRules =
+      ImmutableMap.of(
+          "021-string2", ImmutableList.of("-dontwarn junit.framework.**"),
+          "082-inline-execute", ImmutableList.of("-dontwarn junit.framework.**"));
+
+  private static Map<String, Consumer<InternalOptions>> configurations =
+      ImmutableMap.of(
+          // Has a new-instance instruction that attempts to instantiate an interface.
+          "435-new-instance", options -> options.testing.allowTypeErrors = true);
 
   private static List<String> failuresToTriage = ImmutableList.of(
       // Dex file input into a jar file, not yet supported by the test framework.
@@ -1210,14 +1275,13 @@ public abstract class R8RunArtTestsTest {
     private final boolean disableInlining;
     // Whether to disable class inlining
     private final boolean disableClassInlining;
-    // Whether to disable the uninitialized type optimization.
-    private final boolean disableUninstantiatedTypeOptimization;
     // Has missing classes.
     private final boolean hasMissingClasses;
     // Explicitly disable desugaring.
     private final boolean disableDesugaring;
     // Extra keep rules to use when running with R8.
     private final List<String> keepRules;
+    private final Consumer<InternalOptions> configuration;
 
     TestSpecification(
         String name,
@@ -1234,10 +1298,10 @@ public abstract class R8RunArtTestsTest {
         boolean outputMayDiffer,
         boolean disableInlining,
         boolean disableClassInlining,
-        boolean disableUninstantiatedTypeOptimization,
         boolean hasMissingClasses,
         boolean disableDesugaring,
-        List<String> keepRules) {
+        List<String> keepRules,
+        Consumer<InternalOptions> configuration) {
       this.name = name;
       this.dexTool = dexTool;
       this.nativeLibrary = nativeLibrary;
@@ -1252,10 +1316,10 @@ public abstract class R8RunArtTestsTest {
       this.outputMayDiffer = outputMayDiffer;
       this.disableInlining = disableInlining;
       this.disableClassInlining = disableClassInlining;
-      this.disableUninstantiatedTypeOptimization = disableUninstantiatedTypeOptimization;
       this.hasMissingClasses = hasMissingClasses;
       this.disableDesugaring = disableDesugaring;
       this.keepRules = keepRules;
+      this.configuration = configuration;
     }
 
     TestSpecification(
@@ -1282,9 +1346,9 @@ public abstract class R8RunArtTestsTest {
           disableInlining,
           true, // Disable class inlining for JCTF tests.
           false,
-          false,
           true, // Disable desugaring for JCTF tests.
-          ImmutableList.of());
+          ImmutableList.of(),
+          null);
     }
 
     TestSpecification(
@@ -1310,9 +1374,9 @@ public abstract class R8RunArtTestsTest {
           disableInlining,
           true, // Disable class inlining for JCTF tests.
           false,
-          false,
           true, // Disable desugaring for JCTF tests.
-          ImmutableList.of());
+          ImmutableList.of(),
+          null);
     }
 
     public File resolveFile(String name) {
@@ -1474,10 +1538,10 @@ public abstract class R8RunArtTestsTest {
                 outputMayDiffer.contains(name),
                 requireInliningToBeDisabled.contains(name),
                 requireClassInliningToBeDisabled.contains(name),
-                requireUninstantiatedTypeOptimizationToBeDisabled.contains(name),
                 hasMissingClasses.contains(name),
                 false,
-                keepRules.getOrDefault(name, ImmutableList.of())));
+                keepRules.getOrDefault(name, ImmutableList.of()),
+                configurations.get(name)));
       }
     }
     return data;
@@ -1540,21 +1604,37 @@ public abstract class R8RunArtTestsTest {
     runArtTest(ToolHelper.getDexVm(), compilerUnderTest);
   }
 
-  private static class CompilationOptions {
+  private static class CompilationOptions implements Consumer<InternalOptions> {
+
     private final boolean disableInlining;
     private final boolean disableClassInlining;
-    private final boolean disableUninstantiatedTypeOptimization;
     private final boolean hasMissingClasses;
     private final boolean disableDesugaring;
     private final List<String> keepRules;
+    private final Consumer<InternalOptions> configuration;
 
     private CompilationOptions(TestSpecification spec) {
       this.disableInlining = spec.disableInlining;
       this.disableClassInlining = spec.disableClassInlining;
-      this.disableUninstantiatedTypeOptimization = spec.disableUninstantiatedTypeOptimization;
       this.hasMissingClasses = spec.hasMissingClasses;
       this.disableDesugaring = spec.disableDesugaring;
       this.keepRules = spec.keepRules;
+      this.configuration = spec.configuration;
+    }
+
+    @Override
+    public void accept(InternalOptions options) {
+      if (disableInlining) {
+        options.enableInlining = false;
+      }
+      if (disableClassInlining) {
+        options.enableClassInlining = false;
+      }
+      // Some tests actually rely on missing classes for what they test.
+      options.ignoreMissingClasses = hasMissingClasses;
+      if (configuration != null) {
+        configuration.accept(options);
+      }
     }
 
     @Override
@@ -1568,7 +1648,6 @@ public abstract class R8RunArtTestsTest {
       CompilationOptions options = (CompilationOptions) o;
       return disableInlining == options.disableInlining
           && disableClassInlining == options.disableClassInlining
-          && disableUninstantiatedTypeOptimization == options.disableUninstantiatedTypeOptimization
           && hasMissingClasses == options.hasMissingClasses;
     }
 
@@ -1577,7 +1656,6 @@ public abstract class R8RunArtTestsTest {
       return Objects.hash(
           disableInlining,
           disableClassInlining,
-          disableUninstantiatedTypeOptimization,
           hasMissingClasses);
     }
   }
@@ -1660,8 +1738,8 @@ public abstract class R8RunArtTestsTest {
                   .setMode(mode)
                   .setDisableTreeShaking(true)
                   .setDisableMinification(true)
-                  .addProguardConfiguration(
-                      ImmutableList.of("-keepattributes *"), Origin.unknown())
+                  .addProguardConfiguration(ImmutableList.of("-keepattributes *"), Origin.unknown())
+                  .addProguardConfiguration(compilationOptions.keepRules, Origin.unknown())
                   .setProgramConsumer(
                       new ClassFileConsumer() {
 
@@ -1751,20 +1829,10 @@ public abstract class R8RunArtTestsTest {
           ToolHelper.runR8(
               builder.build(),
               options -> {
-                if (compilationOptions.disableInlining) {
-                  options.enableInlining = false;
-                }
-                if (compilationOptions.disableClassInlining) {
-                  options.enableClassInlining = false;
-                }
-                if (compilationOptions.disableUninstantiatedTypeOptimization) {
-                  options.enableUninstantiatedTypeOptimization = false;
-                }
+                compilationOptions.accept(options);
                 // Make sure we don't depend on this settings.
-                options.classInliningInstructionLimit = 10000;
+                options.classInliningInstructionAllowance = 10000;
                 options.lineNumberOptimization = LineNumberOptimization.OFF;
-                // Some tests actually rely on missing classes for what they test.
-                options.ignoreMissingClasses = compilationOptions.hasMissingClasses;
               });
           break;
         }
@@ -1917,11 +1985,15 @@ public abstract class R8RunArtTestsTest {
     VmErrors vmErrors = new VmErrors();
     List<TestRuntime> vms = new ArrayList<>();
     if (compilerUnderTest == CompilerUnderTest.R8CF) {
-      for (CfVm vm : TestParametersBuilder.getAvailableCfVms()) {
-        vms.add(new TestRuntime.CfRuntime(vm));
-      }
+      // TODO(b/135411839): Run on all java runtimes.
+      vms.add(TestRuntime.getDefaultJavaRuntime());
     } else {
       for (DexVm vm : TestParametersBuilder.getAvailableDexVms()) {
+        // TODO(144966342): Disabled for triaging failures
+        if (vm.getVersion() == DexVm.Version.V10_0_0) {
+          System.out.println("Running on 10.0.0 is disabled, see b/144966342");
+          continue;
+        }
         vms.add(new DexRuntime(vm));
       }
     }
@@ -2100,7 +2172,9 @@ public abstract class R8RunArtTestsTest {
       try {
         runJctfTestDoRunOnArt(fileNames, specification, fullClassName, vmSpec.vm.asDex().getVm());
       } catch (AssertionError e) {
-        vmErrors.addFailedOnRunError(CompilerUnderTest.R8, vmSpec.vm, e);
+        if (!specification.failsOnRun) {
+          vmErrors.addFailedOnRunError(CompilerUnderTest.R8, vmSpec.vm, e);
+        }
       }
     }
     return vmErrors;

@@ -8,11 +8,12 @@ import static org.junit.Assert.assertEquals;
 import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexApplication;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.ConstNumber;
 import com.android.tools.r8.ir.code.Div;
 import com.android.tools.r8.ir.code.IRCode;
+import com.android.tools.r8.ir.code.IRMetadata;
 import com.android.tools.r8.ir.code.Instruction;
 import com.android.tools.r8.ir.code.Move;
 import com.android.tools.r8.ir.code.NumericType;
@@ -30,7 +31,7 @@ import org.junit.Test;
 public class ConstantRemovalTest {
 
   private static class MockLinearScanRegisterAllocator extends LinearScanRegisterAllocator {
-    public MockLinearScanRegisterAllocator(AppView<? extends AppInfo> appView, IRCode code) {
+    MockLinearScanRegisterAllocator(AppView<?> appView, IRCode code) {
       super(appView, code);
     }
 
@@ -41,7 +42,7 @@ public class ConstantRemovalTest {
   }
 
   private static class MockLiveIntervals extends LiveIntervals {
-    public MockLiveIntervals(Value value) {
+    MockLiveIntervals(Value value) {
       super(value);
     }
 
@@ -71,58 +72,60 @@ public class ConstantRemovalTest {
     // is needed and the value 10 is *not* still in register 0 at that point.
     BasicBlock block = new BasicBlock();
     block.setNumber(0);
+
+    IRMetadata metadata = IRMetadata.unknown();
     Position position = Position.testingPosition();
 
-    Value v3 = new Value(3, TypeLatticeElement.LONG, null);
+    Value v3 = new Value(3, TypeElement.getLong(), null);
     v3.setNeedsRegister(true);
     new MockLiveIntervals(v3);
     Instruction instruction = new ConstNumber(v3, 0);
     instruction.setPosition(position);
-    block.add(instruction);
+    block.add(instruction, metadata);
 
-    Value v0 = new Value(0, TypeLatticeElement.LONG, null);
+    Value v0 = new Value(0, TypeElement.getLong(), null);
     v0.setNeedsRegister(true);
     new MockLiveIntervals(v0);
     instruction = new ConstNumber(v0, 10);
     instruction.setPosition(position);
-    block.add(instruction);
+    block.add(instruction, metadata);
 
     instruction = new Div(NumericType.LONG, v3, v3, v0);
     instruction.setPosition(position);
-    block.add(instruction);
+    block.add(instruction, metadata);
 
-    Value v2 = new Value(2, TypeLatticeElement.INT, null);
+    Value v2 = new Value(2, TypeElement.getInt(), null);
     v2.setNeedsRegister(true);
     new MockLiveIntervals(v2);
     instruction = new ConstNumber(v2, 10);
     instruction.setPosition(position);
-    block.add(instruction);
+    block.add(instruction, metadata);
 
-    Value v1 = new Value(1, TypeLatticeElement.INT, null);
+    Value v1 = new Value(1, TypeElement.getInt(), null);
     v1.setNeedsRegister(true);
     new MockLiveIntervals(v1);
     instruction = new Move(v1 ,v2);
     instruction.setPosition(position);
-    block.add(instruction);
+    block.add(instruction, metadata);
 
     instruction = new Div(NumericType.INT, v1, v1, v1);
     instruction.setPosition(position);
-    block.add(instruction);
+    block.add(instruction, metadata);
 
-    Value v0_2 = new Value(0, TypeLatticeElement.LONG, null);
+    Value v0_2 = new Value(0, TypeElement.getLong(), null);
     v0_2.setNeedsRegister(true);
     new MockLiveIntervals(v0_2);
     instruction = new ConstNumber(v0_2, 10);
     instruction.setPosition(position);
-    block.add(instruction);
+    block.add(instruction, metadata);
 
     instruction = new Div(NumericType.LONG, v3, v3, v0_2);
     instruction.setPosition(position);
-    block.add(instruction);
+    block.add(instruction, metadata);
 
     Instruction ret = new Return();
     ret.setPosition(position);
-    block.add(ret);
+    block.add(ret, metadata);
     block.setFilledForTesting();
 
     LinkedList<BasicBlock> blocks = new LinkedList<>();
@@ -130,17 +133,15 @@ public class ConstantRemovalTest {
 
     InternalOptions options = new InternalOptions();
     options.debug = true;
-    AppInfo appInfo = new AppInfo(DexApplication.builder(options.itemFactory, null).build());
-    AppView<? extends AppInfo> appView = AppView.createForD8(appInfo, options);
+    AppInfo appInfo = new AppInfo(DexApplication.builder(options, null).build());
+    AppView<?> appView = AppView.createForD8(appInfo);
     IRCode code =
         new IRCode(
             options,
             null,
             blocks,
             new ValueNumberGenerator(),
-            false,
-            false,
-            false,
+            IRMetadata.unknown(),
             Origin.unknown());
     PeepholeOptimizer.optimize(code, new MockLinearScanRegisterAllocator(appView, code));
 

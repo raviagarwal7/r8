@@ -3,13 +3,17 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
+import static com.android.tools.r8.utils.ExceptionUtils.unwrapExecutionException;
+
 import com.android.tools.r8.dex.ApplicationReader;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
 import com.android.tools.r8.graph.AppServices;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexApplication;
+import com.android.tools.r8.graph.DirectMappedDexApplication;
+import com.android.tools.r8.graph.SubtypingInfo;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.shaking.Enqueuer;
+import com.android.tools.r8.shaking.EnqueuerFactory;
 import com.android.tools.r8.shaking.RootSetBuilder;
 import com.android.tools.r8.shaking.RootSetBuilder.RootSet;
 import com.android.tools.r8.utils.ExceptionUtils;
@@ -81,22 +85,23 @@ public class PrintSeeds {
     assert !options.forceProguardCompatibility;
     Timing timing = new Timing("PrintSeeds");
     try {
-      DexApplication application =
+      DirectMappedDexApplication application =
           new ApplicationReader(command.getInputApp(), options, timing).read(executor).toDirect();
-      AppView<? extends AppInfoWithSubtyping> appView =
-          AppView.createForR8(new AppInfoWithSubtyping(application), options);
+      AppView<? extends AppInfoWithClassHierarchy> appView =
+          AppView.createForR8(new AppInfoWithClassHierarchy(application));
       appView.setAppServices(AppServices.builder(appView).build());
+      SubtypingInfo subtypingInfo = new SubtypingInfo(application.allClasses(), application);
       RootSet rootSet =
-          new RootSetBuilder(appView, application, options.getProguardConfiguration().getRules())
+          new RootSetBuilder(appView, subtypingInfo, options.getProguardConfiguration().getRules())
               .run(executor);
-      Enqueuer enqueuer = new Enqueuer(appView, options, null);
+      Enqueuer enqueuer = EnqueuerFactory.createForInitialTreeShaking(appView, subtypingInfo);
       AppInfoWithLiveness appInfo =
           enqueuer.traceApplication(
               rootSet, options.getProguardConfiguration().getDontWarnPatterns(), executor, timing);
       RootSetBuilder.writeSeeds(
           appInfo, System.out, type -> descriptors.contains(type.toDescriptorString()));
     } catch (ExecutionException e) {
-      throw R8.unwrapExecutionException(e);
+      throw unwrapExecutionException(e);
     }
   }
 }

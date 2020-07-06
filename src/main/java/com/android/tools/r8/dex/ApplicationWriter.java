@@ -16,7 +16,8 @@ import com.android.tools.r8.ProgramConsumer;
 import com.android.tools.r8.ResourceException;
 import com.android.tools.r8.dex.FileWriter.ByteBufferResult;
 import com.android.tools.r8.errors.CompilationError;
-import com.android.tools.r8.graph.AppInfo;
+import com.android.tools.r8.features.FeatureSplitConfiguration.DataResourceProvidersAndConsumer;
+import com.android.tools.r8.graph.AppServices;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexAnnotationDirectory;
@@ -33,18 +34,24 @@ import com.android.tools.r8.graph.DexTypeList;
 import com.android.tools.r8.graph.DexValue;
 import com.android.tools.r8.graph.EnclosingMethodAttribute;
 import com.android.tools.r8.graph.GraphLense;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.InnerClassAttribute;
 import com.android.tools.r8.graph.ObjectToOffsetMapping;
 import com.android.tools.r8.graph.ParameterAnnotationsList;
-import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.naming.ProguardMapSupplier;
+import com.android.tools.r8.naming.ProguardMapSupplier.ProguardMapId;
+import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.DescriptorUtils;
 import com.android.tools.r8.utils.ExceptionUtils;
 import com.android.tools.r8.utils.InternalOptions;
 import com.android.tools.r8.utils.StringDiagnostic;
+import com.android.tools.r8.utils.StringUtils;
 import com.android.tools.r8.utils.ThreadUtils;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ObjectArrays;
+import it.unimi.dsi.fastutil.objects.Reference2LongMap;
+import it.unimi.dsi.fastutil.objects.Reference2LongOpenHashMap;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -56,27 +63,35 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.stream.Collectors;
 
 public class ApplicationWriter {
 
   public final DexApplication application;
-  public final AppView<? extends AppInfo> appView;
-  public final String deadCode;
+  public final AppView<?> appView;
   public final GraphLense graphLense;
+  public final InitClassLens initClassLens;
   public final NamingLens namingLens;
-  public final String proguardSeedsData;
   public final InternalOptions options;
+  private final CodeToKeep desugaredLibraryCodeToKeep;
   public List<Marker> markers;
   public List<DexString> markerStrings;
+
   public DexIndexedConsumer programConsumer;
   public final ProguardMapSupplier proguardMapSupplier;
 
   private static class SortAnnotations extends MixedSectionCollection {
 
+    private final NamingLens namingLens;
+
+    public SortAnnotations(NamingLens namingLens) {
+      this.namingLens = namingLens;
+    }
+
     @Override
     public boolean add(DexAnnotationSet dexAnnotationSet) {
       // Annotation sets are sorted by annotation types.
-      dexAnnotationSet.sort();
+      dexAnnotationSet.sort(namingLens);
       return true;
     }
 
@@ -130,36 +145,33 @@ public class ApplicationWriter {
 
   public ApplicationWriter(
       DexApplication application,
-      AppView<? extends AppInfo> appView,
+      AppView<?> appView,
       InternalOptions options,
       List<Marker> markers,
-      String deadCode,
       GraphLense graphLense,
+      InitClassLens initClassLens,
       NamingLens namingLens,
-      String proguardSeedsData,
       ProguardMapSupplier proguardMapSupplier) {
     this(
         application,
         appView,
         options,
         markers,
-        deadCode,
         graphLense,
+        initClassLens,
         namingLens,
-        proguardSeedsData,
         proguardMapSupplier,
         null);
   }
 
   public ApplicationWriter(
       DexApplication application,
-      AppView<? extends AppInfo> appView,
+      AppView<?> appView,
       InternalOptions options,
       List<Marker> markers,
-      String deadCode,
       GraphLense graphLense,
+      InitClassLens initClassLens,
       NamingLens namingLens,
-      String proguardSeedsData,
       ProguardMapSupplier proguardMapSupplier,
       DexIndexedConsumer consumer) {
     assert application != null;
@@ -167,16 +179,16 @@ public class ApplicationWriter {
     this.appView = appView;
     assert options != null;
     this.options = options;
+    this.desugaredLibraryCodeToKeep = CodeToKeep.createCodeToKeep(options, namingLens);
     this.markers = markers;
-    this.deadCode = deadCode;
     this.graphLense = graphLense;
+    this.initClassLens = initClassLens;
     this.namingLens = namingLens;
-    this.proguardSeedsData = proguardSeedsData;
     this.proguardMapSupplier = proguardMapSupplier;
     this.programConsumer = consumer;
   }
 
-  private Iterable<VirtualFile> distribute(ExecutorService executorService)
+  private List<VirtualFile> distribute(ExecutorService executorService)
       throws ExecutionException, IOException {
     // Distribute classes into dex files.
     VirtualFile.Distributor distributor;
@@ -191,23 +203,44 @@ public class ApplicationWriter {
     } else {
       distributor = new VirtualFile.FillFilesDistributor(this, options, executorService);
     }
-
     return distributor.run();
+  }
+
+  /**
+   * For each class within a virtual file, this function insert a string that contains the
+   * checksum information about that class.
+   *
+   * This needs to be done after distribute but before dex string sorting.
+   */
+  private void encodeChecksums(Iterable<VirtualFile> files) {
+    List<DexProgramClass> classes = application.classes();
+    Reference2LongMap<DexString> inputChecksums = new Reference2LongOpenHashMap<>(classes.size());
+    for (DexProgramClass clazz : classes) {
+      inputChecksums.put(clazz.getType().descriptor, clazz.getChecksum());
+    }
+    for (VirtualFile file : files) {
+      ClassesChecksum toWrite = new ClassesChecksum();
+      for (DexProgramClass clazz : file.classes()) {
+        DexString desc = clazz.type.descriptor;
+        toWrite.addChecksum(desc.toString(), inputChecksums.getLong(desc));
+      }
+      file.injectString(application.dexItemFactory.createString(toWrite.toJsonString()));
+    }
   }
 
   public void write(ExecutorService executorService) throws IOException, ExecutionException {
     application.timing.begin("DexApplication.write");
-    ProguardMapSupplier.ProguardMapAndId proguardMapAndId = null;
+    ProguardMapId proguardMapId = null;
     if (proguardMapSupplier != null && options.proguardMapConsumer != null) {
-      proguardMapAndId = proguardMapSupplier.getProguardMapAndId();
+      proguardMapId = proguardMapSupplier.writeProguardMap();
     }
 
-    // If we do have a map then we're called from R8. In that case we have exactly one marker.
-    assert proguardMapAndId == null || (markers != null && markers.size() == 1);
+    // If we do have a map then we're called from R8. In that case we have at least one marker.
+    assert proguardMapId == null || (markers != null && markers.size() >= 1);
 
     if (markers != null && !markers.isEmpty()) {
-      if (proguardMapAndId != null) {
-        markers.get(0).setPgMapId(proguardMapAndId.id);
+      if (proguardMapId != null) {
+        markers.get(0).setPgMapId(proguardMapId.get());
       }
       markerStrings = new ArrayList<>(markers.size());
       for (Marker marker : markers) {
@@ -215,19 +248,28 @@ public class ApplicationWriter {
       }
     }
     try {
+      // TODO(b/151313715): Move this to the writer threads.
       insertAttributeAnnotations();
-
-      application.dexItemFactory.sort(namingLens);
-      assert markers == null
-          || markers.isEmpty()
-          || application.dexItemFactory.extractMarker() != null;
-
-      SortAnnotations sortAnnotations = new SortAnnotations();
-      application.classes().forEach((clazz) -> clazz.addDependencies(sortAnnotations));
 
       // Generate the dex file contents.
       List<Future<Boolean>> dexDataFutures = new ArrayList<>();
-      Iterable<VirtualFile> virtualFiles = distribute(executorService);
+      List<VirtualFile> virtualFiles = distribute(executorService);
+      if (options.encodeChecksums) {
+        encodeChecksums(virtualFiles);
+      }
+      assert markers == null
+          || markers.isEmpty()
+          || application.dexItemFactory.extractMarkers() != null;
+      assert appView == null
+          || appView.withProtoShrinker(
+              shrinker ->
+                  virtualFiles.stream().allMatch(shrinker::verifyDeadProtoTypesNotReferenced),
+              true);
+
+      // TODO(b/151313617): Sorting annotations mutates elements so run single threaded on main.
+      SortAnnotations sortAnnotations = new SortAnnotations(namingLens);
+      application.classes().forEach((clazz) -> clazz.addDependencies(sortAnnotations));
+
       for (VirtualFile virtualFile : virtualFiles) {
         if (virtualFile.isEmpty()) {
           continue;
@@ -244,10 +286,19 @@ public class ApplicationWriter {
                     consumer = options.getDexFilePerClassFileConsumer();
                     byteBufferProvider = options.getDexFilePerClassFileConsumer();
                   } else {
-                    consumer = options.getDexIndexedConsumer();
-                    byteBufferProvider = options.getDexIndexedConsumer();
+                    if (virtualFile.getFeatureSplit() != null) {
+                      ProgramConsumer featureConsumer =
+                          virtualFile.getFeatureSplit().getProgramConsumer();
+                      assert featureConsumer instanceof DexIndexedConsumer;
+                      consumer = featureConsumer;
+                      byteBufferProvider = (DexIndexedConsumer) featureConsumer;
+                    } else {
+                      consumer = options.getDexIndexedConsumer();
+                      byteBufferProvider = options.getDexIndexedConsumer();
+                    }
                   }
-                  ObjectToOffsetMapping objectMapping = virtualFile.computeMapping(application);
+                  ObjectToOffsetMapping objectMapping =
+                      virtualFile.computeMapping(application, namingLens, initClassLens);
                   MethodToCodeObjectMapping codeMapping =
                       rewriteCodeWithJumboStrings(
                           objectMapping, virtualFile.classes(), application);
@@ -279,18 +330,15 @@ public class ApplicationWriter {
       }
       // Wait for all files to be processed before moving on.
       ThreadUtils.awaitFutures(dexDataFutures);
+      // A consumer can manage the generated keep rules.
+      if (options.desugaredLibraryKeepRuleConsumer != null && !desugaredLibraryCodeToKeep.isNop()) {
+        assert !options.isDesugaredLibraryCompilation();
+        desugaredLibraryCodeToKeep.generateKeepRules(options);
+      }
       // Fail if there are pending errors, e.g., the program consumers may have reported errors.
       options.reporter.failIfPendingErrors();
       // Supply info to all additional resource consumers.
-      supplyAdditionalConsumers(
-          application,
-          appView,
-          graphLense,
-          namingLens,
-          options,
-          deadCode,
-          proguardMapAndId == null ? null : proguardMapAndId.map,
-          proguardSeedsData);
+      supplyAdditionalConsumers(application, appView, graphLense, namingLens, options);
     } finally {
       application.timing.end();
     }
@@ -298,92 +346,116 @@ public class ApplicationWriter {
 
   public static void supplyAdditionalConsumers(
       DexApplication application,
-      AppView<? extends AppInfo> appView,
+      AppView<?> appView,
       GraphLense graphLense,
       NamingLens namingLens,
-      InternalOptions options,
-      String deadCode,
-      String proguardMapContent,
-      String proguardSeedsData) {
+      InternalOptions options) {
     if (options.configurationConsumer != null) {
       ExceptionUtils.withConsumeResourceHandler(
           options.reporter, options.configurationConsumer,
           options.getProguardConfiguration().getParsedConfiguration());
-    }
-    if (options.usageInformationConsumer != null && deadCode != null) {
-      ExceptionUtils.withConsumeResourceHandler(
-          options.reporter, options.usageInformationConsumer, deadCode);
-    }
-    if (proguardMapContent != null) {
-      assert validateProguardMapParses(proguardMapContent);
-      ExceptionUtils.withConsumeResourceHandler(
-          options.reporter, options.proguardMapConsumer, proguardMapContent);
-    }
-
-    if (options.proguardSeedsConsumer != null && proguardSeedsData != null) {
-      ExceptionUtils.withConsumeResourceHandler(
-          options.reporter, options.proguardSeedsConsumer, proguardSeedsData);
+      ExceptionUtils.withFinishedResourceHandler(options.reporter, options.configurationConsumer);
     }
     if (options.mainDexListConsumer != null) {
       ExceptionUtils.withConsumeResourceHandler(
           options.reporter, options.mainDexListConsumer, writeMainDexList(application, namingLens));
+      ExceptionUtils.withFinishedResourceHandler(options.reporter, options.mainDexListConsumer);
     }
+
     DataResourceConsumer dataResourceConsumer = options.dataResourceConsumer;
     if (dataResourceConsumer != null) {
+      ImmutableList<DataResourceProvider> dataResourceProviders = application.dataResourceProviders;
       ResourceAdapter resourceAdapter =
           new ResourceAdapter(appView, application.dexItemFactory, graphLense, namingLens, options);
-      Set<String> generatedResourceNames = new HashSet<>();
 
-      for (DataResourceProvider dataResourceProvider : application.dataResourceProviders) {
-        try {
-          dataResourceProvider.accept(
-              new Visitor() {
-                @Override
-                public void visit(DataDirectoryResource directory) {
-                  DataDirectoryResource adapted = resourceAdapter.adaptIfNeeded(directory);
-                  if (adapted != null) {
-                    dataResourceConsumer.accept(adapted, options.reporter);
-                    options.reporter.failIfPendingErrors();
-                  }
-                }
+      adaptAndPassDataResources(
+          options, dataResourceConsumer, dataResourceProviders, resourceAdapter);
 
-                @Override
-                public void visit(DataEntryResource file) {
-                  if (resourceAdapter.shouldBeDeleted(file)) {
-                    return;
-                  }
+      // Write the META-INF/services resources. Sort on service names and keep the order from
+      // the input for the implementation lines for deterministic output.
+      if (!appView.appServices().isEmpty()) {
+        appView
+            .appServices()
+            .visit(
+                (DexType service, List<DexType> implementations) -> {
+                  String serviceName =
+                      DescriptorUtils.descriptorToJavaType(
+                          namingLens.lookupDescriptor(service).toString());
+                  dataResourceConsumer.accept(
+                      DataEntryResource.fromBytes(
+                          StringUtils.lines(
+                                  implementations.stream()
+                                      .map(namingLens::lookupDescriptor)
+                                      .map(DexString::toString)
+                                      .map(DescriptorUtils::descriptorToJavaType)
+                                      .collect(Collectors.toList()))
+                              .getBytes(),
+                          AppServices.SERVICE_DIRECTORY_NAME + serviceName,
+                          Origin.unknown()),
+                      options.reporter);
+                });
+      }
+    }
 
-                  DataEntryResource adapted = resourceAdapter.adaptIfNeeded(file);
-                  if (generatedResourceNames.add(adapted.getName())) {
-                    dataResourceConsumer.accept(adapted, options.reporter);
-                  } else {
-                    options.reporter.warning(
-                        new StringDiagnostic("Resource '" + file.getName() + "' already exists."));
-                  }
-                  options.reporter.failIfPendingErrors();
-                }
-              });
-        } catch (ResourceException e) {
-          throw new CompilationError(e.getMessage(), e);
-        }
+    if (options.featureSplitConfiguration != null) {
+      for (DataResourceProvidersAndConsumer entry :
+          options.featureSplitConfiguration.getDataResourceProvidersAndConsumers()) {
+        ResourceAdapter resourceAdapter =
+            new ResourceAdapter(
+                appView, application.dexItemFactory, graphLense, namingLens, options);
+        adaptAndPassDataResources(
+            options, entry.getConsumer(), entry.getProviders(), resourceAdapter);
       }
     }
   }
 
-  private static boolean validateProguardMapParses(String content) {
-    try {
-      ClassNameMapper.mapperFromString(content);
-    } catch (IOException e) {
-      e.printStackTrace();
-      return false;
+  private static void adaptAndPassDataResources(
+      InternalOptions options,
+      DataResourceConsumer dataResourceConsumer,
+      Collection<DataResourceProvider> dataResourceProviders,
+      ResourceAdapter resourceAdapter) {
+    Set<String> generatedResourceNames = new HashSet<>();
+
+    for (DataResourceProvider dataResourceProvider : dataResourceProviders) {
+      try {
+        dataResourceProvider.accept(
+            new Visitor() {
+              @Override
+              public void visit(DataDirectoryResource directory) {
+                DataDirectoryResource adapted = resourceAdapter.adaptIfNeeded(directory);
+                if (adapted != null) {
+                  dataResourceConsumer.accept(adapted, options.reporter);
+                  options.reporter.failIfPendingErrors();
+                }
+              }
+
+              @Override
+              public void visit(DataEntryResource file) {
+                if (resourceAdapter.isService(file)) {
+                  // META-INF/services resources are handled below.
+                  return;
+                }
+
+                DataEntryResource adapted = resourceAdapter.adaptIfNeeded(file);
+                if (generatedResourceNames.add(adapted.getName())) {
+                  dataResourceConsumer.accept(adapted, options.reporter);
+                } else {
+                  options.reporter.warning(
+                      new StringDiagnostic("Resource '" + file.getName() + "' already exists."));
+                }
+                options.reporter.failIfPendingErrors();
+              }
+            });
+      } catch (ResourceException e) {
+        throw new CompilationError(e.getMessage(), e);
+      }
     }
-    return true;
   }
 
   private void insertAttributeAnnotations() {
     // Convert inner-class attributes to DEX annotations
     for (DexProgramClass clazz : application.classes()) {
-      EnclosingMethodAttribute enclosingMethod = clazz.getEnclosingMethod();
+      EnclosingMethodAttribute enclosingMethod = clazz.getEnclosingMethodAttribute();
       List<InnerClassAttribute> innerClasses = clazz.getInnerClasses();
       if (enclosingMethod == null && innerClasses.isEmpty()) {
         continue;
@@ -442,14 +514,14 @@ public class ApplicationWriter {
         // Append the annotations to annotations array of the class.
         DexAnnotation[] copy =
             ObjectArrays.concat(
-                clazz.annotations.annotations,
+                clazz.annotations().annotations,
                 annotations.toArray(DexAnnotation.EMPTY_ARRAY),
                 DexAnnotation.class);
-        clazz.annotations = new DexAnnotationSet(copy);
+        clazz.setAnnotations(new DexAnnotationSet(copy));
       }
 
       // Clear the attribute structures now that they are represented in annotations.
-      clazz.clearEnclosingMethod();
+      clazz.clearEnclosingMethodAttribute();
       clazz.clearInnerClasses();
     }
   }
@@ -506,7 +578,14 @@ public class ApplicationWriter {
       MethodToCodeObjectMapping codeMapping,
       ByteBufferProvider provider) {
     FileWriter fileWriter =
-        new FileWriter(provider, objectMapping, codeMapping, application, options, namingLens);
+        new FileWriter(
+            provider,
+            objectMapping,
+            codeMapping,
+            application,
+            options,
+            namingLens,
+            desugaredLibraryCodeToKeep);
     // Collect the non-fixed sections.
     fileWriter.collect();
     // Generate and write the bytes.

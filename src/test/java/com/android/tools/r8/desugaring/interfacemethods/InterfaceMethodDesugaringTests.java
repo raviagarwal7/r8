@@ -55,9 +55,6 @@ public class InterfaceMethodDesugaringTests extends AsmTestBase {
             com.android.tools.r8.desugaring.interfacemethods.test0.InterfaceWithDefaults.class)));
   }
 
-  // NOTE: this particular test is working on pre-N devices since
-  //       it's fixed by interface default method desugaring.
-  @IgnoreForRangeOfVmVersions(from = Version.V7_0_0, to = Version.DEFAULT)
   @Test
   public void testInvokeSpecialToDefaultMethodFromStatic() throws Exception {
     ensureSameOutput(
@@ -141,7 +138,7 @@ public class InterfaceMethodDesugaringTests extends AsmTestBase {
   }
 
   @Test(expected = CompilationFailedException.class)
-  @IgnoreForRangeOfVmVersions(from = Version.V7_0_0, to = Version.DEFAULT) // No desugaring
+  @IgnoreForRangeOfVmVersions(from = Version.V7_0_0, to = Version.V10_0_0) // No desugaring
   public void testInvokeDefault1() throws Exception {
     ensureSameOutput(
         TestMainDefault1.class.getCanonicalName(),

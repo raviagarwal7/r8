@@ -4,8 +4,8 @@
 
 package com.android.tools.r8;
 
-import com.android.tools.r8.TestBase.Backend;
 import com.android.tools.r8.ToolHelper.ProcessResult;
+import com.android.tools.r8.errors.Unimplemented;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import java.io.IOException;
@@ -20,8 +20,12 @@ public class ExternalR8TestCompileResult
   private final String proguardMap;
 
   protected ExternalR8TestCompileResult(
-      TestState state, Path outputJar, ProcessResult processResult, String proguardMap) {
-    super(state, AndroidApp.builder().addProgramFiles(outputJar).build());
+      TestState state,
+      Path outputJar,
+      ProcessResult processResult,
+      String proguardMap,
+      OutputMode outputMode) {
+    super(state, AndroidApp.builder().addProgramFiles(outputJar).build(), outputMode);
     assert processResult.exitCode == 0;
     this.outputJar = outputJar;
     this.processResult = processResult;
@@ -50,13 +54,18 @@ public class ExternalR8TestCompileResult
   }
 
   @Override
-  public Backend getBackend() {
-    return null;
+  public TestDiagnosticMessages getDiagnosticMessages() {
+    throw new UnsupportedOperationException("No diagnostics messages from external R8");
   }
 
   @Override
-  public TestDiagnosticMessages getDiagnosticMessages() {
-    throw new UnsupportedOperationException("No diagnostics messages from external R8");
+  public String getStdout() {
+    throw new Unimplemented("Unexpected attempt to access stdout from external R8");
+  }
+
+  @Override
+  public String getStderr() {
+    throw new Unimplemented("Unexpected attempt to access stderr from external R8");
   }
 
   @Override
@@ -65,7 +74,7 @@ public class ExternalR8TestCompileResult
   }
 
   @Override
-  protected ExternalR8TestRunResult createRunResult(ProcessResult result) {
-    return new ExternalR8TestRunResult(app, outputJar, proguardMap, result);
+  protected ExternalR8TestRunResult createRunResult(TestRuntime runtime, ProcessResult result) {
+    return new ExternalR8TestRunResult(app, outputJar, proguardMap, runtime, result);
   }
 }

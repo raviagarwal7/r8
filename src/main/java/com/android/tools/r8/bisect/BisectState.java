@@ -15,13 +15,12 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.hash.Hashing;
 import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
+import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -146,14 +145,14 @@ public class BisectState {
   private final DexApplication badApp;
   private final List<DexProgramClass> sortedGoodClasses;
   private final Map<DexType, Integer> indexMap;
-  private final File stateFile;
+  private final Path stateFile;
 
   private List<Run> runs = new ArrayList<>();
 
   // Computed data
   private Range nextRange = null;
 
-  public BisectState(DexApplication goodApp, DexApplication badApp, File stateFile) {
+  public BisectState(DexApplication goodApp, DexApplication badApp, Path stateFile) {
     this.badApp = badApp;
     this.stateFile = stateFile;
     signature = makeSignature(goodApp);
@@ -173,8 +172,12 @@ public class BisectState {
     if (stateFile == null) {
       return;
     }
+    if (!Files.exists(stateFile)) {
+      System.out.println("Assuming initial run for non-existent state file: " + stateFile);
+      return;
+    }
     List<String> data = new ArrayList<>();
-    try (BufferedReader reader = new BufferedReader(new FileReader(stateFile))) {
+    try (BufferedReader reader = Files.newBufferedReader(stateFile)) {
       if (!signature.equals(readSignature(reader))) {
         throw new CompilationError(
             "Bisection state file does not match the reference build signature");
@@ -305,7 +308,7 @@ public class BisectState {
     if (stateFile == null) {
       return;
     }
-    try (FileWriter writer = new FileWriter(stateFile, false)) {
+    try (BufferedWriter writer = Files.newBufferedWriter(stateFile)) {
       writer.write(signature);
       writer.write("\n");
       for (Run run : runs) {
@@ -320,9 +323,7 @@ public class BisectState {
 
   private static List<DexProgramClass> getSortedClasses(DexApplication app) {
     List<DexProgramClass> classes = new ArrayList<>(app.classes());
-    app.dexItemFactory.sort(NamingLens.getIdentityLens());
-    classes.sort(Comparator.comparing(DexProgramClass::getType));
-    app.dexItemFactory.resetSortedIndices();
+    classes.sort((a, b) -> a.type.slowCompareTo(b.type, NamingLens.getIdentityLens()));
     return classes;
   }
 

@@ -5,8 +5,8 @@
 package com.android.tools.r8.regress.b111250398;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.TestBase;
 import com.android.tools.r8.code.Iget;
@@ -276,12 +276,8 @@ public class B111250398 extends TestBase {
     // compilation (R8) will eliminate field loads on non-volatile fields.
     assertEquals(1, countIget(mfOnA.getMethod().getCode().asDexCode(), fOnA.getField().field));
     assertEquals(1, countSget(msfOnA.getMethod().getCode().asDexCode(), sfOnA.getField().field));
-    // TODO(111380066). This could be 2 in stead of 4, but right now the optimization tracks the
-    // combined set of fields for all successors, and for synchronized code all blocks have
-    // exceptional edges for ensuring monitor exit causing the active load to be invalidated for
-    // both normal and exceptional successors.
-    assertEquals(4,
-        countIget(mfWithMonitorOnA.getMethod().getCode().asDexCode(), fOnA.getField().field));
+    assertEquals(
+        2, countIget(mfWithMonitorOnA.getMethod().getCode().asDexCode(), fOnA.getField().field));
 
     // For fields on other class both separate compilation (D8) and whole program
     // compilation (R8) will differ in the eliminated field loads of non-volatile fields.

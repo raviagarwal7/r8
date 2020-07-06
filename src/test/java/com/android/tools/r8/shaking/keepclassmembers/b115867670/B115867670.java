@@ -5,18 +5,20 @@
 package com.android.tools.r8.shaking.keepclassmembers.b115867670;
 
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndNotRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
 import static org.hamcrest.CoreMatchers.not;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertFalse;
 
-import com.android.tools.r8.graph.invokesuper.Consumer;
 import com.android.tools.r8.shaking.forceproguardcompatibility.ProguardCompatibilityTestBase;
 import com.android.tools.r8.utils.codeinspector.ClassSubject;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
 import com.google.common.collect.ImmutableList;
 import java.util.Collection;
 import java.util.List;
+import java.util.function.Consumer;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -69,7 +71,8 @@ public class B115867670 extends ProguardCompatibilityTestBase {
 
   @Parameters(name = "shrinker: {0}")
   public static Collection<Object> data() {
-    return ImmutableList.of(Shrinker.PROGUARD6, Shrinker.R8, Shrinker.R8_CF);
+    return ImmutableList.of(
+        Shrinker.PROGUARD6, Shrinker.R8_COMPAT, Shrinker.R8_COMPAT_CF, Shrinker.R8, Shrinker.R8_CF);
   }
 
   public B115867670(Shrinker shrinker) {
@@ -101,8 +104,9 @@ public class B115867670 extends ProguardCompatibilityTestBase {
     for (Class clazz : new Class[] {Foo.class, Foo.Interaction.class, Foo.Request.class}) {
       ClassSubject cls = inspector.clazz(clazz);
       assertThat(cls, isPresent());
+      assertFalse("Class " + clazz.getSimpleName() + " should not be abstract", cls.isAbstract());
       assertEquals(1, cls.asFoundClassSubject().allFields().size());
-      cls.forAllFields(field -> assertThat(field, not(isRenamed())));
+      cls.forAllFields(field -> assertThat(field, isPresentAndNotRenamed()));
     }
   }
 
@@ -111,9 +115,10 @@ public class B115867670 extends ProguardCompatibilityTestBase {
     for (Class clazz : new Class[] {Foo.class, Foo.Interaction.class, Foo.Request.class}) {
       ClassSubject cls = inspector.clazz(clazz);
       assertThat(cls, isPresent());
-      assertThat(cls, isRenamed());
+      assertThat(cls, isPresentAndRenamed());
+      assertFalse("Class " + clazz.getSimpleName() + " should not be abstract", cls.isAbstract());
       assertEquals(1, cls.asFoundClassSubject().allFields().size());
-      cls.forAllFields(field -> assertThat(field, isRenamed()));
+      cls.forAllFields(field -> assertThat(field, isPresentAndRenamed()));
     }
   }
 
@@ -139,44 +144,71 @@ public class B115867670 extends ProguardCompatibilityTestBase {
   @Test
   public void testDependentWithKeepClassMembers() throws Exception {
     runTest(
-        "-keepclassmembers @" + pkg + ".JsonClass class ** { <fields>; }",
+        // In full mode, keepclassmembers does not imply the class is instantiated.
+        addFullModeKeepClassIfReferenced(
+            "-keepclassmembers @" + pkg + ".JsonClass class ** { <fields>; }"),
         this::checkKeepClassMembers);
   }
 
   @Test
   public void testDependentWithKeepClassMembersAllowObfuscation() throws Exception {
     runTest(
-        "-keepclassmembers,allowobfuscation @" + pkg + ".JsonClass class ** { <fields>; }",
+        // In full mode, keepclassmembers does not imply the class is instantiated.
+        addFullModeKeepClassIfReferenced(
+            "-keepclassmembers,allowobfuscation @" + pkg + ".JsonClass class ** { <fields>; }"),
         this::checkKeepClassMembersRenamed);
   }
 
   @Test
   public void testDependentWithIfKeepClassMembers() throws Exception {
     runTest(
-        "-if @" + pkg + ".JsonClass class * -keepclassmembers class <1> { <fields>; }",
+        // In full mode, keepclassmembers does not imply the class is instantiated.
+        addFullModeKeepClassIfReferenced(
+            "-if @" + pkg + ".JsonClass class * -keepclassmembers class <1> { <fields>; }"),
         this::checkKeepClassMembers);
   }
 
   @Test
   public void testDependentWithIfKeepClassMembersAllowObfuscation() throws Exception {
     runTest(
+        // In full mode, keepclassmembers does not imply the class is instantiated.
+        addFullModeKeepClassIfReferenced(
         "-if @"
             + pkg
-            + ".JsonClass class * -keepclassmembers,allowobfuscation class <1> { <fields>; }",
+            + ".JsonClass class * -keepclassmembers,allowobfuscation class <1> { <fields>; }"),
         this::checkKeepClassMembersRenamed);
   }
 
   @Test
   public void testDependentWithIfKeep() throws Exception {
     runTest(
-        "-if @" + pkg + ".JsonClass class * -keep class <1> { <fields>; }",
+        addFullModeKeepAllAttributes(
+            "-if @" + pkg + ".JsonClass class * -keep class <1> { <fields>; }"),
         this::checkKeepClassMembers);
   }
 
   @Test
   public void testDependentWithIfKeepAllowObfuscation() throws Exception {
     runTest(
-        "-if @" + pkg + ".JsonClass class * -keep,allowobfuscation class <1> { <fields>; }",
+        addFullModeKeepAllAttributes(
+            "-if @" + pkg + ".JsonClass class * -keep,allowobfuscation class <1> { <fields>; }"),
         this::checkKeepClassMembersRenamed);
+  }
+
+  // In full mode we need to explicitly keep the class (mark instantiated) if it is referenced.
+  String addFullModeKeepClassIfReferenced(String rules) {
+    return shrinker.isFullModeR8()
+        ? addFullModeKeepAllAttributes(rules
+            + "\n-if @"
+            + JsonClass.class.getTypeName()
+            + " class * -keep,allowobfuscation class <1>")
+        : rules;
+  }
+
+  // TODO(b/132318609): Keep the attributes. Potentially remove this once resolved.
+  String addFullModeKeepAllAttributes(String rules) {
+    return shrinker.isFullModeR8()
+        ? rules + "\n-keepattributes *"
+        : rules;
   }
 }

@@ -5,11 +5,13 @@ package com.android.tools.r8.dex;
 
 import static com.android.tools.r8.utils.LebUtils.sizeAsUleb128;
 
-import com.android.tools.r8.ApiLevelException;
 import com.android.tools.r8.ByteBufferProvider;
 import com.android.tools.r8.code.Instruction;
 import com.android.tools.r8.errors.CompilationError;
-import com.android.tools.r8.graph.Descriptor;
+import com.android.tools.r8.errors.DefaultInterfaceMethodDiagnostic;
+import com.android.tools.r8.errors.InvokeCustomDiagnostic;
+import com.android.tools.r8.errors.PrivateInterfaceMethodDiagnostic;
+import com.android.tools.r8.errors.StaticInterfaceMethodDiagnostic;
 import com.android.tools.r8.graph.DexAnnotation;
 import com.android.tools.r8.graph.DexAnnotationDirectory;
 import com.android.tools.r8.graph.DexAnnotationElement;
@@ -22,12 +24,15 @@ import com.android.tools.r8.graph.DexCode.Try;
 import com.android.tools.r8.graph.DexCode.TryHandler;
 import com.android.tools.r8.graph.DexCode.TryHandler.TypeAddrPair;
 import com.android.tools.r8.graph.DexDebugInfo;
+import com.android.tools.r8.graph.DexDebugInfoForWriting;
 import com.android.tools.r8.graph.DexEncodedAnnotation;
 import com.android.tools.r8.graph.DexEncodedArray;
 import com.android.tools.r8.graph.DexEncodedField;
+import com.android.tools.r8.graph.DexEncodedMember;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexField;
 import com.android.tools.r8.graph.DexItem;
+import com.android.tools.r8.graph.DexMember;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexMethodHandle;
 import com.android.tools.r8.graph.DexMethodHandle.MethodHandleType;
@@ -38,19 +43,19 @@ import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.DexTypeList;
 import com.android.tools.r8.graph.DexValue;
 import com.android.tools.r8.graph.IndexedDexItem;
-import com.android.tools.r8.graph.KeyedDexItem;
 import com.android.tools.r8.graph.ObjectToOffsetMapping;
 import com.android.tools.r8.graph.ParameterAnnotationsList;
-import com.android.tools.r8.graph.PresortedComparable;
 import com.android.tools.r8.graph.ProgramClassVisitor;
 import com.android.tools.r8.logging.Log;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.naming.MemberNaming.MethodSignature;
 import com.android.tools.r8.naming.MemberNaming.Signature;
 import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.position.MethodPosition;
 import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.DexVersion;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.IterableUtils;
 import com.android.tools.r8.utils.LebUtils;
 import com.google.common.collect.Sets;
 import it.unimi.dsi.fastutil.objects.Object2IntLinkedOpenHashMap;
@@ -59,10 +64,12 @@ import it.unimi.dsi.fastutil.objects.Reference2IntLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Reference2IntMap;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -75,6 +82,7 @@ public class FileWriter {
 
   /** Simple pair of a byte buffer and its written length. */
   public static class ByteBufferResult {
+
     // Ownership of the buffer is transferred to the receiver of this result structure.
     public final CompatByteBuffer buffer;
     public final int length;
@@ -92,6 +100,8 @@ public class FileWriter {
   private final NamingLens namingLens;
   private final DexOutputBuffer dest;
   private final MixedSectionOffsets mixedSectionOffsets;
+  private final CodeToKeep desugaredLibraryCodeToKeep;
+  private final Map<DexProgramClass, DexEncodedArray> staticFieldValues = new IdentityHashMap<>();
 
   public FileWriter(
       ByteBufferProvider provider,
@@ -99,7 +109,8 @@ public class FileWriter {
       MethodToCodeObjectMapping codeMapping,
       DexApplication application,
       InternalOptions options,
-      NamingLens namingLens) {
+      NamingLens namingLens,
+      CodeToKeep desugaredLibraryCodeToKeep) {
     this.mapping = mapping;
     this.codeMapping = codeMapping;
     this.application = application;
@@ -107,6 +118,7 @@ public class FileWriter {
     this.namingLens = namingLens;
     this.dest = new DexOutputBuffer(provider);
     this.mixedSectionOffsets = new MixedSectionOffsets(options, codeMapping);
+    this.desugaredLibraryCodeToKeep = desugaredLibraryCodeToKeep;
   }
 
   public static void writeEncodedAnnotation(
@@ -114,10 +126,11 @@ public class FileWriter {
     if (Log.ENABLED) {
       Log.verbose(FileWriter.class, "Writing encoded annotation @ %08x", dest.position());
     }
+    List<DexAnnotationElement> elements = new ArrayList<>(Arrays.asList(annotation.elements));
+    elements.sort((a, b) -> a.name.slowCompareTo(b.name, mapping.getNamingLens()));
     dest.putUleb128(mapping.getOffsetFor(annotation.type));
-    dest.putUleb128(annotation.elements.length);
-    assert PresortedComparable.isSorted(annotation.elements, (element) -> element.name);
-    for (DexAnnotationElement element : annotation.elements) {
+    dest.putUleb128(elements.size());
+    for (DexAnnotationElement element : elements) {
       dest.putUleb128(mapping.getOffsetFor(element.name));
       element.value.writeTo(dest, mapping);
     }
@@ -128,8 +141,6 @@ public class FileWriter {
     new ProgramClassDependencyCollector(application, mapping.getClasses())
         .run(mapping.getClasses());
 
-    // Ensure everything is sorted.
-    assert mixedSectionOffsets.getClassesWithData().stream().allMatch(DexProgramClass::isSorted);
     // Add the static values for all fields now that we have committed to their sorting.
     mixedSectionOffsets.getClassesWithData().forEach(this::addStaticFieldValues);
 
@@ -154,6 +165,9 @@ public class FileWriter {
     // Check restrictions on interface methods.
     checkInterfaceMethods();
 
+    // Check restriction on the names of fields, methods and classes
+    assert verifyNames();
+
     Layout layout = Layout.from(mapping);
     layout.setCodesOffset(layout.dataSectionOffset);
 
@@ -165,11 +179,22 @@ public class FileWriter {
 
     // Output the debug_info_items first, as they have no dependencies.
     dest.moveTo(layout.getCodesOffset() + sizeOfCodeItems(codes));
-    writeItems(mixedSectionOffsets.getDebugInfos(), layout::setDebugInfosOffset,
-        this::writeDebugItem);
+    if (mixedSectionOffsets.getDebugInfos().isEmpty()) {
+      layout.setDebugInfosOffset(0);
+    } else {
+      // Ensure deterministic ordering of debug info by sorting consistent with the code objects.
+      layout.setDebugInfosOffset(dest.align(1));
+      Set<DexDebugInfo> seen = new HashSet<>(mixedSectionOffsets.getDebugInfos().size());
+      for (DexCode code : codes) {
+        DexDebugInfoForWriting info = code.getDebugInfoForWriting();
+        if (info != null && seen.add(info)) {
+          writeDebugItem(info);
+        }
+      }
+    }
 
     // Remember the typelist offset for later.
-    layout.setTypeListsOffset(dest.align(4));  // type_list are aligned.
+    layout.setTypeListsOffset(dest.align(4)); // type_list are aligned.
 
     // Now output the code.
     dest.moveTo(layout.getCodesOffset());
@@ -246,10 +271,8 @@ public class FileWriter {
     }
     if (method.accessFlags.isStatic()) {
       if (!options.canUseDefaultAndStaticInterfaceMethods()) {
-        throw new ApiLevelException(
-            AndroidApiLevel.N,
-            "Static interface methods",
-            method.method.toSourceString());
+        throw options.reporter.fatalError(
+            new StaticInterfaceMethodDiagnostic(new MethodPosition(method.method)));
       }
 
     } else {
@@ -259,10 +282,8 @@ public class FileWriter {
       }
       if (!method.accessFlags.isAbstract() && !method.accessFlags.isPrivate() &&
           !options.canUseDefaultAndStaticInterfaceMethods()) {
-        throw new ApiLevelException(
-            AndroidApiLevel.N,
-            "Default interface methods",
-            method.method.toSourceString());
+        throw options.reporter.fatalError(
+            new DefaultInterfaceMethodDiagnostic(new MethodPosition(method.method)));
       }
     }
 
@@ -270,16 +291,35 @@ public class FileWriter {
       if (options.canUsePrivateInterfaceMethods()) {
         return;
       }
-      throw new ApiLevelException(
-          AndroidApiLevel.N,
-          "Private interface methods",
-          method.method.toSourceString());
+      throw options.reporter.fatalError(
+          new PrivateInterfaceMethodDiagnostic(new MethodPosition(method.method)));
     }
 
     if (!method.accessFlags.isPublic()) {
       throw new CompilationError("Interface methods must not be "
           + "protected or package private: " + method.method.toSourceString());
     }
+  }
+
+  private boolean verifyNames() {
+    if (options.itemFactory.getSkipNameValidationForTesting()) {
+      return true;
+    }
+
+    int apiLevel = options.minApiLevel;
+    for (DexField field : mapping.getFields()) {
+      assert field.name.isValidSimpleName(apiLevel);
+    }
+    for (DexMethod method : mapping.getMethods()) {
+      assert method.name.isValidSimpleName(apiLevel);
+    }
+    for (DexType type : mapping.getTypes()) {
+      if (type.isClassType()) {
+        assert DexString.isValidSimpleName(apiLevel, type.getName());
+      }
+    }
+
+    return true;
   }
 
   private List<DexCode> sortDexCodesByClassName() {
@@ -310,10 +350,10 @@ public class FileWriter {
     String originalClassName;
     if (proguardMap != null) {
       signature = proguardMap.originalSignatureOf(method.method);
-      originalClassName = proguardMap.originalNameOf(method.method.holder);
+      originalClassName = proguardMap.originalNameOf(method.holder());
     } else {
       signature = MethodSignature.fromDexMethod(method.method);
-      originalClassName = method.method.holder.toSourceString();
+      originalClassName = method.holder().toSourceString();
     }
     codeToSignatureMap.put(code, originalClassName + signature);
   }
@@ -435,8 +475,9 @@ public class FileWriter {
     dest.putInt(
         clazz.sourceFile == null ? Constants.NO_INDEX : mapping.getOffsetFor(clazz.sourceFile));
     dest.putInt(mixedSectionOffsets.getOffsetForAnnotationsDirectory(clazz));
-    dest.putInt(clazz.hasMethodsOrFields() ? mixedSectionOffsets.getOffsetFor(clazz) : Constants.NO_OFFSET);
-    dest.putInt(mixedSectionOffsets.getOffsetFor(clazz.getStaticValues()));
+    dest.putInt(
+        clazz.hasMethodsOrFields() ? mixedSectionOffsets.getOffsetFor(clazz) : Constants.NO_OFFSET);
+    dest.putInt(mixedSectionOffsets.getOffsetFor(staticFieldValues.get(clazz)));
   }
 
   private void writeDebugItem(DexDebugInfo debugInfo) {
@@ -456,7 +497,7 @@ public class FileWriter {
     int insnSizeOffset = dest.position();
     dest.forward(4);
     // Write instruction stream.
-    dest.putInstructions(code.instructions, mapping);
+    dest.putInstructions(code.instructions, mapping, desugaredLibraryCodeToKeep);
     // Compute size and do the backward/forward dance to write the size at the beginning.
     int insnSize = dest.position() - insnSizeOffset - 4;
     dest.rewind(insnSize + 4);
@@ -478,6 +519,7 @@ public class FileWriter {
         for (TypeAddrPair pair : handler.pairs) {
           dest.putUleb128(mapping.getOffsetFor(pair.type));
           dest.putUleb128(pair.addr);
+          desugaredLibraryCodeToKeep.recordClass(pair.type);
         }
         if (hasCatchAll) {
           dest.putUleb128(handler.catchAllAddr);
@@ -522,14 +564,14 @@ public class FileWriter {
   }
 
   private void writeAnnotationSet(DexAnnotationSet set) {
-    assert PresortedComparable.isSorted(set.annotations, (item) -> item.annotation.type)
-        : "Unsorted annotation set: " + set.toSourceString();
     mixedSectionOffsets.setOffsetFor(set, dest.align(4));
     if (Log.ENABLED) {
       Log.verbose(getClass(), "Writing AnnotationSet @ 0x%08x.", dest.position());
     }
-    dest.putInt(set.annotations.length);
-    for (DexAnnotation annotation : set.annotations) {
+    List<DexAnnotation> annotations = new ArrayList<>(Arrays.asList(set.annotations));
+    annotations.sort((a, b) -> a.annotation.type.slowCompareTo(b.annotation.type, namingLens));
+    dest.putInt(annotations.size());
+    for (DexAnnotation annotation : annotations) {
       dest.putInt(mixedSectionOffsets.getOffsetFor(annotation));
     }
   }
@@ -548,10 +590,10 @@ public class FileWriter {
     }
   }
 
-  private <S extends Descriptor<T, S>, T extends KeyedDexItem<S>> void writeMemberAnnotations(
-      List<T> items, ToIntFunction<T> getter) {
-    for (T item : items) {
-      dest.putInt(item.getKey().getOffset(mapping));
+  private <D extends DexEncodedMember<D, R>, R extends DexMember<D, R>> void writeMemberAnnotations(
+      List<D> items, ToIntFunction<D> getter) {
+    for (D item : items) {
+      dest.putInt(item.toReference().getOffset(mapping));
       dest.putInt(getter.applyAsInt(item));
     }
   }
@@ -559,34 +601,41 @@ public class FileWriter {
   private void writeAnnotationDirectory(DexAnnotationDirectory annotationDirectory) {
     mixedSectionOffsets.setOffsetForAnnotationsDirectory(annotationDirectory, dest.align(4));
     dest.putInt(mixedSectionOffsets.getOffsetFor(annotationDirectory.getClazzAnnotations()));
-    List<DexEncodedMethod> methodAnnotations = annotationDirectory.getMethodAnnotations();
-    List<DexEncodedMethod> parameterAnnotations = annotationDirectory.getParameterAnnotations();
-    List<DexEncodedField> fieldAnnotations = annotationDirectory.getFieldAnnotations();
+    List<DexEncodedMethod> methodAnnotations =
+        annotationDirectory.sortMethodAnnotations(namingLens);
+    List<DexEncodedMethod> parameterAnnotations =
+        annotationDirectory.sortParameterAnnotations(namingLens);
+    List<DexEncodedField> fieldAnnotations = annotationDirectory.sortFieldAnnotations(namingLens);
     dest.putInt(fieldAnnotations.size());
     dest.putInt(methodAnnotations.size());
     dest.putInt(parameterAnnotations.size());
-    writeMemberAnnotations(fieldAnnotations,
-        item -> mixedSectionOffsets.getOffsetFor(item.annotations));
-    writeMemberAnnotations(methodAnnotations,
-        item -> mixedSectionOffsets.getOffsetFor(item.annotations));
+    writeMemberAnnotations(
+        fieldAnnotations, item -> mixedSectionOffsets.getOffsetFor(item.annotations()));
+    writeMemberAnnotations(
+        methodAnnotations, item -> mixedSectionOffsets.getOffsetFor(item.annotations()));
     writeMemberAnnotations(parameterAnnotations,
         item -> mixedSectionOffsets.getOffsetFor(item.parameterAnnotationsList));
   }
 
-  private void writeEncodedFields(List<DexEncodedField> fields) {
-    assert PresortedComparable.isSorted(fields);
+  private void writeEncodedFields(List<DexEncodedField> unsortedFields) {
+    List<DexEncodedField> fields = new ArrayList<>(unsortedFields);
+    fields.sort((a, b) -> a.field.slowCompareTo(b.field, namingLens));
     int currentOffset = 0;
     for (DexEncodedField field : fields) {
+      assert field.validateDexValue(application.dexItemFactory);
       int nextOffset = mapping.getOffsetFor(field.field);
       assert nextOffset - currentOffset >= 0;
       dest.putUleb128(nextOffset - currentOffset);
       currentOffset = nextOffset;
       dest.putUleb128(field.accessFlags.getAsDexAccessFlags());
+      desugaredLibraryCodeToKeep.recordField(field.field);
     }
   }
 
-  private void writeEncodedMethods(List<DexEncodedMethod> methods, boolean isSharedSynthetic) {
-    assert PresortedComparable.isSorted(methods);
+  private void writeEncodedMethods(
+      Iterable<DexEncodedMethod> unsortedMethods, boolean isSharedSynthetic) {
+    List<DexEncodedMethod> methods = IterableUtils.toNewArrayList(unsortedMethods);
+    methods.sort((a, b) -> a.method.slowCompareTo(b.method, namingLens));
     int currentOffset = 0;
     for (DexEncodedMethod method : methods) {
       int nextOffset = mapping.getOffsetFor(method.method);
@@ -595,6 +644,7 @@ public class FileWriter {
       currentOffset = nextOffset;
       dest.putUleb128(method.accessFlags.getAsDexAccessFlags());
       DexCode code = codeMapping.getCode(method);
+      desugaredLibraryCodeToKeep.recordMethod(method.method);
       if (code == null) {
         assert method.shouldNotHaveCode();
         dest.putUleb128(0);
@@ -609,11 +659,15 @@ public class FileWriter {
 
   private void writeClassData(DexProgramClass clazz) {
     assert clazz.hasMethodsOrFields();
+    desugaredLibraryCodeToKeep.recordClassAllAccesses(clazz.superType);
+    for (DexType itf : clazz.interfaces.values) {
+      desugaredLibraryCodeToKeep.recordClassAllAccesses(itf);
+    }
     mixedSectionOffsets.setOffsetFor(clazz, dest.position());
     dest.putUleb128(clazz.staticFields().size());
     dest.putUleb128(clazz.instanceFields().size());
-    dest.putUleb128(clazz.directMethods().size());
-    dest.putUleb128(clazz.virtualMethods().size());
+    dest.putUleb128(clazz.getMethodCollection().numberOfDirectMethods());
+    dest.putUleb128(clazz.getMethodCollection().numberOfVirtualMethods());
     writeEncodedFields(clazz.staticFields());
     writeEncodedFields(clazz.instanceFields());
     boolean isSharedSynthetic = clazz.getSynthesizedFrom().size() > 1;
@@ -622,12 +676,12 @@ public class FileWriter {
   }
 
   private void addStaticFieldValues(DexProgramClass clazz) {
-    clazz.computeStaticValues();
     // We have collected the individual components of this array due to the data stored in
     // DexEncodedField#staticValues. However, we have to collect the DexEncodedArray itself
     // here.
-    DexEncodedArray staticValues = clazz.getStaticValues();
+    DexEncodedArray staticValues = clazz.computeStaticValuesArray(namingLens);
     if (staticValues != null) {
+      staticFieldValues.put(clazz, staticValues);
       mixedSectionOffsets.add(staticValues);
     }
   }
@@ -742,9 +796,10 @@ public class FileWriter {
     dest.moveTo(0);
     dest.putBytes(Constants.DEX_FILE_MAGIC_PREFIX);
     dest.putBytes(
-        DexVersion
-            .getDexVersion(AndroidApiLevel.getAndroidApiLevel(options.minApiLevel))
-            .getBytes());
+        options.testing.forceDexVersionBytes != null
+            ? options.testing.forceDexVersionBytes
+            : DexVersion.getDexVersion(AndroidApiLevel.getAndroidApiLevel(options.minApiLevel))
+                .getBytes());
     dest.putByte(Constants.DEX_FILE_MAGIC_SUFFIX);
     // Leave out checksum and signature for now.
     dest.moveTo(Constants.FILE_SIZE_OFFSET);
@@ -781,7 +836,7 @@ public class FileWriter {
     try {
       MessageDigest md = MessageDigest.getInstance("SHA-1");
       md.update(dest.asArray(), Constants.FILE_SIZE_OFFSET,
-          layout.getEndOfFile() - Constants.FIELD_IDS_OFF_OFFSET);
+          layout.getEndOfFile() - Constants.FILE_SIZE_OFFSET);
       md.digest(dest.asArray(), Constants.SIGNATURE_OFFSET, 20);
     } catch (Exception e) {
       throw new RuntimeException(e);
@@ -1000,9 +1055,8 @@ public class FileWriter {
 
   /**
    * Encapsulates information on the offsets of items in the sections of the mixed data part of the
-   * DEX file.
-   * Initially, items are collected using the {@link MixedSectionCollection} traversal and all
-   * offsets are unset. When writing a section, the offsets of the written items are stored.
+   * DEX file. Initially, items are collected using the {@link MixedSectionCollection} traversal and
+   * all offsets are unset. When writing a section, the offsets of the written items are stored.
    * These offsets are then used to resolve cross-references between items from different sections
    * into a file offset.
    */
@@ -1328,10 +1382,7 @@ public class FileWriter {
 
   private void checkThatInvokeCustomIsAllowed() {
     if (!options.canUseInvokeCustom()) {
-      throw new ApiLevelException(
-          AndroidApiLevel.O,
-          "Invoke-customs",
-          null /* sourceString */);
+      throw options.reporter.fatalError(new InvokeCustomDiagnostic());
     }
   }
 }

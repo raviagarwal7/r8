@@ -3,14 +3,14 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8;
 
-import com.android.tools.r8.TestBase.Backend;
 import com.android.tools.r8.ToolHelper.ProcessResult;
+import com.android.tools.r8.errors.Unimplemented;
 import com.android.tools.r8.utils.AndroidApp;
 
 public class DXTestCompileResult extends TestCompileResult<DXTestCompileResult, DXTestRunResult> {
 
   DXTestCompileResult(TestState state, AndroidApp app) {
-    super(state, app);
+    super(state, app, OutputMode.DexIndexed);
   }
 
   @Override
@@ -19,17 +19,22 @@ public class DXTestCompileResult extends TestCompileResult<DXTestCompileResult, 
   }
 
   @Override
-  public Backend getBackend() {
-    return Backend.DEX;
-  }
-
-  @Override
   public TestDiagnosticMessages getDiagnosticMessages() {
     throw new UnsupportedOperationException("No diagnostics messages from dx");
   }
 
   @Override
-  public DXTestRunResult createRunResult(ProcessResult result) {
-    return new DXTestRunResult(app, result);
+  public String getStdout() {
+    throw new Unimplemented("Unexpected attempt to access stdout from dx");
+  }
+
+  @Override
+  public String getStderr() {
+    throw new Unimplemented("Unexpected attempt to access stderr from dx");
+  }
+
+  @Override
+  public DXTestRunResult createRunResult(TestRuntime runtime, ProcessResult result) {
+    return new DXTestRunResult(app, runtime, result);
   }
 }

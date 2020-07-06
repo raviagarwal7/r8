@@ -7,7 +7,7 @@ package com.android.tools.r8.ir.optimize.classinliner;
 import static com.android.tools.r8.ir.optimize.classinliner.EscapingBuilderTest.TestClass.escape;
 import static com.android.tools.r8.utils.codeinspector.Matchers.isPresent;
 import static org.hamcrest.CoreMatchers.not;
-import static org.junit.Assert.assertThat;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 import com.android.tools.r8.NeverInline;
 import com.android.tools.r8.TestBase;
@@ -74,7 +74,11 @@ public class EscapingBuilderTest extends TestBase {
     }
 
     @NeverInline
-    public static void escape(Object o) {}
+    static void escape(Object o) {
+      if (System.currentTimeMillis() < 0) {
+        System.out.println(o);
+      }
+    }
   }
 
   // Simple builder that should be class inlined.

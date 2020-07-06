@@ -5,33 +5,36 @@ package com.android.tools.r8.cf.code;
 
 import com.android.tools.r8.cf.CfPrinter;
 import com.android.tools.r8.errors.Unreachable;
+import com.android.tools.r8.graph.DexClassAndMethod;
+import com.android.tools.r8.graph.DexProgramClass;
 import com.android.tools.r8.graph.DexReference;
-import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.InitClassLens;
 import com.android.tools.r8.graph.UseRegistry;
 import com.android.tools.r8.ir.conversion.CfSourceCode;
 import com.android.tools.r8.ir.conversion.CfState;
 import com.android.tools.r8.ir.conversion.IRBuilder;
-import com.android.tools.r8.ir.optimize.ReflectionOptimizer.ClassNameComputationInfo;
+import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
+import com.android.tools.r8.ir.optimize.InliningConstraints;
 import com.android.tools.r8.naming.NamingLens;
+import com.android.tools.r8.naming.dexitembasedstring.NameComputationInfo;
 import org.objectweb.asm.MethodVisitor;
 
 public class CfDexItemBasedConstString extends CfInstruction {
 
   private final DexReference item;
-  private final ClassNameComputationInfo classNameComputationInfo;
+  private final NameComputationInfo<?> nameComputationInfo;
 
-  public CfDexItemBasedConstString(
-      DexReference item, ClassNameComputationInfo classNameComputationInfo) {
+  public CfDexItemBasedConstString(DexReference item, NameComputationInfo<?> nameComputationInfo) {
     this.item = item;
-    this.classNameComputationInfo = classNameComputationInfo;
+    this.nameComputationInfo = nameComputationInfo;
   }
 
   public DexReference getItem() {
     return item;
   }
 
-  public ClassNameComputationInfo getClassNameComputationInfo() {
-    return classNameComputationInfo;
+  public NameComputationInfo<?> getNameComputationInfo() {
+    return nameComputationInfo;
   }
 
   @Override
@@ -45,7 +48,7 @@ public class CfDexItemBasedConstString extends CfInstruction {
   }
 
   @Override
-  public void write(MethodVisitor visitor, NamingLens lens) {
+  public void write(MethodVisitor visitor, InitClassLens initClassLens, NamingLens lens) {
     throw new Unreachable(
         "CfDexItemBasedConstString instructions should always be rewritten into CfConstString");
   }
@@ -62,8 +65,9 @@ public class CfDexItemBasedConstString extends CfInstruction {
   }
 
   @Override
-  public void registerUse(UseRegistry registry, DexType clazz) {
-    if (item.isDexType() && classNameComputationInfo.needsToRegisterTypeReference()) {
+  void internalRegisterUse(UseRegistry registry, DexClassAndMethod context) {
+    if (nameComputationInfo.needsToRegisterReference()) {
+      assert item.isDexType();
       registry.registerTypeReference(item.asDexType());
     }
   }
@@ -71,6 +75,14 @@ public class CfDexItemBasedConstString extends CfInstruction {
   @Override
   public void buildIR(IRBuilder builder, CfState state, CfSourceCode code) {
     builder.addDexItemBasedConstString(
-        state.push(builder.appView.dexItemFactory().stringType).register, item);
+        state.push(builder.appView.dexItemFactory().stringType).register,
+        item,
+        nameComputationInfo);
+  }
+
+  @Override
+  public ConstraintWithTarget inliningConstraint(
+      InliningConstraints inliningConstraints, DexProgramClass context) {
+    return inliningConstraints.forDexItemBasedConstString(item, context);
   }
 }

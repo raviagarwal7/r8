@@ -13,10 +13,10 @@ import shutil
 import sys
 import threading
 import time
+import zipfile
+
 import toolhelper
 import utils
-import zipfile
-import StringIO
 
 USAGE = """%prog [options] app1 app2
   NOTE: This only makes sense if minification is disabled"""
@@ -94,7 +94,7 @@ def generate_file_info(path, options):
         file_path = os.path.join(root, f)
         entry = FileInfo(file_path, path)
         if not options.use_code_size:
-          entry.set_size()
+          entry.set_size(False)
         file_info_map[file_path] = entry
   threads = []
   file_infos = file_info_map.values() if options.use_code_size else []

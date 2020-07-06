@@ -7,7 +7,8 @@ package com.android.tools.r8.ir.optimize.lambda.kotlin;
 import com.android.tools.r8.code.Const16;
 import com.android.tools.r8.code.Const4;
 import com.android.tools.r8.code.ReturnVoid;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
+import com.android.tools.r8.graph.AppInfoWithClassHierarchy;
+import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedField;
 import com.android.tools.r8.graph.DexEncodedMethod;
@@ -17,14 +18,14 @@ import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
 import com.android.tools.r8.graph.EnclosingMethodAttribute;
 import com.android.tools.r8.graph.InnerClassAttribute;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Invoke.Type;
 import com.android.tools.r8.ir.code.Position;
 import com.android.tools.r8.ir.code.ValueType;
 import com.android.tools.r8.ir.optimize.lambda.LambdaGroup;
-import com.android.tools.r8.ir.optimize.lambda.LambdaGroupClassBuilder;
 import com.android.tools.r8.ir.synthetic.SyntheticSourceCode;
 import com.android.tools.r8.kotlin.Kotlin;
+import com.android.tools.r8.shaking.AppInfoWithLiveness;
 import com.android.tools.r8.utils.ThrowingConsumer;
 import com.google.common.collect.Lists;
 import java.util.List;
@@ -41,7 +42,7 @@ import java.util.function.IntFunction;
 //      -----------------------------------------------------------------------
 //
 // Regular stateless k-style lambda class structure looks like below:
-// NOTE: stateless j-style lambdas do not always have INSTANCE field.
+// NOTE: stateless k-style lambdas do not always have INSTANCE field.
 //
 // -----------------------------------------------------------------------------------------------
 // // signature Lkotlin/jvm/internal/Lambda;Lkotlin/jvm/functions/Function2<
@@ -113,13 +114,13 @@ final class KStyleLambdaGroup extends KotlinLambdaGroup {
   }
 
   @Override
-  protected LambdaGroupClassBuilder getBuilder(DexItemFactory factory) {
+  protected ClassBuilder getBuilder(DexItemFactory factory) {
     return new ClassBuilder(factory, "kotlin-style lambda group");
   }
 
   @Override
   public ThrowingConsumer<DexClass, LambdaStructureError> lambdaClassValidator(
-      Kotlin kotlin, AppInfoWithSubtyping appInfo) {
+      Kotlin kotlin, AppInfoWithClassHierarchy appInfo) {
     return new ClassValidator(kotlin, appInfo);
   }
 
@@ -130,10 +131,16 @@ final class KStyleLambdaGroup extends KotlinLambdaGroup {
 
   // Specialized group id.
   final static class GroupId extends KotlinLambdaGroupId {
-    GroupId(String capture, DexType iface,
-        String pkg, String signature, DexEncodedMethod mainMethod,
-        InnerClassAttribute inner, EnclosingMethodAttribute enclosing) {
-      super(capture, iface, pkg, signature, mainMethod, inner, enclosing);
+    GroupId(
+        AppView<AppInfoWithLiveness> appView,
+        String capture,
+        DexType iface,
+        String pkg,
+        String signature,
+        DexEncodedMethod mainMethod,
+        InnerClassAttribute inner,
+        EnclosingMethodAttribute enclosing) {
+      super(appView, capture, iface, pkg, signature, mainMethod, inner, enclosing);
     }
 
     @Override
@@ -154,12 +161,12 @@ final class KStyleLambdaGroup extends KotlinLambdaGroup {
 
   // Specialized class validator.
   private final class ClassValidator extends KotlinLambdaClassValidator {
-    ClassValidator(Kotlin kotlin, AppInfoWithSubtyping appInfo) {
+    ClassValidator(Kotlin kotlin, AppInfoWithClassHierarchy appInfo) {
       super(kotlin, KStyleLambdaGroup.this, appInfo);
     }
 
     @Override
-    int getInstanceInitializerSize(List<DexEncodedField> captures) {
+    int getInstanceInitializerMaxSize(List<DexEncodedField> captures) {
       return captures.size() + 3;
     }
 
@@ -205,7 +212,7 @@ final class KStyleLambdaGroup extends KotlinLambdaGroup {
           group.getLambdaIdField(factory),
           id -> group.getCaptureField(factory, id),
           initializerMethod,
-          id.mainMethodProto.parameters.size(),
+          factory.kotlin.functional.getArity(id.iface),
           callerPosition);
     }
   }
@@ -233,7 +240,7 @@ final class KStyleLambdaGroup extends KotlinLambdaGroup {
     @Override
     void prepareSuperConstructorCall(int receiverRegister) {
       int arityRegister = nextRegister(ValueType.INT);
-      add(builder -> builder.addConst(TypeLatticeElement.INT, arityRegister, arity));
+      add(builder -> builder.addConst(TypeElement.getInt(), arityRegister, arity));
       add(
           builder ->
               builder.addInvoke(

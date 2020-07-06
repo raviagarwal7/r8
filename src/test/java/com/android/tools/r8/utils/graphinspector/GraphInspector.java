@@ -3,7 +3,9 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.utils.graphinspector;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -24,7 +26,10 @@ import com.android.tools.r8.references.ClassReference;
 import com.android.tools.r8.references.FieldReference;
 import com.android.tools.r8.references.MethodReference;
 import com.android.tools.r8.shaking.CollectingGraphConsumer;
+import com.android.tools.r8.utils.Box;
 import com.android.tools.r8.utils.codeinspector.CodeInspector;
+import com.google.common.collect.ImmutableSet;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -32,8 +37,10 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.function.BiPredicate;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
+import org.junit.Assert;
 
 public class GraphInspector {
 
@@ -43,6 +50,12 @@ public class GraphInspector {
     public static final EdgeKindPredicate invokedFrom = new EdgeKindPredicate(EdgeKind.InvokedFrom);
     public static final EdgeKindPredicate reflectedFrom =
         new EdgeKindPredicate(EdgeKind.ReflectiveUseFrom);
+    public static final EdgeKindPredicate isLibraryMethod =
+        new EdgeKindPredicate(EdgeKind.IsLibraryMethod);
+    public static final EdgeKindPredicate overriding =
+        new EdgeKindPredicate(EdgeKind.OverridingMethod);
+    public static final EdgeKindPredicate compatibilityRule =
+        new EdgeKindPredicate(EdgeKind.CompatibilityRule);
 
     private final EdgeKind edgeKind;
 
@@ -61,19 +74,82 @@ public class GraphInspector {
     }
   }
 
+  public static class QueryNodeSet {
+    private final Set<QueryNode> nodes;
+    private final String absentString;
+
+    public QueryNodeSet(Set<QueryNode> nodes, String absentString) {
+      this.nodes = nodes;
+      this.absentString = absentString;
+    }
+
+    private static QueryNodeSet from(Set<QueryNode> nodes, String absentString) {
+      return new QueryNodeSet(nodes, absentString);
+    }
+
+    private String errorMessage(String expected, String actual) {
+      return "Expected " + expected + " but was " + actual + " for " + absentString;
+    }
+
+    public boolean isEmpty() {
+      return nodes.isEmpty();
+    }
+
+    public QueryNodeSet assertEmpty() {
+      assertTrue(errorMessage("empty", "non-empty"), isEmpty());
+      return this;
+    }
+
+    public QueryNodeSet assertNonEmpty() {
+      assertFalse(errorMessage("non-empty", "empty"), isEmpty());
+      return this;
+    }
+
+    public QueryNodeSet assertSize(int expected) {
+      assertEquals(errorMessage("" + expected, "" + nodes.size()), expected, nodes.size());
+      return this;
+    }
+
+    public QueryNodeSet assertAnyMatch(Predicate<QueryNode> predicate) {
+      assertTrue(nodes.stream().anyMatch(predicate));
+      return this;
+    }
+
+    public QueryNodeSet assertAllMatch(Predicate<QueryNode> predicate) {
+      assertTrue(nodes.stream().allMatch(predicate));
+      return this;
+    }
+  }
+
   public abstract static class QueryNode {
 
-    abstract boolean isPresent();
+    @Override
+    public abstract boolean equals(Object obj);
 
-    abstract boolean isRoot();
+    @Override
+    public abstract int hashCode();
 
-    abstract boolean isRenamed();
+    public abstract boolean isPresent();
 
-    abstract boolean isInvokedFrom(MethodReference method);
+    public abstract boolean isRoot();
 
-    abstract boolean isReflectedFrom(MethodReference method);
+    public abstract boolean isRenamed();
 
-    abstract boolean isKeptBy(QueryNode node);
+    public abstract boolean isInvokedFrom(MethodReference method);
+
+    public abstract boolean isReflectedFrom(MethodReference method);
+
+    public abstract boolean isOverriding(MethodReference method);
+
+    public abstract boolean isKeptBy(QueryNode node);
+
+    public abstract boolean isCompatKeptBy(QueryNode node);
+
+    public abstract boolean isPureCompatKeptBy(QueryNode node);
+
+    public abstract boolean isKeptByLibraryMethod(QueryNode node);
+
+    public abstract boolean isSatisfiedBy(QueryNode... nodes);
 
     abstract String getNodeDescription();
 
@@ -98,6 +174,11 @@ public class GraphInspector {
 
     public QueryNode assertRoot() {
       assertTrue(errorMessage("root", "non-root"), isRoot());
+      return this;
+    }
+
+    public QueryNode assertNotRoot() {
+      assertFalse(errorMessage("non-root", "root"), isRoot());
       return this;
     }
 
@@ -136,6 +217,11 @@ public class GraphInspector {
       return this;
     }
 
+    public QueryNode assertOverriding(MethodReference method) {
+      assertTrue(errorMessage("overriding " + method.toString(), "none"), isOverriding(method));
+      return this;
+    }
+
     public QueryNode assertKeptBy(QueryNode node) {
       assertTrue(
           "Invalid call to assertKeptBy with: " + node.getNodeDescription(), node.isPresent());
@@ -153,13 +239,81 @@ public class GraphInspector {
           isKeptBy(node));
       return this;
     }
+
+    public QueryNode assertCompatKeptBy(QueryNode node) {
+      assertTrue(
+          "Invalid call to assertCompatKeptBy with: " + node.getNodeDescription(),
+          node.isPresent());
+      assertTrue(
+          errorMessage("compat kept by " + node.getNodeDescription(), "was not kept by it"),
+          isCompatKeptBy(node));
+      return this;
+    }
+
+    public QueryNode assertNotCompatKeptBy(QueryNode node) {
+      assertTrue(
+          "Invalid call to assertNotKeptBy with: " + node.getNodeDescription(), node.isPresent());
+      assertFalse(
+          errorMessage("not kept by " + node.getNodeDescription(), "was kept by it"),
+          isCompatKeptBy(node));
+      return this;
+    }
+
+    public QueryNode assertPureCompatKeptBy(QueryNode node) {
+      assertTrue(
+          "Invalid call to assertPureCompatKeptBy with: " + node.getNodeDescription(),
+          node.isPresent());
+      assertTrue(
+          errorMessage("compat kept by " + node.getNodeDescription(), "was not kept by it"),
+          isPureCompatKeptBy(node));
+      return this;
+    }
+
+    public QueryNode assertSatisfiedBy(QueryNode... nodes) {
+      if (isSatisfiedBy(nodes)) {
+        return this;
+      }
+      QueryNodeImpl impl = (QueryNodeImpl) this;
+      impl.runSatisfiedBy(Assert::fail, nodes);
+      throw new Unreachable();
+    }
+
+    public QueryNode assertKeptByLibraryMethod(QueryNode node) {
+      assertTrue(
+          "Invalid call to assertKeptBy with: " + node.getNodeDescription(), node.isPresent());
+      assertTrue(
+          errorMessage(
+              "kept by library method on " + node.getNodeDescription(),
+              "was not kept by a library method"),
+          isKeptByLibraryMethod(node));
+      return this;
+    }
+
+    public abstract String getKeptGraphString();
   }
 
   private static class AbsentQueryNode extends QueryNode {
     private final String failedQueryNodeDescription;
 
     public AbsentQueryNode(String failedQueryNodeDescription) {
+      assert failedQueryNodeDescription != null;
       this.failedQueryNodeDescription = failedQueryNodeDescription;
+    }
+
+    @Override
+    public String getKeptGraphString() {
+      return "<not kept>";
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+      return obj instanceof AbsentQueryNode
+          && failedQueryNodeDescription.equals(((AbsentQueryNode) obj).failedQueryNodeDescription);
+    }
+
+    @Override
+    public int hashCode() {
+      return failedQueryNodeDescription.hashCode();
     }
 
     @Override
@@ -173,7 +327,7 @@ public class GraphInspector {
     }
 
     @Override
-    boolean isRoot() {
+    public boolean isRoot() {
       fail("Invalid call to isRoot on " + getNodeDescription());
       throw new Unreachable();
     }
@@ -197,8 +351,38 @@ public class GraphInspector {
     }
 
     @Override
+    public boolean isOverriding(MethodReference method) {
+      fail("Invalid call to isOverriding on " + getNodeDescription());
+      throw new Unreachable();
+    }
+
+    @Override
     public boolean isKeptBy(QueryNode node) {
       fail("Invalid call to isKeptBy on " + getNodeDescription());
+      throw new Unreachable();
+    }
+
+    @Override
+    public boolean isCompatKeptBy(QueryNode node) {
+      fail("Invalid call to isCompatKeptBy on " + getNodeDescription());
+      throw new Unreachable();
+    }
+
+    @Override
+    public boolean isPureCompatKeptBy(QueryNode node) {
+      fail("Invalid call to isPureCompatKeptBy on " + getNodeDescription());
+      throw new Unreachable();
+    }
+
+    @Override
+    public boolean isKeptByLibraryMethod(QueryNode node) {
+      fail("Invalid call to isKeptByLibrary on " + getNodeDescription());
+      throw new Unreachable();
+    }
+
+    @Override
+    public boolean isSatisfiedBy(QueryNode... nodes) {
+      fail("Invalid call to isTriggeredBy on " + getNodeDescription());
       throw new Unreachable();
     }
   }
@@ -217,6 +401,16 @@ public class GraphInspector {
     }
 
     @Override
+    public boolean equals(Object obj) {
+      return obj instanceof QueryNodeImpl && graphNode.equals(((QueryNodeImpl) obj).graphNode);
+    }
+
+    @Override
+    public int hashCode() {
+      return graphNode.hashCode();
+    }
+
+    @Override
     public String getNodeDescription() {
       return graphNode.toString();
     }
@@ -227,7 +421,7 @@ public class GraphInspector {
     }
 
     @Override
-    boolean isRoot() {
+    public boolean isRoot() {
       return inspector.roots.contains(graphNode);
     }
 
@@ -273,6 +467,18 @@ public class GraphInspector {
     }
 
     @Override
+    public boolean isOverriding(MethodReference method) {
+      GraphNode sourceMethod = inspector.methods.get(method);
+      if (sourceMethod == null) {
+        return false;
+      }
+      return filterSources(
+              (node, infos) -> node == sourceMethod && EdgeKindPredicate.overriding.test(infos))
+          .findFirst()
+          .isPresent();
+    }
+
+    @Override
     public boolean isKeptBy(QueryNode node) {
       if (!(node instanceof QueryNodeImpl)) {
         return false;
@@ -281,9 +487,128 @@ public class GraphInspector {
       return filterSources((source, infos) -> impl.graphNode == source).findFirst().isPresent();
     }
 
+    @Override
+    public boolean isCompatKeptBy(QueryNode node) {
+      if (!(node instanceof QueryNodeImpl)) {
+        return false;
+      }
+      QueryNodeImpl impl = (QueryNodeImpl) node;
+      return filterSources(
+              (source, infos) ->
+                  impl.graphNode == source && EdgeKindPredicate.compatibilityRule.test(infos))
+          .findFirst()
+          .isPresent();
+    }
+
+    @Override
+    public boolean isPureCompatKeptBy(QueryNode node) {
+      if (!isCompatKeptBy(node)) {
+        return false;
+      }
+      QueryNodeImpl impl = (QueryNodeImpl) node;
+      return filterSources((source, infos) -> impl.graphNode != source).count() == 0;
+    }
+
+    @Override
+    public boolean isKeptByLibraryMethod(QueryNode node) {
+      assert graphNode instanceof MethodGraphNode;
+      if (!(node instanceof QueryNodeImpl)) {
+        return false;
+      }
+      QueryNodeImpl impl = (QueryNodeImpl) node;
+      return filterSources(
+              (source, infos) ->
+                  impl.graphNode == source && EdgeKindPredicate.isLibraryMethod.test(infos))
+          .findFirst()
+          .isPresent();
+    }
+
+    @Override
+    public boolean isSatisfiedBy(QueryNode... nodes) {
+      Box<Boolean> box = new Box<>(true);
+      runSatisfiedBy(ignore -> box.set(false), nodes);
+      return box.get();
+    }
+
+    private void runSatisfiedBy(Consumer<String> onError, QueryNode[] nodes) {
+      assertTrue(
+          "Invalid call to isTriggeredBy on non-keep rule node: " + graphNode,
+          graphNode instanceof KeepRuleGraphNode);
+      Set<GraphNode> preconditions = ((KeepRuleGraphNode) graphNode).getPreconditions();
+      for (QueryNode node : nodes) {
+        if (!(node instanceof QueryNodeImpl)) {
+          onError.accept(
+              "Expected query of precondition to be present, but it was not. "
+                  + "Precondtion node: "
+                  + node.getNodeDescription());
+          return;
+        }
+        QueryNodeImpl impl = (QueryNodeImpl) node;
+        if (!filterSources((source, infos) -> impl.graphNode == source).findFirst().isPresent()) {
+          onError.accept(
+              "Expected to find dependency from precondtion to dependent rule, but could not. "
+                  + "Precondition node: "
+                  + node.getNodeDescription());
+          return;
+        }
+        if (!preconditions.contains(impl.graphNode)) {
+          onError.accept(
+              "Expected precondition set to contain node "
+                  + node.getNodeDescription()
+                  + ", but it did not.");
+          return;
+        }
+      }
+      assert preconditions.size() >= nodes.length;
+      if (nodes.length != preconditions.size()) {
+        for (GraphNode precondition : preconditions) {
+          if (Arrays.stream(nodes)
+              .noneMatch(node -> ((QueryNodeImpl) node).graphNode == precondition)) {
+            onError.accept("Unexpected item in precondtions: " + precondition.toString());
+            return;
+          }
+        }
+        throw new Unreachable();
+      }
+    }
+
+    @Override
+    public String getKeptGraphString() {
+      StringBuilder builder = new StringBuilder();
+      getKeptGraphString(graphNode, inspector, builder, "", ImmutableSet.of());
+      return builder.toString();
+    }
+
+    private static void getKeptGraphString(
+        GraphNode graphNode,
+        GraphInspector inspector,
+        StringBuilder builder,
+        String indent,
+        Set<GraphNode> seen) {
+      builder.append(graphNode);
+      if (seen.contains(graphNode)) {
+        builder.append(" <CYCLE>");
+        return;
+      }
+      seen = ImmutableSet.<GraphNode>builder().addAll(seen).add(graphNode).build();
+      Map<GraphNode, Set<GraphEdgeInfo>> sources =
+          inspector.consumer.getSourcesTargeting(graphNode);
+      if (sources == null) {
+        builder.append(" <ROOT>");
+        return;
+      }
+      for (Entry<GraphNode, Set<GraphEdgeInfo>> entry : sources.entrySet()) {
+        GraphNode source = entry.getKey();
+        Set<GraphEdgeInfo> reasons = entry.getValue();
+        builder.append('\n').append(indent).append("<- ");
+        getKeptGraphString(source, inspector, builder, indent + "  ", seen);
+      }
+    }
+
     private Stream<GraphNode> filterSources(BiPredicate<GraphNode, Set<GraphEdgeInfo>> test) {
       Map<GraphNode, Set<GraphEdgeInfo>> sources =
           inspector.consumer.getSourcesTargeting(graphNode);
+      assertNotNull("Attempt to iterate sources of apparent root node: " + graphNode, sources);
       return sources.entrySet().stream()
           .filter(e -> test.test(e.getKey(), e.getValue()))
           .map(Entry::getKey);
@@ -336,6 +661,10 @@ public class GraphInspector {
     }
   }
 
+  public CodeInspector codeInspector() {
+    return inspector;
+  }
+
   public Set<GraphNode> getRoots() {
     return Collections.unmodifiableSet(roots);
   }
@@ -351,6 +680,16 @@ public class GraphInspector {
       }
     }
     return getQueryNode(found, ruleContent);
+  }
+
+  public QueryNodeSet ruleInstances(String ruleContent) {
+    Set<QueryNode> set = new HashSet<>();
+    for (KeepRuleGraphNode rule : rules) {
+      if (rule.getContent().equals(ruleContent)) {
+        set.add(getQueryNode(rule, ruleContent));
+      }
+    }
+    return QueryNodeSet.from(set, ruleContent);
   }
 
   public QueryNode rule(Origin origin, int line, int column) {
@@ -397,5 +736,26 @@ public class GraphInspector {
 
   private QueryNode getQueryNode(GraphNode node, String absentString) {
     return node == null ? new AbsentQueryNode(absentString) : new QueryNodeImpl(this, node);
+  }
+
+  private boolean isPureCompatTarget(GraphNode target) {
+    Map<GraphNode, Set<GraphEdgeInfo>> sources = consumer.getSourcesTargeting(target);
+    if (sources == null || sources.isEmpty()) {
+      return false;
+    }
+    for (Entry<GraphNode, Set<GraphEdgeInfo>> edge : sources.entrySet()) {
+      for (GraphEdgeInfo edgeInfo : edge.getValue()) {
+        if (edgeInfo.edgeKind() != EdgeKind.CompatibilityRule) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  public void assertNoPureCompatibilityEdges() {
+    for (GraphNode target : consumer.getTargets()) {
+      assertFalse(isPureCompatTarget(target));
+    }
   }
 }

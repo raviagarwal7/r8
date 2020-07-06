@@ -4,9 +4,9 @@
 
 package com.android.tools.r8.compatproguard.reflection;
 
-import static com.android.tools.r8.utils.codeinspector.Matchers.isRenamed;
+import static com.android.tools.r8.utils.codeinspector.Matchers.isPresentAndRenamed;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertThat;
 
 import com.android.tools.r8.NeverInline;
 import com.android.tools.r8.R8Command;
@@ -48,6 +48,8 @@ class MainTest {
     Method m;
     m = A.class.getMethod("method0");
     m.invoke(a);
+    // The call with in-exact argument to getMethod is intended and should stay.
+    // The warning cannot be suppressed according to b/117198454.
     m = A.class.getMethod("method0", null);
     m.invoke(a);
     m = A.class.getMethod("method0", (Class<?>[]) null);
@@ -466,15 +468,17 @@ public class ReflectionTest extends TestBase {
             readClasses(A.class, mainClass), keepMainProguardConfiguration(mainClass), backend);
     CodeInspector inspector = new CodeInspector(output);
 
-    assertThat(inspector.clazz(A.class).method("void", "method0", ImmutableList.of()), isRenamed());
+    assertThat(
+        inspector.clazz(A.class).method("void", "method0", ImmutableList.of()),
+        isPresentAndRenamed());
     assertThat(
         inspector.clazz(A.class).method("void", "method1", ImmutableList.of("java.lang.String")),
-        isRenamed());
+        isPresentAndRenamed());
     assertThat(
         inspector
             .clazz(A.class)
             .method("void", "method2", ImmutableList.of("java.lang.String", "java.lang.String")),
-        isRenamed());
+        isPresentAndRenamed());
 
     assertEquals(runOnJava(mainClass), runOnVM(output, mainClass, backend));
   }
@@ -493,7 +497,9 @@ public class ReflectionTest extends TestBase {
     AndroidApp output = ToolHelper.runR8(builder.build());
     CodeInspector inspector = new CodeInspector(output);
 
-    assertThat(inspector.clazz(A.class).method("void", "method0", ImmutableList.of()), isRenamed());
+    assertThat(
+        inspector.clazz(A.class).method("void", "method0", ImmutableList.of()),
+        isPresentAndRenamed());
 
     // The reference run on the Java VM will succeed, whereas the run on the R8 output will fail
     // as in this test we fail to recognize the reflective call. To compare the output of the
@@ -533,7 +539,7 @@ public class ReflectionTest extends TestBase {
         .forAllMethods(
             m -> {
               if (!m.isInstanceInitializer()) {
-                assertThat(m, isRenamed());
+                assertThat(m, isPresentAndRenamed());
               }
             });
 
@@ -554,7 +560,7 @@ public class ReflectionTest extends TestBase {
         .forAllMethods(
             m -> {
               if (!m.isInstanceInitializer()) {
-                assertThat(m, isRenamed());
+                assertThat(m, isPresentAndRenamed());
               }
             });
 

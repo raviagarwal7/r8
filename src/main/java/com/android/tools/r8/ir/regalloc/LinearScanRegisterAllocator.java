@@ -10,10 +10,9 @@ import static com.android.tools.r8.ir.regalloc.LiveIntervals.NO_REGISTER;
 import com.android.tools.r8.cf.FixedLocalValue;
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.errors.CompilationError;
-import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
 import com.android.tools.r8.graph.DebugLocalInfo;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Add;
 import com.android.tools.r8.ir.code.And;
 import com.android.tools.r8.ir.code.ArithmeticBinop;
@@ -39,11 +38,13 @@ import com.android.tools.r8.ir.code.Xor;
 import com.android.tools.r8.ir.regalloc.RegisterPositions.Type;
 import com.android.tools.r8.logging.Log;
 import com.android.tools.r8.utils.InternalOptions;
+import com.android.tools.r8.utils.SetUtils;
 import com.android.tools.r8.utils.StringUtils;
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Multiset;
 import com.google.common.collect.Multisets;
+import com.google.common.collect.Sets;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceMap.Entry;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceOpenHashMap;
@@ -56,6 +57,7 @@ import it.unimi.dsi.fastutil.objects.Reference2IntArrayMap;
 import it.unimi.dsi.fastutil.objects.Reference2IntMap;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -124,7 +126,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
   }
 
   // App view to be able to create types and access the options.
-  private final AppView<? extends AppInfo> appView;
+  private final AppView<?> appView;
   // The code for which to allocate registers.
   private final IRCode code;
   // Number of registers used for arguments.
@@ -184,7 +186,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     return numberOfArgumentRegisters;
   }
 
-  public LinearScanRegisterAllocator(AppView<? extends AppInfo> appView, IRCode code) {
+  public LinearScanRegisterAllocator(AppView<?> appView, IRCode code) {
     this.appView = appView;
     this.code = code;
     int argumentRegisters = 0;
@@ -204,7 +206,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     // There are no linked values prior to register allocation.
     assert noLinkedValues();
     assert code.isConsistentSSA();
-    if (this.code.method.accessFlags.isBridge() && implementationIsBridge(this.code)) {
+    if (this.code.method().accessFlags.isBridge() && implementationIsBridge(this.code)) {
       transformBridgeMethod();
     }
     computeNeedsRegister();
@@ -222,9 +224,9 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     // locals alive for their entire live range. In release mode the liveness is all that matters
     // and we do not actually want locals information in the output.
     if (options().debug) {
-      computeDebugInfo(blocks);
-    } else if (code.method.getOptimizationInfo().isReachabilitySensitive()) {
-      InstructionIterator it = code.instructionIterator();
+      computeDebugInfo(code, blocks, liveIntervals, this, liveAtEntrySets);
+    } else if (code.method().getOptimizationInfo().isReachabilitySensitive()) {
+      InstructionListIterator it = code.instructionListIterator();
       while (it.hasNext()) {
         Instruction instruction = it.next();
         if (instruction.isDebugLocalRead()) {
@@ -237,27 +239,8 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     clearState();
   }
 
-  private static Integer nextInRange(int start, int end, List<Integer> points) {
-    while (!points.isEmpty() && points.get(0) < start) {
-      points.remove(0);
-    }
-    if (points.isEmpty()) {
-      return null;
-    }
-    Integer next = points.get(0);
-    assert start <= next;
-    if (next < end) {
-      points.remove(0);
-      return next;
-    }
-    return null;
-  }
-
-  private void computeDebugInfo(ImmutableList<BasicBlock> blocks) {
-    computeDebugInfo(blocks, liveIntervals, this, liveAtEntrySets);
-  }
-
   public static void computeDebugInfo(
+      IRCode code,
       ImmutableList<BasicBlock> blocks,
       List<LiveIntervals> liveIntervals,
       RegisterAllocator allocator,
@@ -275,7 +258,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
         assert child.getSplitChildren() == null || child.getSplitChildren().isEmpty();
         liveRanges.addAll(child.getRanges());
       }
-      liveRanges.sort((r1, r2) -> Integer.compare(r1.start, r2.start));
+      liveRanges.sort(Comparator.comparingInt(r -> r.start));
       for (LiveRange liveRange : liveRanges) {
         int start = liveRange.start;
         int end = liveRange.end;
@@ -298,8 +281,9 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
 
     boolean isEntryBlock = true;
     for (BasicBlock block : blocks) {
-      InstructionListIterator instructionIterator = block.listIterator();
-      Set<Value> liveLocalValues = new HashSet<>(liveAtEntrySets.get(block).liveLocalValues);
+      InstructionListIterator instructionIterator = block.listIterator(code);
+      Set<Value> liveLocalValues =
+          SetUtils.newIdentityHashSet(liveAtEntrySets.get(block).liveLocalValues);
       // Skip past arguments and open argument and phi locals.
       if (isEntryBlock) {
         isEntryBlock = false;
@@ -363,6 +347,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
       while (instructionIterator.hasNext()) {
         Instruction instruction = instructionIterator.next();
         if (!instructionIterator.hasNext()) {
+          instruction.clearDebugValues();
           break;
         }
 
@@ -620,7 +605,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     if (intervals == null) {
       throw new CompilationError(
           "Unexpected attempt to get register for a value without a register in method `"
-              + code.method.method.toSourceString()
+              + code.method().method.toSourceString()
               + "`.",
           code.origin);
     }
@@ -766,7 +751,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
 
   private void removeSpillAndPhiMoves() {
     for (BasicBlock block : code.blocks) {
-      InstructionListIterator it = block.listIterator();
+      InstructionListIterator it = block.listIterator(code);
       while (it.hasNext()) {
         Instruction instruction = it.next();
         if (isSpillInstruction(instruction)) {
@@ -1075,7 +1060,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
       if (checkcastInput.getLiveIntervals() != null &&
           !checkcastInput.getLiveIntervals().overlaps(unhandledInterval) &&
           checkcastInput.getLocalInfo() == unhandledInterval.getValue().definition.getLocalInfo()) {
-        unhandledInterval.setHint(checkcastInput.getLiveIntervals());
+        unhandledInterval.setHint(checkcastInput.getLiveIntervals(), unhandled);
       }
     }
   }
@@ -1093,13 +1078,13 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
       assert left != null;
       if (left.getLiveIntervals() != null &&
           !left.getLiveIntervals().overlaps(unhandledInterval)) {
-        unhandledInterval.setHint(left.getLiveIntervals());
+        unhandledInterval.setHint(left.getLiveIntervals(), unhandled);
       } else {
         Value right = binOp.rightValue();
         assert right != null;
         if (binOp.isCommutative() && right.getLiveIntervals() != null &&
             !right.getLiveIntervals().overlaps(unhandledInterval)) {
-          unhandledInterval.setHint(right.getLiveIntervals());
+          unhandledInterval.setHint(right.getLiveIntervals(), unhandled);
         }
       }
     }
@@ -1228,7 +1213,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
       if (!value.isPhi() && value.definition.isMove()) {
         Move move = value.definition.asMove();
         LiveIntervals intervals = move.src().getLiveIntervals();
-        intervals.setHint(current);
+        intervals.setHint(current, unhandled);
       }
       if (current != unhandledInterval) {
         // Only the start of unhandledInterval has been reached at this point. All other live
@@ -1650,8 +1635,8 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     // Set all free positions for possible registers to max integer.
     RegisterPositions freePositions = new RegisterPositions(registerConstraint + 1);
 
-    if ((options().debug || code.method.getOptimizationInfo().isReachabilitySensitive())
-        && !code.method.accessFlags.isStatic()) {
+    if ((options().debug || code.method().getOptimizationInfo().isReachabilitySensitive())
+        && !code.method().accessFlags.isStatic()) {
       // If we are generating debug information or if the method is reachability sensitive,
       // we pin the this value register. The debugger expects to always be able to find it in
       // the input register.
@@ -1796,11 +1781,9 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     // spilling. For phis we also use the hint before looking at the operand registers. The
     // phi could have a hint from an argument moves which it seems more important to honor in
     // practice.
-    LiveIntervals hint = unhandledInterval.getHint();
+    Integer hint = unhandledInterval.getHint();
     if (hint != null) {
-      int register = hint.getRegister();
-      if (tryHint(unhandledInterval, registerConstraint, freePositions, needsRegisterPair,
-          register)) {
+      if (tryHint(unhandledInterval, registerConstraint, freePositions, needsRegisterPair, hint)) {
         return true;
       }
     }
@@ -1881,13 +1864,14 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     for (Phi phi : value.uniquePhiUsers()) {
       LiveIntervals phiIntervals = phi.getLiveIntervals();
       if (phiIntervals.getHint() == null) {
+        phiIntervals.setHint(intervals, unhandled);
         for (int i = 0; i < phi.getOperands().size(); i++) {
           Value operand = phi.getOperand(i);
           LiveIntervals operandIntervals = operand.getLiveIntervals();
           BasicBlock pred = phi.getBlock().getPredecessors().get(i);
           operandIntervals = operandIntervals.getSplitCovering(pred.exit().getNumber());
           if (operandIntervals.getHint() == null) {
-            operandIntervals.setHint(intervals);
+            operandIntervals.setHint(intervals, unhandled);
           }
         }
       }
@@ -1904,7 +1888,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
         BasicBlock pred = block.getPredecessors().get(i);
         LiveIntervals operandIntervals =
             operand.getLiveIntervals().getSplitCovering(pred.exit().getNumber());
-        operandIntervals.setHint(intervals);
+        operandIntervals.setHint(intervals, unhandled);
       }
     }
   }
@@ -2512,7 +2496,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     // overwritten can therefore lead to verification errors. If we could be targeting one of these
     // VMs we block the receiver register throughout the method.
     if ((options().canHaveThisTypeVerifierBug() || options().canHaveThisJitCodeDebuggingBug())
-        && !code.method.accessFlags.isStatic()) {
+        && !code.method().accessFlags.isStatic()) {
       for (Instruction instruction : code.entryBlock().getInstructions()) {
         if (instruction.isArgument() && instruction.outValue().isThis()) {
           Value thisValue = instruction.outValue();
@@ -2535,9 +2519,9 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
       Map<BasicBlock, LiveAtEntrySets> liveAtEntrySets,
       List<LiveIntervals> liveIntervals) {
     for (BasicBlock block : code.topologicallySortedBlocks()) {
-      Set<Value> live = new HashSet<>();
-      Set<Value> phiOperands = new HashSet<>();
-      Set<Value> liveAtThrowingInstruction = new HashSet<>();
+      Set<Value> live = Sets.newIdentityHashSet();
+      Set<Value> phiOperands = Sets.newIdentityHashSet();
+      Set<Value> liveAtThrowingInstruction = Sets.newIdentityHashSet();
       Set<BasicBlock> exceptionalSuccessors = block.getCatchHandlers().getUniqueTargets();
       for (BasicBlock successor : block.getSuccessors()) {
         // Values live at entry to a block that is an exceptional successor are only live
@@ -2569,8 +2553,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
         }
         addLiveRange(value, block, end, liveIntervals, options);
       }
-      ListIterator<Instruction> iterator =
-          block.getInstructions().listIterator(block.getInstructions().size());
+      InstructionIterator iterator = block.iterator(block.getInstructions().size());
       while (iterator.hasPrevious()) {
         Instruction instruction = iterator.previous();
         Value definition = instruction.outValue();
@@ -2643,7 +2626,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
             }
           }
         }
-        if (options.debug || code.method.getOptimizationInfo().isReachabilitySensitive()) {
+        if (options.debug || code.method().getOptimizationInfo().isReachabilitySensitive()) {
           // In debug mode, or if the method is reachability sensitive, extend the live range
           // to cover the full scope of a local variable (encoded as debug values).
           int number = instruction.getNumber();
@@ -2683,7 +2666,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
   private void transformBridgeMethod() {
     assert implementationIsBridge(code);
     BasicBlock entry = code.entryBlock();
-    InstructionListIterator iterator = entry.listIterator();
+    InstructionIterator iterator = entry.iterator();
     // Create a mapping from argument values to their index, while scanning over the arguments.
     Reference2IntMap<Value> argumentIndices = new Reference2IntArrayMap<>();
     while (iterator.peekNext().isArgument()) {
@@ -2740,7 +2723,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     if (code.blocks.size() > 1) {
       return false;
     }
-    InstructionListIterator iterator = code.entryBlock().listIterator();
+    InstructionIterator iterator = code.entryBlock().iterator();
     // Move forward to the first instruction after the definition of the arguments.
     while (iterator.hasNext() && iterator.peekNext().isArgument()) {
       iterator.next();
@@ -2765,7 +2748,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
     return true;
   }
 
-  private Value createValue(TypeLatticeElement typeLattice) {
+  private Value createValue(TypeElement typeLattice) {
     Value value = code.createValue(typeLattice, null);
     value.setNeedsRegister(true);
     return value;
@@ -2818,7 +2801,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
             argument.isLinked() ||
             argument == previous ||
             argument.hasRegisterConstraint()) {
-          newArgument = createValue(argument.getTypeLattice());
+          newArgument = createValue(argument.getType());
           Move move = new Move(newArgument, argument);
           move.setBlock(invoke.getBlock());
           replaceArgument(invoke, i, newArgument);
@@ -2933,7 +2916,7 @@ public class LinearScanRegisterAllocator implements RegisterAllocator {
 
   private void insertRangeInvokeMoves() {
     for (BasicBlock block : code.blocks) {
-      InstructionListIterator it = block.listIterator();
+      InstructionListIterator it = block.listIterator(code);
       while (it.hasNext()) {
         Instruction instruction = it.next();
         if (instruction.isInvoke()) {

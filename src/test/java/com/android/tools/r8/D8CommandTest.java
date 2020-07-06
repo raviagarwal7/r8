@@ -9,9 +9,13 @@ import static com.android.tools.r8.utils.FileUtils.JAR_EXTENSION;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import com.android.sdklib.AndroidVersion;
+import com.android.tools.r8.AssertionsConfiguration.AssertionTransformation;
+import com.android.tools.r8.AssertionsConfiguration.AssertionTransformationScope;
 import com.android.tools.r8.D8CommandParser.OrderedClassFileResourceProvider;
 import com.android.tools.r8.ToolHelper.ProcessResult;
 import com.android.tools.r8.dex.Marker;
@@ -21,6 +25,7 @@ import com.android.tools.r8.origin.Origin;
 import com.android.tools.r8.utils.AndroidApiLevel;
 import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.FileUtils;
+import com.android.tools.r8.utils.ThreadUtils;
 import com.android.tools.r8.utils.ZipUtils;
 import com.google.common.collect.ImmutableList;
 import java.io.IOException;
@@ -32,14 +37,20 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.zip.ZipFile;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
-public class D8CommandTest {
+@RunWith(Parameterized.class)
+public class D8CommandTest extends TestBase {
 
-  @Rule
-  public TemporaryFolder temp = ToolHelper.getTemporaryFolderForTest();
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withNoneRuntime().build();
+  }
+
+  public D8CommandTest(TestParameters parameters) {}
 
   @Test(expected = CompilationFailedException.class)
   public void emptyBuilder() throws Throwable {
@@ -78,9 +89,15 @@ public class D8CommandTest {
             instanceof DexFilePerClassFileConsumer);
   }
 
-  @Test(expected = CompilationFailedException.class)
-  public void disallowClassFileConsumer() throws Throwable {
-    D8Command.builder().setProgramConsumer(ClassFileConsumer.emptyConsumer()).build();
+  @Test
+  public void desugaredLibraryKeepRuleConsumer() throws Exception {
+    StringConsumer stringConsumer = StringConsumer.emptyConsumer();
+    D8Command command =
+        D8Command.builder()
+            .setProgramConsumer(DexIndexedConsumer.emptyConsumer())
+            .setDesugaredLibraryKeepRuleConsumer(stringConsumer)
+            .build();
+    assertSame(command.getInternalOptions().desugaredLibraryKeepRuleConsumer, stringConsumer);
   }
 
   @Test
@@ -120,12 +137,31 @@ public class D8CommandTest {
     Path working = temp.getRoot().toPath();
     Path flags = working.resolve("flags.txt").toAbsolutePath();
     assertNotEquals(0, ToolHelper.forkR8(working, "@flags.txt").exitCode);
-    DiagnosticsChecker.checkErrorsContains("File not found", handler ->
-        D8.run(
-            D8Command.parse(
-                new String[] { "@" + flags.toString() },
-                EmbeddedOrigin.INSTANCE,
-                handler).build()));
+    DiagnosticsChecker.checkErrorsContains(
+        "NoSuchFileException",
+        handler ->
+            D8.run(
+                D8Command.parse(
+                        new String[] {"@" + flags.toString()}, EmbeddedOrigin.INSTANCE, handler)
+                    .build()));
+  }
+
+  @Test(expected = CompilationFailedException.class)
+  public void recursiveFlagsFile() throws Throwable {
+    Path working = temp.getRoot().toPath();
+    Path flagsFile = working.resolve("flags.txt");
+    Path recursiveFlagsFile = working.resolve("recursive_flags.txt");
+    Path input = Paths.get(EXAMPLES_BUILD_DIR + "/arithmetic.jar").toAbsolutePath();
+    FileUtils.writeTextFile(recursiveFlagsFile, "--output", "output.zip");
+    FileUtils.writeTextFile(
+        flagsFile, "--min-api", "24", input.toString(), "@" + recursiveFlagsFile);
+    DiagnosticsChecker.checkErrorsContains(
+        "Recursive @argfiles are not supported",
+        handler ->
+            D8.run(
+                D8Command.parse(
+                        new String[] {"@" + flagsFile.toString()}, EmbeddedOrigin.INSTANCE, handler)
+                    .build()));
   }
 
   @Test
@@ -237,10 +273,29 @@ public class D8CommandTest {
     parse("--main-dex-list", mainDexList.toString());
   }
 
+  @Test
+  public void testFlagFilePerClass() throws Throwable {
+    D8Command command = parse("--file-per-class");
+    assertTrue(command.getProgramConsumer() instanceof DexFilePerClassFileConsumer);
+  }
+
   @Test(expected = CompilationFailedException.class)
   public void mainDexListWithFilePerClass() throws Throwable {
     Path mainDexList = temp.newFile("main-dex-list.txt").toPath();
     D8Command command = parse("--main-dex-list", mainDexList.toString(), "--file-per-class");
+    assertTrue(ToolHelper.getApp(command).hasMainDexListResources());
+  }
+
+  @Test
+  public void testFlagFilePerClassFile() throws Throwable {
+    D8Command command = parse("--file-per-class-file");
+    assertTrue(command.getProgramConsumer() instanceof DexFilePerClassFileConsumer);
+  }
+
+  @Test(expected = CompilationFailedException.class)
+  public void mainDexListWithFilePerClassFile() throws Throwable {
+    Path mainDexList = temp.newFile("main-dex-list.txt").toPath();
+    D8Command command = parse("--main-dex-list", mainDexList.toString(), "--file-per-class-file");
     assertTrue(ToolHelper.getApp(command).hasMainDexListResources());
   }
 
@@ -507,10 +562,88 @@ public class D8CommandTest {
     assertEquals(0, new ZipFile(emptyZip.toFile(), StandardCharsets.UTF_8).size());
   }
 
+  private void checkSingleForceAllAssertion(
+      List<AssertionsConfiguration> entries, AssertionTransformation transformation) {
+    assertEquals(1, entries.size());
+    assertEquals(transformation, entries.get(0).getTransformation());
+    assertEquals(AssertionTransformationScope.ALL, entries.get(0).getScope());
+  }
+
+  private void checkSingleForceClassAndPackageAssertion(
+      List<AssertionsConfiguration> entries, AssertionTransformation transformation) {
+    assertEquals(2, entries.size());
+    assertEquals(transformation, entries.get(0).getTransformation());
+    assertEquals(AssertionTransformationScope.CLASS, entries.get(0).getScope());
+    assertEquals("ClassName", entries.get(0).getValue());
+    assertEquals(transformation, entries.get(1).getTransformation());
+    assertEquals(AssertionTransformationScope.PACKAGE, entries.get(1).getScope());
+    assertEquals("PackageName", entries.get(1).getValue());
+  }
+
+  @Test
+  public void forceAssertionOption() throws Exception {
+    checkSingleForceAllAssertion(
+        parse("--force-enable-assertions").getAssertionsConfiguration(),
+        AssertionTransformation.ENABLE);
+    checkSingleForceAllAssertion(
+        parse("--force-disable-assertions").getAssertionsConfiguration(),
+        AssertionTransformation.DISABLE);
+    checkSingleForceAllAssertion(
+        parse("--force-passthrough-assertions").getAssertionsConfiguration(),
+        AssertionTransformation.PASSTHROUGH);
+    checkSingleForceClassAndPackageAssertion(
+        parse("--force-enable-assertions:ClassName", "--force-enable-assertions:PackageName...")
+            .getAssertionsConfiguration(),
+        AssertionTransformation.ENABLE);
+    checkSingleForceClassAndPackageAssertion(
+        parse("--force-disable-assertions:ClassName", "--force-disable-assertions:PackageName...")
+            .getAssertionsConfiguration(),
+        AssertionTransformation.DISABLE);
+    checkSingleForceClassAndPackageAssertion(
+        parse(
+                "--force-passthrough-assertions:ClassName",
+                "--force-passthrough-assertions:PackageName...")
+            .getAssertionsConfiguration(),
+        AssertionTransformation.PASSTHROUGH);
+  }
+
   @Test(expected = CompilationFailedException.class)
   public void missingParameterForLastOption() throws CompilationFailedException {
     DiagnosticsChecker.checkErrorsContains(
         "Missing parameter", handler -> parse(handler, "--output"));
+  }
+
+  @Test
+  public void desugaredLibrary() throws CompilationFailedException {
+    D8Command d8Command = parse("--desugared-lib", "src/library_desugar/desugar_jdk_libs.json");
+    assertFalse(
+        d8Command.getInternalOptions().desugaredLibraryConfiguration.getRewritePrefix().isEmpty());
+  }
+
+  @Test
+  public void numThreadsOption() throws Exception {
+    assertEquals(ThreadUtils.NOT_SPECIFIED, parse().getThreadCount());
+    assertEquals(1, parse("--thread-count", "1").getThreadCount());
+    assertEquals(2, parse("--thread-count", "2").getThreadCount());
+    assertEquals(10, parse("--thread-count", "10").getThreadCount());
+  }
+
+  private void numThreadsOptionInvalid(String value) throws Exception {
+    final String expectedErrorContains = "Invalid argument to --thread-count";
+    try {
+      DiagnosticsChecker.checkErrorsContains(
+          expectedErrorContains, handler -> parse(handler, "--thread-count", value));
+      fail("Expected failure");
+    } catch (CompilationFailedException e) {
+      // Expected.
+    }
+  }
+
+  @Test
+  public void numThreadsOptionInvalid() throws Exception {
+    numThreadsOptionInvalid("0");
+    numThreadsOptionInvalid("-1");
+    numThreadsOptionInvalid("two");
   }
 
   private D8Command parse(String... args) throws CompilationFailedException {

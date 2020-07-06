@@ -6,17 +6,19 @@ package com.android.tools.r8.ir.optimize;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
+import com.android.tools.r8.TestBase;
+import com.android.tools.r8.TestParameters;
+import com.android.tools.r8.TestParametersCollection;
 import com.android.tools.r8.graph.AppInfo;
 import com.android.tools.r8.graph.AppView;
-import com.android.tools.r8.graph.DexApplication;
-import com.android.tools.r8.graph.DexItemFactory;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.code.Argument;
 import com.android.tools.r8.ir.code.BasicBlock;
 import com.android.tools.r8.ir.code.ConstNumber;
 import com.android.tools.r8.ir.code.Goto;
 import com.android.tools.r8.ir.code.IRCode;
+import com.android.tools.r8.ir.code.IRMetadata;
 import com.android.tools.r8.ir.code.If;
 import com.android.tools.r8.ir.code.If.Type;
 import com.android.tools.r8.ir.code.Instruction;
@@ -26,13 +28,29 @@ import com.android.tools.r8.ir.code.Throw;
 import com.android.tools.r8.ir.code.Value;
 import com.android.tools.r8.ir.code.ValueNumberGenerator;
 import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.utils.AndroidApp;
 import com.android.tools.r8.utils.InternalOptions;
-import com.android.tools.r8.utils.Timing;
 import com.google.common.collect.ImmutableList;
 import java.util.LinkedList;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
-public class TrivialGotoEliminationTest {
+@RunWith(Parameterized.class)
+public class TrivialGotoEliminationTest extends TestBase {
+
+  @Parameters(name = "{0}")
+  public static TestParametersCollection data() {
+    return getTestParameters().withNoneRuntime().build();
+  }
+
+  public TrivialGotoEliminationTest(TestParameters parameters) {
+    parameters.assertNoneRuntime();
+  }
+
+  private final IRMetadata metadata = IRMetadata.unknown();
+
   @Test
   public void trivialGotoInEntryBlock() {
     // Setup silly block structure:
@@ -47,22 +65,22 @@ public class TrivialGotoEliminationTest {
     Position position = Position.testingPosition();
     BasicBlock block2 = new BasicBlock();
     block2.setNumber(2);
-    BasicBlock block0 = BasicBlock.createGotoBlock(0, position, block2);
+    BasicBlock block0 = BasicBlock.createGotoBlock(0, position, metadata, block2);
     block0.setFilledForTesting();
     block2.getMutablePredecessors().add(block0);
     Instruction ret = new Return();
     ret.setPosition(position);
-    block2.add(ret);
+    block2.add(ret, metadata);
     block2.setFilledForTesting();
     BasicBlock block1 = new BasicBlock();
     block1.setNumber(1);
-    Value value = new Value(0, TypeLatticeElement.INT, null);
+    Value value = new Value(0, TypeElement.getInt(), null);
     Instruction number = new ConstNumber(value, 0);
     number.setPosition(position);
-    block1.add(number);
+    block1.add(number, metadata);
     Instruction throwing = new Throw(value);
     throwing.setPosition(position);
-    block1.add(throwing);
+    block1.add(throwing, metadata);
     block1.setFilledForTesting();
     LinkedList<BasicBlock> blocks = new LinkedList<>();
     blocks.add(block0);
@@ -79,11 +97,9 @@ public class TrivialGotoEliminationTest {
             null,
             blocks,
             new ValueNumberGenerator(),
-            false,
-            false,
-            false,
+            IRMetadata.unknown(),
             Origin.unknown());
-    CodeRewriter.collapseTrivialGotos(null, code);
+    CodeRewriter.collapseTrivialGotos(code);
     assertTrue(code.entryBlock().isTrivialGoto());
     assertTrue(blocks.contains(block0));
     assertTrue(blocks.contains(block1));
@@ -91,10 +107,9 @@ public class TrivialGotoEliminationTest {
   }
 
   @Test
-  public void trivialGotoLoopAsFallthrough() {
-    InternalOptions options = new InternalOptions();
-    DexApplication app = DexApplication.builder(new DexItemFactory(), new Timing("")).build();
-    AppView<AppInfo> appView = AppView.createForD8(new AppInfo(app), options);
+  public void trivialGotoLoopAsFallthrough() throws Exception {
+    AppView<AppInfo> appView = computeAppView(AndroidApp.builder().build());
+    InternalOptions options = appView.options();
     // Setup block structure:
     // block0:
     //   v0 <- argument
@@ -113,18 +128,18 @@ public class TrivialGotoEliminationTest {
     block2.setNumber(2);
     Instruction ret = new Return();
     ret.setPosition(position);
-    block2.add(ret);
+    block2.add(ret, metadata);
     block2.setFilledForTesting();
 
     BasicBlock block3 = new BasicBlock();
     block3.setNumber(3);
     Instruction instruction = new Goto();
     instruction.setPosition(position);
-    block3.add(instruction);
+    block3.add(instruction, metadata);
     block3.setFilledForTesting();
     block3.getMutableSuccessors().add(block3);
 
-    BasicBlock block1 = BasicBlock.createGotoBlock(1, position);
+    BasicBlock block1 = BasicBlock.createGotoBlock(1, position, metadata);
     block1.getMutableSuccessors().add(block3);
     block1.setFilledForTesting();
 
@@ -133,15 +148,15 @@ public class TrivialGotoEliminationTest {
     Value value =
         new Value(
             0,
-            TypeLatticeElement.fromDexType(
-                app.dexItemFactory.throwableType, Nullability.definitelyNotNull(), appView),
+            TypeElement.fromDexType(
+                options.itemFactory.throwableType, Nullability.definitelyNotNull(), appView),
             null);
-    instruction = new Argument(value);
+    instruction = new Argument(value, 0, false);
     instruction.setPosition(position);
-    block0.add(instruction);
+    block0.add(instruction, metadata);
     instruction = new If(Type.EQ, value);
     instruction.setPosition(position);
-    block0.add(instruction);
+    block0.add(instruction, metadata);
     block0.getMutableSuccessors().add(block2);
     block0.getMutableSuccessors().add(block1);
     block0.setFilledForTesting();
@@ -166,11 +181,9 @@ public class TrivialGotoEliminationTest {
             null,
             blocks,
             new ValueNumberGenerator(),
-            false,
-            false,
-            false,
+            IRMetadata.unknown(),
             Origin.unknown());
-    CodeRewriter.collapseTrivialGotos(null, code);
+    CodeRewriter.collapseTrivialGotos(code);
     assertTrue(block0.getInstructions().get(1).isIf());
     assertEquals(block1, block0.getInstructions().get(1).asIf().fallthroughBlock());
     assertTrue(blocks.containsAll(ImmutableList.of(block0, block1, block2, block3)));

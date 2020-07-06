@@ -3,43 +3,53 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.ir.code;
 
-import static com.android.tools.r8.optimize.MemberRebindingAnalysis.isMemberVisibleFromOriginalContext;
-
 import com.android.tools.r8.cf.code.CfInvoke;
 import com.android.tools.r8.code.InvokeStaticRange;
-import com.android.tools.r8.graph.AppInfo;
-import com.android.tools.r8.graph.AppInfoWithSubtyping;
 import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.DexClass;
 import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
 import com.android.tools.r8.graph.DexType;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.graph.ResolutionResult.SingleResolutionResult;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.AnalysisAssumption;
 import com.android.tools.r8.ir.analysis.ClassInitializationAnalysis.Query;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
+import com.android.tools.r8.ir.optimize.DefaultInliningOracle;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
 import com.android.tools.r8.ir.optimize.Inliner.InlineAction;
+import com.android.tools.r8.ir.optimize.Inliner.Reason;
 import com.android.tools.r8.ir.optimize.InliningConstraints;
-import com.android.tools.r8.ir.optimize.InliningOracle;
+import com.android.tools.r8.ir.optimize.inliner.WhyAreYouNotInliningReporter;
 import com.android.tools.r8.shaking.AppInfoWithLiveness;
-import java.util.Collection;
-import java.util.Collections;
+import com.google.common.collect.Sets;
 import java.util.List;
-import org.objectweb.asm.Opcodes;
+import java.util.function.Predicate;
 
 public class InvokeStatic extends InvokeMethod {
 
-  private final boolean itf;
+  private final boolean isInterface;
 
   public InvokeStatic(DexMethod target, Value result, List<Value> arguments) {
     this(target, result, arguments, false);
-    assert target.asDexReference().asDexMethod().proto.parameters.size() == arguments.size();
+    assert target.proto.parameters.size() == arguments.size();
   }
 
-  public InvokeStatic(DexMethod target, Value result, List<Value> arguments, boolean itf) {
+  public InvokeStatic(DexMethod target, Value result, List<Value> arguments, boolean isInterface) {
     super(target, result, arguments);
-    this.itf = itf;
+    this.isInterface = isInterface;
+  }
+
+  @Override
+  public boolean getInterfaceBit() {
+    return isInterface;
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.INVOKE_STATIC;
   }
 
   @Override
@@ -97,52 +107,63 @@ public class InvokeStatic extends InvokeMethod {
   }
 
   @Override
-  public DexEncodedMethod lookupSingleTarget(AppInfoWithLiveness appInfo,
-      DexType invocationContext) {
-    DexMethod method = getInvokedMethod();
-    return appInfo.lookupStaticTarget(method);
-  }
-
-  @Override
-  public Collection<DexEncodedMethod> lookupTargets(AppInfoWithSubtyping appInfo,
-      DexType invocationContext) {
-    DexEncodedMethod target = appInfo.lookupStaticTarget(getInvokedMethod());
-    return target == null ? Collections.emptyList() : Collections.singletonList(target);
+  public DexEncodedMethod lookupSingleTarget(AppView<?> appView, ProgramMethod context) {
+    DexMethod invokedMethod = getInvokedMethod();
+    if (appView.appInfo().hasLiveness()) {
+      AppInfoWithLiveness appInfo = appView.appInfo().withLiveness();
+      DexEncodedMethod result = appInfo.lookupStaticTarget(invokedMethod, context);
+      assert verifyD8LookupResult(
+          result, appView.appInfo().lookupStaticTargetOnItself(invokedMethod, context));
+      return result;
+    }
+    // Allow optimizing static library invokes in D8.
+    DexClass clazz = appView.definitionForHolder(getInvokedMethod());
+    if (clazz != null
+        && (clazz.isLibraryClass() || appView.libraryMethodOptimizer().isModeled(clazz.type))) {
+      return clazz.lookupMethod(getInvokedMethod());
+    }
+    // In D8, we can treat invoke-static instructions as having a single target if the invoke is
+    // targeting a method in the enclosing class.
+    return appView.appInfo().lookupStaticTargetOnItself(invokedMethod, context);
   }
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
-    return inliningConstraints.forInvokeStatic(getInvokedMethod(), invocationContext);
+      InliningConstraints inliningConstraints, ProgramMethod context) {
+    return inliningConstraints.forInvokeStatic(getInvokedMethod(), context.getHolder());
   }
 
   @Override
   public InlineAction computeInlining(
-      InliningOracle decider,
-      DexType invocationContext,
-      ClassInitializationAnalysis classInitializationAnalysis) {
-    return decider.computeForInvokeStatic(this, invocationContext, classInitializationAnalysis);
+      ProgramMethod singleTarget,
+      Reason reason,
+      DefaultInliningOracle decider,
+      ClassInitializationAnalysis classInitializationAnalysis,
+      WhyAreYouNotInliningReporter whyAreYouNotInliningReporter) {
+    return decider.computeForInvokeStatic(
+        this, singleTarget, reason, classInitializationAnalysis, whyAreYouNotInliningReporter);
   }
 
   @Override
   public void buildCf(CfBuilder builder) {
-    builder.add(new CfInvoke(Opcodes.INVOKESTATIC, getInvokedMethod(), itf));
+    builder.add(
+        new CfInvoke(org.objectweb.asm.Opcodes.INVOKESTATIC, getInvokedMethod(), isInterface));
   }
 
   @Override
   public boolean definitelyTriggersClassInitialization(
       DexType clazz,
-      DexType context,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      AppView<AppInfoWithLiveness> appView,
       Query mode,
       AnalysisAssumption assumption) {
     return ClassInitializationAnalysis.InstructionUtils.forInvokeStatic(
-        this, clazz, appView, mode, assumption);
+        this, clazz, context, appView, mode, assumption);
   }
 
   @Override
   public boolean instructionMayHaveSideEffects(
-      AppView<? extends AppInfo> appView, DexType context) {
+      AppView<?> appView, ProgramMethod context, SideEffectAssumption assumption) {
     if (!appView.enableWholeProgramOptimizations()) {
       return true;
     }
@@ -151,40 +172,61 @@ public class InvokeStatic extends InvokeMethod {
       return true;
     }
 
-    // Find the target and check if the invoke may have side effects.
-    if (appView.appInfo().hasLiveness()) {
-      AppInfoWithLiveness appInfoWithLiveness = appView.appInfo().withLiveness();
-      DexEncodedMethod target = lookupSingleTarget(appInfoWithLiveness, context);
-      if (target == null) {
-        return true;
-      }
-
-      // Verify that the target method is accessible in the current context.
-      if (!isMemberVisibleFromOriginalContext(
-          appView, context, target.method.holder, target.accessFlags)) {
-        return true;
-      }
-
-      // Verify that the target method does not have side-effects.
-      boolean targetMayHaveSideEffects =
-          target.getOptimizationInfo().mayHaveSideEffects()
-              && !appInfoWithLiveness.noSideEffects.containsKey(target.method);
-      if (targetMayHaveSideEffects) {
-        return true;
-      }
-
-      // Verify that calling the target method won't lead to class initialization.
-      return target.method.holder.classInitializationMayHaveSideEffects(
-          appView.appInfo(),
-          // Types that are a super type of `context` are guaranteed to be initialized already.
-          type -> appView.isSubtype(context, type).isTrue());
+    // Check if it is a call to one of library methods that are known to be side-effect free.
+    Predicate<InvokeMethod> noSideEffectsPredicate =
+        appView.dexItemFactory().libraryMethodsWithoutSideEffects.get(getInvokedMethod());
+    if (noSideEffectsPredicate != null && noSideEffectsPredicate.test(this)) {
+      return false;
     }
 
-    return true;
-  }
+    // Find the target and check if the invoke may have side effects.
+    if (!appView.appInfo().hasLiveness()) {
+      return true;
+    }
 
-  @Override
-  public boolean canBeDeadCode(AppView<? extends AppInfo> appView, IRCode code) {
-    return !instructionMayHaveSideEffects(appView, code.method.method.holder);
+    AppView<AppInfoWithLiveness> appViewWithLiveness = appView.withLiveness();
+    AppInfoWithLiveness appInfoWithLiveness = appViewWithLiveness.appInfo();
+
+    SingleResolutionResult resolutionResult =
+        appViewWithLiveness
+            .appInfo()
+            .resolveMethod(getInvokedMethod(), isInterface)
+            .asSingleResolution();
+
+    // Verify that the target method is present.
+    if (resolutionResult == null) {
+      return true;
+    }
+
+    DexEncodedMethod singleTarget = resolutionResult.getSingleTarget();
+    assert singleTarget != null;
+
+    // Verify that the target method is static and accessible.
+    if (!singleTarget.isStatic()
+        || resolutionResult.isAccessibleFrom(context, appInfoWithLiveness).isPossiblyFalse()) {
+      return true;
+    }
+
+    // Verify that the target method does not have side-effects.
+    if (appViewWithLiveness.appInfo().noSideEffects.containsKey(singleTarget.getReference())) {
+      return false;
+    }
+
+    if (singleTarget.getOptimizationInfo().mayHaveSideEffects()) {
+      return true;
+    }
+
+    if (assumption.canAssumeClassIsAlreadyInitialized()) {
+      return false;
+    }
+
+    return singleTarget
+        .holder()
+        .classInitializationMayHaveSideEffects(
+            appView,
+            // Types that are a super type of `context` are guaranteed to be initialized
+            // already.
+            type -> appInfoWithLiveness.isSubtype(context.getHolderType(), type),
+            Sets.newIdentityHashSet());
   }
 }

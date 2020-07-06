@@ -8,10 +8,8 @@ import com.android.tools.r8.graph.DexEncodedMethod;
 import com.android.tools.r8.graph.DexMethod;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
 
@@ -76,59 +74,6 @@ final class DefaultMethodsHelper {
 
   final void addDefaultMethod(DexEncodedMethod encoded) {
     candidates.add(encoded);
-  }
-
-  // Creates a list of default method candidates to be implemented in the class.
-  final List<DexEncodedMethod> createCandidatesList() {
-    this.candidates.removeAll(hidden);
-    if (this.candidates.isEmpty()) {
-      return Collections.emptyList();
-    }
-
-    // The list of non-hidden default methods. The list is not expected to be big,
-    // since it only consists of default methods which are maximally specific
-    // interface method of a particular class.
-    List<DexEncodedMethod> candidates = new LinkedList<>();
-
-    // Note that it is possible for a class to have more than one maximally specific
-    // interface method. But runtime requires that when a method is called, there must be
-    // found *only one* maximally specific interface method and this method should be
-    // non-abstract, otherwise a runtime error is generated.
-    //
-    // This code assumes that if such erroneous case exist for particular name/signature,
-    // a method with this name/signature must be defined in class or one of its superclasses,
-    // or otherwise it should never be called. This means that if we see two default method
-    // candidates with same name/signature, it is safe to assume that we don't need to add
-    // these method to the class, because if it was missing in class and its superclasses
-    // but still called in the original code, this call would have resulted in runtime error.
-    // So we are just leaving it unimplemented with the same effect (with a different runtime
-    // exception though).
-    for (DexEncodedMethod candidate : this.candidates) {
-      Iterator<DexEncodedMethod> it = candidates.iterator();
-      boolean conflict = false;
-      while (it.hasNext()) {
-        if (candidate.method.match(it.next())) {
-          conflict = true;
-          it.remove();
-        }
-      }
-      if (!conflict) {
-        candidates.add(candidate);
-      }
-    }
-    return candidates;
-  }
-
-  final List<DexEncodedMethod> createFullList() {
-    if (candidates.isEmpty() && hidden.isEmpty()) {
-      return Collections.emptyList();
-    }
-
-    List<DexEncodedMethod> fullList =
-        new ArrayList<DexEncodedMethod>(candidates.size() + hidden.size());
-    fullList.addAll(candidates);
-    fullList.addAll(hidden);
-    return fullList;
   }
 
   // Create default interface collection based on collected information.

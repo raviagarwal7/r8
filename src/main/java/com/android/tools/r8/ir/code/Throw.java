@@ -6,9 +6,9 @@ package com.android.tools.r8.ir.code;
 import com.android.tools.r8.cf.LoadStoreHelper;
 import com.android.tools.r8.cf.code.CfThrow;
 import com.android.tools.r8.dex.Constants;
-import com.android.tools.r8.graph.DexItemFactory;
-import com.android.tools.r8.graph.DexType;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.graph.AppView;
+import com.android.tools.r8.graph.ProgramMethod;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
 import com.android.tools.r8.ir.conversion.CfBuilder;
 import com.android.tools.r8.ir.conversion.DexBuilder;
 import com.android.tools.r8.ir.optimize.Inliner.ConstraintWithTarget;
@@ -17,7 +17,12 @@ import com.android.tools.r8.ir.optimize.InliningConstraints;
 public class Throw extends JumpInstruction {
 
   public Throw(Value exception) {
-    super(null, exception);
+    super(exception);
+  }
+
+  @Override
+  public int opcode() {
+    return Opcodes.THROW;
   }
 
   @Override
@@ -67,7 +72,7 @@ public class Throw extends JumpInstruction {
 
   @Override
   public ConstraintWithTarget inliningConstraint(
-      InliningConstraints inliningConstraints, DexType invocationContext) {
+      InliningConstraints inliningConstraints, ProgramMethod context) {
     return inliningConstraints.forThrow();
   }
 
@@ -82,11 +87,11 @@ public class Throw extends JumpInstruction {
   }
 
   @Override
-  public boolean throwsNpeIfValueIsNull(Value value, DexItemFactory dexItemFactory) {
+  public boolean throwsNpeIfValueIsNull(Value value, AppView<?> appView, ProgramMethod context) {
     if (exception() == value) {
       return true;
     }
-    TypeLatticeElement exceptionType = exception().getTypeLattice();
+    TypeElement exceptionType = exception().getType();
     if (exceptionType.isNullType()) {
       // throw null
       return true;
@@ -100,7 +105,7 @@ public class Throw extends JumpInstruction {
     if (!aliasedValue.isPhi()) {
       Instruction definition = aliasedValue.getDefinition();
       if (definition.isNewInstance()
-          && definition.asNewInstance().clazz == dexItemFactory.npeType) {
+          && definition.asNewInstance().clazz == appView.dexItemFactory().npeType) {
         // throw new NullPointerException()
         return true;
       }

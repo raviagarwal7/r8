@@ -4,31 +4,119 @@
 
 package com.android.tools.r8;
 
+import static com.android.tools.r8.DiagnosticsMatcher.diagnosticMessage;
+import static org.hamcrest.CoreMatchers.not;
+
+import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import org.hamcrest.Matcher;
 
-
 public interface TestDiagnosticMessages {
 
-  public List<Diagnostic> getInfos();
+  List<Diagnostic> getInfos();
 
-  public List<Diagnostic> getWarnings();
+  List<Diagnostic> getWarnings();
 
-  public List<Diagnostic> getErrors();
+  List<Diagnostic> getErrors();
 
-  public TestDiagnosticMessages assertNoMessages();
+  TestDiagnosticMessages assertNoMessages();
 
-  public TestDiagnosticMessages assertOnlyInfos();
+  TestDiagnosticMessages assertOnlyInfos();
 
-  public TestDiagnosticMessages assertOnlyWarnings();
+  TestDiagnosticMessages assertOnlyWarnings();
 
-  public TestDiagnosticMessages assertInfosCount(int count);
+  TestDiagnosticMessages assertOnlyErrors();
 
-  public TestDiagnosticMessages assertWarningsCount(int count);
+  TestDiagnosticMessages assertInfosCount(int count);
 
-  public TestDiagnosticMessages assertErrorsCount(int count);
+  TestDiagnosticMessages assertWarningsCount(int count);
 
-  public TestDiagnosticMessages assertWarningMessageThatMatches(Matcher<String> matcher);
+  TestDiagnosticMessages assertErrorsCount(int count);
 
-  public TestDiagnosticMessages assertNoWarningMessageThatMatches(Matcher<String> matcher);
+  default TestDiagnosticMessages assertNoInfos() {
+    return assertInfosCount(0);
+  }
+
+  default TestDiagnosticMessages assertNoWarnings() {
+    return assertWarningsCount(0);
+  }
+
+  default TestDiagnosticMessages assertNoErrors() {
+    return assertErrorsCount(0);
+  }
+
+  // Match exact.
+
+  default TestDiagnosticMessages assertDiagnosticsMatch(Matcher<Diagnostic> matcher) {
+    return assertDiagnosticsMatch(Collections.singletonList(matcher));
+  }
+
+  TestDiagnosticMessages assertDiagnosticsMatch(Collection<Matcher<Diagnostic>> matchers);
+
+  default TestDiagnosticMessages assertInfosMatch(Matcher<Diagnostic> matcher) {
+    return assertInfosMatch(Collections.singletonList(matcher));
+  }
+
+  TestDiagnosticMessages assertInfosMatch(Collection<Matcher<Diagnostic>> matchers);
+
+  default TestDiagnosticMessages assertWarningsMatch(Matcher<Diagnostic> matcher) {
+    return assertWarningsMatch(Collections.singletonList(matcher));
+  }
+
+  TestDiagnosticMessages assertWarningsMatch(Collection<Matcher<Diagnostic>> matchers);
+
+  default TestDiagnosticMessages assertErrorsMatch(Matcher<Diagnostic> matcher) {
+    return assertErrorsMatch(Collections.singletonList(matcher));
+  }
+
+  TestDiagnosticMessages assertErrorsMatch(Collection<Matcher<Diagnostic>> matchers);
+
+  // Match one.
+
+  TestDiagnosticMessages assertDiagnosticThatMatches(Matcher<Diagnostic> matcher);
+
+  TestDiagnosticMessages assertInfoThatMatches(Matcher<Diagnostic> matcher);
+
+  TestDiagnosticMessages assertWarningThatMatches(Matcher<Diagnostic> matcher);
+
+  TestDiagnosticMessages assertErrorThatMatches(Matcher<Diagnostic> matcher);
+
+  // Consider removing this helper.
+  default TestDiagnosticMessages assertWarningMessageThatMatches(Matcher<String> matcher) {
+    return assertWarningThatMatches(diagnosticMessage(matcher));
+  }
+
+  // Consider removing this helper.
+  default TestDiagnosticMessages assertErrorMessageThatMatches(Matcher<String> matcher) {
+    return assertErrorThatMatches(diagnosticMessage(matcher));
+  }
+
+  // Match all.
+
+  TestDiagnosticMessages assertAllDiagnosticsMatch(Matcher<Diagnostic> matcher);
+
+  TestDiagnosticMessages assertAllInfosMatch(Matcher<Diagnostic> matcher);
+
+  TestDiagnosticMessages assertAllWarningsMatch(Matcher<Diagnostic> matcher);
+
+  TestDiagnosticMessages assertAllErrorsMatch(Matcher<Diagnostic> matcher);
+
+  // Match none.
+
+  default TestDiagnosticMessages assertNoDiagnosticsMatch(Matcher<Diagnostic> matcher) {
+    return assertAllDiagnosticsMatch(not(matcher));
+  }
+
+  default TestDiagnosticMessages assertNoInfosMatch(Matcher<Diagnostic> matcher) {
+    return assertAllInfosMatch(not(matcher));
+  }
+
+  default TestDiagnosticMessages assertNoWarningsMatch(Matcher<Diagnostic> matcher) {
+    return assertAllWarningsMatch(not(matcher));
+  }
+
+  default TestDiagnosticMessages assertNoErrorsMatch(Matcher<Diagnostic> matcher) {
+    return assertAllErrorsMatch(not(matcher));
+  }
 }

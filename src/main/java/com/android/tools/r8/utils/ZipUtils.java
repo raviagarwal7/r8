@@ -8,25 +8,54 @@ import static com.android.tools.r8.utils.FileUtils.DEX_EXTENSION;
 import static com.android.tools.r8.utils.FileUtils.MODULE_INFO_CLASS;
 
 import com.android.tools.r8.ByteDataView;
+import com.android.tools.r8.DataEntryResource;
+import com.android.tools.r8.ProgramResource;
+import com.android.tools.r8.ResourceException;
 import com.android.tools.r8.errors.CompilationError;
 import com.google.common.io.ByteStreams;
+import com.google.common.io.Closer;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
 
 public class ZipUtils {
+
+  public static void writeResourcesToZip(
+      List<ProgramResource> resources,
+      Set<DataEntryResource> dataResources,
+      Closer closer,
+      ZipOutputStream out)
+      throws IOException, ResourceException {
+    for (ProgramResource resource : resources) {
+      assert resource.getClassDescriptors().size() == 1;
+      Iterator<String> iterator = resource.getClassDescriptors().iterator();
+      String className = iterator.next();
+      String entryName = DescriptorUtils.getClassFileName(className);
+      byte[] bytes = ByteStreams.toByteArray(closer.register(resource.getByteStream()));
+      writeToZipStream(out, entryName, bytes, ZipEntry.DEFLATED);
+    }
+    for (DataEntryResource dataResource : dataResources) {
+      String entryName = dataResource.getName();
+      byte[] bytes = ByteStreams.toByteArray(closer.register(dataResource.getByteStream()));
+      writeToZipStream(out, entryName, bytes, ZipEntry.DEFLATED);
+    }
+  }
 
   public interface OnEntryHandler {
     void onEntry(ZipEntry entry, InputStream input) throws IOException;
@@ -40,6 +69,21 @@ public class ZipUtils {
         try (InputStream entryStream = zipFile.getInputStream(entry)) {
           handler.onEntry(entry, entryStream);
         }
+      }
+    }
+  }
+
+  public static void zip(Path zipFile, Path inputDirectory) throws IOException {
+    try (ZipOutputStream stream = new ZipOutputStream(Files.newOutputStream(zipFile))) {
+      List<Path> files =
+          Files.walk(inputDirectory)
+              .filter(path -> !Files.isDirectory(path))
+              .collect(Collectors.toList());
+      for (Path path : files) {
+        ZipEntry zipEntry = new ZipEntry(inputDirectory.relativize(path).toString());
+        stream.putNextEntry(zipEntry);
+        Files.copy(path, stream);
+        stream.closeEntry();
       }
     }
   }

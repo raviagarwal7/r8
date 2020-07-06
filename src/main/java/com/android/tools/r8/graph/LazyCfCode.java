@@ -26,6 +26,7 @@ import com.android.tools.r8.cf.code.CfInstanceOf;
 import com.android.tools.r8.cf.code.CfInstruction;
 import com.android.tools.r8.cf.code.CfInvoke;
 import com.android.tools.r8.cf.code.CfInvokeDynamic;
+import com.android.tools.r8.cf.code.CfJsrRet;
 import com.android.tools.r8.cf.code.CfLabel;
 import com.android.tools.r8.cf.code.CfLoad;
 import com.android.tools.r8.cf.code.CfLogicalBinop;
@@ -56,10 +57,15 @@ import com.android.tools.r8.ir.code.Monitor;
 import com.android.tools.r8.ir.code.Position;
 import com.android.tools.r8.ir.code.ValueNumberGenerator;
 import com.android.tools.r8.ir.code.ValueType;
+import com.android.tools.r8.ir.conversion.MethodProcessor;
 import com.android.tools.r8.naming.ClassNameMapper;
 import com.android.tools.r8.origin.Origin;
+import com.android.tools.r8.position.MethodPosition;
+import com.android.tools.r8.shaking.ProguardConfiguration;
+import com.android.tools.r8.shaking.ProguardKeepAttributes;
 import com.android.tools.r8.utils.InternalOptions;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceAVLTreeMap;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
 import it.unimi.dsi.fastutil.ints.Int2ReferenceSortedMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -67,8 +73,10 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiFunction;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.ConstantDynamic;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;
@@ -86,18 +94,22 @@ public class LazyCfCode extends Code {
 
   public LazyCfCode(
       DexMethod method, Origin origin, ReparseContext context, JarApplicationReader application) {
-    this.method = method;
     this.origin = origin;
     this.context = context;
     this.application = application;
     context.codeList.add(this);
   }
 
-  private final DexMethod method;
   private final Origin origin;
-  private final JarApplicationReader application;
+  private JarApplicationReader application;
   private CfCode code;
-  private ReparseContext context;
+  protected ReparseContext context;
+  private boolean reachabilitySensitive = false;
+
+  public void markReachabilitySensitive() {
+    assert code == null;
+    reachabilitySensitive = true;
+  }
 
   @Override
   public boolean isCfCode() {
@@ -113,15 +125,17 @@ public class LazyCfCode extends Code {
   public CfCode asCfCode() {
     if (code == null) {
       ReparseContext context = this.context;
+      JarApplicationReader application = this.application;
+      assert application != null;
       assert context != null;
       // The ClassCodeVisitor is in charge of setting this.context to null.
       try {
         parseCode(context, false);
       } catch (JsrEncountered e) {
-        System.out.println("LazyCfCode: JSR encountered; reparse using JSRInlinerAdapter");
         for (Code code : context.codeList) {
           code.asLazyCfCode().code = null;
           code.asLazyCfCode().context = context;
+          code.asLazyCfCode().application = application;
         }
         try {
           parseCode(context, true);
@@ -135,9 +149,30 @@ public class LazyCfCode extends Code {
     return code;
   }
 
+  public static class DebugParsingOptions {
+    public final boolean lineInfo;
+    public final boolean localInfo;
+    public final int asmReaderOptions;
+
+    public DebugParsingOptions(boolean lineInfo, boolean localInfo, int asmReaderOptions) {
+      this.lineInfo = lineInfo;
+      this.localInfo = localInfo;
+      this.asmReaderOptions = asmReaderOptions;
+    }
+  }
+
   public void parseCode(ReparseContext context, boolean useJsrInliner) {
-    ClassCodeVisitor classVisitor = new ClassCodeVisitor(context, application, useJsrInliner);
-    new ClassReader(context.classCache).accept(classVisitor, ClassReader.EXPAND_FRAMES);
+    DebugParsingOptions parsingOptions = getParsingOptions(application, reachabilitySensitive);
+
+    ClassCodeVisitor classVisitor =
+        new ClassCodeVisitor(
+            context.owner,
+            createCodeLocator(context),
+            application,
+            useJsrInliner,
+            origin,
+            parsingOptions);
+    new ClassReader(context.classCache).accept(classVisitor, parsingOptions.asmReaderOptions);
   }
 
   private void setCode(CfCode code) {
@@ -145,8 +180,7 @@ public class LazyCfCode extends Code {
     assert this.context != null;
     this.code = code;
     this.context = null;
-    // Propagate the ownership of LazyCfCode to CfCode.
-    code.setOwner(this.getOwner());
+    this.application = null;
   }
 
   @Override
@@ -175,29 +209,43 @@ public class LazyCfCode extends Code {
   }
 
   @Override
-  public IRCode buildIR(
-      DexEncodedMethod encodedMethod, AppView<? extends AppInfo> appView, Origin origin) {
-    assert getOwner() == encodedMethod;
-    return asCfCode().buildIR(encodedMethod, appView, origin);
+  public IRCode buildIR(ProgramMethod method, AppView<?> appView, Origin origin) {
+    return asCfCode().buildIR(method, appView, origin);
   }
 
   @Override
   public IRCode buildInliningIR(
-      DexEncodedMethod context,
-      DexEncodedMethod encodedMethod,
-      AppView<? extends AppInfo> appView,
+      ProgramMethod context,
+      ProgramMethod method,
+      AppView<?> appView,
       ValueNumberGenerator valueNumberGenerator,
       Position callerPosition,
-      Origin origin) {
-    assert getOwner() == encodedMethod;
+      Origin origin,
+      MethodProcessor methodProcessor) {
     return asCfCode()
         .buildInliningIR(
-            context, encodedMethod, appView, valueNumberGenerator, callerPosition, origin);
+            context,
+            method,
+            appView,
+            valueNumberGenerator,
+            callerPosition,
+            origin,
+            methodProcessor);
   }
 
   @Override
-  public void registerCodeReferences(UseRegistry registry) {
-    asCfCode().registerCodeReferences(registry);
+  public void registerCodeReferences(ProgramMethod method, UseRegistry registry) {
+    asCfCode().registerCodeReferences(method, registry);
+  }
+
+  @Override
+  public void registerCodeReferencesForDesugaring(ClasspathMethod method, UseRegistry registry) {
+    asCfCode().registerCodeReferencesForDesugaring(method, registry);
+  }
+
+  @Override
+  public void registerArgumentReferences(DexEncodedMethod method, ArgumentUse registry) {
+    asCfCode().registerArgumentReferences(method, registry);
   }
 
   @Override
@@ -210,19 +258,49 @@ public class LazyCfCode extends Code {
     return asCfCode().toString(method, naming);
   }
 
-  private static class ClassCodeVisitor extends ClassVisitor {
+  protected BiFunction<String, String, LazyCfCode> createCodeLocator(ReparseContext context) {
+    return new DefaultCodeLocator(context, application);
+  }
 
+  private static class DefaultCodeLocator implements BiFunction<String, String, LazyCfCode> {
     private final ReparseContext context;
     private final JarApplicationReader application;
     private int methodIndex = 0;
-    private boolean usrJsrInliner;
 
-    ClassCodeVisitor(
-        ReparseContext context, JarApplicationReader application, boolean useJsrInliner) {
-      super(InternalOptions.ASM_VERSION);
+    private DefaultCodeLocator(ReparseContext context, JarApplicationReader application) {
       this.context = context;
       this.application = application;
+    }
+
+    @Override
+    public LazyCfCode apply(String name, String desc) {
+      return context.codeList.get(methodIndex++).asLazyCfCode();
+    }
+  }
+
+  private static class ClassCodeVisitor extends ClassVisitor {
+
+    private final DexClass clazz;
+    private final BiFunction<String, String, LazyCfCode> codeLocator;
+    private final JarApplicationReader application;
+    private boolean usrJsrInliner;
+    private final Origin origin;
+    private final DebugParsingOptions debugParsingOptions;
+
+    ClassCodeVisitor(
+        DexClass clazz,
+        BiFunction<String, String, LazyCfCode> codeLocator,
+        JarApplicationReader application,
+        boolean useJsrInliner,
+        Origin origin,
+        DebugParsingOptions debugParsingOptions) {
+      super(InternalOptions.ASM_VERSION);
+      this.clazz = clazz;
+      this.codeLocator = codeLocator;
+      this.application = application;
       this.usrJsrInliner = useJsrInliner;
+      this.origin = origin;
+      this.debugParsingOptions = debugParsingOptions;
     }
 
     @Override
@@ -230,14 +308,16 @@ public class LazyCfCode extends Code {
         int access, String name, String desc, String signature, String[] exceptions) {
       MethodAccessFlags flags = JarClassFileReader.createMethodAccessFlags(name, access);
       if (!flags.isAbstract() && !flags.isNative()) {
-        LazyCfCode code = context.codeList.get(methodIndex++).asLazyCfCode();
-        DexMethod method = application.getMethod(context.owner.type, name, desc);
-        assert code.method == method;
-        MethodCodeVisitor methodVisitor = new MethodCodeVisitor(application, code);
-        if (!usrJsrInliner) {
-          return methodVisitor;
+        LazyCfCode code = codeLocator.apply(name, desc);
+        if (code != null) {
+          DexMethod method = application.getMethod(clazz.type, name, desc);
+          MethodCodeVisitor methodVisitor =
+              new MethodCodeVisitor(application, method, code, origin, debugParsingOptions);
+          if (!usrJsrInliner) {
+            return methodVisitor;
+          }
+          return new JSRInlinerAdapter(methodVisitor, access, name, desc, signature, exceptions);
         }
-        return new JSRInlinerAdapter(methodVisitor, access, name, desc, signature, exceptions);
       }
       return null;
     }
@@ -246,6 +326,7 @@ public class LazyCfCode extends Code {
   private static class MethodCodeVisitor extends MethodVisitor {
     private final JarApplicationReader application;
     private final DexItemFactory factory;
+    private final DebugParsingOptions debugParsingOptions;
     private int maxStack;
     private int maxLocals;
     private List<CfInstruction> instructions;
@@ -254,14 +335,23 @@ public class LazyCfCode extends Code {
     private final Map<DebugLocalInfo, DebugLocalInfo> canonicalDebugLocalInfo = new HashMap<>();
     private Map<Label, CfLabel> labelMap;
     private final LazyCfCode code;
-    private DexMethod method;
+    private final DexMethod method;
+    private final Origin origin;
 
-    MethodCodeVisitor(JarApplicationReader application, LazyCfCode code) {
+    MethodCodeVisitor(
+        JarApplicationReader application,
+        DexMethod method,
+        LazyCfCode code,
+        Origin origin,
+        DebugParsingOptions debugParsingOptions) {
       super(InternalOptions.ASM_VERSION);
+      this.debugParsingOptions = debugParsingOptions;
+      assert code != null;
       this.application = application;
       this.factory = application.getFactory();
-      this.method = code.method;
       this.code = code;
+      this.method = method;
+      this.origin = origin;
     }
 
     @Override
@@ -276,8 +366,20 @@ public class LazyCfCode extends Code {
 
     @Override
     public void visitEnd() {
+      if (instructions == null) {
+        // Everything that is initialized at `visitCode` should be null too.
+        assert tryCatchRanges == null && localVariables == null && labelMap == null;
+        // This code visitor is used only if the method is neither abstract nor native, hence it
+        // should have exactly one Code attribute:
+        // https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-4.html#jvms-4.7.3
+        throw new CompilationError(
+            "Absent Code attribute in method that is not native or abstract",
+            origin,
+            new MethodPosition(method.asMethodReference()));
+      }
       code.setCode(
-          new CfCode(method, maxStack, maxLocals, instructions, tryCatchRanges, localVariables));
+          new CfCode(
+              method.holder, maxStack, maxLocals, instructions, tryCatchRanges, localVariables));
     }
 
     @Override
@@ -537,8 +639,7 @@ public class LazyCfCode extends Code {
           return MemberType.OBJECT;
         case Opcodes.BALOAD:
         case Opcodes.BASTORE:
-          // TODO(b/109788783): Distinguish byte and boolean.
-          return MemberType.BOOLEAN;
+          return MemberType.BOOLEAN_OR_BYTE;
         case Opcodes.CALOAD:
         case Opcodes.CASTORE:
           return MemberType.CHAR;
@@ -614,7 +715,10 @@ public class LazyCfCode extends Code {
           type = ValueType.OBJECT;
           break;
         case Opcodes.RET:
-          throw new JsrEncountered("RET should be handled by the ASM jsr inliner");
+          {
+            instructions.add(new CfJsrRet(var));
+            return;
+          }
         default:
           throw new Unreachable("Unexpected VarInsn opcode: " + opcode);
       }
@@ -763,6 +867,8 @@ public class LazyCfCode extends Code {
         instructions.add(
             new CfConstMethodHandle(
                 DexMethodHandle.fromAsmHandle((Handle) cst, application, method.holder)));
+      } else if (cst instanceof ConstantDynamic) {
+        throw new CompilationError("Unsupported dynamic constant: " + cst.toString());
       } else {
         throw new CompilationError("Unsupported constant: " + cst.toString());
       }
@@ -794,7 +900,47 @@ public class LazyCfCode extends Code {
 
     @Override
     public void visitMultiANewArrayInsn(String desc, int dims) {
-      instructions.add(new CfMultiANewArray(factory.createType(desc), dims));
+      if (!application.options.isGeneratingDex()) {
+        instructions.add(new CfMultiANewArray(factory.createType(desc), dims));
+        return;
+      }
+      // When generating DEX code a multianewarray is desugared to a reflective creation.
+      // The stack transformation is:
+      //   ..., count1, ..., countN (where N = dims)
+      //   ->
+      //   ..., arrayref(of type : desc)
+      //
+      // This is unfolded to a call to java.lang.reflect.Array.newInstance to the same effect:
+      // ..., count1, ..., countN
+      visitLdcInsn(dims);
+      // ..., count1, ..., countN, dims
+      visitIntInsn(Opcodes.NEWARRAY, Opcodes.T_INT);
+      // ..., count1, ..., countN, dim-array
+      for (int i = dims - 1; i >= 0; i--) {
+        visitInsn(Opcodes.DUP_X1);
+        // ..., count1, ..., dim-array, countN, dim-array
+        visitInsn(Opcodes.SWAP);
+        // ..., count1, ..., dim-array, dim-array, countN
+        visitLdcInsn(i);
+        // ..., count1, ..., dim-array, dim-array, countN, index
+        visitInsn(Opcodes.SWAP);
+        // ..., count1, ..., dim-array, dim-array, index, countN
+        visitInsn(Opcodes.IASTORE);
+        // ..., count1, ..., dim-array
+      }
+      visitLdcInsn(Type.getType(desc.substring(dims)));
+      // ..., dim-array, dim-member-type
+      visitInsn(Opcodes.SWAP);
+      // ..., dim-member-type, dim-array
+      visitMethodInsn(
+          Opcodes.INVOKESTATIC,
+          "java/lang/reflect/Array",
+          "newInstance",
+          "(Ljava/lang/Class;[I)Ljava/lang/Object;",
+          false);
+      // ..., ref
+      visitTypeInsn(Opcodes.CHECKCAST, desc);
+      // ..., arrayref(of type : desc)
     }
 
     @Override
@@ -809,14 +955,16 @@ public class LazyCfCode extends Code {
     @Override
     public void visitLocalVariable(
         String name, String desc, String signature, Label start, Label end, int index) {
-      DebugLocalInfo debugLocalInfo =
-          canonicalize(
-              new DebugLocalInfo(
-                  factory.createString(name),
-                  factory.createType(desc),
-                  signature == null ? null : factory.createString(signature)));
-      localVariables.add(
-          new LocalVariableInfo(index, debugLocalInfo, getLabel(start), getLabel(end)));
+      if (debugParsingOptions.localInfo) {
+        DebugLocalInfo debugLocalInfo =
+            canonicalize(
+                new DebugLocalInfo(
+                    factory.createString(name),
+                    factory.createType(desc),
+                    signature == null ? null : factory.createString(signature)));
+        localVariables.add(
+            new LocalVariableInfo(index, debugLocalInfo, getLabel(start), getLabel(end)));
+      }
     }
 
     private DebugLocalInfo canonicalize(DebugLocalInfo debugLocalInfo) {
@@ -825,7 +973,9 @@ public class LazyCfCode extends Code {
 
     @Override
     public void visitLineNumber(int line, Label start) {
-      instructions.add(new CfPosition(getLabel(start), new Position(line, null, method, null)));
+      if (debugParsingOptions.lineInfo) {
+        instructions.add(new CfPosition(getLabel(start), new Position(line, null, method, null)));
+      }
     }
 
     @Override
@@ -837,15 +987,57 @@ public class LazyCfCode extends Code {
     }
   }
 
-  private static boolean verifyNoReparseContext(DexProgramClass owner) {
+  private static DebugParsingOptions getParsingOptions(
+      JarApplicationReader application, boolean reachabilitySensitive) {
+    int parsingOptions =
+        (application.options.enableCfByteCodePassThrough
+                || application.options.testing.readInputStackMaps)
+            ? ClassReader.EXPAND_FRAMES
+            : ClassReader.SKIP_FRAMES;
+
+    ProguardConfiguration configuration = application.options.getProguardConfiguration();
+    if (configuration == null) {
+      return new DebugParsingOptions(true, true, parsingOptions);
+    }
+    ProguardKeepAttributes keep =
+        application.options.getProguardConfiguration().getKeepAttributes();
+
+    boolean localsInfo =
+        configuration.isKeepParameterNames()
+            || keep.localVariableTable
+            || keep.localVariableTypeTable
+            || reachabilitySensitive;
+    boolean lineInfo = keep.lineNumberTable;
+    boolean methodParaeters = keep.methodParameters;
+
+    if (!localsInfo && !lineInfo && !methodParaeters) {
+      parsingOptions |= ClassReader.SKIP_DEBUG;
+    }
+
+    return new DebugParsingOptions(lineInfo, localsInfo, parsingOptions);
+  }
+
+  @Override
+  public boolean verifyNoInputReaders() {
+    assert context == null && application == null;
+    return true;
+  }
+
+  private static boolean verifyNoReparseContext(DexClass owner) {
     for (DexEncodedMethod method : owner.virtualMethods()) {
       Code code = method.getCode();
-      assert code == null || !(code instanceof LazyCfCode) || ((LazyCfCode) code).context == null;
+      assert code == null || code.verifyNoInputReaders();
     }
     for (DexEncodedMethod method : owner.directMethods()) {
       Code code = method.getCode();
-      assert code == null || !(code instanceof LazyCfCode) || ((LazyCfCode) code).context == null;
+      assert code == null || code.verifyNoInputReaders();
     }
     return true;
+  }
+
+  @Override
+  public Int2ReferenceMap<DebugLocalInfo> collectParameterInfo(
+      DexEncodedMethod encodedMethod, AppView<?> appView) {
+    return asCfCode().collectParameterInfo(encodedMethod, appView);
   }
 }

@@ -3,7 +3,9 @@
 // BSD-style license that can be found in the LICENSE file.
 package com.android.tools.r8.graph;
 
-import static com.android.tools.r8.ir.analysis.type.ClassTypeLatticeElement.computeLeastUpperBoundOfInterfaces;
+import static com.android.tools.r8.ir.analysis.type.ClassTypeElement.computeLeastUpperBoundOfInterfaces;
+import static com.android.tools.r8.ir.optimize.ServiceLoaderRewriter.SERVICE_LOADER_CLASS_NAME;
+import static com.google.common.base.Predicates.alwaysTrue;
 
 import com.android.tools.r8.dex.Constants;
 import com.android.tools.r8.dex.Marker;
@@ -17,24 +19,31 @@ import com.android.tools.r8.graph.DexDebugEvent.SetFile;
 import com.android.tools.r8.graph.DexDebugEvent.SetInlineFrame;
 import com.android.tools.r8.graph.DexDebugEvent.SetPrologueEnd;
 import com.android.tools.r8.graph.DexMethodHandle.MethodHandleType;
-import com.android.tools.r8.ir.analysis.type.ArrayTypeLatticeElement;
-import com.android.tools.r8.ir.analysis.type.ClassTypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.ArrayTypeElement;
+import com.android.tools.r8.ir.analysis.type.ClassTypeElement;
 import com.android.tools.r8.ir.analysis.type.Nullability;
-import com.android.tools.r8.ir.analysis.type.ReferenceTypeLatticeElement;
-import com.android.tools.r8.ir.analysis.type.TypeLatticeElement;
+import com.android.tools.r8.ir.analysis.type.ReferenceTypeElement;
+import com.android.tools.r8.ir.analysis.type.TypeElement;
+import com.android.tools.r8.ir.code.InvokeMethod;
 import com.android.tools.r8.ir.code.Position;
+import com.android.tools.r8.ir.code.Value;
+import com.android.tools.r8.ir.desugar.NestBasedAccessDesugaring;
+import com.android.tools.r8.ir.optimize.enums.EnumUnboxingRewriter;
 import com.android.tools.r8.kotlin.Kotlin;
-import com.android.tools.r8.naming.NamingLens;
 import com.android.tools.r8.utils.ArrayUtils;
 import com.android.tools.r8.utils.LRUCacheTable;
+import com.android.tools.r8.utils.Pair;
 import com.google.common.base.Strings;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import it.unimi.dsi.fastutil.ints.Int2ObjectArrayMap;
-import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import com.google.common.collect.Sets;
+import com.google.common.collect.Streams;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceArrayMap;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceMap;
+import it.unimi.dsi.fastutil.ints.Int2ReferenceOpenHashMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -48,35 +57,41 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class DexItemFactory {
 
   public static final String throwableDescriptorString = "Ljava/lang/Throwable;";
 
-  private final ConcurrentHashMap<DexString, DexString> strings = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<DexString, DexType> types = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<DexField, DexField> fields = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<DexProto, DexProto> protos = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<DexMethod, DexMethod> methods = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<DexMethodHandle, DexMethodHandle> methodHandles =
+  /** Set of types that may be synthesized during compilation. */
+  private final Set<DexType> possibleCompilerSynthesizedTypes = Sets.newIdentityHashSet();
+
+  private final Map<DexString, DexString> strings = new ConcurrentHashMap<>();
+  private final Map<DexString, DexType> types = new ConcurrentHashMap<>();
+  private final Map<DexField, DexField> fields = new ConcurrentHashMap<>();
+  private final Map<DexProto, DexProto> protos = new ConcurrentHashMap<>();
+  private final Map<DexMethod, DexMethod> methods = new ConcurrentHashMap<>();
+  private final Map<DexMethodHandle, DexMethodHandle> methodHandles =
       new ConcurrentHashMap<>();
 
   // DexDebugEvent Canonicalization.
-  private final Int2ObjectMap<AdvanceLine> advanceLines = new Int2ObjectOpenHashMap<>();
-  private final Int2ObjectMap<AdvancePC> advancePCs = new Int2ObjectOpenHashMap<>();
-  private final Int2ObjectMap<Default> defaults = new Int2ObjectOpenHashMap<>();
-  private final Int2ObjectMap<EndLocal> endLocals = new Int2ObjectOpenHashMap<>();
-  private final Int2ObjectMap<RestartLocal> restartLocals = new Int2ObjectOpenHashMap<>();
+  private final Int2ReferenceMap<AdvanceLine> advanceLines = new Int2ReferenceOpenHashMap<>();
+  private final Int2ReferenceMap<AdvancePC> advancePCs = new Int2ReferenceOpenHashMap<>();
+  private final Int2ReferenceMap<Default> defaults = new Int2ReferenceOpenHashMap<>();
+  private final Int2ReferenceMap<EndLocal> endLocals = new Int2ReferenceOpenHashMap<>();
+  private final Int2ReferenceMap<RestartLocal> restartLocals = new Int2ReferenceOpenHashMap<>();
   private final SetEpilogueBegin setEpilogueBegin = new SetEpilogueBegin();
   private final SetPrologueEnd setPrologueEnd = new SetPrologueEnd();
   private final Map<DexString, SetFile> setFiles = new HashMap<>();
   private final Map<SetInlineFrame, SetInlineFrame> setInlineFrames = new HashMap<>();
 
-  // ReferenceTypeLattice canonicalization.
-  private final ConcurrentHashMap<DexType, ReferenceTypeLatticeElement>
-      referenceTypeLatticeElements = new ConcurrentHashMap<>();
-  private final ConcurrentHashMap<DexType, Set<DexType>>
-      classTypeLatticeInterfaces = new ConcurrentHashMap<>();
+  // ReferenceTypeElement canonicalization.
+  private final ConcurrentHashMap<DexType, ReferenceTypeElement> referenceTypes =
+      new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<DexType, Set<DexType>> classTypeInterfaces =
+      new ConcurrentHashMap<>();
   public final LRUCacheTable<Set<DexType>, Set<DexType>, Set<DexType>>
       leastUpperBoundOfInterfacesTable = LRUCacheTable.create(8, 8);
 
@@ -95,6 +110,8 @@ public class DexItemFactory {
 
   public DexItemFactory() {
     this.kotlin = new Kotlin(this);
+    assert libraryMethodsWithReturnValueDependingOnlyOnArguments.stream()
+        .allMatch(libraryMethodsWithoutSideEffects::containsKey);
   }
 
   public static boolean isInternalSentinel(DexItem item) {
@@ -110,6 +127,16 @@ public class DexItemFactory {
   public final DexString longDescriptor = createString("J");
   public final DexString shortDescriptor = createString("S");
   public final DexString voidDescriptor = createString("V");
+  public final DexString descriptorSeparator = createString("/");
+
+  private final DexString booleanArrayDescriptor = createString("[Z");
+  private final DexString byteArrayDescriptor = createString("[B");
+  private final DexString charArrayDescriptor = createString("[C");
+  private final DexString doubleArrayDescriptor = createString("[D");
+  private final DexString floatArrayDescriptor = createString("[F");
+  private final DexString intArrayDescriptor = createString("[I");
+  private final DexString longArrayDescriptor = createString("[J");
+  private final DexString shortArrayDescriptor = createString("[S");
 
   public final DexString boxedBooleanDescriptor = createString("Ljava/lang/Boolean;");
   public final DexString boxedByteDescriptor = createString("Ljava/lang/Byte;");
@@ -120,6 +147,11 @@ public class DexItemFactory {
   public final DexString boxedLongDescriptor = createString("Ljava/lang/Long;");
   public final DexString boxedShortDescriptor = createString("Ljava/lang/Short;");
   public final DexString boxedNumberDescriptor = createString("Ljava/lang/Number;");
+  public final DexString boxedVoidDescriptor = createString("Ljava/lang/Void;");
+
+  public final DexString waitMethodName = createString("wait");
+  public final DexString notifyMethodName = createString("notify");
+  public final DexString notifyAllMethodName = createString("notifyAll");
 
   public final DexString unboxBooleanMethodName = createString("booleanValue");
   public final DexString unboxByteMethodName = createString("byteValue");
@@ -133,10 +165,12 @@ public class DexItemFactory {
   public final DexString isEmptyMethodName = createString("isEmpty");
   public final DexString lengthMethodName = createString("length");
 
+  public final DexString concatMethodName = createString("concat");
   public final DexString containsMethodName = createString("contains");
   public final DexString startsWithMethodName = createString("startsWith");
   public final DexString endsWithMethodName = createString("endsWith");
   public final DexString equalsMethodName = createString("equals");
+  public final DexString hashCodeMethodName = createString("hashCode");
   public final DexString equalsIgnoreCaseMethodName = createString("equalsIgnoreCase");
   public final DexString contentEqualsMethodName = createString("contentEquals");
   public final DexString indexOfMethodName = createString("indexOf");
@@ -145,13 +179,21 @@ public class DexItemFactory {
   public final DexString compareToIgnoreCaseMethodName = createString("compareToIgnoreCase");
   public final DexString cloneMethodName = createString("clone");
   public final DexString substringName = createString("substring");
+  public final DexString trimName = createString("trim");
 
   public final DexString valueOfMethodName = createString("valueOf");
+  public final DexString valuesMethodName = createString("values");
   public final DexString toStringMethodName = createString("toString");
+  public final DexString internMethodName = createString("intern");
+
+  public final DexString convertMethodName = createString("convert");
+  public final DexString wrapperFieldName = createString("wrappedValue");
+  public final DexString initMethodName = createString("<init>");
 
   public final DexString getClassMethodName = createString("getClass");
   public final DexString finalizeMethodName = createString("finalize");
   public final DexString ordinalMethodName = createString("ordinal");
+  public final DexString nameMethodName = createString("name");
   public final DexString desiredAssertionStatusMethodName = createString("desiredAssertionStatus");
   public final DexString forNameMethodName = createString("forName");
   public final DexString getNameName = createString("getName");
@@ -168,7 +210,10 @@ public class DexItemFactory {
   public final DexString invokeMethodName = createString("invoke");
   public final DexString invokeExactMethodName = createString("invokeExact");
 
+  public final DexString runtimeExceptionDescriptor = createString("Ljava/lang/RuntimeException;");
+  public final DexString assertionErrorDescriptor = createString("Ljava/lang/AssertionError;");
   public final DexString charSequenceDescriptor = createString("Ljava/lang/CharSequence;");
+  public final DexString charSequenceArrayDescriptor = createString("[Ljava/lang/CharSequence;");
   public final DexString stringDescriptor = createString("Ljava/lang/String;");
   public final DexString stringArrayDescriptor = createString("[Ljava/lang/String;");
   public final DexString objectDescriptor = createString("Ljava/lang/Object;");
@@ -183,6 +228,10 @@ public class DexItemFactory {
   public final DexString enumDescriptor = createString("Ljava/lang/Enum;");
   public final DexString annotationDescriptor = createString("Ljava/lang/annotation/Annotation;");
   public final DexString objectsDescriptor = createString("Ljava/util/Objects;");
+  public final DexString collectionsDescriptor = createString("Ljava/util/Collections;");
+  public final DexString iterableDescriptor = createString("Ljava/lang/Iterable;");
+  public final DexString mathDescriptor = createString("Ljava/lang/Math;");
+  public final DexString strictMathDescriptor = createString("Ljava/lang/StrictMath;");
 
   public final DexString stringBuilderDescriptor = createString("Ljava/lang/StringBuilder;");
   public final DexString stringBufferDescriptor = createString("Ljava/lang/StringBuffer;");
@@ -194,16 +243,40 @@ public class DexItemFactory {
       createString("Ljava/lang/reflect/InvocationHandler;");
   public final DexString proxyDescriptor = createString("Ljava/lang/reflect/Proxy;");
   public final DexString serviceLoaderDescriptor = createString("Ljava/util/ServiceLoader;");
+  public final DexString serviceLoaderConfigurationErrorDescriptor =
+      createString("Ljava/util/ServiceConfigurationError;");
   public final DexString listDescriptor = createString("Ljava/util/List;");
+  public final DexString setDescriptor = createString("Ljava/util/Set;");
+  public final DexString mapDescriptor = createString("Ljava/util/Map;");
+  public final DexString mapEntryDescriptor = createString("Ljava/util/Map$Entry;");
+  public final DexString collectionDescriptor = createString("Ljava/util/Collection;");
+  public final DexString comparatorDescriptor = createString("Ljava/util/Comparator;");
+  public final DexString callableDescriptor = createString("Ljava/util/concurrent/Callable;");
+  public final DexString supplierDescriptor = createString("Ljava/util/function/Supplier;");
+  public final DexString consumerDescriptor = createString("Ljava/util/function/Consumer;");
+  public final DexString runnableDescriptor = createString("Ljava/lang/Runnable;");
+  public final DexString optionalDescriptor = createString("Ljava/util/Optional;");
+  public final DexString optionalDoubleDescriptor = createString("Ljava/util/OptionalDouble;");
+  public final DexString optionalIntDescriptor = createString("Ljava/util/OptionalInt;");
+  public final DexString optionalLongDescriptor = createString("Ljava/util/OptionalLong;");
+  public final DexString streamDescriptor = createString("Ljava/util/stream/Stream;");
+  public final DexString arraysDescriptor = createString("Ljava/util/Arrays;");
 
   public final DexString throwableDescriptor = createString(throwableDescriptorString);
   public final DexString illegalAccessErrorDescriptor =
       createString("Ljava/lang/IllegalAccessError;");
+  public final DexString illegalArgumentExceptionDescriptor =
+      createString("Ljava/lang/IllegalArgumentException;");
   public final DexString icceDescriptor = createString("Ljava/lang/IncompatibleClassChangeError;");
   public final DexString exceptionInInitializerErrorDescriptor =
       createString("Ljava/lang/ExceptionInInitializerError;");
-  public final DexString noSuchFieldErrorDescriptor = createString("Ljava/lang/NoSuchFieldError");
+  public final DexString noClassDefFoundErrorDescriptor =
+      createString("Ljava/lang/NoClassDefFoundError;");
+  public final DexString noSuchFieldErrorDescriptor = createString("Ljava/lang/NoSuchFieldError;");
   public final DexString npeDescriptor = createString("Ljava/lang/NullPointerException;");
+  public final DexString reflectiveOperationExceptionDescriptor =
+      createString("Ljava/lang/ReflectiveOperationException;");
+  public final DexString kotlinMetadataDescriptor = createString("Lkotlin/Metadata;");
 
   public final DexString intFieldUpdaterDescriptor =
       createString("Ljava/util/concurrent/atomic/AtomicIntegerFieldUpdater;");
@@ -214,80 +287,187 @@ public class DexItemFactory {
   public final DexString newUpdaterName = createString("newUpdater");
 
   public final DexString constructorMethodName = createString(Constants.INSTANCE_INITIALIZER_NAME);
-  public final DexString classConstructorMethodName = createString(Constants.CLASS_INITIALIZER_NAME);
+  public final DexString classConstructorMethodName =
+      createString(Constants.CLASS_INITIALIZER_NAME);
 
   public final DexString thisName = createString("this");
+  public final DexString enumValuesFieldName = createString("$VALUES");
 
-  private final DexString charArrayDescriptor = createString("[C");
-  private final DexType charArrayType = createType(charArrayDescriptor);
+  public final DexString enabledFieldName = createString("ENABLED");
+
   public final DexString throwableArrayDescriptor = createString("[Ljava/lang/Throwable;");
 
-  public final DexType booleanType = createType(booleanDescriptor);
-  public final DexType byteType = createType(byteDescriptor);
-  public final DexType charType = createType(charDescriptor);
-  public final DexType doubleType = createType(doubleDescriptor);
-  public final DexType floatType = createType(floatDescriptor);
-  public final DexType intType = createType(intDescriptor);
-  public final DexType longType = createType(longDescriptor);
-  public final DexType shortType = createType(shortDescriptor);
-  public final DexType voidType = createType(voidDescriptor);
+  public final DexType booleanType = createStaticallyKnownType(booleanDescriptor);
+  public final DexType byteType = createStaticallyKnownType(byteDescriptor);
+  public final DexType charType = createStaticallyKnownType(charDescriptor);
+  public final DexType doubleType = createStaticallyKnownType(doubleDescriptor);
+  public final DexType floatType = createStaticallyKnownType(floatDescriptor);
+  public final DexType intType = createStaticallyKnownType(intDescriptor);
+  public final DexType longType = createStaticallyKnownType(longDescriptor);
+  public final DexType shortType = createStaticallyKnownType(shortDescriptor);
+  public final DexType voidType = createStaticallyKnownType(voidDescriptor);
 
-  public final DexType boxedBooleanType = createType(boxedBooleanDescriptor);
-  public final DexType boxedByteType = createType(boxedByteDescriptor);
-  public final DexType boxedCharType = createType(boxedCharDescriptor);
-  public final DexType boxedDoubleType = createType(boxedDoubleDescriptor);
-  public final DexType boxedFloatType = createType(boxedFloatDescriptor);
-  public final DexType boxedIntType = createType(boxedIntDescriptor);
-  public final DexType boxedLongType = createType(boxedLongDescriptor);
-  public final DexType boxedShortType = createType(boxedShortDescriptor);
-  public final DexType boxedNumberType = createType(boxedNumberDescriptor);
+  public final DexType booleanArrayType = createStaticallyKnownType(booleanArrayDescriptor);
+  public final DexType byteArrayType = createStaticallyKnownType(byteArrayDescriptor);
+  public final DexType charArrayType = createStaticallyKnownType(charArrayDescriptor);
+  public final DexType doubleArrayType = createStaticallyKnownType(doubleArrayDescriptor);
+  public final DexType floatArrayType = createStaticallyKnownType(floatArrayDescriptor);
+  public final DexType intArrayType = createStaticallyKnownType(intArrayDescriptor);
+  public final DexType longArrayType = createStaticallyKnownType(longArrayDescriptor);
+  public final DexType shortArrayType = createStaticallyKnownType(shortArrayDescriptor);
 
-  public final DexType charSequenceType = createType(charSequenceDescriptor);
-  public final DexType stringType = createType(stringDescriptor);
-  public final DexType stringArrayType = createType(stringArrayDescriptor);
-  public final DexType objectType = createType(objectDescriptor);
-  public final DexType objectArrayType = createType(objectArrayDescriptor);
-  public final DexType classArrayType = createType(classArrayDescriptor);
-  public final DexType enumType = createType(enumDescriptor);
-  public final DexType annotationType = createType(annotationDescriptor);
+  public final DexType boxedBooleanType = createStaticallyKnownType(boxedBooleanDescriptor);
+  public final DexType boxedByteType = createStaticallyKnownType(boxedByteDescriptor);
+  public final DexType boxedCharType = createStaticallyKnownType(boxedCharDescriptor);
+  public final DexType boxedDoubleType = createStaticallyKnownType(boxedDoubleDescriptor);
+  public final DexType boxedFloatType = createStaticallyKnownType(boxedFloatDescriptor);
+  public final DexType boxedIntType = createStaticallyKnownType(boxedIntDescriptor);
+  public final DexType boxedLongType = createStaticallyKnownType(boxedLongDescriptor);
+  public final DexType boxedShortType = createStaticallyKnownType(boxedShortDescriptor);
+  public final DexType boxedNumberType = createStaticallyKnownType(boxedNumberDescriptor);
+  public final DexType boxedVoidType = createStaticallyKnownType(boxedVoidDescriptor);
 
-  public final DexType classType = createType(classDescriptor);
-  public final DexType classLoaderType = createType(classLoaderDescriptor);
-  public final DexType autoCloseableType = createType(autoCloseableDescriptor);
+  public final DexType charSequenceType = createStaticallyKnownType(charSequenceDescriptor);
+  public final DexType charSequenceArrayType =
+      createStaticallyKnownType(charSequenceArrayDescriptor);
+  public final DexType stringType = createStaticallyKnownType(stringDescriptor);
+  public final DexType stringArrayType = createStaticallyKnownType(stringArrayDescriptor);
+  public final DexType objectType = createStaticallyKnownType(objectDescriptor);
+  public final DexType objectArrayType = createStaticallyKnownType(objectArrayDescriptor);
+  public final DexType classArrayType = createStaticallyKnownType(classArrayDescriptor);
+  public final DexType enumType = createStaticallyKnownType(enumDescriptor);
+  public final DexType annotationType = createStaticallyKnownType(annotationDescriptor);
+  public final DexType objectsType = createStaticallyKnownType(objectsDescriptor);
+  public final DexType collectionsType = createStaticallyKnownType(collectionsDescriptor);
+  public final DexType iterableType = createStaticallyKnownType(iterableDescriptor);
+  public final DexType mathType = createStaticallyKnownType(mathDescriptor);
+  public final DexType strictMathType = createStaticallyKnownType(strictMathDescriptor);
+  public final DexType referenceFieldUpdaterType =
+      createStaticallyKnownType(referenceFieldUpdaterDescriptor);
 
-  public final DexType stringBuilderType = createType(stringBuilderDescriptor);
-  public final DexType stringBufferType = createType(stringBufferDescriptor);
+  public final DexType classType = createStaticallyKnownType(classDescriptor);
+  public final DexType classLoaderType = createStaticallyKnownType(classLoaderDescriptor);
+  public final DexType fieldType = createStaticallyKnownType(fieldDescriptor);
+  public final DexType methodType = createStaticallyKnownType(methodDescriptor);
+  public final DexType autoCloseableType = createStaticallyKnownType(autoCloseableDescriptor);
 
-  public final DexType varHandleType = createType(varHandleDescriptor);
-  public final DexType methodHandleType = createType(methodHandleDescriptor);
-  public final DexType methodTypeType = createType(methodTypeDescriptor);
-  public final DexType invocationHandlerType = createType(invocationHandlerDescriptor);
-  public final DexType proxyType = createType(proxyDescriptor);
-  public final DexType serviceLoaderType = createType(serviceLoaderDescriptor);
-  public final DexType listType = createType(listDescriptor);
+  public final DexType stringBuilderType = createStaticallyKnownType(stringBuilderDescriptor);
+  public final DexType stringBufferType = createStaticallyKnownType(stringBufferDescriptor);
 
-  public final DexType throwableType = createType(throwableDescriptor);
-  public final DexType illegalAccessErrorType = createType(illegalAccessErrorDescriptor);
-  public final DexType icceType = createType(icceDescriptor);
+  public final DexType javaLangSystemType = createStaticallyKnownType("Ljava/lang/System;");
+  public final DexType javaIoPrintStreamType = createStaticallyKnownType("Ljava/io/PrintStream;");
+
+  public final DexType varHandleType = createStaticallyKnownType(varHandleDescriptor);
+  public final DexType methodHandleType = createStaticallyKnownType(methodHandleDescriptor);
+  public final DexType methodTypeType = createStaticallyKnownType(methodTypeDescriptor);
+  public final DexType invocationHandlerType =
+      createStaticallyKnownType(invocationHandlerDescriptor);
+  public final DexType proxyType = createStaticallyKnownType(proxyDescriptor);
+  public final DexType serviceLoaderType = createStaticallyKnownType(serviceLoaderDescriptor);
+  public final DexType serviceLoaderRewrittenClassType =
+      createStaticallyKnownType("L" + SERVICE_LOADER_CLASS_NAME + ";");
+  public final DexType serviceLoaderConfigurationErrorType =
+      createStaticallyKnownType(serviceLoaderConfigurationErrorDescriptor);
+  public final DexType listType = createStaticallyKnownType(listDescriptor);
+  public final DexType setType = createStaticallyKnownType(setDescriptor);
+  public final DexType mapType = createStaticallyKnownType(mapDescriptor);
+  public final DexType mapEntryType = createStaticallyKnownType(mapEntryDescriptor);
+  public final DexType abstractMapSimpleEntryType =
+      createStaticallyKnownType("Ljava/util/AbstractMap$SimpleEntry;");
+  public final DexType collectionType = createStaticallyKnownType(collectionDescriptor);
+  public final DexType comparatorType = createStaticallyKnownType(comparatorDescriptor);
+  public final DexType callableType = createStaticallyKnownType(callableDescriptor);
+  public final DexType supplierType = createStaticallyKnownType(supplierDescriptor);
+  public final DexType consumerType = createStaticallyKnownType(consumerDescriptor);
+  public final DexType runnableType = createStaticallyKnownType(runnableDescriptor);
+  public final DexType optionalType = createStaticallyKnownType(optionalDescriptor);
+  public final DexType optionalDoubleType = createStaticallyKnownType(optionalDoubleDescriptor);
+  public final DexType optionalIntType = createStaticallyKnownType(optionalIntDescriptor);
+  public final DexType optionalLongType = createStaticallyKnownType(optionalLongDescriptor);
+  public final DexType streamType = createStaticallyKnownType(streamDescriptor);
+
+  public final DexType doubleConsumer =
+      createStaticallyKnownType("Ljava/util/function/DoubleConsumer;");
+  public final DexType longConsumer =
+      createStaticallyKnownType("Ljava/util/function/LongConsumer;");
+  public final DexType intConsumer = createStaticallyKnownType("Ljava/util/function/IntConsumer;");
+
+  public final DexType runtimeExceptionType = createStaticallyKnownType(runtimeExceptionDescriptor);
+  public final DexType throwableType = createStaticallyKnownType(throwableDescriptor);
+  public final DexType illegalAccessErrorType =
+      createStaticallyKnownType(illegalAccessErrorDescriptor);
+  public final DexType illegalArgumentExceptionType =
+      createStaticallyKnownType(illegalArgumentExceptionDescriptor);
+  public final DexType icceType = createStaticallyKnownType(icceDescriptor);
   public final DexType exceptionInInitializerErrorType =
-      createType(exceptionInInitializerErrorDescriptor);
-  public final DexType noSuchFieldErrorType = createType(noSuchFieldErrorDescriptor);
-  public final DexType npeType = createType(npeDescriptor);
+      createStaticallyKnownType(exceptionInInitializerErrorDescriptor);
+  public final DexType noClassDefFoundErrorType =
+      createStaticallyKnownType(noClassDefFoundErrorDescriptor);
+  public final DexType noSuchFieldErrorType = createStaticallyKnownType(noSuchFieldErrorDescriptor);
+  public final DexType npeType = createStaticallyKnownType(npeDescriptor);
+  public final DexType reflectiveOperationExceptionType =
+      createStaticallyKnownType(reflectiveOperationExceptionDescriptor);
+  public final DexType kotlinMetadataType = createStaticallyKnownType(kotlinMetadataDescriptor);
+
+  public final DexType javaIoFileType = createStaticallyKnownType("Ljava/io/File;");
+  public final DexType javaMathBigIntegerType = createStaticallyKnownType("Ljava/math/BigInteger;");
+  public final DexType javaNioByteOrderType = createStaticallyKnownType("Ljava/nio/ByteOrder;");
+  public final DexType javaUtilCollectionsType =
+      createStaticallyKnownType("Ljava/util/Collections;");
+  public final DexType javaUtilComparatorType = createStaticallyKnownType("Ljava/util/Comparator;");
+  public final DexType javaUtilConcurrentTimeUnitType =
+      createStaticallyKnownType("Ljava/util/concurrent/TimeUnit;");
+  public final DexType javaUtilListType = createStaticallyKnownType("Ljava/util/List;");
+  public final DexType javaUtilLocaleType = createStaticallyKnownType("Ljava/util/Locale;");
+  public final DexType javaUtilLoggingLevelType =
+      createStaticallyKnownType("Ljava/util/logging/Level;");
+  public final DexType javaUtilLoggingLoggerType =
+      createStaticallyKnownType("Ljava/util/logging/Logger;");
+  public final DexType javaUtilSetType = createStaticallyKnownType("Ljava/util/Set;");
+
+  public final DexType androidOsBuildType = createStaticallyKnownType("Landroid/os/Build;");
+  public final DexType androidOsBuildVersionType =
+      createStaticallyKnownType("Landroid/os/Build$VERSION;");
+  public final DexType androidOsBundleType = createStaticallyKnownType("Landroid/os/Bundle;");
+  public final DexType androidOsParcelableCreatorType =
+      createStaticallyKnownType("Landroid/os/Parcelable$Creator;");
+  public final DexType androidSystemOsConstantsType =
+      createStaticallyKnownType("Landroid/system/OsConstants;");
+  public final DexType androidUtilLogType = createStaticallyKnownType("Landroid/util/Log;");
+  public final DexType androidUtilPropertyType =
+      createStaticallyKnownType("Landroid/util/Property;");
+  public final DexType androidViewViewType = createStaticallyKnownType("Landroid/view/View;");
+
+  public final DexString nestConstructorDescriptor =
+      createString("L" + NestBasedAccessDesugaring.NEST_CONSTRUCTOR_NAME + ";");
+  public final DexType nestConstructorType = createStaticallyKnownType(nestConstructorDescriptor);
+
+  public final DexString enumUnboxingUtilityDescriptor =
+      createString(
+          "Lcom/android/tools/r8/" + EnumUnboxingRewriter.ENUM_UNBOXING_UTILITY_CLASS_NAME + ";");
+  public final DexType enumUnboxingUtilityType =
+      createStaticallyKnownType(enumUnboxingUtilityDescriptor);
 
   public final StringBuildingMethods stringBuilderMethods =
       new StringBuildingMethods(stringBuilderType);
   public final StringBuildingMethods stringBufferMethods =
       new StringBuildingMethods(stringBufferType);
+  public final BooleanMembers booleanMembers = new BooleanMembers();
+  public final FloatMembers floatMembers = new FloatMembers();
+  public final IntegerMembers integerMembers = new IntegerMembers();
   public final ObjectsMethods objectsMethods = new ObjectsMethods();
-  public final ObjectMethods objectMethods = new ObjectMethods();
-  public final StringMethods stringMethods = new StringMethods();
-  public final LongMethods longMethods = new LongMethods();
-  public final JavaUtilArraysMethods utilArraysMethods = new JavaUtilArraysMethods();
+  public final ObjectMembers objectMembers = new ObjectMembers();
+  public final StringMembers stringMembers = new StringMembers();
+  public final LongMembers longMembers = new LongMembers();
+  public final DoubleMethods doubleMethods = new DoubleMethods();
   public final ThrowableMethods throwableMethods = new ThrowableMethods();
+  public final AssertionErrorMethods assertionErrorMethods = new AssertionErrorMethods();
   public final ClassMethods classMethods = new ClassMethods();
   public final ConstructorMethods constructorMethods = new ConstructorMethods();
   public final EnumMethods enumMethods = new EnumMethods();
   public final NullPointerExceptionMethods npeMethods = new NullPointerExceptionMethods();
+  public final IllegalArgumentExceptionMethods illegalArgumentExceptionMethods =
+      new IllegalArgumentExceptionMethods();
   public final PrimitiveTypesBoxedTypeFields primitiveTypesBoxedTypeFields =
       new PrimitiveTypesBoxedTypeFields();
   public final AtomicFieldUpdaterMethods atomicFieldUpdaterMethods =
@@ -296,49 +476,148 @@ public class DexItemFactory {
   public final PolymorphicMethods polymorphicMethods = new PolymorphicMethods();
   public final ProxyMethods proxyMethods = new ProxyMethods();
 
+  // android.**
+  public final AndroidOsBuildMembers androidOsBuildMembers = new AndroidOsBuildMembers();
+  public final AndroidOsBuildVersionMembers androidOsBuildVersionMembers =
+      new AndroidOsBuildVersionMembers();
+  public final AndroidOsBundleMembers androidOsBundleMembers = new AndroidOsBundleMembers();
+  public final AndroidSystemOsConstantsMembers androidSystemOsConstantsMembers =
+      new AndroidSystemOsConstantsMembers();
+  public final AndroidViewViewMembers androidViewViewMembers = new AndroidViewViewMembers();
+
+  // java.**
+  public final JavaIoFileMembers javaIoFileMembers = new JavaIoFileMembers();
+  public final JavaMathBigIntegerMembers javaMathBigIntegerMembers =
+      new JavaMathBigIntegerMembers();
+  public final JavaNioByteOrderMembers javaNioByteOrderMembers = new JavaNioByteOrderMembers();
+  public final JavaUtilArraysMethods javaUtilArraysMethods = new JavaUtilArraysMethods();
+  public final JavaUtilComparatorMembers javaUtilComparatorMembers =
+      new JavaUtilComparatorMembers();
+  public final JavaUtilConcurrentTimeUnitMembers javaUtilConcurrentTimeUnitMembers =
+      new JavaUtilConcurrentTimeUnitMembers();
+  public final JavaUtilLocaleMembers javaUtilLocaleMembers = new JavaUtilLocaleMembers();
+  public final JavaUtilLoggingLevelMembers javaUtilLoggingLevelMembers =
+      new JavaUtilLoggingLevelMembers();
+
+  public final List<LibraryMembers> libraryMembersCollection =
+      ImmutableList.of(
+          booleanMembers,
+          floatMembers,
+          integerMembers,
+          longMembers,
+          stringMembers,
+          // android.**
+          androidOsBuildMembers,
+          androidOsBuildVersionMembers,
+          androidOsBundleMembers,
+          androidSystemOsConstantsMembers,
+          androidViewViewMembers,
+          // java.**
+          javaIoFileMembers,
+          javaMathBigIntegerMembers,
+          javaNioByteOrderMembers,
+          javaUtilComparatorMembers,
+          javaUtilConcurrentTimeUnitMembers,
+          javaUtilLocaleMembers,
+          javaUtilLoggingLevelMembers);
+
   public final DexString twrCloseResourceMethodName = createString("$closeResource");
   public final DexProto twrCloseResourceMethodProto =
       createProto(voidType, throwableType, autoCloseableType);
 
   public final DexString deserializeLambdaMethodName = createString("$deserializeLambda$");
   public final DexProto deserializeLambdaMethodProto =
-      createProto(objectType, createType("Ljava/lang/invoke/SerializedLambda;"));
+      createProto(objectType, createStaticallyKnownType("Ljava/lang/invoke/SerializedLambda;"));
 
   // Dex system annotations.
   // See https://source.android.com/devices/tech/dalvik/dex-format.html#system-annotation
-  public final DexType annotationDefault = createType("Ldalvik/annotation/AnnotationDefault;");
-  public final DexType annotationEnclosingClass = createType("Ldalvik/annotation/EnclosingClass;");
-  public final DexType annotationEnclosingMethod = createType(
-      "Ldalvik/annotation/EnclosingMethod;");
-  public final DexType annotationInnerClass = createType("Ldalvik/annotation/InnerClass;");
-  public final DexType annotationMemberClasses = createType("Ldalvik/annotation/MemberClasses;");
-  public final DexType annotationMethodParameters = createType(
-      "Ldalvik/annotation/MethodParameters;");
-  public final DexType annotationSignature = createType("Ldalvik/annotation/Signature;");
-  public final DexType annotationSourceDebugExtension = createType(
-      "Ldalvik/annotation/SourceDebugExtension;");
-  public final DexType annotationThrows = createType("Ldalvik/annotation/Throws;");
+  public final DexType annotationDefault =
+      createStaticallyKnownType("Ldalvik/annotation/AnnotationDefault;");
+  public final DexType annotationEnclosingClass =
+      createStaticallyKnownType("Ldalvik/annotation/EnclosingClass;");
+  public final DexType annotationEnclosingMethod =
+      createStaticallyKnownType("Ldalvik/annotation/EnclosingMethod;");
+  public final DexType annotationInnerClass =
+      createStaticallyKnownType("Ldalvik/annotation/InnerClass;");
+  public final DexType annotationMemberClasses =
+      createStaticallyKnownType("Ldalvik/annotation/MemberClasses;");
+  public final DexType annotationMethodParameters =
+      createStaticallyKnownType("Ldalvik/annotation/MethodParameters;");
+  public final DexType annotationSignature =
+      createStaticallyKnownType("Ldalvik/annotation/Signature;");
+  public final DexType annotationSourceDebugExtension =
+      createStaticallyKnownType("Ldalvik/annotation/SourceDebugExtension;");
+  public final DexType annotationThrows = createStaticallyKnownType("Ldalvik/annotation/Throws;");
   public final DexType annotationSynthesizedClassMap =
-      createType("Lcom/android/tools/r8/annotations/SynthesizedClassMap;");
+      createStaticallyKnownType("Lcom/android/tools/r8/annotations/SynthesizedClassMap;");
   public final DexType annotationCovariantReturnType =
-      createType("Ldalvik/annotation/codegen/CovariantReturnType;");
+      createStaticallyKnownType("Ldalvik/annotation/codegen/CovariantReturnType;");
   public final DexType annotationCovariantReturnTypes =
-      createType("Ldalvik/annotation/codegen/CovariantReturnType$CovariantReturnTypes;");
+      createStaticallyKnownType(
+          "Ldalvik/annotation/codegen/CovariantReturnType$CovariantReturnTypes;");
   public final DexType annotationReachabilitySensitive =
-      createType("Ldalvik/annotation/optimization/ReachabilitySensitive;");
+      createStaticallyKnownType("Ldalvik/annotation/optimization/ReachabilitySensitive;");
+
+  // Runtime affecting yet class-retained annotations.
+  public final DexType dalvikFastNativeAnnotation =
+      createStaticallyKnownType("Ldalvik/annotation/optimization/FastNative;");
+  public final DexType dalvikCriticalNativeAnnotation =
+      createStaticallyKnownType("Ldalvik/annotation/optimization/CriticalNative;");
 
   private static final String METAFACTORY_METHOD_NAME = "metafactory";
   private static final String METAFACTORY_ALT_METHOD_NAME = "altMetafactory";
 
-  public final DexType metafactoryType = createType("Ljava/lang/invoke/LambdaMetafactory;");
-  public final DexType callSiteType = createType("Ljava/lang/invoke/CallSite;");
-  public final DexType lookupType = createType("Ljava/lang/invoke/MethodHandles$Lookup;");
-  public final DexType iteratorType = createType("Ljava/util/Iterator;");
-  public final DexType serializableType = createType("Ljava/io/Serializable;");
-  public final DexType externalizableType = createType("Ljava/io/Externalizable;");
-  public final DexType comparableType = createType("Ljava/lang/Comparable;");
+  public final DexType metafactoryType =
+      createStaticallyKnownType("Ljava/lang/invoke/LambdaMetafactory;");
+  public final DexType callSiteType = createStaticallyKnownType("Ljava/lang/invoke/CallSite;");
+  public final DexType lookupType =
+      createStaticallyKnownType("Ljava/lang/invoke/MethodHandles$Lookup;");
+  public final DexType iteratorType = createStaticallyKnownType("Ljava/util/Iterator;");
+  public final DexType listIteratorType = createStaticallyKnownType("Ljava/util/ListIterator;");
+  public final DexType enumerationType = createStaticallyKnownType("Ljava/util/Enumeration;");
+  public final DexType serializableType = createStaticallyKnownType("Ljava/io/Serializable;");
+  public final DexType externalizableType = createStaticallyKnownType("Ljava/io/Externalizable;");
+  public final DexType cloneableType = createStaticallyKnownType("Ljava/lang/Cloneable;");
+  public final DexType comparableType = createStaticallyKnownType("Ljava/lang/Comparable;");
 
   public final ServiceLoaderMethods serviceLoaderMethods = new ServiceLoaderMethods();
+
+  public final BiMap<DexType, DexType> primitiveToBoxed = HashBiMap.create(
+      ImmutableMap.<DexType, DexType>builder()
+          .put(booleanType, boxedBooleanType)
+          .put(byteType, boxedByteType)
+          .put(charType, boxedCharType)
+          .put(shortType, boxedShortType)
+          .put(intType, boxedIntType)
+          .put(longType, boxedLongType)
+          .put(floatType, boxedFloatType)
+          .put(doubleType, boxedDoubleType)
+          .build());
+
+  public DexType getBoxedForPrimitiveType(DexType primitive) {
+    assert primitive.isPrimitiveType();
+    return primitiveToBoxed.get(primitive);
+  }
+
+  public DexType getPrimitiveFromBoxed(DexType boxedPrimitive) {
+    return primitiveToBoxed.inverse().get(boxedPrimitive);
+  }
+
+  // Boxed Boxed#valueOf(Primitive), e.g., Boolean Boolean#valueOf(B)
+  private Set<DexMethod> boxedValueOfMethods() {
+    return primitiveToBoxed.entrySet().stream()
+        .map(
+            entry -> {
+              DexType primitive = entry.getKey();
+              DexType boxed = entry.getValue();
+              return createMethod(
+                  boxed.descriptor,
+                  valueOfMethodName,
+                  boxed.descriptor,
+                  new DexString[] {primitive.descriptor});
+            })
+        .collect(Collectors.toSet());
+  }
 
   public final DexMethod metafactoryMethod =
       createMethod(
@@ -359,8 +638,11 @@ public class DexItemFactory {
           createProto(callSiteType, lookupType, stringType, methodTypeType, objectArrayType),
           createString(METAFACTORY_ALT_METHOD_NAME));
 
+  public final DexMethod deserializeLambdaMethod =
+      createMethod(objectType, deserializeLambdaMethodProto, deserializeLambdaMethodName);
+
   public final DexType stringConcatFactoryType =
-      createType("Ljava/lang/invoke/StringConcatFactory;");
+      createStaticallyKnownType("Ljava/lang/invoke/StringConcatFactory;");
 
   public final DexMethod stringConcatWithConstantsMethod =
       createMethod(
@@ -386,7 +668,7 @@ public class DexItemFactory {
           createString("makeConcat")
       );
 
-  public final Set<DexMethod> libraryMethodsReturningReceiver =
+  public Set<DexMethod> libraryMethodsReturningReceiver =
       ImmutableSet.<DexMethod>builder()
           .addAll(stringBufferMethods.appendMethods)
           .addAll(stringBuilderMethods.appendMethods)
@@ -395,21 +677,67 @@ public class DexItemFactory {
   // Library methods listed here are based on their original implementations. That is, we assume
   // these cannot be overridden.
   public final Set<DexMethod> libraryMethodsReturningNonNull =
-      ImmutableSet.of(classMethods.getName, classMethods.getSimpleName, stringMethods.valueOf);
+      ImmutableSet.of(
+          classMethods.getName,
+          classMethods.getSimpleName,
+          classMethods.forName,
+          objectsMethods.requireNonNull,
+          objectsMethods.requireNonNullWithMessage,
+          objectsMethods.requireNonNullWithMessageSupplier,
+          stringMembers.valueOf);
 
-  public Set<DexMethod> libraryMethodsWithoutSideEffects =
+  // We assume library methods listed here are `public`, i.e., free from visibility side effects.
+  // If not, that library method should not be added here because it literally has side effects.
+  public Map<DexMethod, Predicate<InvokeMethod>> libraryMethodsWithoutSideEffects =
+      Streams.<Pair<DexMethod, Predicate<InvokeMethod>>>concat(
+              Stream.of(new Pair<>(enumMethods.constructor, alwaysTrue())),
+              Stream.of(new Pair<>(npeMethods.init, alwaysTrue())),
+              Stream.of(new Pair<>(npeMethods.initWithMessage, alwaysTrue())),
+              Stream.of(new Pair<>(objectMembers.constructor, alwaysTrue())),
+              Stream.of(new Pair<>(objectMembers.getClass, alwaysTrue())),
+              Stream.of(new Pair<>(stringMembers.hashCode, alwaysTrue())),
+              mapToPredicate(classMethods.getNames, alwaysTrue()),
+              mapToPredicate(
+                  stringBufferMethods.constructorMethods,
+                  stringBufferMethods::constructorInvokeIsSideEffectFree),
+              mapToPredicate(
+                  stringBuilderMethods.constructorMethods,
+                  stringBuilderMethods::constructorInvokeIsSideEffectFree),
+              mapToPredicate(boxedValueOfMethods(), alwaysTrue()))
+          .collect(Collectors.toMap(Pair::getFirst, Pair::getSecond));
+
+  private static Stream<Pair<DexMethod, Predicate<InvokeMethod>>> mapToPredicate(
+      Set<DexMethod> methods, Predicate<InvokeMethod> predicate) {
+    return methods.stream().map(method -> new Pair<>(method, predicate));
+  }
+
+  // TODO(b/119596718): More idempotent methods? Any singleton accessors? E.g.,
+  // java.util.Calendar#getInstance(...) // 4 variants
+  // java.util.Locale#getDefault() // returns JVM default locale.
+  // android.os.Looper#myLooper() // returns the associated Looper instance.
+  // Note that this set is used for canonicalization of method invocations, together with a set of
+  // library methods that do not have side effects.
+  public Set<DexMethod> libraryMethodsWithReturnValueDependingOnlyOnArguments =
       ImmutableSet.<DexMethod>builder()
-          .add(objectMethods.constructor)
-          .addAll(stringBufferMethods.constructorMethods)
-          .addAll(stringBuilderMethods.constructorMethods)
+          .addAll(boxedValueOfMethods())
           .build();
 
   public Set<DexType> libraryTypesAssumedToBePresent =
-      ImmutableSet.of(objectType, stringBufferType, stringBuilderType);
+      ImmutableSet.<DexType>builder()
+          .add(
+              callableType,
+              enumType,
+              npeType,
+              objectType,
+              stringBufferType,
+              stringBuilderType,
+              stringType)
+          .addAll(primitiveToBoxed.values())
+          .build();
 
-  public final Set<DexType> libraryTypesWithoutStaticInitialization =
+  public Set<DexType> libraryClassesWithoutStaticInitialization =
       ImmutableSet.of(
-          iteratorType, objectType, serializableType, stringBufferType, stringBuilderType);
+          boxedBooleanType, enumType, npeType, objectType, stringBufferType, stringBuilderType);
 
   private boolean skipNameValidationForTesting = false;
 
@@ -425,34 +753,195 @@ public class DexItemFactory {
     return dexMethod == metafactoryMethod || dexMethod == metafactoryAltMethod;
   }
 
-  public final BiMap<DexType, DexType> primitiveToBoxed = HashBiMap.create(
-      ImmutableMap.<DexType, DexType>builder()
-          .put(booleanType, boxedBooleanType)
-          .put(byteType, boxedByteType)
-          .put(charType, boxedCharType)
-          .put(shortType, boxedShortType)
-          .put(intType, boxedIntType)
-          .put(longType, boxedLongType)
-          .put(floatType, boxedFloatType)
-          .put(doubleType, boxedDoubleType)
-          .build());
+  public interface LibraryMembers {
 
-  public DexType getBoxedForPrimitiveType(DexType primitive) {
-    assert primitive.isPrimitiveType();
-    return primitiveToBoxed.get(primitive);
+    void forEachFinalField(Consumer<DexField> consumer);
   }
 
-  public DexType getPrimitiveFromBoxed(DexType boxedPrimitive) {
-    return primitiveToBoxed.inverse().get(boxedPrimitive);
+  public class BooleanMembers implements LibraryMembers {
+
+    public final DexField FALSE = createField(boxedBooleanType, boxedBooleanType, "FALSE");
+    public final DexField TRUE = createField(boxedBooleanType, boxedBooleanType, "TRUE");
+    public final DexField TYPE = createField(boxedBooleanType, classType, "TYPE");
+
+    public final DexMethod booleanValue =
+        createMethod(boxedBooleanType, createProto(booleanType), "booleanValue");
+    public final DexMethod parseBoolean =
+        createMethod(boxedBooleanType, createProto(booleanType, stringType), "parseBoolean");
+    public final DexMethod valueOf =
+        createMethod(boxedBooleanType, createProto(boxedBooleanType, booleanType), "valueOf");
+
+    private BooleanMembers() {}
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(FALSE);
+      consumer.accept(TRUE);
+      consumer.accept(TYPE);
+    }
   }
 
-  public class LongMethods {
+  public class AndroidOsBuildMembers implements LibraryMembers {
 
-    public final DexMethod compare;
+    public final DexField BOOTLOADER = createField(androidOsBuildType, stringType, "BOOTLOADER");
+    public final DexField BRAND = createField(androidOsBuildType, stringType, "BRAND");
+    public final DexField CPU_ABI = createField(androidOsBuildType, stringType, "CPU_ABI");
+    public final DexField CPU_ABI2 = createField(androidOsBuildType, stringType, "CPU_ABI2");
+    public final DexField DEVICE = createField(androidOsBuildType, stringType, "DEVICE");
+    public final DexField DISPLAY = createField(androidOsBuildType, stringType, "DISPLAY");
+    public final DexField FINGERPRINT = createField(androidOsBuildType, stringType, "FINGERPRINT");
+    public final DexField HARDWARE = createField(androidOsBuildType, stringType, "HARDWARE");
+    public final DexField MANUFACTURER =
+        createField(androidOsBuildType, stringType, "MANUFACTURER");
+    public final DexField MODEL = createField(androidOsBuildType, stringType, "MODEL");
+    public final DexField PRODUCT = createField(androidOsBuildType, stringType, "PRODUCT");
+    public final DexField SERIAL = createField(androidOsBuildType, stringType, "SERIAL");
+    public final DexField SUPPORTED_32_BIT_ABIS =
+        createField(androidOsBuildType, stringArrayType, "SUPPORTED_32_BIT_ABIS");
+    public final DexField SUPPORTED_64_BIT_ABIS =
+        createField(androidOsBuildType, stringArrayType, "SUPPORTED_64_BIT_ABIS");
+    public final DexField SUPPORTED_ABIS =
+        createField(androidOsBuildType, stringArrayType, "SUPPORTED_ABIS");
+    public final DexField TIME = createField(androidOsBuildType, longType, "TIME");
+    public final DexField TYPE = createField(androidOsBuildType, stringType, "TYPE");
 
-    private LongMethods() {
-      compare = createMethod(boxedLongDescriptor,
-          createString("compare"), intDescriptor, new DexString[]{longDescriptor, longDescriptor});
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(BOOTLOADER);
+      consumer.accept(BRAND);
+      consumer.accept(CPU_ABI);
+      consumer.accept(CPU_ABI2);
+      consumer.accept(DEVICE);
+      consumer.accept(DISPLAY);
+      consumer.accept(FINGERPRINT);
+      consumer.accept(HARDWARE);
+      consumer.accept(MANUFACTURER);
+      consumer.accept(MODEL);
+      consumer.accept(PRODUCT);
+      consumer.accept(SERIAL);
+      consumer.accept(SUPPORTED_32_BIT_ABIS);
+      consumer.accept(SUPPORTED_64_BIT_ABIS);
+      consumer.accept(SUPPORTED_ABIS);
+      consumer.accept(TIME);
+      consumer.accept(TYPE);
+    }
+  }
+
+  public class AndroidOsBuildVersionMembers implements LibraryMembers {
+
+    public final DexField CODENAME = createField(androidOsBuildVersionType, stringType, "CODENAME");
+    public final DexField RELEASE = createField(androidOsBuildVersionType, stringType, "RELEASE");
+    public final DexField SDK = createField(androidOsBuildVersionType, stringType, "SDK");
+    public final DexField SDK_INT = createField(androidOsBuildVersionType, intType, "SDK_INT");
+    public final DexField SECURITY_PATCH =
+        createField(androidOsBuildVersionType, stringType, "SECURITY_PATCH");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(CODENAME);
+      consumer.accept(RELEASE);
+      consumer.accept(SDK);
+      consumer.accept(SDK_INT);
+      consumer.accept(SECURITY_PATCH);
+    }
+  }
+
+  public class AndroidOsBundleMembers implements LibraryMembers {
+
+    public final DexField CREATOR =
+        createField(androidOsBundleType, androidOsParcelableCreatorType, "CREATOR");
+    public final DexField EMPTY = createField(androidOsBundleType, androidOsBundleType, "EMPTY");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(CREATOR);
+      consumer.accept(EMPTY);
+    }
+  }
+
+  public class AndroidSystemOsConstantsMembers implements LibraryMembers {
+
+    public final DexField S_IRUSR = createField(androidSystemOsConstantsType, intType, "S_IRUSR");
+    public final DexField S_IXUSR = createField(androidSystemOsConstantsType, intType, "S_IXUSR");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(S_IRUSR);
+      consumer.accept(S_IXUSR);
+    }
+  }
+
+  public class AndroidViewViewMembers implements LibraryMembers {
+
+    public final DexField TRANSLATION_Z =
+        createField(androidViewViewType, androidUtilPropertyType, "TRANSLATION_Z");
+    public final DexField EMPTY_STATE_SET =
+        createField(androidViewViewType, intArrayType, "EMPTY_STATE_SET");
+    public final DexField ENABLED_STATE_SET =
+        createField(androidViewViewType, intArrayType, "ENABLED_STATE_SET");
+    public final DexField PRESSED_ENABLED_STATE_SET =
+        createField(androidViewViewType, intArrayType, "PRESSED_ENABLED_STATE_SET");
+    public final DexField SELECTED_STATE_SET =
+        createField(androidViewViewType, intArrayType, "SELECTED_STATE_SET");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(TRANSLATION_Z);
+      consumer.accept(EMPTY_STATE_SET);
+      consumer.accept(ENABLED_STATE_SET);
+      consumer.accept(PRESSED_ENABLED_STATE_SET);
+      consumer.accept(SELECTED_STATE_SET);
+    }
+  }
+
+  public class FloatMembers implements LibraryMembers {
+
+    public final DexField TYPE = createField(boxedFloatType, classType, "TYPE");
+
+    private FloatMembers() {}
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(TYPE);
+    }
+  }
+
+  public class JavaIoFileMembers implements LibraryMembers {
+
+    public final DexField pathSeparator = createField(javaIoFileType, stringType, "pathSeparator");
+    public final DexField separator = createField(javaIoFileType, stringType, "separator");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(pathSeparator);
+      consumer.accept(separator);
+    }
+  }
+
+  public class JavaMathBigIntegerMembers implements LibraryMembers {
+
+    public final DexField ONE = createField(javaMathBigIntegerType, javaMathBigIntegerType, "ONE");
+    public final DexField ZERO =
+        createField(javaMathBigIntegerType, javaMathBigIntegerType, "ZERO");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(ONE);
+      consumer.accept(ZERO);
+    }
+  }
+
+  public class JavaNioByteOrderMembers implements LibraryMembers {
+
+    public final DexField LITTLE_ENDIAN =
+        createField(javaNioByteOrderType, javaNioByteOrderType, "LITTLE_ENDIAN");
+    public final DexField BIG_ENDIAN =
+        createField(javaNioByteOrderType, javaNioByteOrderType, "BIG_ENDIAN");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(LITTLE_ENDIAN);
+      consumer.accept(BIG_ENDIAN);
     }
   }
 
@@ -463,49 +952,234 @@ public class DexItemFactory {
     private JavaUtilArraysMethods() {
       asList =
           createMethod(
-              createString("Ljava/util/Arrays;"),
+              arraysDescriptor,
               createString("asList"),
               listDescriptor,
               new DexString[] {objectArrayDescriptor});
     }
   }
 
+  public class JavaUtilComparatorMembers implements LibraryMembers {
+
+    public final DexField EMPTY_LIST =
+        createField(javaUtilCollectionsType, javaUtilListType, "EMPTY_LIST");
+    public final DexField EMPTY_SET =
+        createField(javaUtilCollectionsType, javaUtilSetType, "EMPTY_SET");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(EMPTY_LIST);
+      consumer.accept(EMPTY_SET);
+    }
+  }
+
+  public class JavaUtilConcurrentTimeUnitMembers implements LibraryMembers {
+
+    public final DexField DAYS =
+        createField(javaUtilConcurrentTimeUnitType, javaUtilConcurrentTimeUnitType, "DAYS");
+    public final DexField HOURS =
+        createField(javaUtilConcurrentTimeUnitType, javaUtilConcurrentTimeUnitType, "HOURS");
+    public final DexField MICROSECONDS =
+        createField(javaUtilConcurrentTimeUnitType, javaUtilConcurrentTimeUnitType, "MICROSECONDS");
+    public final DexField MILLISECONDS =
+        createField(javaUtilConcurrentTimeUnitType, javaUtilConcurrentTimeUnitType, "MILLISECONDS");
+    public final DexField MINUTES =
+        createField(javaUtilConcurrentTimeUnitType, javaUtilConcurrentTimeUnitType, "MINUTES");
+    public final DexField NANOSECONDS =
+        createField(javaUtilConcurrentTimeUnitType, javaUtilConcurrentTimeUnitType, "NANOSECONDS");
+    public final DexField SECONDS =
+        createField(javaUtilConcurrentTimeUnitType, javaUtilConcurrentTimeUnitType, "SECONDS");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(DAYS);
+      consumer.accept(HOURS);
+      consumer.accept(MICROSECONDS);
+      consumer.accept(MILLISECONDS);
+      consumer.accept(MINUTES);
+      consumer.accept(NANOSECONDS);
+      consumer.accept(SECONDS);
+    }
+  }
+
+  public class JavaUtilLocaleMembers implements LibraryMembers {
+
+    public final DexField ENGLISH = createField(javaUtilLocaleType, javaUtilLocaleType, "ENGLISH");
+    public final DexField ROOT = createField(javaUtilLocaleType, javaUtilLocaleType, "ROOT");
+    public final DexField US = createField(javaUtilLocaleType, javaUtilLocaleType, "US");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(ENGLISH);
+      consumer.accept(ROOT);
+      consumer.accept(US);
+    }
+  }
+
+  public class JavaUtilLoggingLevelMembers implements LibraryMembers {
+
+    public final DexField CONFIG =
+        createField(javaUtilLoggingLevelType, javaUtilLoggingLevelType, "CONFIG");
+    public final DexField FINE =
+        createField(javaUtilLoggingLevelType, javaUtilLoggingLevelType, "FINE");
+    public final DexField FINER =
+        createField(javaUtilLoggingLevelType, javaUtilLoggingLevelType, "FINER");
+    public final DexField FINEST =
+        createField(javaUtilLoggingLevelType, javaUtilLoggingLevelType, "FINEST");
+    public final DexField SEVERE =
+        createField(javaUtilLoggingLevelType, javaUtilLoggingLevelType, "SEVERE");
+    public final DexField WARNING =
+        createField(javaUtilLoggingLevelType, javaUtilLoggingLevelType, "WARNING");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(CONFIG);
+      consumer.accept(FINE);
+      consumer.accept(FINER);
+      consumer.accept(FINEST);
+      consumer.accept(SEVERE);
+      consumer.accept(WARNING);
+    }
+  }
+
+  public class LongMembers implements LibraryMembers {
+
+    public final DexField TYPE = createField(boxedLongType, classType, "TYPE");
+
+    public final DexMethod compare;
+
+    private LongMembers() {
+      compare = createMethod(boxedLongDescriptor,
+          createString("compare"), intDescriptor, new DexString[]{longDescriptor, longDescriptor});
+    }
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(TYPE);
+    }
+  }
+
+  public class DoubleMethods {
+
+    public final DexMethod isNaN;
+
+    private DoubleMethods() {
+      isNaN =
+          createMethod(
+              boxedDoubleDescriptor,
+              createString("isNaN"),
+              booleanDescriptor,
+              new DexString[] {doubleDescriptor});
+    }
+  }
+
+  public class IntegerMembers implements LibraryMembers {
+
+    public final DexField TYPE = createField(boxedIntType, classType, "TYPE");
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(TYPE);
+    }
+  }
+
   public class ThrowableMethods {
 
     public final DexMethod addSuppressed;
+    public final DexMethod getMessage;
     public final DexMethod getSuppressed;
+    public final DexMethod initCause;
 
     private ThrowableMethods() {
       addSuppressed = createMethod(throwableDescriptor,
           createString("addSuppressed"), voidDescriptor, new DexString[]{throwableDescriptor});
       getSuppressed = createMethod(throwableDescriptor,
           createString("getSuppressed"), throwableArrayDescriptor, DexString.EMPTY_ARRAY);
+      initCause = createMethod(throwableDescriptor, createString("initCause"), throwableDescriptor,
+          new DexString[] { throwableDescriptor });
+      getMessage =
+          createMethod(
+              throwableDescriptor,
+              createString("getMessage"),
+              stringDescriptor,
+              DexString.EMPTY_ARRAY);
     }
   }
 
-  public class ObjectMethods {
+  public class AssertionErrorMethods {
+    public final DexMethod initMessage;
+    public final DexMethod initMessageAndCause;
 
+    private AssertionErrorMethods() {
+      this.initMessage =
+          createMethod(assertionErrorDescriptor, constructorMethodName, voidDescriptor,
+              new DexString[] { objectDescriptor });
+      this.initMessageAndCause =
+          createMethod(assertionErrorDescriptor, constructorMethodName, voidDescriptor,
+              new DexString[] { stringDescriptor, throwableDescriptor });
+    }
+  }
+
+  public class ObjectMembers {
+
+    /**
+     * This field is not on {@link Object}, but will be synthesized on program classes as a static
+     * field, for the compiler to have a principled way to trigger the initialization of a given
+     * class.
+     */
+    public final DexField clinitField = createField(objectType, intType, "$r8$clinit");
+
+    public final DexMethod clone;
     public final DexMethod getClass;
     public final DexMethod constructor;
     public final DexMethod finalize;
+    public final DexMethod toString;
 
-    private ObjectMethods() {
-      getClass = createMethod(objectDescriptor, getClassMethodName, classDescriptor,
-          DexString.EMPTY_ARRAY);
+    private ObjectMembers() {
+      // The clone method is installed on each array, so one has to use method.match(clone).
+      clone = createMethod(objectType, createProto(objectType), cloneMethodName);
+      getClass = createMethod(objectDescriptor,
+          getClassMethodName, classDescriptor, DexString.EMPTY_ARRAY);
       constructor = createMethod(objectDescriptor,
           constructorMethodName, voidType.descriptor, DexString.EMPTY_ARRAY);
       finalize = createMethod(objectDescriptor,
           finalizeMethodName, voidType.descriptor, DexString.EMPTY_ARRAY);
+      toString = createMethod(objectDescriptor,
+          toStringMethodName, stringDescriptor, DexString.EMPTY_ARRAY);
     }
   }
 
   public class ObjectsMethods {
 
-    public DexMethod requireNonNull;
+    public final DexMethod requireNonNull;
+    public final DexMethod requireNonNullWithMessage;
+    public final DexMethod requireNonNullWithMessageSupplier;
 
     private ObjectsMethods() {
-      requireNonNull = createMethod(objectsDescriptor,
-          createString("requireNonNull"), objectDescriptor, new DexString[]{objectDescriptor});
+      DexString requireNonNullMethodName = createString("requireNonNull");
+      requireNonNull =
+          createMethod(objectsType, createProto(objectType, objectType), requireNonNullMethodName);
+      requireNonNullWithMessage =
+          createMethod(
+              objectsType,
+              createProto(objectType, objectType, stringType),
+              requireNonNullMethodName);
+      requireNonNullWithMessageSupplier =
+          createMethod(
+              objectsType,
+              createProto(objectType, objectType, supplierType),
+              requireNonNullMethodName);
+    }
+
+    public boolean isRequireNonNullMethod(DexMethod method) {
+      return method == requireNonNull
+          || method == requireNonNullWithMessage
+          || method == requireNonNullWithMessageSupplier;
+    }
+
+    public Iterable<DexMethod> requireNonNullMethods() {
+      return ImmutableList.of(
+          requireNonNull, requireNonNullWithMessage, requireNonNullWithMessageSupplier);
     }
   }
 
@@ -513,6 +1187,7 @@ public class DexItemFactory {
 
     public final DexMethod desiredAssertionStatus;
     public final DexMethod forName;
+    public final DexMethod forName3;
     public final DexMethod getName;
     public final DexMethod getCanonicalName;
     public final DexMethod getSimpleName;
@@ -529,8 +1204,18 @@ public class DexItemFactory {
     private ClassMethods() {
       desiredAssertionStatus = createMethod(classDescriptor,
           desiredAssertionStatusMethodName, booleanDescriptor, DexString.EMPTY_ARRAY);
-      forName = createMethod(classDescriptor,
-          forNameMethodName, classDescriptor, new DexString[]{stringDescriptor});
+      forName =
+          createMethod(
+              classDescriptor,
+              forNameMethodName,
+              classDescriptor,
+              new DexString[] {stringDescriptor});
+      forName3 =
+          createMethod(
+              classDescriptor,
+              forNameMethodName,
+              classDescriptor,
+              new DexString[] {stringDescriptor, booleanDescriptor, classLoaderDescriptor});
       getName = createMethod(classDescriptor, getNameName, stringDescriptor, DexString.EMPTY_ARRAY);
       getCanonicalName = createMethod(
           classDescriptor, getCanonicalNameName, stringDescriptor, DexString.EMPTY_ARRAY);
@@ -545,17 +1230,21 @@ public class DexItemFactory {
               constructorDescriptor,
               new DexString[] {classArrayDescriptor});
       getField = createMethod(classDescriptor, getFieldName, fieldDescriptor,
-          new DexString[]{stringDescriptor});
+          new DexString[] {stringDescriptor});
       getDeclaredField = createMethod(classDescriptor, getDeclaredFieldName, fieldDescriptor,
-          new DexString[]{stringDescriptor});
+          new DexString[] {stringDescriptor});
       getMethod = createMethod(classDescriptor, getMethodName, methodDescriptor,
-          new DexString[]{stringDescriptor, classArrayDescriptor});
+          new DexString[] {stringDescriptor, classArrayDescriptor});
       getDeclaredMethod = createMethod(classDescriptor, getDeclaredMethodName, methodDescriptor,
-          new DexString[]{stringDescriptor, classArrayDescriptor});
+          new DexString[] {stringDescriptor, classArrayDescriptor});
       newInstance =
           createMethod(classDescriptor, newInstanceName, objectDescriptor, DexString.EMPTY_ARRAY);
       getMembers = ImmutableSet.of(getField, getDeclaredField, getMethod, getDeclaredMethod);
       getNames = ImmutableSet.of(getName, getCanonicalName, getSimpleName, getTypeName);
+    }
+
+    public boolean isReflectiveClassLookup(DexMethod method) {
+      return method == forName || method == forName3;
     }
 
     public boolean isReflectiveMemberLookup(DexMethod method) {
@@ -583,7 +1272,18 @@ public class DexItemFactory {
 
   public class EnumMethods {
 
-    public DexMethod valueOf;
+    public final DexMethod valueOf;
+    public final DexMethod ordinal;
+    public final DexMethod name;
+    public final DexMethod toString;
+    public final DexMethod compareTo;
+    public final DexMethod equals;
+    public final DexMethod hashCode;
+
+    public final DexMethod constructor =
+        createMethod(enumType, createProto(voidType, stringType, intType), constructorMethodName);
+    public final DexMethod finalize =
+        createMethod(enumType, createProto(voidType), finalizeMethodName);
 
     private EnumMethods() {
       valueOf =
@@ -592,21 +1292,68 @@ public class DexItemFactory {
               valueOfMethodName,
               enumDescriptor,
               new DexString[] {classDescriptor, stringDescriptor});
+      ordinal =
+          createMethod(
+              enumDescriptor,
+              ordinalMethodName,
+              intDescriptor,
+              DexString.EMPTY_ARRAY);
+      name =
+          createMethod(
+              enumDescriptor,
+              nameMethodName,
+              stringDescriptor,
+              DexString.EMPTY_ARRAY);
+      toString =
+          createMethod(
+              enumDescriptor,
+              toStringMethodName,
+              stringDescriptor,
+              DexString.EMPTY_ARRAY);
+      compareTo =
+          createMethod(
+              enumDescriptor, compareToMethodName, intDescriptor, new DexString[] {enumDescriptor});
+      equals =
+          createMethod(
+              enumDescriptor,
+              equalsMethodName,
+              booleanDescriptor,
+              new DexString[] {objectDescriptor});
+      hashCode =
+          createMethod(enumDescriptor, hashCodeMethodName, intDescriptor, DexString.EMPTY_ARRAY);
+    }
+
+    public boolean isValuesMethod(DexMethod method, DexClass enumClass) {
+      assert enumClass.isEnum();
+      return method.holder == enumClass.type
+          && method.proto.returnType == enumClass.type.toArrayType(1, DexItemFactory.this)
+          && method.proto.parameters.size() == 0
+          && method.name == valuesMethodName;
+    }
+
+    public boolean isValueOfMethod(DexMethod method, DexClass enumClass) {
+      assert enumClass.isEnum();
+      return method.holder == enumClass.type
+          && method.proto.returnType == enumClass.type
+          && method.proto.parameters.size() == 1
+          && method.proto.parameters.values[0] == stringType
+          && method.name == valueOfMethodName;
     }
   }
 
   public class NullPointerExceptionMethods {
 
-    public final DexMethod init;
+    public final DexMethod init =
+        createMethod(npeType, createProto(voidType), constructorMethodName);
+    public final DexMethod initWithMessage =
+        createMethod(npeType, createProto(voidType, stringType), constructorMethodName);
+  }
 
-    private NullPointerExceptionMethods() {
-      init =
-          createMethod(
-              npeDescriptor,
-              constructorMethodName,
-              voidDescriptor,
-              DexString.EMPTY_ARRAY);
-    }
+  public class IllegalArgumentExceptionMethods {
+
+    public final DexMethod initWithMessage =
+        createMethod(
+            illegalArgumentExceptionType, createProto(voidType, stringType), initMethodName);
   }
 
   /**
@@ -616,7 +1363,7 @@ public class DexItemFactory {
    * E.g. for Boolean https://docs.oracle.com/javase/8/docs/api/java/lang/Boolean.html#TYPE.
    */
   public class PrimitiveTypesBoxedTypeFields {
-    public final DexField booleanTYPE;
+
     public final DexField byteTYPE;
     public final DexField charTYPE;
     public final DexField shortTYPE;
@@ -628,7 +1375,6 @@ public class DexItemFactory {
     private final Map<DexField, DexType> boxedFieldTypeToPrimitiveType;
 
     private PrimitiveTypesBoxedTypeFields() {
-      booleanTYPE = createField(boxedBooleanType, classType, "TYPE");
       byteTYPE = createField(boxedByteType, classType, "TYPE");
       charTYPE = createField(boxedCharType, classType, "TYPE");
       shortTYPE = createField(boxedShortType, classType, "TYPE");
@@ -639,7 +1385,7 @@ public class DexItemFactory {
 
       boxedFieldTypeToPrimitiveType =
           ImmutableMap.<DexField, DexType>builder()
-              .put(booleanTYPE, booleanType)
+              .put(booleanMembers.TYPE, booleanType)
               .put(byteTYPE, byteType)
               .put(charTYPE, charType)
               .put(shortTYPE, shortType)
@@ -671,19 +1417,19 @@ public class DexItemFactory {
               intFieldUpdaterDescriptor,
               newUpdaterName,
               intFieldUpdaterDescriptor,
-              new DexString[]{classDescriptor, stringDescriptor});
+              new DexString[] {classDescriptor, stringDescriptor});
       longUpdater =
           createMethod(
               longFieldUpdaterDescriptor,
               newUpdaterName,
               longFieldUpdaterDescriptor,
-              new DexString[]{classDescriptor, stringDescriptor});
+              new DexString[] {classDescriptor, stringDescriptor});
       referenceUpdater =
           createMethod(
               referenceFieldUpdaterDescriptor,
               newUpdaterName,
               referenceFieldUpdaterDescriptor,
-              new DexString[]{classDescriptor, classDescriptor, stringDescriptor});
+              new DexString[] {classDescriptor, classDescriptor, stringDescriptor});
       updaters = ImmutableSet.of(intUpdater, longUpdater, referenceUpdater);
     }
 
@@ -692,10 +1438,15 @@ public class DexItemFactory {
     }
   }
 
-  public class StringMethods {
+  public class StringMembers implements LibraryMembers {
+
+    public final DexField CASE_INSENSITIVE_ORDER =
+        createField(stringType, javaUtilComparatorType, "CASE_INSENSITIVE_ORDER");
+
     public final DexMethod isEmpty;
     public final DexMethod length;
 
+    public final DexMethod concat;
     public final DexMethod contains;
     public final DexMethod startsWith;
     public final DexMethod endsWith;
@@ -710,10 +1461,14 @@ public class DexItemFactory {
     public final DexMethod compareTo;
     public final DexMethod compareToIgnoreCase;
 
+    public final DexMethod hashCode;
     public final DexMethod valueOf;
     public final DexMethod toString;
+    public final DexMethod intern;
 
-    private StringMethods() {
+    public final DexMethod trim = createMethod(stringType, createProto(stringType), trimName);
+
+    private StringMembers() {
       isEmpty = createMethod(
           stringDescriptor, isEmptyMethodName, booleanDescriptor, DexString.EMPTY_ARRAY);
       length = createMethod(
@@ -724,6 +1479,7 @@ public class DexItemFactory {
       DexString[] needsOneObject = { objectDescriptor };
       DexString[] needsOneInt = { intDescriptor };
 
+      concat = createMethod(stringDescriptor, concatMethodName, stringDescriptor, needsOneString);
       contains = createMethod(
           stringDescriptor, containsMethodName, booleanDescriptor, needsOneCharSequence);
       startsWith = createMethod(
@@ -751,10 +1507,18 @@ public class DexItemFactory {
           createMethod(stringDescriptor, compareToIgnoreCaseMethodName, intDescriptor,
               needsOneString);
 
+      hashCode = createMethod(stringType, createProto(intType), hashCodeMethodName);
       valueOf = createMethod(
           stringDescriptor, valueOfMethodName, stringDescriptor, needsOneObject);
       toString = createMethod(
           stringDescriptor, toStringMethodName, stringDescriptor, DexString.EMPTY_ARRAY);
+      intern = createMethod(
+          stringDescriptor, internMethodName, stringDescriptor, DexString.EMPTY_ARRAY);
+    }
+
+    @Override
+    public void forEachFinalField(Consumer<DexField> consumer) {
+      consumer.accept(CASE_INSENSITIVE_ORDER);
     }
   }
 
@@ -777,12 +1541,12 @@ public class DexItemFactory {
     public final DexMethod defaultConstructor;
     public final DexMethod intConstructor;
     public final DexMethod stringConstructor;
+    public final DexMethod toString;
 
     private final Set<DexMethod> appendMethods;
     private final Set<DexMethod> constructorMethods;
 
     private StringBuildingMethods(DexType receiver) {
-      DexType sbufType = createType(createString("Ljava/lang/StringBuffer;"));
       DexString append = createString("append");
 
       appendBoolean = createMethod(receiver, createProto(receiver, booleanType), append);
@@ -799,7 +1563,7 @@ public class DexItemFactory {
       appendLong = createMethod(receiver, createProto(receiver, longType), append);
       appendObject = createMethod(receiver, createProto(receiver, objectType), append);
       appendString = createMethod(receiver, createProto(receiver, stringType), append);
-      appendStringBuffer = createMethod(receiver, createProto(receiver, sbufType), append);
+      appendStringBuffer = createMethod(receiver, createProto(receiver, stringBufferType), append);
 
       charSequenceConstructor =
           createMethod(receiver, createProto(voidType, charSequenceType), constructorMethodName);
@@ -808,6 +1572,7 @@ public class DexItemFactory {
           createMethod(receiver, createProto(voidType, intType), constructorMethodName);
       stringConstructor =
           createMethod(receiver, createProto(voidType, stringType), constructorMethodName);
+      toString = createMethod(receiver, createProto(stringType), toStringMethodName);
 
       appendMethods =
           ImmutableSet.of(
@@ -831,6 +1596,37 @@ public class DexItemFactory {
 
     public boolean isAppendMethod(DexMethod method) {
       return appendMethods.contains(method);
+    }
+
+    public boolean constructorInvokeIsSideEffectFree(InvokeMethod invoke) {
+      DexMethod invokedMethod = invoke.getInvokedMethod();
+      if (invokedMethod == charSequenceConstructor) {
+        // NullPointerException - if seq is null.
+        Value seqValue = invoke.inValues().get(1);
+        return !seqValue.getType().isNullable();
+      }
+
+      if (invokedMethod == defaultConstructor) {
+        return true;
+      }
+
+      if (invokedMethod == intConstructor) {
+        // NegativeArraySizeException - if the capacity argument is less than 0.
+        Value capacityValue = invoke.inValues().get(1);
+        if (capacityValue.hasValueRange()) {
+          return capacityValue.getValueRange().getMin() >= 0;
+        }
+        return false;
+      }
+
+      if (invokedMethod == stringConstructor) {
+        // NullPointerException - if str is null.
+        Value strValue = invoke.inValues().get(1);
+        return !strValue.getType().isNullable();
+      }
+
+      assert false : "Unexpected invoke targeting `" + invokedMethod.toSourceString() +  "`";
+      return false;
     }
   }
 
@@ -945,7 +1741,7 @@ public class DexItemFactory {
     }
   }
 
-  private static <T extends DexItem> T canonicalize(ConcurrentHashMap<T, T> map, T item) {
+  private static <T extends DexItem> T canonicalize(Map<T, T> map, T item) {
     assert item != null;
     assert !DexItemFactory.isInternalSentinel(item);
     T previous = map.putIfAbsent(item, item);
@@ -962,21 +1758,12 @@ public class DexItemFactory {
     return canonicalize(strings, new DexString(source));
   }
 
-  public DexString lookupString(String source) {
-    return strings.get(new DexString(source));
+  public DexString lookupString(int size, byte[] content) {
+    return strings.get(new DexString(size, content));
   }
 
-  // Debugging support to extract marking string.
-  public synchronized Collection<Marker> extractMarker() {
-    // This is slow but it is not needed for any production code yet.
-    List<Marker> markers = new ArrayList<>();
-    for (DexString dexString : strings.keySet()) {
-      Marker result = Marker.parse(dexString);
-      if (result != null) {
-        markers.add(result);
-      }
-    }
-    return markers;
+  public DexString lookupString(String source) {
+    return strings.get(new DexString(source));
   }
 
   // Debugging support to extract marking string.
@@ -993,18 +1780,68 @@ public class DexItemFactory {
     return markers;
   }
 
-  synchronized public DexType createType(DexString descriptor) {
+  // Non-synchronized internal create.
+  private DexType internalCreateType(DexString descriptor) {
     assert !sorted;
     assert descriptor != null;
     DexType result = types.get(descriptor);
     if (result == null) {
       result = new DexType(descriptor);
-      assert result.isArrayType() || result.isClassType() || result.isPrimitiveType() ||
-          result.isVoidType();
+      assert result.isArrayType()
+          || result.isClassType()
+          || result.isPrimitiveType()
+          || result.isVoidType();
       assert !isInternalSentinel(result);
       types.put(descriptor, result);
     }
     return result;
+  }
+
+  private DexType createStaticallyKnownType(String descriptor) {
+    return createStaticallyKnownType(createString(descriptor));
+  }
+
+  private DexType createStaticallyKnownType(DexString descriptor) {
+    DexType type = internalCreateType(descriptor);
+    // Conservatively add all statically known types to "compiler synthesized types set".
+    addPossiblySynthesizedType(type);
+    return type;
+  }
+
+  // Safe synchronized external create. May be used for statically known types in synthetic code.
+  // See the generated BackportedMethods.java for reference.
+  public synchronized DexType createSynthesizedType(String descriptor) {
+    DexType type = internalCreateType(createString(descriptor));
+    addPossiblySynthesizedType(type);
+    return type;
+  }
+
+  // Registration of a type that is only dynamically known (eg, in the desugared lib spec), but
+  // will be referenced during desugaring.
+  public void registerTypeNeededForDesugaring(DexType type) {
+    addPossiblySynthesizedType(type);
+  }
+
+  private void addPossiblySynthesizedType(DexType type) {
+    if (type.isArrayType()) {
+      type = type.toBaseType(this);
+    }
+    if (type.isClassType()) {
+      possibleCompilerSynthesizedTypes.add(type);
+    }
+  }
+
+  public boolean isPossiblyCompilerSynthesizedType(DexType type) {
+    return possibleCompilerSynthesizedTypes.contains(type);
+  }
+
+  public void forEachPossiblyCompilerSynthesizedType(Consumer<DexType> fn) {
+    possibleCompilerSynthesizedTypes.forEach(fn);
+  }
+
+  // Safe synchronized external create. Should never be used to create a statically known type!
+  public synchronized DexType createType(DexString descriptor) {
+    return internalCreateType(descriptor);
   }
 
   public DexType createType(String descriptor) {
@@ -1030,7 +1867,7 @@ public class DexItemFactory {
     return createField(clazz, type, createString(name));
   }
 
-  public DexProto createProto(DexType returnType, DexString shorty, DexTypeList parameters) {
+  public DexProto createProto(DexType returnType, DexTypeList parameters, DexString shorty) {
     assert !sorted;
     DexProto proto = new DexProto(shorty, returnType, parameters);
     return canonicalize(protos, proto);
@@ -1038,8 +1875,40 @@ public class DexItemFactory {
 
   public DexProto createProto(DexType returnType, DexType... parameters) {
     assert !sorted;
-    return createProto(returnType, createShorty(returnType, parameters),
-        parameters.length == 0 ? DexTypeList.empty() : new DexTypeList(parameters));
+    return createProto(
+        returnType,
+        parameters.length == 0 ? DexTypeList.empty() : new DexTypeList(parameters),
+        createShorty(returnType, parameters));
+  }
+
+  public DexProto createProto(DexType returnType, List<DexType> parameters) {
+    return createProto(returnType, parameters.toArray(DexType.EMPTY_ARRAY));
+  }
+
+  public DexProto protoWithDifferentFirstParameter(DexProto proto, DexType firstParameter) {
+    DexType[] parameterTypes = proto.parameters.values.clone();
+    parameterTypes[0] = firstParameter;
+    return createProto(proto.returnType, parameterTypes);
+  }
+
+  public DexProto prependHolderToProto(DexMethod method) {
+    return prependTypeToProto(method.holder, method.proto);
+  }
+
+  public DexProto prependTypeToProto(DexType extraFirstType, DexProto initialProto) {
+    DexType[] parameterTypes = new DexType[initialProto.parameters.size() + 1];
+    parameterTypes[0] = extraFirstType;
+    System.arraycopy(
+        initialProto.parameters.values, 0, parameterTypes, 1, initialProto.parameters.size());
+    return createProto(initialProto.returnType, parameterTypes);
+  }
+
+  public DexProto appendTypeToProto(DexProto initialProto, DexType extraLastType) {
+    DexType[] parameterTypes = new DexType[initialProto.parameters.size() + 1];
+    System.arraycopy(
+        initialProto.parameters.values, 0, parameterTypes, 0, initialProto.parameters.size());
+    parameterTypes[parameterTypes.length - 1] = extraLastType;
+    return createProto(initialProto.returnType, parameterTypes);
   }
 
   public DexProto applyClassMappingToProto(
@@ -1065,7 +1934,7 @@ public class DexItemFactory {
 
   private static DexType[] applyClassMappingToDexTypes(
       DexType[] types, Function<DexType, DexType> mapping) {
-    Map<Integer, DexType> changed = new Int2ObjectArrayMap<>();
+    Map<Integer, DexType> changed = new Int2ReferenceArrayMap<>();
     for (int i = 0; i < types.length; i++) {
       DexType applied = mapping.apply(types[i]);
       if (applied != types[i]) {
@@ -1098,7 +1967,7 @@ public class DexItemFactory {
 
   public DexMethodHandle createMethodHandle(
       MethodHandleType type,
-      Descriptor<? extends DexItem, ? extends Descriptor<?, ?>> fieldOrMethod,
+      DexMember<? extends DexItem, ? extends DexMember<?, ?>> fieldOrMethod,
       boolean isInterface) {
     assert !sorted;
     DexMethodHandle methodHandle = new DexMethodHandle(type, fieldOrMethod, isInterface);
@@ -1115,7 +1984,9 @@ public class DexItemFactory {
     return new DexCallSite(methodName, methodProto, bootstrapMethod, bootstrapArgs);
   }
 
-  public DexMethod createMethod(DexString clazzDescriptor, DexString name,
+  public DexMethod createMethod(
+      DexString clazzDescriptor,
+      DexString name,
       DexString returnTypeDescriptor,
       DexString[] parameterDescriptors) {
     assert !sorted;
@@ -1189,21 +2060,21 @@ public class DexItemFactory {
     return method.name == classConstructorMethodName;
   }
 
-  public void clearTypeLatticeElementsCache() {
-    referenceTypeLatticeElements.clear();
-    classTypeLatticeInterfaces.clear();
+  public void clearTypeElementsCache() {
+    referenceTypes.clear();
+    classTypeInterfaces.clear();
     leastUpperBoundOfInterfacesTable.clear();
   }
 
-  public boolean verifyNoCachedTypeLatticeElements() {
-    assert referenceTypeLatticeElements.isEmpty();
-    assert classTypeLatticeInterfaces.isEmpty();
+  public boolean verifyNoCachedTypeElements() {
+    assert referenceTypes.isEmpty();
+    assert classTypeInterfaces.isEmpty();
     assert leastUpperBoundOfInterfacesTable.isEmpty();
     return true;
   }
 
-  public ReferenceTypeLatticeElement createReferenceTypeLatticeElement(
-      DexType type, Nullability nullability, AppView<? extends AppInfo> appView) {
+  public ReferenceTypeElement createReferenceTypeElement(
+      DexType type, Nullability nullability, AppView<?> appView) {
     // Class case:
     // If two concurrent threads will try to create the same class-type the concurrent hash map will
     // synchronize on the type in .computeIfAbsent and only a single class type is created.
@@ -1216,89 +2087,54 @@ public class DexItemFactory {
     // (ii) If base is ArrayLattice case we can use our induction hypothesis to get that only one
     //      element is created for us up to this case. Threads will now race to return from the
     //      latest recursive call and fight to get access to .computeIfAbsent to add the
-    //      ArrayTypeLatticeElement but only one will enter. The property that only one
-    //      ArrayTypeLatticeElement is created per level therefore holds inductively.
-    TypeLatticeElement memberType = null;
+    //      ArrayTypeElement but only one will enter. The property that only one
+    //      ArrayTypeElement is created per level therefore holds inductively.
+    TypeElement memberType = null;
     if (type.isArrayType()) {
-      ReferenceTypeLatticeElement existing = referenceTypeLatticeElements.get(type);
+      ReferenceTypeElement existing = referenceTypes.get(type);
       if (existing != null) {
         return existing.getOrCreateVariant(nullability);
       }
       memberType =
-          TypeLatticeElement.fromDexType(
+          TypeElement.fromDexType(
               type.toArrayElementType(this), Nullability.maybeNull(), appView, true);
     }
-    TypeLatticeElement finalMemberType = memberType;
-    return referenceTypeLatticeElements
+    TypeElement finalMemberType = memberType;
+    return referenceTypes
         .computeIfAbsent(
             type,
             t -> {
               if (type.isClassType()) {
                 if (!appView.enableWholeProgramOptimizations()) {
                   // Don't reason at the level of interfaces in D8.
-                  return ClassTypeLatticeElement.create(type, nullability, Collections.emptySet());
+                  return ClassTypeElement.create(type, nullability, Collections.emptySet());
                 }
-                assert appView.appInfo().hasSubtyping();
+                assert appView.appInfo().hasClassHierarchy();
                 if (appView.isInterface(type).isTrue()) {
-                  return ClassTypeLatticeElement.create(
+                  return ClassTypeElement.create(
                       objectType, nullability, Collections.singleton(type));
                 }
                 // In theory, `interfaces` is the least upper bound of implemented interfaces.
                 // It is expensive to walk through type hierarchy; collect implemented interfaces;
                 // and compute the least upper bound of two interface sets. Hence, lazy
                 // computations. Most likely during lattice join. See {@link
-                // ClassTypeLatticeElement#getInterfaces}.
-                return ClassTypeLatticeElement.create(type, nullability, appView.withSubtyping());
+                // ClassTypeElement#getInterfaces}.
+                return ClassTypeElement.create(type, nullability, appView.withClassHierarchy());
               }
               assert type.isArrayType();
-              return ArrayTypeLatticeElement.create(finalMemberType, nullability);
+              return ArrayTypeElement.create(finalMemberType, nullability);
             })
         .getOrCreateVariant(nullability);
   }
 
   public Set<DexType> getOrComputeLeastUpperBoundOfImplementedInterfaces(
-      DexType type, AppView<? extends AppInfoWithSubtyping> appView) {
-    return classTypeLatticeInterfaces
-        .computeIfAbsent(
-            type,
-            t -> {
-              Set<DexType> itfs = appView.appInfo().implementedInterfaces(t);
-              return computeLeastUpperBoundOfInterfaces(appView, itfs, itfs);
-            }
-        );
-  }
-
-  private static <S extends PresortedComparable<S>> void assignSortedIndices(Collection<S> items,
-      NamingLens namingLens) {
-    List<S> sorted = new ArrayList<>(items);
-    sorted.sort((a, b) -> a.layeredCompareTo(b, namingLens));
-    int i = 0;
-    for (S value : sorted) {
-      value.setSortedIndex(i++);
-    }
-  }
-
-  synchronized public void sort(NamingLens namingLens) {
-    assert !sorted;
-    assignSortedIndices(strings.values(), namingLens);
-    assignSortedIndices(types.values(), namingLens);
-    assignSortedIndices(fields.values(), namingLens);
-    assignSortedIndices(protos.values(), namingLens);
-    assignSortedIndices(methods.values(), namingLens);
-    sorted = true;
-  }
-
-  synchronized public void resetSortedIndices() {
-    if (!sorted) {
-      return;
-    }
-    // Only used for asserting that we don't use the sorted index after we build the graph.
-    strings.values().forEach(IndexedDexItem::resetSortedIndex);
-    types.values().forEach(IndexedDexItem::resetSortedIndex);
-    fields.values().forEach(IndexedDexItem::resetSortedIndex);
-    protos.values().forEach(IndexedDexItem::resetSortedIndex);
-    methods.values().forEach(IndexedDexItem::resetSortedIndex);
-    sorted = false;
+      DexType type, AppView<? extends AppInfoWithClassHierarchy> appView) {
+    return classTypeInterfaces.computeIfAbsent(
+        type,
+        t -> {
+          Set<DexType> itfs = appView.appInfo().implementedInterfaces(t);
+          return computeLeastUpperBoundOfInterfaces(appView, itfs, itfs);
+        });
   }
 
   synchronized public void forAllTypes(Consumer<DexType> f) {
